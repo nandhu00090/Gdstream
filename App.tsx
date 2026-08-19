@@ -19,13 +19,11 @@ const App = () => {
 
   const authenticateAndFetch = async () => {
     try {
-      // Step 1: Background-la Login panrom
       const loginData = `username=${USERNAME}&password=${PASSWORD}`;
       await axios.post(`${BASE_URL}/login`, loginData, {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       });
 
-      // Step 2: Login success aanathum movies list-ah vangrom
       const response = await axios.post(`${BASE_URL}/0:/`, {
         page_index: 0
       });
@@ -43,8 +41,10 @@ const App = () => {
   const handlePress = (item) => {
     if (item.mimeType === 'application/vnd.google-apps.folder') {
       console.log('Folder clicked:', item.name);
-    } else if (item.mimeType.includes('video')) {
-      setCurrentVideo(`${BASE_URL}${item.link}`);
+    } else {
+      // FIX: Folder illatha ellathaiyum play panna set panrom!
+      const videoPath = item.link ? item.link : `/0:/${encodeURIComponent(item.name)}`;
+      setCurrentVideo(`${BASE_URL}${videoPath}`);
     }
   };
 
