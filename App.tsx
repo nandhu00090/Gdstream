@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Linking } from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
+import IntentLauncher from 'react-native-intent-launcher';
 
 const BASE_URL = 'https://movies-and-series.ambalartssb01.workers.dev';
 const USERNAME = 'admin'; 
@@ -12,9 +13,8 @@ const App = () => {
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(true);
   
-  // Puthu states: Click panna file-ah store panna
   const [selectedFile, setSelectedFile] = useState(null);
-  const [playMode, setPlayMode] = useState(null); // 'internal' allathu 'external'
+  const [playMode, setPlayMode] = useState(null);
 
   useEffect(() => {
     authenticateAndFetch();
@@ -45,7 +45,6 @@ const App = () => {
     if (item.mimeType === 'application/vnd.google-apps.folder') {
       console.log('Folder clicked:', item.name);
     } else {
-      // File-ah click panna udane play pannaama, select mattum panrom
       setSelectedFile(item);
       setPlayMode(null);
     }
@@ -59,15 +58,19 @@ const App = () => {
   const openInExternalPlayer = async () => {
     if (!selectedFile) return;
     const url = getFileUrl(selectedFile);
-    // Simple-aana URL open method. Ithu OS-aiye player-ah choose panna vekkum.
+    
     try {
-      await Linking.openURL(url);
+      // FIX: Android OS-kitta ithu "video/*" nu explicit-ah solrom!
+      await IntentLauncher.startActivity({
+        action: 'android.intent.action.VIEW',
+        data: url,
+        type: 'video/*',
+      });
     } catch (error) {
-      console.log("Linking error:", error);
+      Alert.alert("Error ⚠️", "Unga phone-la media players ethuvum kidaikkala!");
     }
   };
 
-  // 1. Internal Player Screen (ExoPlayer)
   if (selectedFile && playMode === 'internal') {
     return (
       <View style={styles.playerContainer}>
@@ -90,7 +93,6 @@ const App = () => {
     );
   }
 
-  // 2. Selection Screen (ExoPlayer load aagaathu, RAM safe!)
   if (selectedFile && playMode === null) {
     return (
       <View style={styles.selectionContainer}>
@@ -101,7 +103,7 @@ const App = () => {
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.secondaryButton} onPress={openInExternalPlayer}>
-          <Text style={styles.buttonText}>Play in VLC (REMUX Files) 🎦</Text>
+          <Text style={styles.buttonText}>Play in External Player 🎦</Text>
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.backButton} onPress={() => setSelectedFile(null)}>
@@ -111,7 +113,6 @@ const App = () => {
     );
   }
 
-  // 3. Normal List Screen
   return (
     <View style={styles.container}>
       <Text style={styles.headerTitle}>GDStream 🍿</Text>
