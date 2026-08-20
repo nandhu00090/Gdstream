@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput, ScrollView, Modal, BackHandler } from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput, ScrollView, BackHandler } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
 import Orientation from 'react-native-orientation-locker';
@@ -139,7 +139,7 @@ const App = () => {
     setSelectedText(undefined);
   };
 
-  // 🔥 RESUME PLAYBACK LOGIC 🔥
+  // 🔥 SILENT RESUME PLAYBACK 🔥
   const handleVideoLoad = async (meta) => {
     setDuration(meta.duration);
     if (meta.audioTracks) setAudioTracks(meta.audioTracks);
@@ -149,42 +149,42 @@ const App = () => {
       const savedTimeStr = await AsyncStorage.getItem(`time_${selectedFile.name}`);
       if (savedTimeStr) {
         const savedTime = parseFloat(savedTimeStr);
-        // Padam mudiya 3 minute-ku mela iruntha mattum resume pannu (Prevent auto-resume on finished movies)
         if (savedTime > 0 && meta.duration - savedTime > 180) {
           videoRef.current?.seek(savedTime);
-          Alert.alert("Resumed 🍿", "Playing from where you left off!");
+          // Removed the Alert here for a seamless experience
         }
       }
     } catch(e) {}
   };
 
-  // 🔥 SILENT SAVE PROGRESS LOGIC 🔥
   const handleProgress = (progress) => {
     setCurrentTime(progress.currentTime);
-    // Every 5 seconds, save time to local storage
     if (Math.floor(progress.currentTime) > 0 && Math.floor(progress.currentTime) % 5 === 0) {
       AsyncStorage.setItem(`time_${selectedFile?.name}`, progress.currentTime.toString()).catch(() => {});
     }
   };
 
-  // 🔥 AUTO-NEXT EPISODE LOGIC 🔥
+  // 🔥 SMART AUTO-NEXT EPISODE LOGIC 🔥
   const handleVideoEnd = async () => {
-    // Clear current file progress so it starts from 0 next time
     try { await AsyncStorage.removeItem(`time_${selectedFile?.name}`); } catch(e) {}
     
-    // Find Next File
-    const currentIndex = filteredFiles.findIndex(f => f.name === selectedFile?.name);
-    if (currentIndex !== -1 && currentIndex + 1 < filteredFiles.length) {
-      const nextFile = filteredFiles[currentIndex + 1];
-      if (!nextFile.mimeType?.includes('folder')) {
-        Alert.alert("Auto-Playing Next 🍿", nextFile.name);
-        openFile(nextFile); // Load Next Episode Automatically!
-      } else {
-        closeInternalPlayer();
+    // Series ah nu check panra Regex (e.g., S01E01, s1e1, S02E14)
+    const episodeRegex = /[Ss]\d+[Ee]\d+/;
+    const isEpisode = episodeRegex.test(selectedFile?.name || '');
+
+    if (isEpisode) {
+      const currentIndex = filteredFiles.findIndex(f => f.name === selectedFile?.name);
+      if (currentIndex !== -1 && currentIndex + 1 < filteredFiles.length) {
+        const nextFile = filteredFiles[currentIndex + 1];
+        if (!nextFile.mimeType?.includes('folder')) {
+          openFile(nextFile); // Seamless ah next episode play aagum, no alerts!
+          return;
+        }
       }
-    } else {
-      closeInternalPlayer();
     }
+    
+    // Movie aah iruntha illana adutha episode illana close aagidum
+    closeInternalPlayer();
   };
 
   const seekForward = () => { videoRef.current?.seek(currentTime + 10); };
