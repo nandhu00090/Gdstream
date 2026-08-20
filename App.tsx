@@ -1,11 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator } from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, Linking } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
 
 const BASE_URL = 'https://movies-and-series.ambalartssb01.workers.dev';
 const USERNAME = 'admin'; 
-// KEEZHA IRUKKA EDATHULA UNGA UNMAIYANA PASSWORD-AH MAATHUNGA:
+// UNGA UNMAIYANA PASSWORD-AH INGA MAATHUNGA:
 const PASSWORD = '629175'; 
 
 const App = () => {
@@ -42,19 +42,23 @@ const App = () => {
     if (item.mimeType === 'application/vnd.google-apps.folder') {
       console.log('Folder clicked:', item.name);
     } else {
-      // FIX: Folder illatha ellathaiyum play panna set panrom!
       const videoPath = item.link ? item.link : `/0:/${encodeURIComponent(item.name)}`;
       setCurrentVideo(`${BASE_URL}${videoPath}`);
     }
   };
 
-  const renderItem = ({ item }) => (
-    <TouchableOpacity style={styles.itemCard} onPress={() => handlePress(item)}>
-      <Text style={styles.itemText}>
-        {item.mimeType.includes('folder') ? '📁' : '🎬'} {item.name}
-      </Text>
-    </TouchableOpacity>
-  );
+  const openInExternalPlayer = async () => {
+    if (!currentVideo) return;
+    // Android-oda default video player chooser-ah thirakka intent
+    const cleanUrl = currentVideo.replace(/^https?:\/\//, '');
+    const intentUrl = `intent://${cleanUrl}#Intent;scheme=https;action=android.intent.action.VIEW;type=video/*;end`;
+    
+    try {
+      await Linking.openURL(intentUrl);
+    } catch (error) {
+      Alert.alert("Error", "VLC allathu MX Player install panni irukka nu check pannunga!");
+    }
+  };
 
   return (
     <View style={styles.container}>
@@ -67,11 +71,21 @@ const App = () => {
             style={styles.videoPlayer}
             controls={true}
             resizeMode="contain"
-            onEnd={() => setCurrentVideo(null)}
+            onError={(e) => {
+              console.log("Video Error: ", e);
+              Alert.alert("Heavy File ⚠️", "Ithu REMUX file. Keela irukka 'Play in External Player' button-ah use pannunga.");
+            }}
           />
-          <TouchableOpacity style={styles.closeButton} onPress={() => setCurrentVideo(null)}>
-            <Text style={styles.closeText}>Close Player ❌</Text>
-          </TouchableOpacity>
+          
+          <View style={styles.buttonRow}>
+            <TouchableOpacity style={styles.externalButton} onPress={openInExternalPlayer}>
+              <Text style={styles.buttonText}>Open in VLC / MX 🎦</Text>
+            </TouchableOpacity>
+            
+            <TouchableOpacity style={styles.closeButton} onPress={() => setCurrentVideo(null)}>
+              <Text style={styles.buttonText}>Close ❌</Text>
+            </TouchableOpacity>
+          </View>
         </View>
       ) : (
         loading ? (
@@ -80,7 +94,13 @@ const App = () => {
           <FlatList
             data={files}
             keyExtractor={(item) => item.id}
-            renderItem={renderItem}
+            renderItem={({ item }) => (
+              <TouchableOpacity style={styles.itemCard} onPress={() => handlePress(item)}>
+                <Text style={styles.itemText}>
+                  {item.mimeType.includes('folder') ? '📁' : '🎬'} {item.name}
+                </Text>
+              </TouchableOpacity>
+            )}
             contentContainerStyle={{ paddingBottom: 20 }}
           />
         )
@@ -96,8 +116,10 @@ const styles = StyleSheet.create({
   itemText: { color: '#FFF', fontSize: 16 },
   playerContainer: { flex: 1, backgroundColor: '#000', justifyContent: 'center' },
   videoPlayer: { width: '100%', height: 300 },
-  closeButton: { padding: 15, backgroundColor: '#333', alignItems: 'center', marginTop: 20 },
-  closeText: { color: '#FFF', fontSize: 16, fontWeight: 'bold' }
+  buttonRow: { flexDirection: 'row', justifyContent: 'space-evenly', marginTop: 20 },
+  externalButton: { padding: 15, backgroundColor: '#E50914', borderRadius: 8 },
+  closeButton: { padding: 15, backgroundColor: '#333', borderRadius: 8 },
+  buttonText: { color: '#FFF', fontSize: 16, fontWeight: 'bold' }
 });
 
 export default App;
