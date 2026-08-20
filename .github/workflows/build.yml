@@ -28,12 +28,6 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Fix outdated intent-launcher package (The Hack & Jetifier)
-        run: |
-          sed -i 's/compile /implementation /g' node_modules/react-native-intent-launcher/android/build.gradle
-          sed -i 's/compile(/implementation(/g' node_modules/react-native-intent-launcher/android/build.gradle
-          npx jetifier
-
       - name: Build Android Release APK
         run: |
           cd android
