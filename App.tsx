@@ -39,6 +39,9 @@ const App = () => {
   const [duration, setDuration] = useState(0);
   const [progressWidth, setProgressWidth] = useState(0);
   const videoRef = useRef(null);
+  
+  // 🔥 New Ref to stop double-triggering Auto-Next
+  const switchingEpisode = useRef(false);
 
   const [audioTracks, setAudioTracks] = useState([]);
   const [textTracks, setTextTracks] = useState([]);
@@ -85,6 +88,7 @@ const App = () => {
   };
 
   const openFile = (file) => {
+    switchingEpisode.current = false; // Reset lock for new file
     setSelectedAudio(undefined);
     setSelectedText(undefined);
     setCurrentTime(0);
@@ -139,7 +143,6 @@ const App = () => {
     setSelectedText(undefined);
   };
 
-  // 🔥 SILENT RESUME PLAYBACK 🔥
   const handleVideoLoad = async (meta) => {
     setDuration(meta.duration);
     if (meta.audioTracks) setAudioTracks(meta.audioTracks);
@@ -151,24 +154,18 @@ const App = () => {
         const savedTime = parseFloat(savedTimeStr);
         if (savedTime > 0 && meta.duration - savedTime > 180) {
           videoRef.current?.seek(savedTime);
-          // Removed the Alert here for a seamless experience
         }
       }
     } catch(e) {}
   };
 
-  const handleProgress = (progress) => {
-    setCurrentTime(progress.currentTime);
-    if (Math.floor(progress.currentTime) > 0 && Math.floor(progress.currentTime) % 5 === 0) {
-      AsyncStorage.setItem(`time_${selectedFile?.name}`, progress.currentTime.toString()).catch(() => {});
-    }
-  };
-
-  // 🔥 SMART AUTO-NEXT EPISODE LOGIC 🔥
+  // 🔥 THE NEW AUTO-NEXT EPISODE LOGIC 🔥
   const handleVideoEnd = async () => {
+    if (switchingEpisode.current) return; // Prevent double trigger
+    switchingEpisode.current = true; // Lock it
+
     try { await AsyncStorage.removeItem(`time_${selectedFile?.name}`); } catch(e) {}
     
-    // Series ah nu check panra Regex (e.g., S01E01, s1e1, S02E14)
     const episodeRegex = /[Ss]\d+[Ee]\d+/;
     const isEpisode = episodeRegex.test(selectedFile?.name || '');
 
@@ -177,14 +174,27 @@ const App = () => {
       if (currentIndex !== -1 && currentIndex + 1 < filteredFiles.length) {
         const nextFile = filteredFiles[currentIndex + 1];
         if (!nextFile.mimeType?.includes('folder')) {
-          openFile(nextFile); // Seamless ah next episode play aagum, no alerts!
+          openFile(nextFile);
           return;
         }
       }
     }
     
-    // Movie aah iruntha illana adutha episode illana close aagidum
     closeInternalPlayer();
+  };
+
+  const handleProgress = (progress) => {
+    setCurrentTime(progress.currentTime);
+    
+    // Save progress
+    if (Math.floor(progress.currentTime) > 0 && Math.floor(progress.currentTime) % 5 === 0) {
+      AsyncStorage.setItem(`time_${selectedFile?.name}`, progress.currentTime.toString()).catch(() => {});
+    }
+
+    // 🔥 THE 1.5 SECONDS HACK (Fixes ExoPlayer stuck at end bug) 🔥
+    if (duration > 0 && (duration - progress.currentTime) < 1.5) {
+      handleVideoEnd();
+    }
   };
 
   const seekForward = () => { videoRef.current?.seek(currentTime + 10); };
@@ -241,6 +251,7 @@ const App = () => {
     return (
       <View style={styles.playerWrapper}>
         <Video 
+          key={selectedFile.link} // 🔥 THE CACHE FIX (Forces fresh remount for next episode)
           ref={videoRef}
           source={{ uri: `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}` }} 
           style={styles.videoPlayer} 
@@ -248,7 +259,7 @@ const App = () => {
           paused={isPaused}
           onLoad={handleVideoLoad}
           onProgress={handleProgress}
-          onEnd={handleVideoEnd} // TRIGGER AUTO NEXT
+          onEnd={handleVideoEnd} // Fallback if regular end works
           {...(selectedAudio ? { selectedAudioTrack: selectedAudio } : {})}
           {...(selectedText ? { selectedTextTrack: selectedText } : {})}
           controls={false} 
