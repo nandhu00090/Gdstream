@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput, ScrollView } from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput, ScrollView, Modal } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
 import Orientation from 'react-native-orientation-locker';
@@ -41,7 +41,7 @@ const App = () => {
   const [audioTracks, setAudioTracks] = useState([]);
   const [textTracks, setTextTracks] = useState([]);
   
-  // 🔥 FIX 2: Default undefined to prevent Mute Bug
+  // Audio & Subtitle Default States (Prevents Mute & Crash)
   const [selectedAudio, setSelectedAudio] = useState(undefined);
   const [selectedText, setSelectedText] = useState(undefined);
   const [activeMenu, setActiveMenu] = useState(null);
@@ -149,7 +149,7 @@ const App = () => {
                 setActiveMenu(null);
               }}>
                 <Icon name="check" size={20} color={isSelected ? 'white' : 'transparent'} />
-                <Text style={styles.menuItemText}>
+                <Text style={styles.menuItemText} numberOfLines={1}>
                   {track.language ? track.language.toUpperCase() : `Track ${index + 1}`} - {track.title || "Auto"}
                 </Text>
               </TouchableOpacity>
@@ -166,7 +166,10 @@ const App = () => {
     return (
       <View style={styles.playerWrapper}>
         
-        {/* 🔥 FIX 1: Removed Background Color to unhide the hardware decoder video */}
+        {/* 🔥 THE FINAL FIX: 
+            1. Removed useTextureView={false} (Uses standard stable React Native video renderer) 
+            2. Added Absolute bounds to perfectly fit the black wrapper 
+        */}
         <Video 
           ref={videoRef}
           source={{ uri: `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}` }} 
@@ -178,10 +181,11 @@ const App = () => {
           {...(selectedAudio ? { selectedAudioTrack: selectedAudio } : {})}
           {...(selectedText ? { selectedTextTrack: selectedText } : {})}
           controls={false} 
-          useTextureView={false} // Hardware Decode Enabled
+          bufferConfig={{ minBufferMs: 15000, maxBufferMs: 30000, bufferForPlaybackMs: 2500, bufferForPlaybackAfterRebufferMs: 5000 }}
         />
         
-        <TouchableOpacity style={StyleSheet.absoluteFill} activeOpacity={1} onPress={() => { setShowControls(!showControls); setActiveMenu(null); }}>
+        {/* Controls Overlay Layer */}
+        <TouchableOpacity style={styles.controlsTouchable} activeOpacity={1} onPress={() => { setShowControls(!showControls); setActiveMenu(null); }}>
           {showControls && (
             <View style={styles.controlsOverlay}>
               
@@ -294,9 +298,10 @@ const styles = StyleSheet.create({
   secondaryButton: { backgroundColor: '#E06C00', padding: 15, width: 250, borderRadius: 8, marginTop: 15, alignItems: 'center' },
   buttonText: { color: '#FFF', fontWeight: 'bold' },
   
-  // 🔥 BUG FIX: Removed background colors from Video layer to allow hardware rendering
-  playerWrapper: { flex: 1, backgroundColor: 'black' }, 
-  videoPlayer: { ...StyleSheet.absoluteFillObject }, 
+  // 🔥 RESTORED VIDEO RENDERER STYLES 🔥
+  playerWrapper: { flex: 1, backgroundColor: 'black' }, // Black background limits transparent letterbox issues
+  videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 }, 
+  controlsTouchable: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
   controlsOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'space-between' },
   
   playerTopBar: { flexDirection: 'row', alignItems: 'center', padding: 20, paddingTop: 40 },
@@ -317,7 +322,7 @@ const styles = StyleSheet.create({
   floatingMenu: { position: 'absolute', bottom: 90, right: 20, width: 280, backgroundColor: 'rgba(28, 28, 30, 0.95)', borderRadius: 12, padding: 15, zIndex: 100 },
   floatingMenuTitle: { color: '#888', fontSize: 14, marginBottom: 10, fontWeight: 'bold', borderBottomWidth: 1, borderBottomColor: '#444', paddingBottom: 10 },
   menuItem: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12 },
-  menuItemText: { color: 'white', fontSize: 16, marginLeft: 10 }
+  menuItemText: { color: 'white', fontSize: 16, marginLeft: 10, flex: 1 }
 });
 
 export default App;
