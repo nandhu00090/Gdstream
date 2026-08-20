@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput, ScrollView, Modal } from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput, ScrollView, Modal, BackHandler } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
 import Orientation from 'react-native-orientation-locker';
@@ -36,7 +36,7 @@ const App = () => {
   
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [progressWidth, setProgressWidth] = useState(0); // 🔥 New State for Seekbar
+  const [progressWidth, setProgressWidth] = useState(0);
   const videoRef = useRef(null);
 
   const [audioTracks, setAudioTracks] = useState([]);
@@ -47,6 +47,26 @@ const App = () => {
   const [activeMenu, setActiveMenu] = useState(null);
 
   useEffect(() => { fetchDirectory('/0:/'); }, []);
+
+  // 🔥 THE NEW BACK GESTURE HANDLER 🔥
+  useEffect(() => {
+    const backAction = () => {
+      if (playMode === 'internal') {
+        closeInternalPlayer();
+        return true; // App close aagama thadukkuthu
+      } else if (selectedFile) {
+        setSelectedFile(null);
+        return true;
+      } else if (pathStack.length > 1) {
+        goBack();
+        return true;
+      }
+      return false; // Default ah App close aagum
+    };
+
+    const backHandler = BackHandler.addEventListener("hardwareBackPress", backAction);
+    return () => backHandler.remove();
+  }, [playMode, selectedFile, pathStack]);
 
   const fetchDirectory = async (path) => {
     setLoading(true);
@@ -123,7 +143,6 @@ const App = () => {
   const seekForward = () => { videoRef.current?.seek(currentTime + 10); };
   const seekBackward = () => { videoRef.current?.seek(currentTime - 10); };
 
-  // 🔥 NEW FEATURE: Touch to Seek Logic
   const handleSeekTouch = (event) => {
     if (progressWidth > 0 && duration > 0) {
       const touchX = event.nativeEvent.locationX;
@@ -214,7 +233,6 @@ const App = () => {
               </View>
 
               <View style={styles.playerBottomArea}>
-                {/* 🔥 INTERACTIVE TOUCH SEEKBAR 🔥 */}
                 <TouchableOpacity 
                   activeOpacity={1}
                   style={styles.progressBarBg}
@@ -321,7 +339,7 @@ const styles = StyleSheet.create({
   whiteCircleBtn: { backgroundColor: 'white', width: 70, height: 70, borderRadius: 35, alignItems: 'center', justifyContent: 'center' },
   
   playerBottomArea: { paddingHorizontal: 20, paddingBottom: 30, width: '100%' },
-  progressBarBg: { height: 25, justifyContent: 'center', marginBottom: 5, width: '100%' }, // Made taller to easily touch!
+  progressBarBg: { height: 25, justifyContent: 'center', marginBottom: 5, width: '100%' }, 
   progressBarFill: { height: 4, backgroundColor: 'white', borderRadius: 2, position: 'absolute' },
   progressDot: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'white', top: 5, marginLeft: -7 },
   
