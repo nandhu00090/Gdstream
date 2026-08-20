@@ -36,12 +36,12 @@ const App = () => {
   
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [progressWidth, setProgressWidth] = useState(0); // 🔥 New State for Seekbar
   const videoRef = useRef(null);
 
   const [audioTracks, setAudioTracks] = useState([]);
   const [textTracks, setTextTracks] = useState([]);
   
-  // Audio & Subtitle Default States (Prevents Mute & Crash)
   const [selectedAudio, setSelectedAudio] = useState(undefined);
   const [selectedText, setSelectedText] = useState(undefined);
   const [activeMenu, setActiveMenu] = useState(null);
@@ -123,6 +123,16 @@ const App = () => {
   const seekForward = () => { videoRef.current?.seek(currentTime + 10); };
   const seekBackward = () => { videoRef.current?.seek(currentTime - 10); };
 
+  // 🔥 NEW FEATURE: Touch to Seek Logic
+  const handleSeekTouch = (event) => {
+    if (progressWidth > 0 && duration > 0) {
+      const touchX = event.nativeEvent.locationX;
+      const seekTime = (touchX / progressWidth) * duration;
+      videoRef.current?.seek(seekTime);
+      setCurrentTime(seekTime);
+    }
+  };
+
   const renderFloatingMenu = () => {
     if (!activeMenu) return null;
     const isAudio = activeMenu === 'audio';
@@ -166,10 +176,6 @@ const App = () => {
     return (
       <View style={styles.playerWrapper}>
         
-        {/* 🔥 THE FINAL FIX: 
-            1. Removed useTextureView={false} (Uses standard stable React Native video renderer) 
-            2. Added Absolute bounds to perfectly fit the black wrapper 
-        */}
         <Video 
           ref={videoRef}
           source={{ uri: `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}` }} 
@@ -184,7 +190,6 @@ const App = () => {
           bufferConfig={{ minBufferMs: 15000, maxBufferMs: 30000, bufferForPlaybackMs: 2500, bufferForPlaybackAfterRebufferMs: 5000 }}
         />
         
-        {/* Controls Overlay Layer */}
         <TouchableOpacity style={styles.controlsTouchable} activeOpacity={1} onPress={() => { setShowControls(!showControls); setActiveMenu(null); }}>
           {showControls && (
             <View style={styles.controlsOverlay}>
@@ -209,10 +214,16 @@ const App = () => {
               </View>
 
               <View style={styles.playerBottomArea}>
-                <View style={styles.progressBarBg}>
-                  <View style={[styles.progressBarFill, { width: `${progressPercent}%` }]} />
-                  <View style={[styles.progressDot, { left: `${progressPercent}%` }]} />
-                </View>
+                {/* 🔥 INTERACTIVE TOUCH SEEKBAR 🔥 */}
+                <TouchableOpacity 
+                  activeOpacity={1}
+                  style={styles.progressBarBg}
+                  onLayout={(e) => setProgressWidth(e.nativeEvent.layout.width)}
+                  onPress={handleSeekTouch}
+                >
+                  <View style={[styles.progressBarFill, { width: `${progressPercent}%` }]} pointerEvents="none" />
+                  <View style={[styles.progressDot, { left: `${progressPercent}%` }]} pointerEvents="none" />
+                </TouchableOpacity>
                 
                 <View style={styles.playerBottomControls}>
                   <Text style={styles.timeText}>{formatTime(currentTime)} • {formatTime(duration)}</Text>
@@ -298,8 +309,7 @@ const styles = StyleSheet.create({
   secondaryButton: { backgroundColor: '#E06C00', padding: 15, width: 250, borderRadius: 8, marginTop: 15, alignItems: 'center' },
   buttonText: { color: '#FFF', fontWeight: 'bold' },
   
-  // 🔥 RESTORED VIDEO RENDERER STYLES 🔥
-  playerWrapper: { flex: 1, backgroundColor: 'black' }, // Black background limits transparent letterbox issues
+  playerWrapper: { flex: 1, backgroundColor: 'black' }, 
   videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 }, 
   controlsTouchable: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
   controlsOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'space-between' },
@@ -311,9 +321,9 @@ const styles = StyleSheet.create({
   whiteCircleBtn: { backgroundColor: 'white', width: 70, height: 70, borderRadius: 35, alignItems: 'center', justifyContent: 'center' },
   
   playerBottomArea: { paddingHorizontal: 20, paddingBottom: 30, width: '100%' },
-  progressBarBg: { height: 4, backgroundColor: 'rgba(255,255,255,0.3)', borderRadius: 2, marginBottom: 15, width: '100%', position: 'relative' },
-  progressBarFill: { height: '100%', backgroundColor: 'white', borderRadius: 2 },
-  progressDot: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'white', top: -5, marginLeft: -7 },
+  progressBarBg: { height: 25, justifyContent: 'center', marginBottom: 5, width: '100%' }, // Made taller to easily touch!
+  progressBarFill: { height: 4, backgroundColor: 'white', borderRadius: 2, position: 'absolute' },
+  progressDot: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'white', top: 5, marginLeft: -7 },
   
   playerBottomControls: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   timeText: { color: 'white', fontSize: 14, fontWeight: '500' },
