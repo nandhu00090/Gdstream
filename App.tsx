@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput } from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput, Modal, ScrollView } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
 import Orientation from 'react-native-orientation-locker';
@@ -8,11 +8,9 @@ import Icon from 'react-native-vector-icons/MaterialIcons';
 const { VideoPlayerManager } = NativeModules;
 const BASE_URL = 'https://movies-and-series.ambalartssb01.workers.dev';
 const USERNAME = 'admin'; 
-// UNGA ORIGINAL PASSWORD INGA PODUNGA:
 const PASSWORD = '629175'; 
 
 const App = () => {
-  // File Manager States
   const [files, setFiles] = useState([]);
   const [filteredFiles, setFilteredFiles] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -20,15 +18,21 @@ const App = () => {
   const [currentPath, setCurrentPath] = useState('/0:/');
   const [searchQuery, setSearchQuery] = useState('');
   
-  // Player States
   const [selectedFile, setSelectedFile] = useState(null);
   const [playMode, setPlayMode] = useState(null);
   const [resizeMode, setResizeMode] = useState('contain');
   const [showControls, setShowControls] = useState(true);
   const [isPaused, setIsPaused] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const videoRef = useRef(null);
 
-  // --- FILE MANAGER LOGIC ---
+  // Audio & Subtitle States
+  const [audioTracks, setAudioTracks] = useState([]);
+  const [textTracks, setTextTracks] = useState([]);
+  const [selectedAudio, setSelectedAudio] = useState({ type: 'system' });
+  const [selectedText, setSelectedText] = useState({ type: 'disabled' });
+  const [activeModal, setActiveModal] = useState(null); 
+
   useEffect(() => { fetchDirectory('/0:/'); }, []);
 
   const fetchDirectory = async (path) => {
@@ -71,84 +75,150 @@ const App = () => {
     setFilteredFiles(filtered);
   };
 
-  // --- PLAYER LOGIC ---
   const openInExternalPlayer = async () => {
     const url = `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}`;
     try { await VideoPlayerManager.playVideo(url); } catch (e) { Alert.alert("Error", "Player illai!"); }
   };
 
   const toggleFullscreen = () => {
-    Orientation.getOrientation((orientation) => {
-      if (orientation === 'LANDSCAPE') { Orientation.lockToPortrait(); } 
-      else { Orientation.lockToLandscape(); }
-    });
+    if (isFullscreen) {
+      Orientation.lockToPortrait();
+      setIsFullscreen(false);
+    } else {
+      Orientation.lockToLandscape();
+      setIsFullscreen(true);
+    }
   };
 
   const closeInternalPlayer = () => {
-    Orientation.lockToPortrait(); // Close panrappo thirumba portrait vandhudum
+    Orientation.lockToPortrait(); 
+    setIsFullscreen(false);
     setPlayMode(null);
     setSelectedFile(null);
   };
 
-  // --- CUSTOM VIDEO PLAYER SCREEN ---
+  const handleVideoLoad = (meta) => {
+    if (meta.audioTracks) setAudioTracks(meta.audioTracks);
+    if (meta.textTracks) setTextTracks(meta.textTracks);
+  };
+
+  const renderTrackModal = () => {
+    const isAudio = activeModal === 'audio';
+    const tracks = isAudio ? audioTracks : textTracks;
+    
+    return (
+      <Modal visible={!!activeModal} transparent={true} animationType="slide">
+        <View style={styles.modalBackground}>
+          <View style={styles.modalContainer}>
+            <Text style={styles.modalTitle}>{isAudio ? "Audio Tracks 🎵" : "Subtitles 💬"}</Text>
+            <ScrollView style={{width: '100%'}}>
+              
+              {!isAudio && (
+                <TouchableOpacity 
+                  style={styles.trackItem} 
+                  onPress={() => { setSelectedText({ type: 'disabled' }); setActiveModal(null); }}>
+                  <Text style={[styles.trackText, selectedText.type === 'disabled' && styles.trackSelected]}>
+                    Disable Subtitles
+                  </Text>
+                </TouchableOpacity>
+              )}
+
+              {tracks.map((track, index) => (
+                <TouchableOpacity 
+                  key={index} 
+                  style={styles.trackItem}
+                  onPress={() => {
+                    if (isAudio) setSelectedAudio({ type: 'index', value: index });
+                    else setSelectedText({ type: 'index', value: index });
+                    setActiveModal(null);
+                  }}
+                >
+                  <Text style={[
+                    styles.trackText, 
+                    (isAudio ? selectedAudio.value === index : selectedText.value === index) && styles.trackSelected
+                  ]}>
+                    {track.language ? track.language.toUpperCase() : `Track ${index + 1}`} - {track.title || "Unknown"}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+              
+              {tracks.length === 0 && <Text style={{color: 'grey', textAlign: 'center'}}>No tracks found</Text>}
+            </ScrollView>
+            <TouchableOpacity onPress={() => setActiveModal(null)} style={styles.modalCloseBtn}>
+              <Text style={{color: 'white', fontWeight: 'bold'}}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
   if (selectedFile && playMode === 'internal') {
     return (
       <View style={styles.fullscreenContainer}>
+        {/* Layer 1: The Video (Absolute, covers whole screen) */}
         <Video 
           ref={videoRef}
           source={{ uri: `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}` }} 
-          style={StyleSheet.absoluteFill} 
+          style={styles.videoPlayer} 
           resizeMode={resizeMode}
           paused={isPaused}
-          controls={false} // Namma sontha controls!
+          onLoad={handleVideoLoad}
+          selectedAudioTrack={selectedAudio}
+          selectedTextTrack={selectedText}
+          controls={false} 
           bufferConfig={{ minBufferMs: 15000, maxBufferMs: 30000, bufferForPlaybackMs: 2500, bufferForPlaybackAfterRebufferMs: 5000 }}
         />
         
-        {/* Modern Controls Overlay */}
-        <TouchableOpacity style={StyleSheet.absoluteFill} activeOpacity={1} onPress={() => setShowControls(!showControls)}>
-          {showControls && (
-            <View style={styles.overlay}>
-              {/* Top Bar */}
-              <View style={styles.playerTopBar}>
-                <TouchableOpacity onPress={closeInternalPlayer} style={{padding: 10}}>
-                  <Icon name="arrow-back" size={28} color="white" />
-                </TouchableOpacity>
-                <Text style={styles.playerTitle} numberOfLines={1}>{selectedFile.name}</Text>
-              </View>
+        {/* Layer 2: The Controls Overlay (Absolute, perfectly overlaps video with z-index) */}
+        <View style={styles.overlayWrapper}>
+          <TouchableOpacity style={{flex: 1}} activeOpacity={1} onPress={() => setShowControls(!showControls)}>
+            {showControls && (
+              <View style={styles.overlay}>
+                {/* Top */}
+                <View style={styles.playerTopBar}>
+                  <TouchableOpacity onPress={closeInternalPlayer} style={{padding: 10}}><Icon name="arrow-back" size={28} color="white" /></TouchableOpacity>
+                  <Text style={styles.playerTitle} numberOfLines={1}>{selectedFile.name}</Text>
+                </View>
 
-              {/* Center Play/Pause */}
-              <View style={styles.centerPlayButton}>
-                <TouchableOpacity onPress={() => setIsPaused(!isPaused)}>
-                  <Icon name={isPaused ? "play-circle-filled" : "pause-circle-filled"} size={70} color="white" />
-                </TouchableOpacity>
-              </View>
-
-              {/* Bottom Bar (Icons exactly like your screenshot) */}
-              <View style={styles.playerBottomBar}>
-                <TouchableOpacity onPress={() => setResizeMode(prev => prev === 'contain' ? 'cover' : 'contain')} style={{padding: 10}}>
-                  <Icon name={resizeMode === 'contain' ? "aspect-ratio" : "crop-free"} size={28} color="white" />
-                </TouchableOpacity>
-                
-                <View style={{flexDirection: 'row'}}>
-                  {/* CC / Subtitle Icon */}
-                  <TouchableOpacity style={{padding: 10}} onPress={() => Alert.alert("Coming Soon", "Audio & Subtitle selector will be added in next update!")}>
-                    <Icon name="closed-caption" size={28} color="white" />
-                  </TouchableOpacity>
-                  
-                  {/* Fullscreen Icon */}
-                  <TouchableOpacity onPress={toggleFullscreen} style={{padding: 10}}>
-                    <Icon name="fullscreen" size={28} color="white" />
+                {/* Center */}
+                <View style={styles.centerPlayButton}>
+                  <TouchableOpacity onPress={() => setIsPaused(!isPaused)}>
+                    <Icon name={isPaused ? "play-circle-filled" : "pause-circle-filled"} size={70} color="white" />
                   </TouchableOpacity>
                 </View>
+
+                {/* Bottom */}
+                <View style={styles.playerBottomBar}>
+                  <TouchableOpacity onPress={() => setResizeMode(prev => prev === 'contain' ? 'cover' : 'contain')} style={{padding: 10}}>
+                    <Icon name={resizeMode === 'contain' ? "aspect-ratio" : "crop-free"} size={28} color="white" />
+                  </TouchableOpacity>
+                  
+                  <View style={{flexDirection: 'row'}}>
+                    <TouchableOpacity style={{padding: 10, marginRight: 10}} onPress={() => setActiveModal('audio')}>
+                      <Icon name="audiotrack" size={28} color={selectedAudio.type !== 'system' ? '#E50914' : 'white'} />
+                    </TouchableOpacity>
+                    
+                    <TouchableOpacity style={{padding: 10, marginRight: 10}} onPress={() => setActiveModal('subtitle')}>
+                      <Icon name="subtitles" size={28} color={selectedText.type !== 'disabled' ? '#E50914' : 'white'} />
+                    </TouchableOpacity>
+                    
+                    <TouchableOpacity onPress={toggleFullscreen} style={{padding: 10}}>
+                      <Icon name={isFullscreen ? "fullscreen-exit" : "fullscreen"} size={28} color="white" />
+                    </TouchableOpacity>
+                  </View>
+                </View>
               </View>
-            </View>
-          )}
-        </TouchableOpacity>
+            )}
+          </TouchableOpacity>
+        </View>
+        
+        {/* Layer 3: Modals */}
+        {renderTrackModal()}
       </View>
     );
   }
 
-  // --- SELECTION SCREEN ---
   if (selectedFile) {
     return (
       <View style={styles.selectionContainer}>
@@ -164,23 +234,11 @@ const App = () => {
     );
   }
 
-  // --- MAIN FOLDER LIST SCREEN ---
   return (
     <View style={styles.container}>
       <Text style={styles.headerTitle}>GDStream 🍿</Text>
-      
-      <TextInput 
-        style={styles.searchBar} 
-        placeholder="Search movies / episodes..." 
-        placeholderTextColor="#888" 
-        value={searchQuery}
-        onChangeText={handleSearch} 
-      />
-
-      {pathStack.length > 1 && (
-        <TouchableOpacity style={styles.backButton} onPress={goBack}><Text style={{color:'white'}}>⬅️ Back</Text></TouchableOpacity>
-      )}
-      
+      <TextInput style={styles.searchBar} placeholder="Search movies / episodes..." placeholderTextColor="#888" value={searchQuery} onChangeText={handleSearch} />
+      {pathStack.length > 1 && <TouchableOpacity style={styles.backButton} onPress={goBack}><Text style={{color:'white'}}>⬅️ Back</Text></TouchableOpacity>}
       {loading ? <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 50 }} /> : (
         <FlatList 
           data={filteredFiles} 
@@ -212,13 +270,24 @@ const styles = StyleSheet.create({
   secondaryButton: { backgroundColor: '#E06C00', padding: 15, width: 250, borderRadius: 8, marginTop: 15, alignItems: 'center' },
   buttonText: { color: '#FFF', fontWeight: 'bold' },
   
-  // Custom Player Styles
-  fullscreenContainer: { flex: 1, backgroundColor: 'black' },
-  overlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'space-between' },
+  // FIXED PLAYER STYLES 🔥
+  fullscreenContainer: { flex: 1, backgroundColor: 'black', position: 'relative' },
+  videoPlayer: { width: '100%', height: '100%', position: 'absolute', top: 0, left: 0 },
+  overlayWrapper: { position: 'absolute', width: '100%', height: '100%', zIndex: 10, elevation: 10 },
+  overlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'space-between' },
   playerTopBar: { flexDirection: 'row', alignItems: 'center', padding: 20, paddingTop: 40 },
   playerTitle: { color: 'white', fontSize: 16, fontWeight: 'bold', marginLeft: 15, flex: 1 },
   centerPlayButton: { alignItems: 'center', justifyContent: 'center' },
-  playerBottomBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, paddingBottom: 30 }
+  playerBottomBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, paddingBottom: 30 },
+  
+  // Modal Styles
+  modalBackground: { flex: 1, backgroundColor: 'rgba(0,0,0,0.8)', justifyContent: 'center', alignItems: 'center' },
+  modalContainer: { width: '85%', maxHeight: '70%', backgroundColor: '#222', borderRadius: 12, padding: 20, alignItems: 'center' },
+  modalTitle: { color: 'white', fontSize: 20, fontWeight: 'bold', marginBottom: 20 },
+  trackItem: { paddingVertical: 15, width: '100%', borderBottomWidth: 1, borderBottomColor: '#444' },
+  trackText: { color: '#CCC', fontSize: 16, textAlign: 'center' },
+  trackSelected: { color: '#E50914', fontWeight: 'bold', fontSize: 18 },
+  modalCloseBtn: { marginTop: 20, backgroundColor: '#E50914', padding: 15, borderRadius: 8, width: '100%', alignItems: 'center' }
 });
 
 export default App;
