@@ -47,8 +47,8 @@ const App = () => {
   const [selectedText, setSelectedText] = useState(undefined);
   const [activeMenu, setActiveMenu] = useState(null);
 
-  // 🔥 GESTURE STATES (Real Double Tap)
-  const [seekOverlay, setSeekOverlay] = useState({ visible: false, icon: '', time: 0 });
+  // 🔥 TRUE GESTURE STATES 🔥
+  const [seekOverlay, setSeekOverlay] = useState({ visible: false, icon: '', time: 0, position: 'center' });
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const tapCount = useRef(0);
   const multiTapTimer = useRef(null);
@@ -89,7 +89,7 @@ const App = () => {
     setSelectedText(undefined);
     setCurrentTime(0);
     setSelectedFile(file);
-    // Note: We don't set playMode here to allow the selection screen to show!
+    // PlayMode is NOT set here so the Selection Screen shows!
   };
 
   const handlePress = (item) => {
@@ -128,34 +128,31 @@ const App = () => {
 
   const closeInternalPlayer = () => { Orientation.lockToPortrait(); setIsFullscreen(false); setPlayMode(null); setSelectedFile(null); };
 
-  // 🔥 TRUE DOUBLE-TAP LOGIC 🔥
+  // 🔥 TRUE MULTI-TAP GESTURE LOGIC 🔥
   const handleZoneTap = (isForward) => {
     const now = Date.now();
     const DOUBLE_PRESS_DELAY = 300;
 
     if (now - lastTapTime.current < DOUBLE_PRESS_DELAY) {
-      // Double tap confirmed
+      // Double Tap detected!
       clearTimeout(singleTapTimer.current);
       tapCount.current += 1;
       clearTimeout(multiTapTimer.current);
 
       const seekSeconds = tapCount.current * 10;
-      setSeekOverlay({ visible: true, icon: isForward ? 'fast-forward' : 'fast-rewind', time: seekSeconds });
+      setSeekOverlay({ visible: true, icon: isForward ? 'fast-forward' : 'fast-rewind', time: seekSeconds, position: isForward ? 'right' : 'left' });
       
-      Animated.sequence([
-        Animated.timing(fadeAnim, { toValue: 1, duration: 100, useNativeDriver: true }),
-        Animated.delay(500),
-        Animated.timing(fadeAnim, { toValue: 0, duration: 300, useNativeDriver: true })
-      ]).start();
+      fadeAnim.setValue(1);
+      Animated.timing(fadeAnim, { toValue: 0, duration: 800, useNativeDriver: true }).start();
 
       multiTapTimer.current = setTimeout(() => {
         const targetTime = isForward ? currentTime + seekSeconds : currentTime - seekSeconds;
         videoRef.current?.seek(targetTime);
-        tapCount.current = 0; // Reset tap count after seeking
-      }, 600);
+        tapCount.current = 0; 
+      }, 500);
 
     } else {
-      // Single tap processing (waits to see if double tap happens)
+      // Single Tap
       tapCount.current = 1; 
       singleTapTimer.current = setTimeout(() => {
         setShowControls(!showControls);
@@ -187,7 +184,7 @@ const App = () => {
       const currentIndex = filteredFiles.findIndex(f => f.name === selectedFile?.name);
       if (currentIndex !== -1 && currentIndex + 1 < filteredFiles.length) {
         openFile(filteredFiles[currentIndex + 1]);
-        setPlayMode('internal'); // Continue playing next
+        setPlayMode('internal'); // Auto play the next one
         return;
       }
     }
@@ -198,7 +195,6 @@ const App = () => {
     if (!activeMenu) return null;
     const isAudio = activeMenu === 'audio';
     const tracks = isAudio ? audioTracks : textTracks;
-
     return (
       <View style={styles.floatingMenu}>
         <Text style={styles.floatingMenuTitle}>{isAudio ? "Audio Tracks 🎵" : "Subtitles 💬"}</Text>
@@ -229,6 +225,7 @@ const App = () => {
     );
   };
 
+  // 🔥 1. PLAYER SCREEN 🔥
   if (selectedFile && playMode === 'internal') {
     const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
     return (
@@ -259,10 +256,12 @@ const App = () => {
           <TouchableOpacity style={{flex: 1}} activeOpacity={1} onPress={() => handleZoneTap(true)} />
         </View>
 
-        {/* SEEK OVERLAY (Fade animation) */}
-        <Animated.View style={[styles.seekOverlay, { opacity: fadeAnim }]} pointerEvents="none">
-           <Icon name={seekOverlay.icon} size={50} color="white" />
-           <Text style={styles.seekText}>{seekOverlay.time} seconds</Text>
+        {/* DYNAMIC OVERLAY POSITION */}
+        <Animated.View style={[styles.seekOverlay, { opacity: fadeAnim, alignItems: seekOverlay.position === 'right' ? 'flex-end' : 'flex-start' }]} pointerEvents="none">
+           <View style={styles.overlayBox}>
+            <Icon name={seekOverlay.icon} size={40} color="white" />
+            <Text style={styles.seekText}>{seekOverlay.time} seconds</Text>
+           </View>
         </Animated.View>
 
         {/* CONTROLS OVERLAY */}
@@ -272,20 +271,19 @@ const App = () => {
               <TouchableOpacity onPress={closeInternalPlayer}><Icon name="arrow-back" size={28} color="white" /></TouchableOpacity>
               <Text style={styles.playerTitle} numberOfLines={1}>{selectedFile.name}</Text>
             </View>
-            <TouchableOpacity onPress={() => setIsPaused(!isPaused)} style={styles.centerPlayBtn}>
-                <Icon name={isPaused ? "play-arrow" : "pause"} size={60} color="white" />
-            </TouchableOpacity>
+            <TouchableOpacity onPress={() => setIsPaused(!isPaused)} style={styles.centerPlayBtn}><Icon name={isPaused ? "play-arrow" : "pause"} size={60} color="white" /></TouchableOpacity>
             <View style={styles.playerBottomArea}>
                 <TouchableOpacity activeOpacity={1} style={styles.progressBarBg} onLayout={(e) => setProgressWidth(e.nativeEvent.layout.width)} onPress={(e) => {
                     const seekTime = (e.nativeEvent.locationX / progressWidth) * duration;
                     videoRef.current?.seek(seekTime);
                 }}>
+                  <View style={styles.progressBarTrack} />
                   <View style={[styles.progressBarFill, { width: `${progressPercent}%` }]} pointerEvents="none" />
                   <View style={[styles.progressDot, { left: `${progressPercent}%` }]} pointerEvents="none" />
                 </TouchableOpacity>
                 <View style={styles.playerBottomControls}>
                     <Text style={styles.timeText}>{formatTime(currentTime)} • {formatTime(duration)}</Text>
-                    <View style={{flexDirection: 'row', alignItems: 'center'}}>
+                    <View style={{flexDirection: 'row'}}>
                         <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'audio' ? null : 'audio')}><Icon name="audiotrack" size={26} color={activeMenu === 'audio' ? '#E50914' : 'white'} /></TouchableOpacity>
                         <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'subtitle' ? null : 'subtitle')}><Icon name="closed-caption" size={26} color={activeMenu === 'subtitle' ? '#E50914' : 'white'} /></TouchableOpacity>
                         <TouchableOpacity style={styles.iconBtn} onPress={() => setResizeMode(prev => prev === 'contain' ? 'cover' : 'contain')}><Icon name={resizeMode === 'contain' ? "aspect-ratio" : "crop-free"} size={26} color="white" /></TouchableOpacity>
@@ -295,15 +293,12 @@ const App = () => {
             </View>
           </View>
         )}
-        
-        {/* AUDIO & SUBTITLE MENU (RESTORED!) */}
         {renderFloatingMenu()}
-
       </View>
     );
   }
 
-  // 🔥 EXTERNAL PLAYER SELECTION SCREEN (RESTORED!) 🔥
+  // 🔥 2. EXTERNAL PLAYER SELECTION SCREEN (RESTORED!) 🔥
   if (selectedFile && playMode === null) {
     return (
       <View style={styles.selectionContainer}>
@@ -319,6 +314,7 @@ const App = () => {
     );
   }
 
+  // 🔥 3. HOME FOLDER SCREEN 🔥
   return (
     <View style={styles.container}>
       <Text style={styles.headerTitle}>GDStream 🍿</Text>
@@ -349,25 +345,25 @@ const styles = StyleSheet.create({
   backButton: { backgroundColor: '#333', padding: 10, marginHorizontal: 15, borderRadius: 5, marginBottom: 10 },
   itemCard: { backgroundColor: '#222', padding: 18, marginVertical: 5, marginHorizontal: 15, borderRadius: 8 },
   itemText: { color: '#FFF', fontSize: 16, flex: 1 },
-  
   selectionContainer: { flex: 1, backgroundColor: '#141414', justifyContent: 'center', alignItems: 'center', padding: 20 },
   selectionTitle: { color: '#FFF', fontSize: 18, textAlign: 'center', marginBottom: 40 },
   primaryButton: { backgroundColor: '#E50914', padding: 15, width: 250, borderRadius: 8, alignItems: 'center' },
   secondaryButton: { backgroundColor: '#E06C00', padding: 15, width: 250, borderRadius: 8, marginTop: 15, alignItems: 'center' },
   buttonText: { color: '#FFF', fontWeight: 'bold' },
-  
   playerWrapper: { flex: 1, backgroundColor: 'black' },
   videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
   controlsOverlay: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'space-between' },
-  seekOverlay: { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.3)' },
-  seekText: { color: 'white', fontSize: 18, marginTop: 10, fontWeight: 'bold' },
+  seekOverlay: { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, justifyContent: 'center', paddingHorizontal: 50 },
+  overlayBox: { alignItems: 'center' },
+  seekText: { color: 'white', fontSize: 16, fontWeight: 'bold' },
   playerTopBar: { padding: 20, paddingTop: 40, flexDirection: 'row', alignItems: 'center' },
   playerTitle: { color: 'white', marginLeft: 15, fontSize: 16, fontWeight: '500', flex: 1 },
   centerPlayBtn: { alignSelf: 'center', justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.5)', borderRadius: 50, padding: 10 },
   playerBottomArea: { paddingHorizontal: 20, paddingBottom: 30, width: '100%' },
-  progressBarBg: { height: 25, justifyContent: 'center', marginBottom: 5, width: '100%' },
-  progressBarFill: { height: 4, backgroundColor: 'white', borderRadius: 2, position: 'absolute' },
-  progressDot: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'white', top: 5, marginLeft: -7 },
+  progressBarBg: { height: 30, justifyContent: 'center', marginBottom: 5, width: '100%' },
+  progressBarTrack: { height: 6, backgroundColor: 'rgba(255,255,255,0.3)', borderRadius: 3 },
+  progressBarFill: { height: 6, backgroundColor: '#E50914', borderRadius: 3, position: 'absolute' },
+  progressDot: { position: 'absolute', width: 16, height: 16, borderRadius: 8, backgroundColor: 'white', top: 7, marginLeft: -8 },
   playerBottomControls: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   timeText: { color: 'white', fontSize: 14, fontWeight: '500' },
   iconBtn: { padding: 10, marginLeft: 5 },
