@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, Linking } from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Linking } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
 
@@ -11,7 +11,10 @@ const PASSWORD = '629175';
 const App = () => {
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [currentVideo, setCurrentVideo] = useState(null);
+  
+  // Puthu states: Click panna file-ah store panna
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [playMode, setPlayMode] = useState(null); // 'internal' allathu 'external'
 
   useEffect(() => {
     authenticateAndFetch();
@@ -42,68 +45,92 @@ const App = () => {
     if (item.mimeType === 'application/vnd.google-apps.folder') {
       console.log('Folder clicked:', item.name);
     } else {
-      const videoPath = item.link ? item.link : `/0:/${encodeURIComponent(item.name)}`;
-      setCurrentVideo(`${BASE_URL}${videoPath}`);
+      // File-ah click panna udane play pannaama, select mattum panrom
+      setSelectedFile(item);
+      setPlayMode(null);
     }
+  };
+
+  const getFileUrl = (item) => {
+    const videoPath = item.link ? item.link : `/0:/${encodeURIComponent(item.name)}`;
+    return `${BASE_URL}${videoPath}`;
   };
 
   const openInExternalPlayer = async () => {
-    if (!currentVideo) return;
-    // Android-oda default video player chooser-ah thirakka intent
-    const cleanUrl = currentVideo.replace(/^https?:\/\//, '');
-    const intentUrl = `intent://${cleanUrl}#Intent;scheme=https;action=android.intent.action.VIEW;type=video/*;end`;
-    
+    if (!selectedFile) return;
+    const url = getFileUrl(selectedFile);
+    // Simple-aana URL open method. Ithu OS-aiye player-ah choose panna vekkum.
     try {
-      await Linking.openURL(intentUrl);
+      await Linking.openURL(url);
     } catch (error) {
-      Alert.alert("Error", "VLC allathu MX Player install panni irukka nu check pannunga!");
+      console.log("Linking error:", error);
     }
   };
 
+  // 1. Internal Player Screen (ExoPlayer)
+  if (selectedFile && playMode === 'internal') {
+    return (
+      <View style={styles.playerContainer}>
+        <Video
+          source={{ uri: getFileUrl(selectedFile) }}
+          style={styles.videoPlayer}
+          controls={true}
+          resizeMode="contain"
+          bufferConfig={{
+            minBufferMs: 15000,
+            maxBufferMs: 50000,
+            bufferForPlaybackMs: 2500,
+            bufferForPlaybackAfterRebufferMs: 5000
+          }}
+        />
+        <TouchableOpacity style={styles.closeButton} onPress={() => setSelectedFile(null)}>
+          <Text style={styles.buttonText}>Close Player ❌</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  // 2. Selection Screen (ExoPlayer load aagaathu, RAM safe!)
+  if (selectedFile && playMode === null) {
+    return (
+      <View style={styles.selectionContainer}>
+        <Text style={styles.selectionTitle}>{selectedFile.name}</Text>
+        
+        <TouchableOpacity style={styles.primaryButton} onPress={() => setPlayMode('internal')}>
+          <Text style={styles.buttonText}>Play in App (Normal Files) 🍿</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.secondaryButton} onPress={openInExternalPlayer}>
+          <Text style={styles.buttonText}>Play in VLC (REMUX Files) 🎦</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.backButton} onPress={() => setSelectedFile(null)}>
+          <Text style={styles.buttonText}>Back to List ⬅️</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  // 3. Normal List Screen
   return (
     <View style={styles.container}>
       <Text style={styles.headerTitle}>GDStream 🍿</Text>
 
-      {currentVideo ? (
-        <View style={styles.playerContainer}>
-          <Video
-            source={{ uri: currentVideo }}
-            style={styles.videoPlayer}
-            controls={true}
-            resizeMode="contain"
-            onError={(e) => {
-              console.log("Video Error: ", e);
-              Alert.alert("Heavy File ⚠️", "Ithu REMUX file. Keela irukka 'Play in External Player' button-ah use pannunga.");
-            }}
-          />
-          
-          <View style={styles.buttonRow}>
-            <TouchableOpacity style={styles.externalButton} onPress={openInExternalPlayer}>
-              <Text style={styles.buttonText}>Open in VLC / MX 🎦</Text>
-            </TouchableOpacity>
-            
-            <TouchableOpacity style={styles.closeButton} onPress={() => setCurrentVideo(null)}>
-              <Text style={styles.buttonText}>Close ❌</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
+      {loading ? (
+        <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 50 }} />
       ) : (
-        loading ? (
-          <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 50 }} />
-        ) : (
-          <FlatList
-            data={files}
-            keyExtractor={(item) => item.id}
-            renderItem={({ item }) => (
-              <TouchableOpacity style={styles.itemCard} onPress={() => handlePress(item)}>
-                <Text style={styles.itemText}>
-                  {item.mimeType.includes('folder') ? '📁' : '🎬'} {item.name}
-                </Text>
-              </TouchableOpacity>
-            )}
-            contentContainerStyle={{ paddingBottom: 20 }}
-          />
-        )
+        <FlatList
+          data={files}
+          keyExtractor={(item) => item.id}
+          renderItem={({ item }) => (
+            <TouchableOpacity style={styles.itemCard} onPress={() => handlePress(item)}>
+              <Text style={styles.itemText}>
+                {item.mimeType.includes('folder') ? '📁' : '🎬'} {item.name}
+              </Text>
+            </TouchableOpacity>
+          )}
+          contentContainerStyle={{ paddingBottom: 20 }}
+        />
       )}
     </View>
   );
@@ -114,11 +141,17 @@ const styles = StyleSheet.create({
   headerTitle: { color: '#E50914', fontSize: 28, fontWeight: 'bold', textAlign: 'center', marginBottom: 20 },
   itemCard: { backgroundColor: '#222', padding: 18, marginVertical: 8, marginHorizontal: 16, borderRadius: 8 },
   itemText: { color: '#FFF', fontSize: 16 },
+  
   playerContainer: { flex: 1, backgroundColor: '#000', justifyContent: 'center' },
   videoPlayer: { width: '100%', height: 300 },
-  buttonRow: { flexDirection: 'row', justifyContent: 'space-evenly', marginTop: 20 },
-  externalButton: { padding: 15, backgroundColor: '#E50914', borderRadius: 8 },
-  closeButton: { padding: 15, backgroundColor: '#333', borderRadius: 8 },
+  
+  selectionContainer: { flex: 1, backgroundColor: '#141414', justifyContent: 'center', padding: 20 },
+  selectionTitle: { color: '#FFF', fontSize: 20, fontWeight: 'bold', textAlign: 'center', marginBottom: 40 },
+  primaryButton: { backgroundColor: '#E50914', padding: 15, borderRadius: 8, marginVertical: 10, alignItems: 'center' },
+  secondaryButton: { backgroundColor: '#E06C00', padding: 15, borderRadius: 8, marginVertical: 10, alignItems: 'center' },
+  backButton: { backgroundColor: '#333', padding: 15, borderRadius: 8, marginVertical: 10, alignItems: 'center', marginTop: 30 },
+  
+  closeButton: { padding: 15, backgroundColor: '#333', alignItems: 'center', marginTop: 20, marginHorizontal: 50, borderRadius: 8 },
   buttonText: { color: '#FFF', fontSize: 16, fontWeight: 'bold' }
 });
 
