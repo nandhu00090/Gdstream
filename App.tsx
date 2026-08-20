@@ -26,7 +26,6 @@ const App = () => {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const videoRef = useRef(null);
 
-  // Audio & Subtitle States
   const [audioTracks, setAudioTracks] = useState([]);
   const [textTracks, setTextTracks] = useState([]);
   const [selectedAudio, setSelectedAudio] = useState({ type: 'system' });
@@ -107,7 +106,7 @@ const App = () => {
     const tracks = isAudio ? audioTracks : textTracks;
     
     return (
-      <Modal visible={!!activeModal} transparent={true} animationType="slide">
+      <Modal visible={!!activeModal} transparent={true} animationType="fade">
         <View style={styles.modalBackground}>
           <View style={styles.modalContainer}>
             <Text style={styles.modalTitle}>{isAudio ? "Audio Tracks 🎵" : "Subtitles 💬"}</Text>
@@ -156,7 +155,7 @@ const App = () => {
   if (selectedFile && playMode === 'internal') {
     return (
       <View style={styles.fullscreenContainer}>
-        {/* Layer 1: The Video (Absolute, covers whole screen) */}
+        {/* Layer 1: Hardware Accelerated Video */}
         <Video 
           ref={videoRef}
           source={{ uri: `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}` }} 
@@ -167,28 +166,28 @@ const App = () => {
           selectedAudioTrack={selectedAudio}
           selectedTextTrack={selectedText}
           controls={false} 
+          // 🔥 THE MAGIC FIX FOR BLURAY REMUX 🔥
+          useTextureView={false} 
+          // -----------------------------------
           bufferConfig={{ minBufferMs: 15000, maxBufferMs: 30000, bufferForPlaybackMs: 2500, bufferForPlaybackAfterRebufferMs: 5000 }}
         />
         
-        {/* Layer 2: The Controls Overlay (Absolute, perfectly overlaps video with z-index) */}
+        {/* Layer 2: Custom Controls Overlay */}
         <View style={styles.overlayWrapper}>
           <TouchableOpacity style={{flex: 1}} activeOpacity={1} onPress={() => setShowControls(!showControls)}>
             {showControls && (
               <View style={styles.overlay}>
-                {/* Top */}
                 <View style={styles.playerTopBar}>
                   <TouchableOpacity onPress={closeInternalPlayer} style={{padding: 10}}><Icon name="arrow-back" size={28} color="white" /></TouchableOpacity>
                   <Text style={styles.playerTitle} numberOfLines={1}>{selectedFile.name}</Text>
                 </View>
 
-                {/* Center */}
                 <View style={styles.centerPlayButton}>
                   <TouchableOpacity onPress={() => setIsPaused(!isPaused)}>
                     <Icon name={isPaused ? "play-circle-filled" : "pause-circle-filled"} size={70} color="white" />
                   </TouchableOpacity>
                 </View>
 
-                {/* Bottom */}
                 <View style={styles.playerBottomBar}>
                   <TouchableOpacity onPress={() => setResizeMode(prev => prev === 'contain' ? 'cover' : 'contain')} style={{padding: 10}}>
                     <Icon name={resizeMode === 'contain' ? "aspect-ratio" : "crop-free"} size={28} color="white" />
@@ -213,7 +212,6 @@ const App = () => {
           </TouchableOpacity>
         </View>
         
-        {/* Layer 3: Modals */}
         {renderTrackModal()}
       </View>
     );
@@ -270,17 +268,15 @@ const styles = StyleSheet.create({
   secondaryButton: { backgroundColor: '#E06C00', padding: 15, width: 250, borderRadius: 8, marginTop: 15, alignItems: 'center' },
   buttonText: { color: '#FFF', fontWeight: 'bold' },
   
-  // FIXED PLAYER STYLES 🔥
-  fullscreenContainer: { flex: 1, backgroundColor: 'black', position: 'relative' },
-  videoPlayer: { width: '100%', height: '100%', position: 'absolute', top: 0, left: 0 },
-  overlayWrapper: { position: 'absolute', width: '100%', height: '100%', zIndex: 10, elevation: 10 },
-  overlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'space-between' },
+  fullscreenContainer: { flex: 1, backgroundColor: 'black' },
+  videoPlayer: { ...StyleSheet.absoluteFillObject },
+  overlayWrapper: { ...StyleSheet.absoluteFillObject, zIndex: 10, elevation: 10 },
+  overlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'space-between' },
   playerTopBar: { flexDirection: 'row', alignItems: 'center', padding: 20, paddingTop: 40 },
   playerTitle: { color: 'white', fontSize: 16, fontWeight: 'bold', marginLeft: 15, flex: 1 },
   centerPlayButton: { alignItems: 'center', justifyContent: 'center' },
   playerBottomBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, paddingBottom: 30 },
   
-  // Modal Styles
   modalBackground: { flex: 1, backgroundColor: 'rgba(0,0,0,0.8)', justifyContent: 'center', alignItems: 'center' },
   modalContainer: { width: '85%', maxHeight: '70%', backgroundColor: '#222', borderRadius: 12, padding: 20, alignItems: 'center' },
   modalTitle: { color: 'white', fontSize: 20, fontWeight: 'bold', marginBottom: 20 },
