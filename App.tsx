@@ -34,17 +34,17 @@ const App = () => {
   const [isPaused, setIsPaused] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   
-  // Progress States
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const videoRef = useRef(null);
 
-  // Audio & Subtitle States
   const [audioTracks, setAudioTracks] = useState([]);
   const [textTracks, setTextTracks] = useState([]);
-  const [selectedAudio, setSelectedAudio] = useState({ type: 'system' });
-  const [selectedText, setSelectedText] = useState({ type: 'disabled' });
-  const [activeMenu, setActiveMenu] = useState(null); // 'audio' | 'subtitle' | null
+  
+  // 🔥 FIX 2: Default undefined to prevent Mute Bug
+  const [selectedAudio, setSelectedAudio] = useState(undefined);
+  const [selectedText, setSelectedText] = useState(undefined);
+  const [activeMenu, setActiveMenu] = useState(null);
 
   useEffect(() => { fetchDirectory('/0:/'); }, []);
 
@@ -123,7 +123,6 @@ const App = () => {
   const seekForward = () => { videoRef.current?.seek(currentTime + 10); };
   const seekBackward = () => { videoRef.current?.seek(currentTime - 10); };
 
-  // --- JUST PLAYER STYLE FLOATING MENU ---
   const renderFloatingMenu = () => {
     if (!activeMenu) return null;
     const isAudio = activeMenu === 'audio';
@@ -136,13 +135,13 @@ const App = () => {
           
           {!isAudio && (
             <TouchableOpacity style={styles.menuItem} onPress={() => { setSelectedText({ type: 'disabled' }); setActiveMenu(null); }}>
-              <Icon name="check" size={20} color={selectedText.type === 'disabled' ? 'white' : 'transparent'} />
+              <Icon name="check" size={20} color={selectedText?.type === 'disabled' ? 'white' : 'transparent'} />
               <Text style={styles.menuItemText}>Disable Subtitles</Text>
             </TouchableOpacity>
           )}
 
           {tracks.map((track, index) => {
-            const isSelected = isAudio ? selectedAudio.value === index : selectedText.value === index;
+            const isSelected = isAudio ? selectedAudio?.value === index : selectedText?.value === index;
             return (
               <TouchableOpacity key={index} style={styles.menuItem} onPress={() => {
                 if (isAudio) setSelectedAudio({ type: 'index', value: index });
@@ -162,13 +161,12 @@ const App = () => {
   };
 
   if (selectedFile && playMode === 'internal') {
-    // Calculate progress bar width
     const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
 
     return (
       <View style={styles.playerWrapper}>
         
-        {/* Layer 1: Hardware Accelerated Video. Background transparent is the MAGIC FIX! */}
+        {/* 🔥 FIX 1: Removed Background Color to unhide the hardware decoder video */}
         <Video 
           ref={videoRef}
           source={{ uri: `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}` }} 
@@ -177,31 +175,26 @@ const App = () => {
           paused={isPaused}
           onLoad={handleVideoLoad}
           onProgress={handleProgress}
-          selectedAudioTrack={selectedAudio}
-          selectedTextTrack={selectedText}
+          {...(selectedAudio ? { selectedAudioTrack: selectedAudio } : {})}
+          {...(selectedText ? { selectedTextTrack: selectedText } : {})}
           controls={false} 
-          useTextureView={false} // Hardware Decoding for 10-bit Bluray!
-          bufferConfig={{ minBufferMs: 15000, maxBufferMs: 30000, bufferForPlaybackMs: 2500, bufferForPlaybackAfterRebufferMs: 5000 }}
+          useTextureView={false} // Hardware Decode Enabled
         />
         
-        {/* Layer 2: Just Player UI Clone */}
         <TouchableOpacity style={StyleSheet.absoluteFill} activeOpacity={1} onPress={() => { setShowControls(!showControls); setActiveMenu(null); }}>
           {showControls && (
             <View style={styles.controlsOverlay}>
               
-              {/* Top Bar: Title */}
               <View style={styles.playerTopBar}>
                 <TouchableOpacity onPress={closeInternalPlayer} style={{padding: 10}}><Icon name="arrow-back" size={28} color="white" /></TouchableOpacity>
                 <Text style={styles.playerTitle} numberOfLines={1}>{selectedFile.name}</Text>
               </View>
 
-              {/* Center Bar: Play/Pause/Seek */}
               <View style={styles.centerControls}>
                 <TouchableOpacity onPress={seekBackward} style={{marginRight: 40}}>
                   <Icon name="replay-10" size={45} color="white" />
                 </TouchableOpacity>
                 
-                {/* Just Player White Circle Button */}
                 <TouchableOpacity onPress={() => setIsPaused(!isPaused)} style={styles.whiteCircleBtn}>
                   <Icon name={isPaused ? "play-arrow" : "pause"} size={40} color="black" />
                 </TouchableOpacity>
@@ -211,19 +204,15 @@ const App = () => {
                 </TouchableOpacity>
               </View>
 
-              {/* Bottom Bar: Progress & Icons */}
               <View style={styles.playerBottomArea}>
-                {/* Progress Bar */}
                 <View style={styles.progressBarBg}>
                   <View style={[styles.progressBarFill, { width: `${progressPercent}%` }]} />
                   <View style={[styles.progressDot, { left: `${progressPercent}%` }]} />
                 </View>
                 
                 <View style={styles.playerBottomControls}>
-                  {/* Time Text */}
                   <Text style={styles.timeText}>{formatTime(currentTime)} • {formatTime(duration)}</Text>
                   
-                  {/* Just Player Style Icons Right Side */}
                   <View style={{flexDirection: 'row', alignItems: 'center'}}>
                     <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'audio' ? null : 'audio')}>
                       <Icon name="audiotrack" size={26} color={activeMenu === 'audio' ? '#E50914' : 'white'} />
@@ -248,13 +237,11 @@ const App = () => {
           )}
         </TouchableOpacity>
 
-        {/* Layer 3: Floating Menu (Just Player Style) */}
         {renderFloatingMenu()}
       </View>
     );
   }
 
-  // --- SELECTION SCREEN ---
   if (selectedFile) {
     return (
       <View style={styles.selectionContainer}>
@@ -270,7 +257,6 @@ const App = () => {
     );
   }
 
-  // --- MAIN SCREEN ---
   return (
     <View style={styles.container}>
       <Text style={styles.headerTitle}>GDStream 🍿</Text>
@@ -308,10 +294,10 @@ const styles = StyleSheet.create({
   secondaryButton: { backgroundColor: '#E06C00', padding: 15, width: 250, borderRadius: 8, marginTop: 15, alignItems: 'center' },
   buttonText: { color: '#FFF', fontWeight: 'bold' },
   
-  // 🔥 THE JUST PLAYER UI CLONE 🔥
-  playerWrapper: { flex: 1, backgroundColor: 'transparent' }, // MAGIC FIX: Must be transparent for hardware decode!
-  videoPlayer: { ...StyleSheet.absoluteFillObject, backgroundColor: 'black' }, // Video itself has black bg
-  controlsOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'space-between' },
+  // 🔥 BUG FIX: Removed background colors from Video layer to allow hardware rendering
+  playerWrapper: { flex: 1, backgroundColor: 'black' }, 
+  videoPlayer: { ...StyleSheet.absoluteFillObject }, 
+  controlsOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'space-between' },
   
   playerTopBar: { flexDirection: 'row', alignItems: 'center', padding: 20, paddingTop: 40 },
   playerTitle: { color: 'white', fontSize: 16, fontWeight: '500', marginLeft: 15, flex: 1 },
@@ -328,7 +314,6 @@ const styles = StyleSheet.create({
   timeText: { color: 'white', fontSize: 14, fontWeight: '500' },
   iconBtn: { padding: 10, marginLeft: 5 },
   
-  // Floating Menu Styles (Just Player Style Popup)
   floatingMenu: { position: 'absolute', bottom: 90, right: 20, width: 280, backgroundColor: 'rgba(28, 28, 30, 0.95)', borderRadius: 12, padding: 15, zIndex: 100 },
   floatingMenuTitle: { color: '#888', fontSize: 14, marginBottom: 10, fontWeight: 'bold', borderBottomWidth: 1, borderBottomColor: '#444', paddingBottom: 10 },
   menuItem: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12 },
