@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput, ScrollView, BackHandler } from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput, ScrollView, BackHandler, Animated } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
 import Orientation from 'react-native-orientation-locker';
@@ -39,34 +39,31 @@ const App = () => {
   const [duration, setDuration] = useState(0);
   const [progressWidth, setProgressWidth] = useState(0);
   const videoRef = useRef(null);
-  
-  // 🔥 New Ref to stop double-triggering Auto-Next
   const switchingEpisode = useRef(false);
 
   const [audioTracks, setAudioTracks] = useState([]);
   const [textTracks, setTextTracks] = useState([]);
-  
   const [selectedAudio, setSelectedAudio] = useState(undefined);
   const [selectedText, setSelectedText] = useState(undefined);
   const [activeMenu, setActiveMenu] = useState(null);
+
+  // 🔥 GESTURE STATES (Real Double Tap)
+  const [seekOverlay, setSeekOverlay] = useState({ visible: false, icon: '', time: 0 });
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+  const tapCount = useRef(0);
+  const multiTapTimer = useRef(null);
+  const singleTapTimer = useRef(null);
+  const lastTapTime = useRef(0);
 
   useEffect(() => { fetchDirectory('/0:/'); }, []);
 
   useEffect(() => {
     const backAction = () => {
-      if (playMode === 'internal') {
-        closeInternalPlayer();
-        return true; 
-      } else if (selectedFile) {
-        setSelectedFile(null);
-        return true;
-      } else if (pathStack.length > 1) {
-        goBack();
-        return true;
-      }
+      if (playMode === 'internal') { closeInternalPlayer(); return true; }
+      else if (selectedFile) { setSelectedFile(null); return true; }
+      else if (pathStack.length > 1) { goBack(); return true; }
       return false; 
     };
-
     const backHandler = BackHandler.addEventListener("hardwareBackPress", backAction);
     return () => backHandler.remove();
   }, [playMode, selectedFile, pathStack]);
@@ -81,18 +78,18 @@ const App = () => {
         setFiles(response.data.data.files);
         setFilteredFiles(response.data.data.files);
         setCurrentPath(path);
-        setSearchQuery('');
       }
     } catch (error) { Alert.alert("Error", "Folder load aagala!"); } 
     finally { setLoading(false); }
   };
 
   const openFile = (file) => {
-    switchingEpisode.current = false; // Reset lock for new file
+    switchingEpisode.current = false;
     setSelectedAudio(undefined);
     setSelectedText(undefined);
     setCurrentTime(0);
     setSelectedFile(file);
+    // Note: We don't set playMode here to allow the selection screen to show!
   };
 
   const handlePress = (item) => {
@@ -125,88 +122,76 @@ const App = () => {
   };
 
   const toggleFullscreen = () => {
-    if (isFullscreen) {
-      Orientation.lockToPortrait();
-      setIsFullscreen(false);
-    } else {
-      Orientation.lockToLandscape();
-      setIsFullscreen(true);
-    }
+    if (isFullscreen) { Orientation.lockToPortrait(); setIsFullscreen(false); } 
+    else { Orientation.lockToLandscape(); setIsFullscreen(true); }
   };
 
-  const closeInternalPlayer = () => {
-    Orientation.lockToPortrait(); 
-    setIsFullscreen(false);
-    setPlayMode(null);
-    setSelectedFile(null);
-    setSelectedAudio(undefined);
-    setSelectedText(undefined);
+  const closeInternalPlayer = () => { Orientation.lockToPortrait(); setIsFullscreen(false); setPlayMode(null); setSelectedFile(null); };
+
+  // 🔥 TRUE DOUBLE-TAP LOGIC 🔥
+  const handleZoneTap = (isForward) => {
+    const now = Date.now();
+    const DOUBLE_PRESS_DELAY = 300;
+
+    if (now - lastTapTime.current < DOUBLE_PRESS_DELAY) {
+      // Double tap confirmed
+      clearTimeout(singleTapTimer.current);
+      tapCount.current += 1;
+      clearTimeout(multiTapTimer.current);
+
+      const seekSeconds = tapCount.current * 10;
+      setSeekOverlay({ visible: true, icon: isForward ? 'fast-forward' : 'fast-rewind', time: seekSeconds });
+      
+      Animated.sequence([
+        Animated.timing(fadeAnim, { toValue: 1, duration: 100, useNativeDriver: true }),
+        Animated.delay(500),
+        Animated.timing(fadeAnim, { toValue: 0, duration: 300, useNativeDriver: true })
+      ]).start();
+
+      multiTapTimer.current = setTimeout(() => {
+        const targetTime = isForward ? currentTime + seekSeconds : currentTime - seekSeconds;
+        videoRef.current?.seek(targetTime);
+        tapCount.current = 0; // Reset tap count after seeking
+      }, 600);
+
+    } else {
+      // Single tap processing (waits to see if double tap happens)
+      tapCount.current = 1; 
+      singleTapTimer.current = setTimeout(() => {
+        setShowControls(!showControls);
+        setActiveMenu(null);
+      }, DOUBLE_PRESS_DELAY);
+    }
+    lastTapTime.current = now;
   };
 
   const handleVideoLoad = async (meta) => {
     setDuration(meta.duration);
     if (meta.audioTracks) setAudioTracks(meta.audioTracks);
     if (meta.textTracks) setTextTracks(meta.textTracks);
-
     try {
       const savedTimeStr = await AsyncStorage.getItem(`time_${selectedFile.name}`);
       if (savedTimeStr) {
         const savedTime = parseFloat(savedTimeStr);
-        if (savedTime > 0 && meta.duration - savedTime > 180) {
-          videoRef.current?.seek(savedTime);
-        }
+        if (savedTime > 0 && meta.duration - savedTime > 180) videoRef.current?.seek(savedTime);
       }
     } catch(e) {}
   };
 
-  // 🔥 THE NEW AUTO-NEXT EPISODE LOGIC 🔥
   const handleVideoEnd = async () => {
-    if (switchingEpisode.current) return; // Prevent double trigger
-    switchingEpisode.current = true; // Lock it
-
+    if (switchingEpisode.current) return;
+    switchingEpisode.current = true;
     try { await AsyncStorage.removeItem(`time_${selectedFile?.name}`); } catch(e) {}
-    
     const episodeRegex = /[Ss]\d+[Ee]\d+/;
-    const isEpisode = episodeRegex.test(selectedFile?.name || '');
-
-    if (isEpisode) {
+    if (episodeRegex.test(selectedFile?.name || '')) {
       const currentIndex = filteredFiles.findIndex(f => f.name === selectedFile?.name);
       if (currentIndex !== -1 && currentIndex + 1 < filteredFiles.length) {
-        const nextFile = filteredFiles[currentIndex + 1];
-        if (!nextFile.mimeType?.includes('folder')) {
-          openFile(nextFile);
-          return;
-        }
+        openFile(filteredFiles[currentIndex + 1]);
+        setPlayMode('internal'); // Continue playing next
+        return;
       }
     }
-    
     closeInternalPlayer();
-  };
-
-  const handleProgress = (progress) => {
-    setCurrentTime(progress.currentTime);
-    
-    // Save progress
-    if (Math.floor(progress.currentTime) > 0 && Math.floor(progress.currentTime) % 5 === 0) {
-      AsyncStorage.setItem(`time_${selectedFile?.name}`, progress.currentTime.toString()).catch(() => {});
-    }
-
-    // 🔥 THE 1.5 SECONDS HACK (Fixes ExoPlayer stuck at end bug) 🔥
-    if (duration > 0 && (duration - progress.currentTime) < 1.5) {
-      handleVideoEnd();
-    }
-  };
-
-  const seekForward = () => { videoRef.current?.seek(currentTime + 10); };
-  const seekBackward = () => { videoRef.current?.seek(currentTime - 10); };
-
-  const handleSeekTouch = (event) => {
-    if (progressWidth > 0 && duration > 0) {
-      const touchX = event.nativeEvent.locationX;
-      const seekTime = (touchX / progressWidth) * duration;
-      videoRef.current?.seek(seekTime);
-      setCurrentTime(seekTime);
-    }
   };
 
   const renderFloatingMenu = () => {
@@ -224,7 +209,6 @@ const App = () => {
               <Text style={styles.menuItemText}>Disable Subtitles</Text>
             </TouchableOpacity>
           )}
-
           {tracks.map((track, index) => {
             const isSelected = isAudio ? selectedAudio?.value === index : selectedText?.value === index;
             return (
@@ -247,66 +231,80 @@ const App = () => {
 
   if (selectedFile && playMode === 'internal') {
     const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
-
     return (
       <View style={styles.playerWrapper}>
         <Video 
-          key={selectedFile.link} // 🔥 THE CACHE FIX (Forces fresh remount for next episode)
+          key={selectedFile.link}
           ref={videoRef}
           source={{ uri: `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}` }} 
           style={styles.videoPlayer} 
           resizeMode={resizeMode}
           paused={isPaused}
           onLoad={handleVideoLoad}
-          onProgress={handleProgress}
-          onEnd={handleVideoEnd} // Fallback if regular end works
+          onProgress={(p) => {
+             setCurrentTime(p.currentTime);
+             if (Math.floor(p.currentTime) % 5 === 0) AsyncStorage.setItem(`time_${selectedFile?.name}`, p.currentTime.toString());
+             if (duration > 0 && (duration - p.currentTime) < 1.5) handleVideoEnd();
+          }}
+          onEnd={handleVideoEnd}
           {...(selectedAudio ? { selectedAudioTrack: selectedAudio } : {})}
           {...(selectedText ? { selectedTextTrack: selectedText } : {})}
-          controls={false} 
-          bufferConfig={{ minBufferMs: 15000, maxBufferMs: 30000, bufferForPlaybackMs: 2500, bufferForPlaybackAfterRebufferMs: 5000 }}
+          controls={false}
+          useTextureView={false}
         />
         
-        <TouchableOpacity style={styles.controlsTouchable} activeOpacity={1} onPress={() => { setShowControls(!showControls); setActiveMenu(null); }}>
-          {showControls && (
-            <View style={styles.controlsOverlay}>
-              <View style={styles.playerTopBar}>
-                <TouchableOpacity onPress={closeInternalPlayer} style={{padding: 10}}><Icon name="arrow-back" size={28} color="white" /></TouchableOpacity>
-                <Text style={styles.playerTitle} numberOfLines={1}>{selectedFile.name}</Text>
-              </View>
+        {/* TRUE DOUBLE TAP ZONES */}
+        <View style={StyleSheet.absoluteFill} flexDirection="row">
+          <TouchableOpacity style={{flex: 1}} activeOpacity={1} onPress={() => handleZoneTap(false)} />
+          <TouchableOpacity style={{flex: 1}} activeOpacity={1} onPress={() => handleZoneTap(true)} />
+        </View>
 
-              <View style={styles.centerControls}>
-                <TouchableOpacity onPress={seekBackward} style={{marginRight: 40}}><Icon name="replay-10" size={45} color="white" /></TouchableOpacity>
-                <TouchableOpacity onPress={() => setIsPaused(!isPaused)} style={styles.whiteCircleBtn}>
-                  <Icon name={isPaused ? "play-arrow" : "pause"} size={40} color="black" />
-                </TouchableOpacity>
-                <TouchableOpacity onPress={seekForward} style={{marginLeft: 40}}><Icon name="forward-10" size={45} color="white" /></TouchableOpacity>
-              </View>
+        {/* SEEK OVERLAY (Fade animation) */}
+        <Animated.View style={[styles.seekOverlay, { opacity: fadeAnim }]} pointerEvents="none">
+           <Icon name={seekOverlay.icon} size={50} color="white" />
+           <Text style={styles.seekText}>{seekOverlay.time} seconds</Text>
+        </Animated.View>
 
-              <View style={styles.playerBottomArea}>
-                <TouchableOpacity activeOpacity={1} style={styles.progressBarBg} onLayout={(e) => setProgressWidth(e.nativeEvent.layout.width)} onPress={handleSeekTouch}>
+        {/* CONTROLS OVERLAY */}
+        {showControls && (
+          <View style={styles.controlsOverlay} pointerEvents="box-none">
+            <View style={styles.playerTopBar}>
+              <TouchableOpacity onPress={closeInternalPlayer}><Icon name="arrow-back" size={28} color="white" /></TouchableOpacity>
+              <Text style={styles.playerTitle} numberOfLines={1}>{selectedFile.name}</Text>
+            </View>
+            <TouchableOpacity onPress={() => setIsPaused(!isPaused)} style={styles.centerPlayBtn}>
+                <Icon name={isPaused ? "play-arrow" : "pause"} size={60} color="white" />
+            </TouchableOpacity>
+            <View style={styles.playerBottomArea}>
+                <TouchableOpacity activeOpacity={1} style={styles.progressBarBg} onLayout={(e) => setProgressWidth(e.nativeEvent.layout.width)} onPress={(e) => {
+                    const seekTime = (e.nativeEvent.locationX / progressWidth) * duration;
+                    videoRef.current?.seek(seekTime);
+                }}>
                   <View style={[styles.progressBarFill, { width: `${progressPercent}%` }]} pointerEvents="none" />
                   <View style={[styles.progressDot, { left: `${progressPercent}%` }]} pointerEvents="none" />
                 </TouchableOpacity>
-                
                 <View style={styles.playerBottomControls}>
-                  <Text style={styles.timeText}>{formatTime(currentTime)} • {formatTime(duration)}</Text>
-                  <View style={{flexDirection: 'row', alignItems: 'center'}}>
-                    <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'audio' ? null : 'audio')}><Icon name="audiotrack" size={26} color={activeMenu === 'audio' ? '#E50914' : 'white'} /></TouchableOpacity>
-                    <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'subtitle' ? null : 'subtitle')}><Icon name="closed-caption" size={26} color={activeMenu === 'subtitle' ? '#E50914' : 'white'} /></TouchableOpacity>
-                    <TouchableOpacity style={styles.iconBtn} onPress={() => setResizeMode(prev => prev === 'contain' ? 'cover' : 'contain')}><Icon name={resizeMode === 'contain' ? "aspect-ratio" : "crop-free"} size={26} color="white" /></TouchableOpacity>
-                    <TouchableOpacity onPress={toggleFullscreen} style={styles.iconBtn}><Icon name={isFullscreen ? "fullscreen-exit" : "fullscreen"} size={26} color="white" /></TouchableOpacity>
-                  </View>
+                    <Text style={styles.timeText}>{formatTime(currentTime)} • {formatTime(duration)}</Text>
+                    <View style={{flexDirection: 'row', alignItems: 'center'}}>
+                        <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'audio' ? null : 'audio')}><Icon name="audiotrack" size={26} color={activeMenu === 'audio' ? '#E50914' : 'white'} /></TouchableOpacity>
+                        <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'subtitle' ? null : 'subtitle')}><Icon name="closed-caption" size={26} color={activeMenu === 'subtitle' ? '#E50914' : 'white'} /></TouchableOpacity>
+                        <TouchableOpacity style={styles.iconBtn} onPress={() => setResizeMode(prev => prev === 'contain' ? 'cover' : 'contain')}><Icon name={resizeMode === 'contain' ? "aspect-ratio" : "crop-free"} size={26} color="white" /></TouchableOpacity>
+                        <TouchableOpacity onPress={toggleFullscreen} style={styles.iconBtn}><Icon name={isFullscreen ? "fullscreen-exit" : "fullscreen"} size={26} color="white" /></TouchableOpacity>
+                    </View>
                 </View>
-              </View>
             </View>
-          )}
-        </TouchableOpacity>
+          </View>
+        )}
+        
+        {/* AUDIO & SUBTITLE MENU (RESTORED!) */}
         {renderFloatingMenu()}
+
       </View>
     );
   }
 
-  if (selectedFile) {
+  // 🔥 EXTERNAL PLAYER SELECTION SCREEN (RESTORED!) 🔥
+  if (selectedFile && playMode === null) {
     return (
       <View style={styles.selectionContainer}>
         <Text style={styles.selectionTitle}>{selectedFile.name}</Text>
@@ -351,21 +349,23 @@ const styles = StyleSheet.create({
   backButton: { backgroundColor: '#333', padding: 10, marginHorizontal: 15, borderRadius: 5, marginBottom: 10 },
   itemCard: { backgroundColor: '#222', padding: 18, marginVertical: 5, marginHorizontal: 15, borderRadius: 8 },
   itemText: { color: '#FFF', fontSize: 16, flex: 1 },
+  
   selectionContainer: { flex: 1, backgroundColor: '#141414', justifyContent: 'center', alignItems: 'center', padding: 20 },
   selectionTitle: { color: '#FFF', fontSize: 18, textAlign: 'center', marginBottom: 40 },
   primaryButton: { backgroundColor: '#E50914', padding: 15, width: 250, borderRadius: 8, alignItems: 'center' },
   secondaryButton: { backgroundColor: '#E06C00', padding: 15, width: 250, borderRadius: 8, marginTop: 15, alignItems: 'center' },
   buttonText: { color: '#FFF', fontWeight: 'bold' },
-  playerWrapper: { flex: 1, backgroundColor: 'black' }, 
-  videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 }, 
-  controlsTouchable: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
-  controlsOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'space-between' },
-  playerTopBar: { flexDirection: 'row', alignItems: 'center', padding: 20, paddingTop: 40 },
-  playerTitle: { color: 'white', fontSize: 16, fontWeight: '500', marginLeft: 15, flex: 1 },
-  centerControls: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
-  whiteCircleBtn: { backgroundColor: 'white', width: 70, height: 70, borderRadius: 35, alignItems: 'center', justifyContent: 'center' },
+  
+  playerWrapper: { flex: 1, backgroundColor: 'black' },
+  videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
+  controlsOverlay: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'space-between' },
+  seekOverlay: { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.3)' },
+  seekText: { color: 'white', fontSize: 18, marginTop: 10, fontWeight: 'bold' },
+  playerTopBar: { padding: 20, paddingTop: 40, flexDirection: 'row', alignItems: 'center' },
+  playerTitle: { color: 'white', marginLeft: 15, fontSize: 16, fontWeight: '500', flex: 1 },
+  centerPlayBtn: { alignSelf: 'center', justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.5)', borderRadius: 50, padding: 10 },
   playerBottomArea: { paddingHorizontal: 20, paddingBottom: 30, width: '100%' },
-  progressBarBg: { height: 25, justifyContent: 'center', marginBottom: 5, width: '100%' }, 
+  progressBarBg: { height: 25, justifyContent: 'center', marginBottom: 5, width: '100%' },
   progressBarFill: { height: 4, backgroundColor: 'white', borderRadius: 2, position: 'absolute' },
   progressDot: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'white', top: 5, marginLeft: -7 },
   playerBottomControls: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
