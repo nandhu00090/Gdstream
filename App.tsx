@@ -4,6 +4,7 @@ import Video from 'react-native-video';
 import axios from 'axios';
 import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const { VideoPlayerManager } = NativeModules;
 const BASE_URL = 'https://movies-and-series.ambalartssb01.workers.dev';
@@ -48,12 +49,11 @@ const App = () => {
 
   useEffect(() => { fetchDirectory('/0:/'); }, []);
 
-  // 🔥 THE NEW BACK GESTURE HANDLER 🔥
   useEffect(() => {
     const backAction = () => {
       if (playMode === 'internal') {
         closeInternalPlayer();
-        return true; // App close aagama thadukkuthu
+        return true; 
       } else if (selectedFile) {
         setSelectedFile(null);
         return true;
@@ -61,7 +61,7 @@ const App = () => {
         goBack();
         return true;
       }
-      return false; // Default ah App close aagum
+      return false; 
     };
 
     const backHandler = BackHandler.addEventListener("hardwareBackPress", backAction);
@@ -84,13 +84,20 @@ const App = () => {
     finally { setLoading(false); }
   };
 
+  const openFile = (file) => {
+    setSelectedAudio(undefined);
+    setSelectedText(undefined);
+    setCurrentTime(0);
+    setSelectedFile(file);
+  };
+
   const handlePress = (item) => {
     if (item.mimeType?.includes('folder')) {
       const newPath = `${currentPath}${item.name}/`;
       setPathStack([...pathStack, newPath]);
       fetchDirectory(newPath);
     } else {
-      setSelectedFile(item);
+      openFile(item);
     }
   };
 
@@ -128,16 +135,56 @@ const App = () => {
     setIsFullscreen(false);
     setPlayMode(null);
     setSelectedFile(null);
+    setSelectedAudio(undefined);
+    setSelectedText(undefined);
   };
 
-  const handleVideoLoad = (meta) => {
+  // 🔥 RESUME PLAYBACK LOGIC 🔥
+  const handleVideoLoad = async (meta) => {
     setDuration(meta.duration);
     if (meta.audioTracks) setAudioTracks(meta.audioTracks);
     if (meta.textTracks) setTextTracks(meta.textTracks);
+
+    try {
+      const savedTimeStr = await AsyncStorage.getItem(`time_${selectedFile.name}`);
+      if (savedTimeStr) {
+        const savedTime = parseFloat(savedTimeStr);
+        // Padam mudiya 3 minute-ku mela iruntha mattum resume pannu (Prevent auto-resume on finished movies)
+        if (savedTime > 0 && meta.duration - savedTime > 180) {
+          videoRef.current?.seek(savedTime);
+          Alert.alert("Resumed 🍿", "Playing from where you left off!");
+        }
+      }
+    } catch(e) {}
   };
 
+  // 🔥 SILENT SAVE PROGRESS LOGIC 🔥
   const handleProgress = (progress) => {
     setCurrentTime(progress.currentTime);
+    // Every 5 seconds, save time to local storage
+    if (Math.floor(progress.currentTime) > 0 && Math.floor(progress.currentTime) % 5 === 0) {
+      AsyncStorage.setItem(`time_${selectedFile?.name}`, progress.currentTime.toString()).catch(() => {});
+    }
+  };
+
+  // 🔥 AUTO-NEXT EPISODE LOGIC 🔥
+  const handleVideoEnd = async () => {
+    // Clear current file progress so it starts from 0 next time
+    try { await AsyncStorage.removeItem(`time_${selectedFile?.name}`); } catch(e) {}
+    
+    // Find Next File
+    const currentIndex = filteredFiles.findIndex(f => f.name === selectedFile?.name);
+    if (currentIndex !== -1 && currentIndex + 1 < filteredFiles.length) {
+      const nextFile = filteredFiles[currentIndex + 1];
+      if (!nextFile.mimeType?.includes('folder')) {
+        Alert.alert("Auto-Playing Next 🍿", nextFile.name);
+        openFile(nextFile); // Load Next Episode Automatically!
+      } else {
+        closeInternalPlayer();
+      }
+    } else {
+      closeInternalPlayer();
+    }
   };
 
   const seekForward = () => { videoRef.current?.seek(currentTime + 10); };
@@ -161,7 +208,6 @@ const App = () => {
       <View style={styles.floatingMenu}>
         <Text style={styles.floatingMenuTitle}>{isAudio ? "Audio Tracks 🎵" : "Subtitles 💬"}</Text>
         <ScrollView style={{maxHeight: 200}}>
-          
           {!isAudio && (
             <TouchableOpacity style={styles.menuItem} onPress={() => { setSelectedText({ type: 'disabled' }); setActiveMenu(null); }}>
               <Icon name="check" size={20} color={selectedText?.type === 'disabled' ? 'white' : 'transparent'} />
@@ -194,7 +240,6 @@ const App = () => {
 
     return (
       <View style={styles.playerWrapper}>
-        
         <Video 
           ref={videoRef}
           source={{ uri: `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}` }} 
@@ -203,6 +248,7 @@ const App = () => {
           paused={isPaused}
           onLoad={handleVideoLoad}
           onProgress={handleProgress}
+          onEnd={handleVideoEnd} // TRIGGER AUTO NEXT
           {...(selectedAudio ? { selectedAudioTrack: selectedAudio } : {})}
           {...(selectedText ? { selectedTextTrack: selectedText } : {})}
           controls={false} 
@@ -212,64 +258,38 @@ const App = () => {
         <TouchableOpacity style={styles.controlsTouchable} activeOpacity={1} onPress={() => { setShowControls(!showControls); setActiveMenu(null); }}>
           {showControls && (
             <View style={styles.controlsOverlay}>
-              
               <View style={styles.playerTopBar}>
                 <TouchableOpacity onPress={closeInternalPlayer} style={{padding: 10}}><Icon name="arrow-back" size={28} color="white" /></TouchableOpacity>
                 <Text style={styles.playerTitle} numberOfLines={1}>{selectedFile.name}</Text>
               </View>
 
               <View style={styles.centerControls}>
-                <TouchableOpacity onPress={seekBackward} style={{marginRight: 40}}>
-                  <Icon name="replay-10" size={45} color="white" />
-                </TouchableOpacity>
-                
+                <TouchableOpacity onPress={seekBackward} style={{marginRight: 40}}><Icon name="replay-10" size={45} color="white" /></TouchableOpacity>
                 <TouchableOpacity onPress={() => setIsPaused(!isPaused)} style={styles.whiteCircleBtn}>
                   <Icon name={isPaused ? "play-arrow" : "pause"} size={40} color="black" />
                 </TouchableOpacity>
-                
-                <TouchableOpacity onPress={seekForward} style={{marginLeft: 40}}>
-                  <Icon name="forward-10" size={45} color="white" />
-                </TouchableOpacity>
+                <TouchableOpacity onPress={seekForward} style={{marginLeft: 40}}><Icon name="forward-10" size={45} color="white" /></TouchableOpacity>
               </View>
 
               <View style={styles.playerBottomArea}>
-                <TouchableOpacity 
-                  activeOpacity={1}
-                  style={styles.progressBarBg}
-                  onLayout={(e) => setProgressWidth(e.nativeEvent.layout.width)}
-                  onPress={handleSeekTouch}
-                >
+                <TouchableOpacity activeOpacity={1} style={styles.progressBarBg} onLayout={(e) => setProgressWidth(e.nativeEvent.layout.width)} onPress={handleSeekTouch}>
                   <View style={[styles.progressBarFill, { width: `${progressPercent}%` }]} pointerEvents="none" />
                   <View style={[styles.progressDot, { left: `${progressPercent}%` }]} pointerEvents="none" />
                 </TouchableOpacity>
                 
                 <View style={styles.playerBottomControls}>
                   <Text style={styles.timeText}>{formatTime(currentTime)} • {formatTime(duration)}</Text>
-                  
                   <View style={{flexDirection: 'row', alignItems: 'center'}}>
-                    <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'audio' ? null : 'audio')}>
-                      <Icon name="audiotrack" size={26} color={activeMenu === 'audio' ? '#E50914' : 'white'} />
-                    </TouchableOpacity>
-                    
-                    <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'subtitle' ? null : 'subtitle')}>
-                      <Icon name="closed-caption" size={26} color={activeMenu === 'subtitle' ? '#E50914' : 'white'} />
-                    </TouchableOpacity>
-                    
-                    <TouchableOpacity style={styles.iconBtn} onPress={() => setResizeMode(prev => prev === 'contain' ? 'cover' : 'contain')}>
-                      <Icon name={resizeMode === 'contain' ? "aspect-ratio" : "crop-free"} size={26} color="white" />
-                    </TouchableOpacity>
-
-                    <TouchableOpacity onPress={toggleFullscreen} style={styles.iconBtn}>
-                      <Icon name={isFullscreen ? "fullscreen-exit" : "fullscreen"} size={26} color="white" />
-                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'audio' ? null : 'audio')}><Icon name="audiotrack" size={26} color={activeMenu === 'audio' ? '#E50914' : 'white'} /></TouchableOpacity>
+                    <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'subtitle' ? null : 'subtitle')}><Icon name="closed-caption" size={26} color={activeMenu === 'subtitle' ? '#E50914' : 'white'} /></TouchableOpacity>
+                    <TouchableOpacity style={styles.iconBtn} onPress={() => setResizeMode(prev => prev === 'contain' ? 'cover' : 'contain')}><Icon name={resizeMode === 'contain' ? "aspect-ratio" : "crop-free"} size={26} color="white" /></TouchableOpacity>
+                    <TouchableOpacity onPress={toggleFullscreen} style={styles.iconBtn}><Icon name={isFullscreen ? "fullscreen-exit" : "fullscreen"} size={26} color="white" /></TouchableOpacity>
                   </View>
                 </View>
               </View>
-
             </View>
           )}
         </TouchableOpacity>
-
         {renderFloatingMenu()}
       </View>
     );
@@ -320,33 +340,26 @@ const styles = StyleSheet.create({
   backButton: { backgroundColor: '#333', padding: 10, marginHorizontal: 15, borderRadius: 5, marginBottom: 10 },
   itemCard: { backgroundColor: '#222', padding: 18, marginVertical: 5, marginHorizontal: 15, borderRadius: 8 },
   itemText: { color: '#FFF', fontSize: 16, flex: 1 },
-  
   selectionContainer: { flex: 1, backgroundColor: '#141414', justifyContent: 'center', alignItems: 'center', padding: 20 },
   selectionTitle: { color: '#FFF', fontSize: 18, textAlign: 'center', marginBottom: 40 },
   primaryButton: { backgroundColor: '#E50914', padding: 15, width: 250, borderRadius: 8, alignItems: 'center' },
   secondaryButton: { backgroundColor: '#E06C00', padding: 15, width: 250, borderRadius: 8, marginTop: 15, alignItems: 'center' },
   buttonText: { color: '#FFF', fontWeight: 'bold' },
-  
   playerWrapper: { flex: 1, backgroundColor: 'black' }, 
   videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 }, 
   controlsTouchable: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
   controlsOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'space-between' },
-  
   playerTopBar: { flexDirection: 'row', alignItems: 'center', padding: 20, paddingTop: 40 },
   playerTitle: { color: 'white', fontSize: 16, fontWeight: '500', marginLeft: 15, flex: 1 },
-  
   centerControls: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
   whiteCircleBtn: { backgroundColor: 'white', width: 70, height: 70, borderRadius: 35, alignItems: 'center', justifyContent: 'center' },
-  
   playerBottomArea: { paddingHorizontal: 20, paddingBottom: 30, width: '100%' },
   progressBarBg: { height: 25, justifyContent: 'center', marginBottom: 5, width: '100%' }, 
   progressBarFill: { height: 4, backgroundColor: 'white', borderRadius: 2, position: 'absolute' },
   progressDot: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'white', top: 5, marginLeft: -7 },
-  
   playerBottomControls: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   timeText: { color: 'white', fontSize: 14, fontWeight: '500' },
   iconBtn: { padding: 10, marginLeft: 5 },
-  
   floatingMenu: { position: 'absolute', bottom: 90, right: 20, width: 280, backgroundColor: 'rgba(28, 28, 30, 0.95)', borderRadius: 12, padding: 15, zIndex: 100 },
   floatingMenuTitle: { color: '#888', fontSize: 14, marginBottom: 10, fontWeight: 'bold', borderBottomWidth: 1, borderBottomColor: '#444', paddingBottom: 10 },
   menuItem: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12 },
