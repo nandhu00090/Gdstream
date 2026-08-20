@@ -2,7 +2,6 @@ import React, { useState, useEffect } from 'react';
 import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const { VideoPlayerManager } = NativeModules;
 const BASE_URL = 'https://movies-and-series.ambalartssb01.workers.dev';
@@ -11,11 +10,13 @@ const PASSWORD = '629175';
 
 const App = () => {
   const [files, setFiles] = useState([]);
+  const [filteredFiles, setFilteredFiles] = useState([]);
   const [loading, setLoading] = useState(true);
   const [pathStack, setPathStack] = useState(['/0:/']); 
   const [currentPath, setCurrentPath] = useState('/0:/');
   const [selectedFile, setSelectedFile] = useState(null);
   const [playMode, setPlayMode] = useState(null);
+  const [searchQuery, setSearchQuery] = useState('');
 
   useEffect(() => {
     fetchDirectory('/0:/');
@@ -29,7 +30,9 @@ const App = () => {
       const response = await axios.post(`${BASE_URL}${path}`, { page_index: 0 });
       if (response.data?.data?.files) {
         setFiles(response.data.data.files);
+        setFilteredFiles(response.data.data.files);
         setCurrentPath(path);
+        setSearchQuery(''); // Puthu folder poga pothu search clear aaganum
       }
     } catch (error) { Alert.alert("Error", "Folder-ah open panna mudiyala!"); } 
     finally { setLoading(false); }
@@ -53,20 +56,32 @@ const App = () => {
     }
   };
 
+  const handleSearch = (text) => {
+    setSearchQuery(text);
+    const filtered = files.filter(file => file.name.toLowerCase().includes(text.toLowerCase()));
+    setFilteredFiles(filtered);
+  };
+
   const openInExternalPlayer = async () => {
     const url = `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}`;
     try { await VideoPlayerManager.playVideo(url); } catch (e) { Alert.alert("Error", "Player illai!"); }
   };
 
-  // Rendering logic
   if (selectedFile && playMode === 'internal') {
     return (
       <View style={{flex: 1, backgroundColor: 'black', justifyContent: 'center'}}>
         <Video 
-          source={{ uri: `${BASE_URL}${selectedFile.link}` }} 
+          source={{ uri: `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}` }} 
           style={{width: '100%', height: 300}} 
           controls={true} 
           resizeMode="contain"
+          // OOM Crash-ah thadukka Buffer Optimization:
+          bufferConfig={{
+            minBufferMs: 15000,
+            maxBufferMs: 30000, // Reduced max buffer to save RAM!
+            bufferForPlaybackMs: 2500,
+            bufferForPlaybackAfterRebufferMs: 5000
+          }}
         />
         <TouchableOpacity onPress={() => {setPlayMode(null); setSelectedFile(null);}} style={styles.closeButton}>
           <Text style={styles.buttonText}>Close ❌</Text>
@@ -93,12 +108,23 @@ const App = () => {
   return (
     <View style={styles.container}>
       <Text style={styles.headerTitle}>GDStream 🍿</Text>
+      
+      {/* Search Bar is BACK! */}
+      <TextInput 
+        style={styles.searchBar} 
+        placeholder="Search movies / episodes..." 
+        placeholderTextColor="#888" 
+        value={searchQuery}
+        onChangeText={handleSearch} 
+      />
+
       {pathStack.length > 1 && (
         <TouchableOpacity style={styles.backButton} onPress={goBack}><Text style={{color:'white'}}>⬅️ Back</Text></TouchableOpacity>
       )}
+      
       {loading ? <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 50 }} /> : (
         <FlatList 
-          data={files} 
+          data={filteredFiles} 
           keyExtractor={(item) => item.id}
           renderItem={({item}) => (
             <TouchableOpacity style={styles.itemCard} onPress={() => handlePress(item)}>
@@ -116,7 +142,8 @@ const App = () => {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#141414', paddingTop: 40 },
-  headerTitle: { color: '#E50914', fontSize: 24, fontWeight: 'bold', textAlign: 'center', marginBottom: 20 },
+  headerTitle: { color: '#E50914', fontSize: 24, fontWeight: 'bold', textAlign: 'center', marginBottom: 10 },
+  searchBar: { backgroundColor: '#222', color: 'white', marginHorizontal: 15, marginBottom: 15, padding: 12, borderRadius: 8 },
   backButton: { backgroundColor: '#333', padding: 10, marginHorizontal: 15, borderRadius: 5, marginBottom: 10 },
   itemCard: { backgroundColor: '#222', padding: 18, marginVertical: 5, marginHorizontal: 15, borderRadius: 8 },
   itemText: { color: '#FFF', fontSize: 16 },
