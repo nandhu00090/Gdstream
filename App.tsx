@@ -1,7 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, Linking } from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
+
+// Namma uruvakkuna Native Module-ah import panrom!
+const { VideoPlayerManager } = NativeModules;
 
 const BASE_URL = 'https://movies-and-series.ambalartssb01.workers.dev';
 const USERNAME = 'admin'; 
@@ -40,21 +43,12 @@ const App = () => {
   const openInExternalPlayer = async () => {
     if (!selectedFile) return;
     const url = getFileUrl(selectedFile);
-    const cleanUrl = url.replace(/^https?:\/\//, '');
-    
-    // Muthalla Just Player-ah direct-ah thedi thirakka try pannum
-    const justPlayerIntent = `intent://${cleanUrl}#Intent;package=com.brouken.player;scheme=https;type=video/*;end`;
     
     try {
-      await Linking.openURL(justPlayerIntent);
+      // 100% Native Android Intent trigger aagum!
+      await VideoPlayerManager.playVideo(url);
     } catch (e) {
-      // Just Player illa na, adutha option-ah VLC-ku pogum
-      const vlcIntent = `intent://${cleanUrl}#Intent;package=org.videolan.vlc;scheme=https;type=video/*;end`;
-      try {
-        await Linking.openURL(vlcIntent);
-      } catch (err) {
-        Alert.alert("Player Missing ⚠️", "Unga phone-la Just Player allathu VLC install panni irukka nu check pannunga!");
-      }
+      Alert.alert("Player Missing", "Unga phone-la media players ethuvum kedaikkala!");
     }
   };
 
@@ -84,7 +78,7 @@ const App = () => {
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.secondaryButton} onPress={openInExternalPlayer}>
-          <Text style={styles.buttonText}>Play in Just Player / VLC 🎦</Text>
+          <Text style={styles.buttonText}>Play in External Player 🎦</Text>
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.backButton} onPress={() => setSelectedFile(null)}>
