@@ -22,7 +22,7 @@ class SubtitleFileModule(private val reactContext: ReactApplicationContext) :
 
     init {
         reactContext.addActivityEventListener(object : BaseActivityEventListener() {
-            override fun onActivityResult(activity: Activity?, requestCode: Int, resultCode: Int, data: Intent?) {
+            override fun onActivityResult(activity: Activity, requestCode: Int, resultCode: Int, data: Intent?) {
                 this@SubtitleFileModule.onActivityResult(activity, requestCode, resultCode, data)
             }
         })
@@ -65,7 +65,7 @@ class SubtitleFileModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun onActivityResult(activity: Activity?, requestCode: Int, resultCode: Int, data: Intent?) {
+    private fun onActivityResult(activity: Activity, requestCode: Int, resultCode: Int, data: Intent?) {
         val promise = pickPromise ?: return
         if (requestCode != REQUEST_CODE) return
         pickPromise = null
@@ -78,7 +78,7 @@ class SubtitleFileModule(private val reactContext: ReactApplicationContext) :
             val uri: Uri = data.data!!
             val name = queryDisplayName(uri)
             val sb = StringBuilder()
-            activity?.contentResolver?.openInputStream(uri)?.use { ins ->
+            activity.contentResolver.openInputStream(uri)?.use { ins ->
                 val buf = ByteArray(8192)
                 var len: Int
                 while (ins.read(buf).also { len = it } > 0) {
