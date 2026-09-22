@@ -268,26 +268,21 @@ const App = () => {
             setCurrentSubtitle(text ? text.trim() : '');
           }}
           selectedAudioTrack={selectedAudio}
-          // The chosen track IS selected natively (required so cue data flows
-          // to JS via onTextTrackDataChanged). Its rendering is made
-          // INVISIBLE via the aggressive subtitleStyle below.
+          // The chosen track IS selected natively (required so ExoPlayer
+          // processes the embedded MKV subtitles and fires
+          // onTextTrackDataChanged). Its rendering is hidden via the
+          // transparent subtitleStyle below — WITHOUT enable: false, which
+          // would kill the whole subtitle pipeline.
           selectedTextTrack={subtitlesDisabled ? { type: 'disabled' } : (selectedText || { type: 'disabled' })}
-          // 🔥 AGGRESSIVE NATIVE SUBTITLE INVISIBILITY 🔥
-          // Every styling path the native SubtitleView supports is forced
-          // to transparent/zero so the native captions can never be seen,
-          // no matter the zoom level or resizeMode.
+          // 🔥 HIDE NATIVE RENDERING WITHOUT BREAKING THE DATA PIPELINE 🔥
+          // NO enable: false here! The native SubtitleView stays alive (so
+          // cue data keeps flowing to onTextTrackDataChanged) but is made
+          // invisible: fully transparent and pushed far off-screen.
           subtitleStyle={{
-            enable: false,
             opacity: 0,
+            paddingBottom: 5000,
             color: 'transparent',
             backgroundColor: 'transparent',
-            textShadowColor: 'transparent',
-            shadowColor: 'transparent',
-            shadowRadius: 0,
-            shadowOffset: { width: 0, height: 0 },
-            padding: 0,
-            paddingBottom: 100000,
-            subtitlesFollowVideo: false,
           }}
           controls={false}
           useTextureView={false}
