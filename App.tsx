@@ -47,6 +47,11 @@ const App = () => {
   const [selectedText, setSelectedText] = useState(undefined);
   const [activeMenu, setActiveMenu] = useState(null);
 
+  // 🔥 SUBTITLE ACTIVITY STATE (restored) 🔥
+  // True when a real subtitle track is selected (not 'disabled'). Used by
+  // selectedTextTrack to decide whether ExoPlayer renders native subtitles.
+  const subtitlesActive = !!selectedText && selectedText.type !== 'disabled';
+
   // 🔥 TRUE GESTURE STATES 🔥
   const [seekOverlay, setSeekOverlay] = useState({ visible: false, icon: '', time: 0, position: 'center' });
   const fadeAnim = useRef(new Animated.Value(0)).current;
