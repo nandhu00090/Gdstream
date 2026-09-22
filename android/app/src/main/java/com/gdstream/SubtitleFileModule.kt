@@ -4,15 +4,15 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
-import com.facebook.react.bridge.ActivityEventListener
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
+import com.facebook.react.bridge.BaseActivityEventListener
 
 class SubtitleFileModule(private val reactContext: ReactApplicationContext) :
-    ReactContextBaseJavaModule(reactContext), ActivityEventListener {
+    ReactContextBaseJavaModule(reactContext) {
 
     companion object {
         private const val REQUEST_CODE = 47123
@@ -21,7 +21,11 @@ class SubtitleFileModule(private val reactContext: ReactApplicationContext) :
     private var pickPromise: Promise? = null
 
     init {
-        reactContext.addActivityEventListener(this)
+        reactContext.addActivityEventListener(object : BaseActivityEventListener() {
+            override fun onActivityResult(activity: Activity?, requestCode: Int, resultCode: Int, data: Intent?) {
+                this@SubtitleFileModule.onActivityResult(activity, requestCode, resultCode, data)
+            }
+        })
     }
 
     override fun getName(): String {
@@ -61,7 +65,7 @@ class SubtitleFileModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    override fun onActivityResult(activity: Activity?, requestCode: Int, resultCode: Int, data: Intent?) {
+    private fun onActivityResult(activity: Activity?, requestCode: Int, resultCode: Int, data: Intent?) {
         val promise = pickPromise ?: return
         if (requestCode != REQUEST_CODE) return
         pickPromise = null
@@ -88,10 +92,6 @@ class SubtitleFileModule(private val reactContext: ReactApplicationContext) :
         } catch (e: Exception) {
             promise.reject("ERROR", e.message)
         }
-    }
-
-    override fun onNewIntent(intent: Intent?) {
-        // not needed
     }
 
     private fun queryDisplayName(uri: Uri): String {
