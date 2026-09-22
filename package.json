@@ -1,1 +1,1 @@
-ls node_modules/react-native-video/android/src/main/java/com/brentvatne/react/
+git checkout HEAD -- package.json
