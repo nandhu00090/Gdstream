@@ -6,7 +6,7 @@ import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const { VideoPlayerManager, VideoZoomModule } = NativeModules;
+const { VideoPlayerManager } = NativeModules;
 const BASE_URL = 'https://movies-and-series.ambalartssb01.workers.dev';
 const USERNAME = 'admin'; 
 const PASSWORD = '629175'; 
@@ -30,6 +30,7 @@ const App = () => {
   
   const [selectedFile, setSelectedFile] = useState(null);
   const [playMode, setPlayMode] = useState(null);
+  const [resizeMode, setResizeMode] = useState('contain');
   const [showControls, setShowControls] = useState(true);
   const [isPaused, setIsPaused] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -45,13 +46,6 @@ const App = () => {
   const [selectedAudio, setSelectedAudio] = useState(undefined);
   const [selectedText, setSelectedText] = useState(undefined);
   const [activeMenu, setActiveMenu] = useState(null);
-
-  // 🔥 NATIVE TEXTUREVIEW ZOOM 🔥
-  // Zoom is applied natively to ONLY the video surface (TextureView) via
-  // VideoZoomModule. The SubtitleView is a sibling inside the player view,
-  // so it is never scaled or cropped — subtitles stay readable at any zoom.
-  const [isNativeZoomed, setIsNativeZoomed] = useState(false);
-  const subtitlesActive = !!selectedText && selectedText.type !== 'disabled';
 
   // 🔥 TRUE GESTURE STATES 🔥
   const [seekOverlay, setSeekOverlay] = useState({ visible: false, icon: '', time: 0, position: 'center' });
@@ -94,7 +88,7 @@ const App = () => {
     setSelectedAudio(undefined);
     setSelectedText(undefined);
     setCurrentTime(0);
-    setIsNativeZoomed(false);
+    setResizeMode('contain');
     setSelectedFile(file);
     // PlayMode is NOT set here so the Selection Screen shows!
   };
@@ -135,21 +129,12 @@ const App = () => {
 
   const closeInternalPlayer = () => { Orientation.lockToPortrait(); setIsFullscreen(false); setPlayMode(null); setSelectedFile(null); };
 
-  // 🔥 NATIVE ZOOM TOGGLE (TAG-FREE) 🔥
-  // Scales ONLY the TextureView (video surface) natively to 1.35x. The
-  // SubtitleView is untouched, so subtitles remain fully visible and
-  // unscaled even while the video is zoomed. Works with subtitles on or off.
-  //
-  // No view tag needed: the native module traverses the current activity's
-  // root view to find the TextureView directly.
+  // 🔥 ZOOM TOGGLE (standard resizeMode approach) 🔥
+  // Toggles between 'contain' (fit) and 'cover' (zoom/fill). Native
+  // subtitles are protected from cropping via dynamic paddingBottom in
+  // subtitleStyle — the same technique used by players like Just Player.
   const handleZoomToggle = () => {
-    const newZoomState = !isNativeZoomed;
-    try {
-      VideoZoomModule.setVideoZoom(newZoomState);
-      setIsNativeZoomed(newZoomState);
-    } catch (e) {
-      Alert.alert("Error", "Zoom apply aagala!");
-    }
+    setResizeMode(prev => prev === 'contain' ? 'cover' : 'contain');
   };
 
   // 🔥 SUBTITLE TRACK SELECTION 🔥
@@ -266,11 +251,7 @@ const App = () => {
           ref={videoRef}
           source={{ uri: `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}` }} 
           style={styles.videoPlayer} 
-          // 🔥 PERMANENT 'contain' 🔥
-          // The player layout (and its native SubtitleView) is NEVER cropped
-          // by React Native's layout engine. Zoom is applied natively to the
-          // TextureView only, via VideoZoomModule.
-          resizeMode="contain"
+          resizeMode={resizeMode}
           paused={isPaused}
           onLoad={handleVideoLoad}
           onTextTracks={(tracks) => { if (tracks && tracks.length) setTextTracks(tracks); }}
@@ -281,12 +262,12 @@ const App = () => {
           }}
           onEnd={handleVideoEnd}
           selectedAudioTrack={selectedAudio}
-          // 🔥 NATIVE SUBTITLE RENDERING 🔥
-          // ExoPlayer renders embedded MKV subtitles natively. Since the
-          // layout is never cropped and zoom only scales the TextureView,
-          // subtitles stay fully visible and unscaled at any zoom level.
+          // 🔥 NATIVE SUBTITLE RENDERING with DYNAMIC PADDING 🔥
+          // When zoomed ('cover'), paddingBottom pushes the native subtitles
+          // up into the safe view area so they are never cropped off-screen.
+          // When 'contain', a small normal padding is used.
+          subtitleStyle={{ paddingBottom: resizeMode === 'cover' ? 120 : 10 }}
           selectedTextTrack={subtitlesActive ? selectedText : { type: 'disabled' }}
-          // CRITICAL: TextureView is required for the native scale transform
           useTextureView={true}
           controls={false}
         />
@@ -327,7 +308,7 @@ const App = () => {
                     <View style={{flexDirection: 'row'}}>
                         <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'audio' ? null : 'audio')}><Icon name="audiotrack" size={26} color={activeMenu === 'audio' ? '#E50914' : 'white'} /></TouchableOpacity>
                         <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'subtitle' ? null : 'subtitle')}><Icon name="closed-caption" size={26} color={activeMenu === 'subtitle' ? '#E50914' : 'white'} /></TouchableOpacity>
-                        <TouchableOpacity style={styles.iconBtn} onPress={handleZoomToggle}><Icon name={isNativeZoomed ? "crop-free" : "aspect-ratio"} size={26} color={isNativeZoomed ? '#E50914' : 'white'} /></TouchableOpacity>
+                        <TouchableOpacity style={styles.iconBtn} onPress={handleZoomToggle}><Icon name={resizeMode === 'contain' ? "aspect-ratio" : "crop-free"} size={26} color={resizeMode === 'cover' ? '#E50914' : 'white'} /></TouchableOpacity>
                         <TouchableOpacity onPress={toggleFullscreen} style={styles.iconBtn}><Icon name={isFullscreen ? "fullscreen-exit" : "fullscreen"} size={26} color="white" /></TouchableOpacity>
                     </View>
                 </View>
