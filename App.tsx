@@ -47,9 +47,11 @@ const App = () => {
   const [selectedText, setSelectedText] = useState(undefined);
   const [activeMenu, setActiveMenu] = useState(null);
 
-  // 🔥 Custom subtitle overlay: independent of video zoom/scale 🔥
-  const [currentSubtitle, setCurrentSubtitle] = useState('');
-  const subtitlesDisabled = selectedText?.type === 'disabled';
+  // 🔥 SMART ZOOM TOGGLE 🔥
+  // Native subtitles scale with the video surface, so when a subtitle track
+  // is active we force resizeMode 'contain' (never cropped/zoomed). Zoom
+  // ('cover') is only allowed when subtitles are disabled.
+  const subtitlesActive = !!selectedText && selectedText.type !== 'disabled';
 
   // 🔥 TRUE GESTURE STATES 🔥
   const [seekOverlay, setSeekOverlay] = useState({ visible: false, icon: '', time: 0, position: 'center' });
@@ -92,7 +94,7 @@ const App = () => {
     setSelectedAudio(undefined);
     setSelectedText(undefined);
     setCurrentTime(0);
-    setCurrentSubtitle('');
+    setResizeMode('contain');
     setSelectedFile(file);
     // PlayMode is NOT set here so the Selection Screen shows!
   };
@@ -132,6 +134,34 @@ const App = () => {
   };
 
   const closeInternalPlayer = () => { Orientation.lockToPortrait(); setIsFullscreen(false); setPlayMode(null); setSelectedFile(null); };
+
+  // 🔥 SMART ZOOM TOGGLE 🔥
+  // Zoom is only allowed when subtitles are NOT active. If the user tries
+  // to zoom while subtitles are on, show a friendly notice instead.
+  const handleZoomToggle = () => {
+    if (subtitlesActive) {
+      Alert.alert(
+        "Zoom disabled 📝",
+        "Zoom is disabled while subtitles are active, otherwise they get cropped. Disable subtitles to zoom.",
+        [{ text: "OK" }]
+      );
+      return;
+    }
+    setResizeMode(prev => prev === 'contain' ? 'cover' : 'contain');
+  };
+
+  // 🔥 SUBTITLE TRACK SELECTION (with zoom enforcement) 🔥
+  const handleSelectTextTrack = (track) => {
+    setSelectedText(track);
+    setActiveMenu(null);
+    if (track.type === 'disabled') {
+      // Subtitles off — restore zoom freedom
+      setResizeMode('contain');
+    } else {
+      // Subtitles on — force 'contain' so native subtitles are never cropped
+      setResizeMode('contain');
+    }
+  };
 
   // 🔥 DOUBLE-TAP TO SEEK EXACTLY 10 SECONDS 🔥
   const handleZoneTap = (isForward) => {
@@ -207,8 +237,8 @@ const App = () => {
         <Text style={styles.floatingMenuTitle}>{isAudio ? "Audio Tracks 🎵" : "Subtitles 💬"}</Text>
         <ScrollView style={{maxHeight: 200}}>
           {!isAudio && (
-            <TouchableOpacity style={styles.menuItem} onPress={() => { setSelectedText({ type: 'disabled' }); setCurrentSubtitle(''); setActiveMenu(null); }}>
-              <Icon name="check" size={20} color={selectedText?.type === 'disabled' ? 'white' : 'transparent'} />
+            <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectTextTrack({ type: 'disabled' })}>
+              <Icon name="check" size={20} color={selectedText?.type === 'disabled' || !selectedText ? 'white' : 'transparent'} />
               <Text style={styles.menuItemText}>Disable Subtitles</Text>
             </TouchableOpacity>
           )}
@@ -217,8 +247,7 @@ const App = () => {
             return (
               <TouchableOpacity key={index} style={styles.menuItem} onPress={() => {
                 if (isAudio) setSelectedAudio({ type: 'index', value: index });
-                else setSelectedText({ type: 'index', value: index });
-                setActiveMenu(null);
+                else handleSelectTextTrack({ type: 'index', value: index });
               }}>
                 <Icon name="check" size={20} color={isSelected ? 'white' : 'transparent'} />
                 <Text style={styles.menuItemText} numberOfLines={1}>
@@ -245,7 +274,6 @@ const App = () => {
           resizeMode={resizeMode}
           paused={isPaused}
           onLoad={handleVideoLoad}
-          // v6 fallback: text track list also arrives here
           onTextTracks={(tracks) => { if (tracks && tracks.length) setTextTracks(tracks); }}
           onProgress={(p) => {
              setCurrentTime(p.currentTime);
@@ -253,50 +281,15 @@ const App = () => {
              if (duration > 0 && (duration - p.currentTime) < 1.5) handleVideoEnd();
           }}
           onEnd={handleVideoEnd}
-          // 🔥 EMBEDDED SUBTITLE SOURCE 🔥
-          // Hardened handler: accepts a bare string, an object, or an array.
-          // The cue text is fed to our custom zoom-independent overlay.
-          onTextTrackDataChanged={(data) => {
-            let text = '';
-            if (typeof data === 'string') {
-              text = data;
-            } else if (Array.isArray(data)) {
-              text = data.map(d => (typeof d === 'string' ? d : (d?.text || d?.title || ''))).join(' ');
-            } else if (data && typeof data === 'object') {
-              text = data.text || data.title || '';
-            }
-            setCurrentSubtitle(text ? text.trim() : '');
-          }}
           selectedAudioTrack={selectedAudio}
-          // The chosen track IS selected natively (required so ExoPlayer
-          // processes the embedded MKV subtitles and fires
-          // onTextTrackDataChanged). Its rendering is hidden via the
-          // transparent subtitleStyle below — WITHOUT enable: false, which
-          // would kill the whole subtitle pipeline.
-          selectedTextTrack={subtitlesDisabled ? { type: 'disabled' } : (selectedText || { type: 'disabled' })}
-          // 🔥 HIDE NATIVE RENDERING WITHOUT BREAKING THE DATA PIPELINE 🔥
-          // NO enable: false here! The native SubtitleView stays alive (so
-          // cue data keeps flowing to onTextTrackDataChanged) but is made
-          // invisible: fully transparent and pushed far off-screen.
-          subtitleStyle={{
-            opacity: 0,
-            paddingBottom: 5000,
-            color: 'transparent',
-            backgroundColor: 'transparent',
-          }}
+          // 🔥 NATIVE SUBTITLE RENDERING (fully restored) 🔥
+          // No subtitleStyle hacks — ExoPlayer renders embedded MKV
+          // subtitles natively. The smart zoom toggle keeps resizeMode at
+          // 'contain' while subtitles are active so they are never cropped.
+          selectedTextTrack={subtitlesActive ? selectedText : { type: 'disabled' }}
           controls={false}
           useTextureView={false}
         />
-
-        {/* 🔥 CUSTOM SUBTITLE OVERLAY — independent of video zoom/scale 🔥
-            Sibling of the Video component (not inside it), fixed position
-            at the bottom center, fixed font size. Fed by
-            onTextTrackDataChanged (embedded MKV subtitles). */}
-        {!subtitlesDisabled && !!currentSubtitle && (
-          <View style={styles.subtitleOverlay} pointerEvents="none">
-            <Text style={styles.subtitleText}>{currentSubtitle}</Text>
-          </View>
-        )}
         
         {/* TRUE DOUBLE TAP ZONES */}
         <View style={StyleSheet.absoluteFill} flexDirection="row">
@@ -334,7 +327,7 @@ const App = () => {
                     <View style={{flexDirection: 'row'}}>
                         <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'audio' ? null : 'audio')}><Icon name="audiotrack" size={26} color={activeMenu === 'audio' ? '#E50914' : 'white'} /></TouchableOpacity>
                         <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'subtitle' ? null : 'subtitle')}><Icon name="closed-caption" size={26} color={activeMenu === 'subtitle' ? '#E50914' : 'white'} /></TouchableOpacity>
-                        <TouchableOpacity style={styles.iconBtn} onPress={() => setResizeMode(prev => prev === 'contain' ? 'cover' : 'contain')}><Icon name={resizeMode === 'contain' ? "aspect-ratio" : "crop-free"} size={26} color="white" /></TouchableOpacity>
+                        <TouchableOpacity style={styles.iconBtn} onPress={handleZoomToggle}><Icon name={resizeMode === 'contain' ? "aspect-ratio" : "crop-free"} size={26} color={subtitlesActive ? '#888' : 'white'} /></TouchableOpacity>
                         <TouchableOpacity onPress={toggleFullscreen} style={styles.iconBtn}><Icon name={isFullscreen ? "fullscreen-exit" : "fullscreen"} size={26} color="white" /></TouchableOpacity>
                     </View>
                 </View>
@@ -400,9 +393,6 @@ const styles = StyleSheet.create({
   buttonText: { color: '#FFF', fontWeight: 'bold' },
   playerWrapper: { flex: 1, backgroundColor: 'black' },
   videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
-  // Subtitle overlay: fixed position, fixed size, unaffected by video zoom
-  subtitleOverlay: { position: 'absolute', left: 0, right: 0, bottom: 60, alignItems: 'center', paddingHorizontal: 24, zIndex: 50 },
-  subtitleText: { color: 'white', fontSize: 16, lineHeight: 22, textAlign: 'center', backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 4, overflow: 'hidden' },
   controlsOverlay: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'space-between' },
   seekOverlay: { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, justifyContent: 'center', paddingHorizontal: 50 },
   overlayBox: { alignItems: 'center' },
