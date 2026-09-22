@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput, ScrollView, BackHandler, Animated, findNodeHandle } from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput, ScrollView, BackHandler, Animated } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
 import Orientation from 'react-native-orientation-locker';
@@ -139,13 +139,22 @@ const App = () => {
   // Scales ONLY the TextureView (video surface) natively to 1.35x. The
   // SubtitleView is untouched, so subtitles remain fully visible and
   // unscaled even while the video is zoomed. Works with subtitles on or off.
+  //
+  // NOTE: videoRef.current from react-native-video v6 is a JS wrapper, NOT
+  // a host component — findNodeHandle would crash. We extract the native
+  // view tag from the wrapper's internal properties instead.
   const handleZoomToggle = () => {
     const newZoomState = !isNativeZoomed;
-    const tag = findNodeHandle(videoRef.current);
+    const videoInstance = videoRef.current;
+    const tag = videoInstance?.getNativeViewHandle
+      ? videoInstance.getNativeViewHandle()
+      : (videoInstance?._nativeTag || videoInstance?.viewConfig?.validAttributes?.nativeTag);
+
     if (tag == null) {
-      Alert.alert("Error", "Video surface not ready yet!");
+      console.warn("Could not find native video tag");
       return;
     }
+
     try {
       VideoZoomModule.setVideoZoom(tag, newZoomState);
       setIsNativeZoomed(newZoomState);
