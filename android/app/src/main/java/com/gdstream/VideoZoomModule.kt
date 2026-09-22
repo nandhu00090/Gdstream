@@ -8,7 +8,7 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.UiThreadUtil
 
-class VideoZoomModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
+class VideoZoomModule(private val reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
     override fun getName(): String {
         return "VideoZoomModule"
     }
@@ -37,7 +37,9 @@ class VideoZoomModule(reactContext: ReactApplicationContext) : ReactContextBaseJ
     fun setVideoZoom(isZoomed: Boolean) {
         UiThreadUtil.runOnUiThread {
             try {
-                val activity = currentActivity ?: return@runOnUiThread
+                // Access the current activity via the React application
+                // context — the standard React Native approach.
+                val activity = reactContext.currentActivity ?: return@runOnUiThread
                 val rootView = activity.window.decorView.rootView
                 val textureView = findTextureView(rootView) ?: return@runOnUiThread
 
