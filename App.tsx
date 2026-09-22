@@ -6,7 +6,7 @@ import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const { VideoPlayerManager } = NativeModules;
+const { VideoPlayerManager, SubtitleFileModule } = NativeModules;
 const BASE_URL = 'https://movies-and-series.ambalartssb01.workers.dev';
 const USERNAME = 'admin'; 
 const PASSWORD = '629175'; 
@@ -18,6 +18,55 @@ const formatTime = (seconds) => {
   const s = Math.floor(seconds % 60);
   if (h > 0) return `${h}:${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
   return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
+};
+
+// 🔥 SUBTITLE FILE PARSING (for external subtitle files) 🔥
+const parseCueTime = (ts) => {
+  const m = ts.trim().match(/(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{1,3})/);
+  if (!m) return -1;
+  const h = parseInt(m[1] || '0', 10);
+  const min = parseInt(m[2], 10);
+  const sec = parseInt(m[3], 10);
+  const ms = parseInt(m[4].padEnd(3, '0'), 10);
+  return h * 3600 + min * 60 + sec + ms / 1000;
+};
+
+const formatVttTime = (seconds) => {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  const ms = Math.round((seconds - Math.floor(seconds)) * 1000);
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
+};
+
+// Parse an .srt or .vtt file into timed cues
+const parseSubtitleFile = (raw) => {
+  const cues = [];
+  const blocks = raw.replace(/\r/g, '').replace(/^WEBVTT.*\n/i, '').split(/\n\n+/);
+  for (const block of blocks) {
+    const lines = block.split('\n').filter(l => l.trim() !== '');
+    if (!lines.length) continue;
+    const timeLineIdx = lines.findIndex(l => l.includes('-->'));
+    if (timeLineIdx === -1) continue;
+    const [startStr, endStr] = lines[timeLineIdx].split('-->');
+    const start = parseCueTime(startStr);
+    const end = parseCueTime(endStr);
+    if (start < 0 || end < 0) continue;
+    const text = lines.slice(timeLineIdx + 1)
+      .map(l => l.replace(/<[^>]+>/g, '').trim())
+      .filter(l => l !== '')
+      .join('\n');
+    if (text) cues.push({ start, end, text });
+  }
+  return cues;
+};
+
+// Re-encode cues (with delay already applied) as a WebVTT document
+const cuesToVtt = (cues) => {
+  const body = cues.map((c, i) =>
+    `${i + 1}\n${formatVttTime(Math.max(0, c.start))} --> ${formatVttTime(Math.max(0, c.end))}\n${c.text}\n`
+  ).join('\n');
+  return `WEBVTT\n\n${body}`;
 };
 
 const App = () => {
@@ -47,10 +96,36 @@ const App = () => {
   const [selectedText, setSelectedText] = useState(undefined);
   const [activeMenu, setActiveMenu] = useState(null);
 
-  // 🔥 SUBTITLE ACTIVITY STATE (restored) 🔥
+  // 🔥 SUBTITLE ACTIVITY STATE 🔥
   // True when a real subtitle track is selected (not 'disabled'). Used by
   // selectedTextTrack to decide whether ExoPlayer renders native subtitles.
   const subtitlesActive = !!selectedText && selectedText.type !== 'disabled';
+
+  // 🔥 SUBTITLE / AUDIO CUSTOMIZATION STATE 🔥
+  const [subtitleSize, setSubtitleSize] = useState(18);          // dynamic font size (sp)
+  const [subtitleDelay, setSubtitleDelay] = useState(0);         // seconds (external subtitle file)
+  const [audioDelay, setAudioDelay] = useState(0);               // seconds (native audioDelay prop)
+  const [externalSubtitle, setExternalSubtitle] = useState(null); // { name, content }
+
+  // 🔥 EXTERNAL SUBTITLE TRACK (delay-aware) 🔥
+  // The chosen file is parsed, its cue timings are shifted by subtitleDelay,
+  // and it is re-encoded as a WebVTT data: URI fed to ExoPlayer as an
+  // external text track. Changing the delay re-generates the track, so the
+  // adjustment genuinely affects playback.
+  const externalTrack = (() => {
+    if (!externalSubtitle) return null;
+    const cues = parseSubtitleFile(externalSubtitle.content)
+      .map(c => ({ start: c.start + subtitleDelay, end: c.end + subtitleDelay, text: c.text }));
+    if (!cues.length) return null;
+    const vtt = cuesToVtt(cues);
+    return {
+      title: 'External File',
+      language: 'ext',
+      type: 'text/vtt',
+      uri: `data:text/vtt;charset=utf-8,${encodeURIComponent(vtt)}`,
+    };
+  })();
+  const isExternalSubtitleSelected = selectedText?.type === 'title' && selectedText?.value === 'External File';
 
   // 🔥 TRUE GESTURE STATES 🔥
   const [seekOverlay, setSeekOverlay] = useState({ visible: false, icon: '', time: 0, position: 'center' });
@@ -94,6 +169,9 @@ const App = () => {
     setSelectedText(undefined);
     setCurrentTime(0);
     setResizeMode('contain');
+    setSubtitleDelay(0);
+    setAudioDelay(0);
+    setExternalSubtitle(null);
     setSelectedFile(file);
     // PlayMode is NOT set here so the Selection Screen shows!
   };
@@ -146,6 +224,24 @@ const App = () => {
   const handleSelectTextTrack = (track) => {
     setSelectedText(track);
     setActiveMenu(null);
+  };
+
+  // 🔥 EXTERNAL SUBTITLE FILE PICKER 🔥
+  const handlePickSubtitleFile = async () => {
+    try {
+      const res = await SubtitleFileModule.pickSubtitleFile();
+      if (!res) return; // user cancelled
+      const cues = parseSubtitleFile(res.content || '');
+      if (!cues.length) {
+        Alert.alert("Error", "Could not read any subtitles from that file!");
+        return;
+      }
+      setExternalSubtitle({ name: res.name, content: res.content });
+      setSelectedText({ type: 'title', value: 'External File' });
+      setActiveMenu(null);
+    } catch (e) {
+      Alert.alert("Error", "Could not load subtitle file!");
+    }
   };
 
   // 🔥 DOUBLE-TAP TO SEEK EXACTLY 10 SECONDS 🔥
@@ -220,12 +316,59 @@ const App = () => {
     return (
       <View style={styles.floatingMenu}>
         <Text style={styles.floatingMenuTitle}>{isAudio ? "Audio Tracks 🎵" : "Subtitles 💬"}</Text>
-        <ScrollView style={{maxHeight: 200}}>
+        <ScrollView style={{maxHeight: 260}}>
           {!isAudio && (
             <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectTextTrack({ type: 'disabled' })}>
               <Icon name="check" size={20} color={selectedText?.type === 'disabled' || !selectedText ? 'white' : 'transparent'} />
               <Text style={styles.menuItemText}>Disable Subtitles</Text>
             </TouchableOpacity>
+          )}
+          {!isAudio && (
+            <TouchableOpacity style={styles.menuItem} onPress={handlePickSubtitleFile}>
+              <Icon name="folder-open" size={20} color={isExternalSubtitleSelected ? '#E50914' : 'white'} />
+              <Text style={styles.menuItemText} numberOfLines={1}>
+                {externalSubtitle ? `File: ${externalSubtitle.name}` : "Select subtitle file 📂"}
+              </Text>
+            </TouchableOpacity>
+          )}
+          {!isAudio && (
+            <View style={styles.adjustRow}>
+              <Text style={styles.adjustLabel}>Size</Text>
+              <TouchableOpacity style={styles.adjustBtn} onPress={() => setSubtitleSize(s => Math.max(10, s - 2))}>
+                <Icon name="remove" size={20} color="white" />
+              </TouchableOpacity>
+              <Text style={styles.adjustValue}>{subtitleSize}</Text>
+              <TouchableOpacity style={styles.adjustBtn} onPress={() => setSubtitleSize(s => Math.min(40, s + 2))}>
+                <Icon name="add" size={20} color="white" />
+              </TouchableOpacity>
+            </View>
+          )}
+          {!isAudio && (
+            <View style={styles.adjustRow}>
+              <Text style={styles.adjustLabel}>Delay</Text>
+              <TouchableOpacity style={styles.adjustBtn} onPress={() => setSubtitleDelay(d => Math.round((d - 0.5) * 10) / 10)}>
+                <Icon name="remove" size={20} color="white" />
+              </TouchableOpacity>
+              <Text style={styles.adjustValue}>{subtitleDelay.toFixed(1)}s</Text>
+              <TouchableOpacity style={styles.adjustBtn} onPress={() => setSubtitleDelay(d => Math.round((d + 0.5) * 10) / 10)}>
+                <Icon name="add" size={20} color="white" />
+              </TouchableOpacity>
+            </View>
+          )}
+          {!isAudio && !!externalSubtitle && (
+            <Text style={styles.adjustHint}>Size & delay apply to the selected file</Text>
+          )}
+          {isAudio && (
+            <View style={styles.adjustRow}>
+              <Text style={styles.adjustLabel}>Audio Delay</Text>
+              <TouchableOpacity style={styles.adjustBtn} onPress={() => setAudioDelay(d => Math.round((d - 0.25) * 100) / 100)}>
+                <Icon name="remove" size={20} color="white" />
+              </TouchableOpacity>
+              <Text style={styles.adjustValue}>{audioDelay.toFixed(2)}s</Text>
+              <TouchableOpacity style={styles.adjustBtn} onPress={() => setAudioDelay(d => Math.round((d + 0.25) * 100) / 100)}>
+                <Icon name="add" size={20} color="white" />
+              </TouchableOpacity>
+            </View>
           )}
           {tracks.map((track, index) => {
             const isSelected = isAudio ? selectedAudio?.value === index : selectedText?.value === index;
@@ -254,7 +397,12 @@ const App = () => {
         <Video 
           key={selectedFile.link}
           ref={videoRef}
-          source={{ uri: `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}` }} 
+          source={{ 
+            uri: `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}`,
+            // External subtitle file (delay-shifted VTT) as a real ExoPlayer
+            // text track — this is what makes subtitle delay actually work.
+            textTracks: externalTrack ? [externalTrack] : undefined,
+          }} 
           style={styles.videoPlayer} 
           resizeMode={resizeMode}
           paused={isPaused}
@@ -267,11 +415,21 @@ const App = () => {
           }}
           onEnd={handleVideoEnd}
           selectedAudioTrack={selectedAudio}
+          // 🔥 REAL AUDIO DELAY 🔥
+          // react-native-video v6 native prop: offsets the audio track
+          // relative to the video during playback (positive = audio later).
+          audioDelay={audioDelay}
           // 🔥 NATIVE SUBTITLE RENDERING with DYNAMIC PADDING 🔥
           // When zoomed ('cover'), paddingBottom pushes the native subtitles
           // up into the safe view area so they are never cropped off-screen.
           // When 'contain', a small normal padding is used.
-          subtitleStyle={{ paddingBottom: resizeMode === 'cover' ? 120 : 10 }}
+          // fontSize applies live; backgroundColor 'transparent' removes the
+          // black box behind subtitles — clean text over the video.
+          subtitleStyle={{
+            paddingBottom: resizeMode === 'cover' ? 120 : 10,
+            fontSize: subtitleSize,
+            backgroundColor: 'transparent',
+          }}
           selectedTextTrack={subtitlesActive ? selectedText : { type: 'disabled' }}
           useTextureView={true}
           controls={false}
@@ -397,7 +555,12 @@ const styles = StyleSheet.create({
   floatingMenu: { position: 'absolute', bottom: 90, right: 20, width: 280, backgroundColor: 'rgba(28, 28, 30, 0.95)', borderRadius: 12, padding: 15, zIndex: 100 },
   floatingMenuTitle: { color: '#888', fontSize: 14, marginBottom: 10, fontWeight: 'bold', borderBottomWidth: 1, borderBottomColor: '#444', paddingBottom: 10 },
   menuItem: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12 },
-  menuItemText: { color: 'white', fontSize: 16, marginLeft: 10, flex: 1 }
+  menuItemText: { color: 'white', fontSize: 16, marginLeft: 10, flex: 1 },
+  adjustRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 8 },
+  adjustLabel: { color: '#AAA', fontSize: 14, width: 90 },
+  adjustBtn: { width: 34, height: 34, borderRadius: 17, backgroundColor: '#333', justifyContent: 'center', alignItems: 'center' },
+  adjustValue: { color: 'white', fontSize: 15, fontWeight: 'bold', width: 60, textAlign: 'center' },
+  adjustHint: { color: '#777', fontSize: 12, paddingVertical: 6 }
 });
 
 export default App;
