@@ -41,7 +41,10 @@ class VideoZoomModule(reactContext: ReactApplicationContext) : ReactContextBaseJ
         uiManager.addUIBlock(object : UIBlock {
             override fun execute(nativeViewHierarchyManager: NativeViewHierarchyManager) {
                 try {
-                    val exoView = nativeViewHierarchyManager.resolveView(viewTag)
+                    // resolveView returns a nullable View? — handle the null
+                    // case explicitly to satisfy Kotlin's null-safety.
+                    val exoView: View? = nativeViewHierarchyManager.resolveView(viewTag)
+                    if (exoView == null) return
                     val textureView = findTextureView(exoView) ?: return
                     val scale = if (isZoomed) 1.35f else 1.0f
                     textureView.scaleX = scale
