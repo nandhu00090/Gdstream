@@ -20,39 +20,6 @@ const formatTime = (seconds) => {
   return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
 };
 
-// 🔥 SRT/VTT timestamp -> seconds 🔥
-const parseCueTime = (ts) => {
-  const m = ts.trim().match(/(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{1,3})/);
-  if (!m) return -1;
-  const h = parseInt(m[1] || '0', 10);
-  const min = parseInt(m[2], 10);
-  const sec = parseInt(m[3], 10);
-  const ms = parseInt(m[4].padEnd(3, '0'), 10);
-  return h * 3600 + min * 60 + sec + ms / 1000;
-};
-
-// 🔥 Parse an .srt or .vtt file into timed cues 🔥
-const parseSubtitleFile = (raw) => {
-  const cues = [];
-  const blocks = raw.replace(/\r/g, '').replace(/^WEBVTT.*\n/i, '').split(/\n\n+/);
-  for (const block of blocks) {
-    const lines = block.split('\n').filter(l => l.trim() !== '');
-    if (!lines.length) continue;
-    const timeLineIdx = lines.findIndex(l => l.includes('-->'));
-    if (timeLineIdx === -1) continue;
-    const [startStr, endStr] = lines[timeLineIdx].split('-->');
-    const start = parseCueTime(startStr);
-    const end = parseCueTime(endStr);
-    if (start < 0 || end < 0) continue;
-    const text = lines.slice(timeLineIdx + 1)
-      .map(l => l.replace(/<[^>]+>/g, '').trim())
-      .filter(l => l !== '')
-      .join('\n');
-    if (text) cues.push({ start, end, text });
-  }
-  return cues;
-};
-
 const App = () => {
   const [files, setFiles] = useState([]);
   const [filteredFiles, setFilteredFiles] = useState([]);
@@ -82,9 +49,6 @@ const App = () => {
 
   // 🔥 Custom subtitle overlay: independent of video zoom/scale 🔥
   const [currentSubtitle, setCurrentSubtitle] = useState('');
-  // Sidecar subtitle cues (parsed from .srt/.vtt next to the video)
-  const [subtitleCues, setSubtitleCues] = useState([]);
-  const hasSidecarSubs = subtitleCues.length > 0;
   const subtitlesDisabled = selectedText?.type === 'disabled';
 
   // 🔥 TRUE GESTURE STATES 🔥
@@ -129,42 +93,9 @@ const App = () => {
     setSelectedText(undefined);
     setCurrentTime(0);
     setCurrentSubtitle('');
-    setSubtitleCues([]);
     setSelectedFile(file);
     // PlayMode is NOT set here so the Selection Screen shows!
   };
-
-  // 🔥 FOOLPROOF SUBTITLE SOURCE: sidecar .srt/.vtt in the same folder 🔥
-  // If found, we parse it ourselves and NEVER select a native text track,
-  // so the native SubtitleView renders nothing at all.
-  useEffect(() => {
-    const loadSidecar = async () => {
-      if (!selectedFile || playMode !== 'internal') return;
-      try {
-        const baseName = selectedFile.name.replace(/\.[^.]+$/, '').toLowerCase();
-        const sidecar = filteredFiles.find(f => {
-          const n = f.name.toLowerCase();
-          return !f.mimeType?.includes('folder') &&
-            (n.endsWith('.srt') || n.endsWith('.vtt')) &&
-            n.replace(/\.[^.]+$/, '').startsWith(baseName);
-        });
-        if (!sidecar) return;
-        const url = `${BASE_URL}${sidecar.link || `/0:/${encodeURIComponent(sidecar.name)}`}`;
-        const res = await axios.get(url, { responseType: 'text' });
-        const cues = parseSubtitleFile(typeof res.data === 'string' ? res.data : '');
-        if (cues.length) setSubtitleCues(cues);
-      } catch (e) { /* no sidecar or parse failure — fall back to embedded */ }
-    };
-    loadSidecar();
-  }, [selectedFile, playMode, filteredFiles]);
-
-  // 🔥 Show the active sidecar cue, synced to currentTime 🔥
-  useEffect(() => {
-    if (!hasSidecarSubs) return;
-    const cue = subtitleCues.find(c => currentTime >= c.start && currentTime <= c.end);
-    const text = cue ? cue.text : '';
-    setCurrentSubtitle(prev => (prev === text ? prev : text));
-  }, [currentTime, subtitleCues, hasSidecarSubs]);
 
   const handlePress = (item) => {
     if (item.mimeType?.includes('folder')) {
@@ -322,7 +253,9 @@ const App = () => {
              if (duration > 0 && (duration - p.currentTime) < 1.5) handleVideoEnd();
           }}
           onEnd={handleVideoEnd}
-          // 🔥 HARDENED handler: accepts a bare string, an object, or an array 🔥
+          // 🔥 EMBEDDED SUBTITLE SOURCE 🔥
+          // Hardened handler: accepts a bare string, an object, or an array.
+          // The cue text is fed to our custom zoom-independent overlay.
           onTextTrackDataChanged={(data) => {
             let text = '';
             if (typeof data === 'string') {
@@ -335,25 +268,35 @@ const App = () => {
             setCurrentSubtitle(text ? text.trim() : '');
           }}
           selectedAudioTrack={selectedAudio}
-          // 🔥 FOOLPROOF NATIVE SUPPRESSION 🔥
-          // When we have our own sidecar cues, the native text track is
-          // NEVER selected — with no track selected, ExoPlayer's
-          // SubtitleView renders nothing. Guaranteed, no styling needed.
-          // Only when there is no sidecar do we select the track (so cue
-          // data reaches JS), with subtitleStyle as best-effort suppression.
-          selectedTextTrack={
-            hasSidecarSubs
-              ? { type: 'disabled' }
-              : (subtitlesDisabled ? { type: 'disabled' } : (selectedText || { type: 'disabled' }))
-          }
-          subtitleStyle={{ enable: false }}
+          // The chosen track IS selected natively (required so cue data flows
+          // to JS via onTextTrackDataChanged). Its rendering is made
+          // INVISIBLE via the aggressive subtitleStyle below.
+          selectedTextTrack={subtitlesDisabled ? { type: 'disabled' } : (selectedText || { type: 'disabled' })}
+          // 🔥 AGGRESSIVE NATIVE SUBTITLE INVISIBILITY 🔥
+          // Every styling path the native SubtitleView supports is forced
+          // to transparent/zero so the native captions can never be seen,
+          // no matter the zoom level or resizeMode.
+          subtitleStyle={{
+            enable: false,
+            opacity: 0,
+            color: 'transparent',
+            backgroundColor: 'transparent',
+            textShadowColor: 'transparent',
+            shadowColor: 'transparent',
+            shadowRadius: 0,
+            shadowOffset: { width: 0, height: 0 },
+            padding: 0,
+            paddingBottom: 100000,
+            subtitlesFollowVideo: false,
+          }}
           controls={false}
           useTextureView={false}
         />
 
         {/* 🔥 CUSTOM SUBTITLE OVERLAY — independent of video zoom/scale 🔥
             Sibling of the Video component (not inside it), fixed position
-            at the bottom center, fixed font size. */}
+            at the bottom center, fixed font size. Fed by
+            onTextTrackDataChanged (embedded MKV subtitles). */}
         {!subtitlesDisabled && !!currentSubtitle && (
           <View style={styles.subtitleOverlay} pointerEvents="none">
             <Text style={styles.subtitleText}>{currentSubtitle}</Text>
