@@ -135,28 +135,17 @@ const App = () => {
 
   const closeInternalPlayer = () => { Orientation.lockToPortrait(); setIsFullscreen(false); setPlayMode(null); setSelectedFile(null); };
 
-  // 🔥 NATIVE ZOOM TOGGLE 🔥
+  // 🔥 NATIVE ZOOM TOGGLE (TAG-FREE) 🔥
   // Scales ONLY the TextureView (video surface) natively to 1.35x. The
   // SubtitleView is untouched, so subtitles remain fully visible and
   // unscaled even while the video is zoomed. Works with subtitles on or off.
   //
-  // NOTE: videoRef.current from react-native-video v6 is a JS wrapper, NOT
-  // a host component — findNodeHandle would crash. We extract the native
-  // view tag from the wrapper's internal properties instead.
+  // No view tag needed: the native module traverses the current activity's
+  // root view to find the TextureView directly.
   const handleZoomToggle = () => {
     const newZoomState = !isNativeZoomed;
-    const videoInstance = videoRef.current;
-    const tag = videoInstance?.getNativeViewHandle
-      ? videoInstance.getNativeViewHandle()
-      : (videoInstance?._nativeTag || videoInstance?.viewConfig?.validAttributes?.nativeTag);
-
-    if (tag == null) {
-      console.warn("Could not find native video tag");
-      return;
-    }
-
     try {
-      VideoZoomModule.setVideoZoom(tag, newZoomState);
+      VideoZoomModule.setVideoZoom(newZoomState);
       setIsNativeZoomed(newZoomState);
     } catch (e) {
       Alert.alert("Error", "Zoom apply aagala!");

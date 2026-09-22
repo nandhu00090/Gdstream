@@ -2,15 +2,11 @@ package com.gdstream
 
 import android.view.View
 import android.view.ViewGroup
-import android.widget.FrameLayout
 import android.view.TextureView
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.UiThreadUtil
-import com.facebook.react.uimanager.NativeViewHierarchyManager
-import com.facebook.react.uimanager.UIBlock
-import com.facebook.react.uimanager.UIManagerModule
 
 class VideoZoomModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
     override fun getName(): String {
@@ -33,29 +29,27 @@ class VideoZoomModule(reactContext: ReactApplicationContext) : ReactContextBaseJ
         return null
     }
 
+    /**
+     * Tag-free zoom: traverses the current activity's root view to find the
+     * TextureView directly — no React Native node handles required.
+     */
     @ReactMethod
-    fun setVideoZoom(viewTag: Int, isZoomed: Boolean) {
-        val reactContext = reactApplicationContext
-        val uiManager = reactContext.getNativeModule(UIManagerModule::class.java) ?: return
+    fun setVideoZoom(isZoomed: Boolean) {
+        UiThreadUtil.runOnUiThread {
+            try {
+                val activity = currentActivity ?: return@runOnUiThread
+                val rootView = activity.window.decorView.rootView
+                val textureView = findTextureView(rootView) ?: return@runOnUiThread
 
-        uiManager.addUIBlock(object : UIBlock {
-            override fun execute(nativeViewHierarchyManager: NativeViewHierarchyManager) {
-                try {
-                    // resolveView returns a nullable View? — handle the null
-                    // case explicitly to satisfy Kotlin's null-safety.
-                    val exoView: View? = nativeViewHierarchyManager.resolveView(viewTag)
-                    if (exoView == null) return
-                    val textureView = findTextureView(exoView) ?: return
-                    val scale = if (isZoomed) 1.35f else 1.0f
-                    textureView.scaleX = scale
-                    textureView.scaleY = scale
-                    // Keep the scaled surface centered within the player bounds
-                    textureView.pivotX = textureView.width / 2f
-                    textureView.pivotY = textureView.height / 2f
-                } catch (e: Exception) {
-                    // View may not be attached yet — safe to ignore
-                }
+                val scale = if (isZoomed) 1.35f else 1.0f
+                textureView.scaleX = scale
+                textureView.scaleY = scale
+                // Keep the scaled surface centered within the player bounds
+                textureView.pivotX = textureView.width / 2f
+                textureView.pivotY = textureView.height / 2f
+            } catch (e: Exception) {
+                // View may not be attached yet — safe to ignore
             }
-        })
+        }
     }
 }
