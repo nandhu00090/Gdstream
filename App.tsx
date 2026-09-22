@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput, ScrollView, BackHandler, Animated } from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert, NativeModules, TextInput, ScrollView, BackHandler, Animated, findNodeHandle } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
 import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const { VideoPlayerManager } = NativeModules;
+const { VideoPlayerManager, VideoZoomModule } = NativeModules;
 const BASE_URL = 'https://movies-and-series.ambalartssb01.workers.dev';
 const USERNAME = 'admin'; 
 const PASSWORD = '629175'; 
@@ -30,7 +30,6 @@ const App = () => {
   
   const [selectedFile, setSelectedFile] = useState(null);
   const [playMode, setPlayMode] = useState(null);
-  const [resizeMode, setResizeMode] = useState('contain');
   const [showControls, setShowControls] = useState(true);
   const [isPaused, setIsPaused] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -47,10 +46,11 @@ const App = () => {
   const [selectedText, setSelectedText] = useState(undefined);
   const [activeMenu, setActiveMenu] = useState(null);
 
-  // 🔥 SMART ZOOM TOGGLE 🔥
-  // Native subtitles scale with the video surface, so when a subtitle track
-  // is active we force resizeMode 'contain' (never cropped/zoomed). Zoom
-  // ('cover') is only allowed when subtitles are disabled.
+  // 🔥 NATIVE TEXTUREVIEW ZOOM 🔥
+  // Zoom is applied natively to ONLY the video surface (TextureView) via
+  // VideoZoomModule. The SubtitleView is a sibling inside the player view,
+  // so it is never scaled or cropped — subtitles stay readable at any zoom.
+  const [isNativeZoomed, setIsNativeZoomed] = useState(false);
   const subtitlesActive = !!selectedText && selectedText.type !== 'disabled';
 
   // 🔥 TRUE GESTURE STATES 🔥
@@ -94,7 +94,7 @@ const App = () => {
     setSelectedAudio(undefined);
     setSelectedText(undefined);
     setCurrentTime(0);
-    setResizeMode('contain');
+    setIsNativeZoomed(false);
     setSelectedFile(file);
     // PlayMode is NOT set here so the Selection Screen shows!
   };
@@ -135,32 +135,29 @@ const App = () => {
 
   const closeInternalPlayer = () => { Orientation.lockToPortrait(); setIsFullscreen(false); setPlayMode(null); setSelectedFile(null); };
 
-  // 🔥 SMART ZOOM TOGGLE 🔥
-  // Zoom is only allowed when subtitles are NOT active. If the user tries
-  // to zoom while subtitles are on, show a friendly notice instead.
+  // 🔥 NATIVE ZOOM TOGGLE 🔥
+  // Scales ONLY the TextureView (video surface) natively to 1.35x. The
+  // SubtitleView is untouched, so subtitles remain fully visible and
+  // unscaled even while the video is zoomed. Works with subtitles on or off.
   const handleZoomToggle = () => {
-    if (subtitlesActive) {
-      Alert.alert(
-        "Zoom disabled 📝",
-        "Zoom is disabled while subtitles are active, otherwise they get cropped. Disable subtitles to zoom.",
-        [{ text: "OK" }]
-      );
+    const newZoomState = !isNativeZoomed;
+    const tag = findNodeHandle(videoRef.current);
+    if (tag == null) {
+      Alert.alert("Error", "Video surface not ready yet!");
       return;
     }
-    setResizeMode(prev => prev === 'contain' ? 'cover' : 'contain');
+    try {
+      VideoZoomModule.setVideoZoom(tag, newZoomState);
+      setIsNativeZoomed(newZoomState);
+    } catch (e) {
+      Alert.alert("Error", "Zoom apply aagala!");
+    }
   };
 
-  // 🔥 SUBTITLE TRACK SELECTION (with zoom enforcement) 🔥
+  // 🔥 SUBTITLE TRACK SELECTION 🔥
   const handleSelectTextTrack = (track) => {
     setSelectedText(track);
     setActiveMenu(null);
-    if (track.type === 'disabled') {
-      // Subtitles off — restore zoom freedom
-      setResizeMode('contain');
-    } else {
-      // Subtitles on — force 'contain' so native subtitles are never cropped
-      setResizeMode('contain');
-    }
   };
 
   // 🔥 DOUBLE-TAP TO SEEK EXACTLY 10 SECONDS 🔥
@@ -271,7 +268,11 @@ const App = () => {
           ref={videoRef}
           source={{ uri: `${BASE_URL}${selectedFile.link || `/0:/${encodeURIComponent(selectedFile.name)}`}` }} 
           style={styles.videoPlayer} 
-          resizeMode={resizeMode}
+          // 🔥 PERMANENT 'contain' 🔥
+          // The player layout (and its native SubtitleView) is NEVER cropped
+          // by React Native's layout engine. Zoom is applied natively to the
+          // TextureView only, via VideoZoomModule.
+          resizeMode="contain"
           paused={isPaused}
           onLoad={handleVideoLoad}
           onTextTracks={(tracks) => { if (tracks && tracks.length) setTextTracks(tracks); }}
@@ -282,13 +283,14 @@ const App = () => {
           }}
           onEnd={handleVideoEnd}
           selectedAudioTrack={selectedAudio}
-          // 🔥 NATIVE SUBTITLE RENDERING (fully restored) 🔥
-          // No subtitleStyle hacks — ExoPlayer renders embedded MKV
-          // subtitles natively. The smart zoom toggle keeps resizeMode at
-          // 'contain' while subtitles are active so they are never cropped.
+          // 🔥 NATIVE SUBTITLE RENDERING 🔥
+          // ExoPlayer renders embedded MKV subtitles natively. Since the
+          // layout is never cropped and zoom only scales the TextureView,
+          // subtitles stay fully visible and unscaled at any zoom level.
           selectedTextTrack={subtitlesActive ? selectedText : { type: 'disabled' }}
+          // CRITICAL: TextureView is required for the native scale transform
+          useTextureView={true}
           controls={false}
-          useTextureView={false}
         />
         
         {/* TRUE DOUBLE TAP ZONES */}
@@ -327,7 +329,7 @@ const App = () => {
                     <View style={{flexDirection: 'row'}}>
                         <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'audio' ? null : 'audio')}><Icon name="audiotrack" size={26} color={activeMenu === 'audio' ? '#E50914' : 'white'} /></TouchableOpacity>
                         <TouchableOpacity style={styles.iconBtn} onPress={() => setActiveMenu(activeMenu === 'subtitle' ? null : 'subtitle')}><Icon name="closed-caption" size={26} color={activeMenu === 'subtitle' ? '#E50914' : 'white'} /></TouchableOpacity>
-                        <TouchableOpacity style={styles.iconBtn} onPress={handleZoomToggle}><Icon name={resizeMode === 'contain' ? "aspect-ratio" : "crop-free"} size={26} color={subtitlesActive ? '#888' : 'white'} /></TouchableOpacity>
+                        <TouchableOpacity style={styles.iconBtn} onPress={handleZoomToggle}><Icon name={isNativeZoomed ? "crop-free" : "aspect-ratio"} size={26} color={isNativeZoomed ? '#E50914' : 'white'} /></TouchableOpacity>
                         <TouchableOpacity onPress={toggleFullscreen} style={styles.iconBtn}><Icon name={isFullscreen ? "fullscreen-exit" : "fullscreen"} size={26} color="white" /></TouchableOpacity>
                     </View>
                 </View>
