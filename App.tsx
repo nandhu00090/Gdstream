@@ -47,6 +47,10 @@ const App = () => {
   const [selectedText, setSelectedText] = useState(undefined);
   const [activeMenu, setActiveMenu] = useState(null);
 
+  // 🔥 Custom subtitle overlay: independent of video zoom/scale 🔥
+  const [currentSubtitle, setCurrentSubtitle] = useState('');
+  const subtitlesDisabled = selectedText?.type === 'disabled';
+
   // 🔥 TRUE GESTURE STATES 🔥
   const [seekOverlay, setSeekOverlay] = useState({ visible: false, icon: '', time: 0, position: 'center' });
   const fadeAnim = useRef(new Animated.Value(0)).current;
@@ -88,6 +92,7 @@ const App = () => {
     setSelectedAudio(undefined);
     setSelectedText(undefined);
     setCurrentTime(0);
+    setCurrentSubtitle('');
     setSelectedFile(file);
     // PlayMode is NOT set here so the Selection Screen shows!
   };
@@ -128,7 +133,10 @@ const App = () => {
 
   const closeInternalPlayer = () => { Orientation.lockToPortrait(); setIsFullscreen(false); setPlayMode(null); setSelectedFile(null); };
 
-  // 🔥 TRUE MULTI-TAP GESTURE LOGIC 🔥
+  // 🔥 DOUBLE-TAP TO SEEK EXACTLY 10 SECONDS 🔥
+  // Each double-tap always seeks exactly ±10s. No accumulation between
+  // separate double-taps: the counter is reset after every seek, and the
+  // seek target is computed from the time at the moment of the double-tap.
   const handleZoneTap = (isForward) => {
     const now = Date.now();
     const DOUBLE_PRESS_DELAY = 300;
@@ -136,20 +144,22 @@ const App = () => {
     if (now - lastTapTime.current < DOUBLE_PRESS_DELAY) {
       // Double Tap detected!
       clearTimeout(singleTapTimer.current);
-      tapCount.current += 1;
       clearTimeout(multiTapTimer.current);
 
-      const seekSeconds = tapCount.current * 10;
-      setSeekOverlay({ visible: true, icon: isForward ? 'fast-forward' : 'fast-rewind', time: seekSeconds, position: isForward ? 'right' : 'left' });
+      const SEEK_SECONDS = 10;
+      setSeekOverlay({ visible: true, icon: isForward ? 'fast-forward' : 'fast-rewind', time: SEEK_SECONDS, position: isForward ? 'right' : 'left' });
       
       fadeAnim.setValue(1);
       Animated.timing(fadeAnim, { toValue: 0, duration: 800, useNativeDriver: true }).start();
 
+      // Capture the base time NOW so rapid re-taps don't compound.
+      const baseTime = currentTime;
       multiTapTimer.current = setTimeout(() => {
-        const targetTime = isForward ? currentTime + seekSeconds : currentTime - seekSeconds;
+        const targetTime = isForward ? baseTime + SEEK_SECONDS : baseTime - SEEK_SECONDS;
         videoRef.current?.seek(targetTime);
-        tapCount.current = 0; 
-      }, 500);
+        setCurrentTime(targetTime);
+        tapCount.current = 0;
+      }, 400);
 
     } else {
       // Single Tap
@@ -200,7 +210,7 @@ const App = () => {
         <Text style={styles.floatingMenuTitle}>{isAudio ? "Audio Tracks 🎵" : "Subtitles 💬"}</Text>
         <ScrollView style={{maxHeight: 200}}>
           {!isAudio && (
-            <TouchableOpacity style={styles.menuItem} onPress={() => { setSelectedText({ type: 'disabled' }); setActiveMenu(null); }}>
+            <TouchableOpacity style={styles.menuItem} onPress={() => { setSelectedText({ type: 'disabled' }); setCurrentSubtitle(''); setActiveMenu(null); }}>
               <Icon name="check" size={20} color={selectedText?.type === 'disabled' ? 'white' : 'transparent'} />
               <Text style={styles.menuItemText}>Disable Subtitles</Text>
             </TouchableOpacity>
@@ -244,11 +254,27 @@ const App = () => {
              if (duration > 0 && (duration - p.currentTime) < 1.5) handleVideoEnd();
           }}
           onEnd={handleVideoEnd}
-          {...(selectedAudio ? { selectedAudioTrack: selectedAudio } : {})}
-          {...(selectedText ? { selectedTextTrack: selectedText } : {})}
+          // Capture subtitle cue text so we can render it ourselves
+          onTextTrackDataChanged={(data) => {
+            const text = Array.isArray(data) ? data.map(d => d.text || d.title || '').join(' ') : (data?.text || '');
+            setCurrentSubtitle(text ? text.trim() : '');
+          }}
+          // Native subtitles are ALWAYS disabled — we render our own overlay
+          selectedAudioTrack={selectedAudio}
+          selectedTextTrack={subtitlesDisabled ? { type: 'disabled' } : (selectedText || { type: 'disabled' })}
           controls={false}
           useTextureView={false}
         />
+
+        {/* 🔥 CUSTOM SUBTITLE OVERLAY — independent of video zoom/scale 🔥
+            This is a sibling of the Video component (not inside it), so
+            resizeMode 'cover'/scaling never affects it. Fixed position at
+            the bottom center, fixed font size. */}
+        {!subtitlesDisabled && !!currentSubtitle && (
+          <View style={styles.subtitleOverlay} pointerEvents="none">
+            <Text style={styles.subtitleText}>{currentSubtitle}</Text>
+          </View>
+        )}
         
         {/* TRUE DOUBLE TAP ZONES */}
         <View style={StyleSheet.absoluteFill} flexDirection="row">
@@ -352,6 +378,9 @@ const styles = StyleSheet.create({
   buttonText: { color: '#FFF', fontWeight: 'bold' },
   playerWrapper: { flex: 1, backgroundColor: 'black' },
   videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
+  // Subtitle overlay: fixed position, fixed size, unaffected by video zoom
+  subtitleOverlay: { position: 'absolute', left: 0, right: 0, bottom: 60, alignItems: 'center', paddingHorizontal: 24, zIndex: 50 },
+  subtitleText: { color: 'white', fontSize: 16, lineHeight: 22, textAlign: 'center', backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 4, overflow: 'hidden' },
   controlsOverlay: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'space-between' },
   seekOverlay: { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, justifyContent: 'center', paddingHorizontal: 50 },
   overlayBox: { alignItems: 'center' },
