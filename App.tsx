@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   View,
   Text,
@@ -12,6 +12,8 @@ import {
   ScrollView,
   BackHandler,
   Animated,
+  Platform,
+  DeviceEventEmitter,
 } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
@@ -23,6 +25,36 @@ const { VideoPlayerManager, SubtitleFileModule } = NativeModules;
 const BASE_URL = 'https://movies-and-series.ambalartssb01.workers.dev';
 const USERNAME = 'admin';
 const PASSWORD = '629175';
+const IS_TV = Platform.isTV;
+
+const FocusableButton = ({
+  style,
+  focusedStyle,
+  onPress,
+  children,
+  hasTVPreferredFocus,
+  activeOpacity = 0.8,
+  ...rest
+}: any) => {
+  const [isFocused, setIsFocused] = useState(false);
+  return (
+    <TouchableOpacity
+      focusable={true}
+      hasTVPreferredFocus={hasTVPreferredFocus}
+      activeOpacity={activeOpacity}
+      onPress={onPress}
+      onFocus={() => setIsFocused(true)}
+      onBlur={() => setIsFocused(false)}
+      style={[
+        style,
+        isFocused && styles.tvFocused,
+        isFocused && focusedStyle,
+      ]}
+      {...rest}>
+      {children}
+    </TouchableOpacity>
+  );
+};
 
 const formatTime = (seconds: number) => {
   if (isNaN(seconds) || seconds < 0) return '00:00';
@@ -82,7 +114,7 @@ const App = () => {
   const [showControls, setShowControls] = useState(true);
   const [isPaused, setIsPaused] = useState(false);
   const [isVideoBuffering, setIsVideoBuffering] = useState(false);
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(IS_TV);
   const [playbackRate, setPlaybackRate] = useState(1.0);
 
   const [currentTime, setCurrentTime] = useState(0);
@@ -159,6 +191,9 @@ const App = () => {
   const lastTapDirection = useRef<boolean | null>(null);
 
   useEffect(() => {
+    if (IS_TV) {
+      Orientation.lockToLandscape();
+    }
     fetchDirectory('/0:/');
   }, []);
 
@@ -174,6 +209,10 @@ const App = () => {
   useEffect(() => {
     const backAction = () => {
       if (playMode === 'internal') {
+        if (activeMenu) {
+          setActiveMenu(null);
+          return true;
+        }
         closeInternalPlayer();
         return true;
       } else if (selectedFile) {
@@ -190,7 +229,108 @@ const App = () => {
       backAction,
     );
     return () => backHandler.remove();
-  }, [playMode, selectedFile, pathStack]);
+  }, [playMode, selectedFile, pathStack, activeMenu]);
+
+  const seekBothPlayers = useCallback(
+    (targetTime: number) => {
+      videoRef.current?.seek(targetTime);
+      setCurrentTime(targetTime);
+      if (isExternalAudioSelected && externalAudioRef.current) {
+        const audioTarget = Math.max(0, targetTime - audioDelay);
+        externalAudioRef.current.seek(audioTarget);
+        externalAudioTimeRef.current = audioTarget;
+        lastAudioSyncMs.current = Date.now();
+      }
+    },
+    [isExternalAudioSelected, audioDelay],
+  );
+
+  const triggerStepSeek = useCallback(
+    (isForward: boolean) => {
+      clearTimeout(multiTapTimer.current);
+      if (seekBaseTime.current === null) {
+        seekBaseTime.current = currentTime;
+        accumulatedSeek.current = 0;
+      }
+      accumulatedSeek.current += 10;
+      const totalSeek = accumulatedSeek.current;
+
+      setSeekOverlay({
+        visible: true,
+        icon: isForward ? 'fast-forward' : 'fast-rewind',
+        time: totalSeek,
+        position: isForward ? 'right' : 'left',
+      });
+
+      fadeAnim.setValue(1);
+      Animated.timing(fadeAnim, {
+        toValue: 0,
+        duration: 800,
+        useNativeDriver: true,
+      }).start();
+
+      multiTapTimer.current = setTimeout(() => {
+        const base = seekBaseTime.current ?? currentTime;
+        const rawTarget = isForward ? base + totalSeek : base - totalSeek;
+        const clampedTarget =
+          duration > 0
+            ? Math.max(0, Math.min(duration, rawTarget))
+            : Math.max(0, rawTarget);
+        seekBothPlayers(clampedTarget);
+        seekBaseTime.current = null;
+        accumulatedSeek.current = 0;
+        lastTapDirection.current = null;
+      }, 300);
+    },
+    [currentTime, duration, fadeAnim, seekBothPlayers],
+  );
+
+  // Android TV Remote Key Handler during Video Playback
+  useEffect(() => {
+    if (playMode !== 'internal') return;
+
+    const sub = DeviceEventEmitter.addListener('onTVRemoteKey', event => {
+      const keyCode = event?.keyCode;
+      // Media Play/Pause (85), Media Play (126), Media Pause (127)
+      if (keyCode === 85 || keyCode === 126 || keyCode === 127) {
+        setIsPaused(p => !p);
+        return;
+      }
+      // Media Rewind (89)
+      if (keyCode === 89) {
+        triggerStepSeek(false);
+        return;
+      }
+      // Media Fast Forward (90)
+      if (keyCode === 90) {
+        triggerStepSeek(true);
+        return;
+      }
+
+      if (activeMenu) return;
+
+      // When controls are hidden on TV, D-Pad controls playback directly
+      if (!showControls) {
+        if (keyCode === 21) {
+          // DPAD_LEFT
+          triggerStepSeek(false);
+        } else if (keyCode === 22) {
+          // DPAD_RIGHT
+          triggerStepSeek(true);
+        } else if (
+          keyCode === 23 ||
+          keyCode === 66 ||
+          keyCode === 19 ||
+          keyCode === 20
+        ) {
+          // DPAD_CENTER, ENTER, UP, DOWN -> Show controls
+          setShowControls(true);
+        }
+      }
+    });
+
+    return () => sub.remove();
+  }, [playMode, showControls, activeMenu, triggerStepSeek]);
 
   const ensureLoggedIn = async (force = false) => {
     if (isLoggedIn.current && !force) return;
@@ -285,6 +425,11 @@ const App = () => {
   };
 
   const toggleFullscreen = () => {
+    if (IS_TV) {
+      Orientation.lockToLandscape();
+      setIsFullscreen(true);
+      return;
+    }
     if (isFullscreen) {
       Orientation.lockToPortrait();
       setIsFullscreen(false);
@@ -295,8 +440,11 @@ const App = () => {
   };
 
   const closeInternalPlayer = () => {
-    Orientation.lockToPortrait();
-    setIsFullscreen(false);
+    if (!IS_TV) {
+      Orientation.lockToPortrait();
+      setIsFullscreen(false);
+    }
+    setActiveMenu(null);
     setPlayMode(null);
     setSelectedFile(null);
   };
@@ -332,21 +480,13 @@ const App = () => {
       const res = await SubtitleFileModule.pickAudioFile();
       if (!res || !res.uri) return;
       setExternalAudio({ name: res.name || 'External Audio', uri: res.uri });
-      setSelectedAudio({ type: 'external', value: res.name || 'External Audio' });
+      setSelectedAudio({
+        type: 'external',
+        value: res.name || 'External Audio',
+      });
       setActiveMenu(null);
     } catch (e) {
       Alert.alert('Error', 'Could not load audio file!');
-    }
-  };
-
-  const seekBothPlayers = (targetTime: number) => {
-    videoRef.current?.seek(targetTime);
-    setCurrentTime(targetTime);
-    if (isExternalAudioSelected && externalAudioRef.current) {
-      const audioTarget = Math.max(0, targetTime - audioDelay);
-      externalAudioRef.current.seek(audioTarget);
-      externalAudioTimeRef.current = audioTarget;
-      lastAudioSyncMs.current = Date.now();
     }
   };
 
@@ -360,42 +500,7 @@ const App = () => {
         lastTapDirection.current === isForward)
     ) {
       clearTimeout(singleTapTimer.current);
-      clearTimeout(multiTapTimer.current);
-
-      if (seekBaseTime.current === null) {
-        seekBaseTime.current = currentTime;
-        accumulatedSeek.current = 0;
-      }
-
-      accumulatedSeek.current += 10;
-      const totalSeek = accumulatedSeek.current;
-
-      setSeekOverlay({
-        visible: true,
-        icon: isForward ? 'fast-forward' : 'fast-rewind',
-        time: totalSeek,
-        position: isForward ? 'right' : 'left',
-      });
-
-      fadeAnim.setValue(1);
-      Animated.timing(fadeAnim, {
-        toValue: 0,
-        duration: 800,
-        useNativeDriver: true,
-      }).start();
-
-      multiTapTimer.current = setTimeout(() => {
-        const base = seekBaseTime.current ?? currentTime;
-        const rawTarget = isForward ? base + totalSeek : base - totalSeek;
-        const clampedTarget =
-          duration > 0
-            ? Math.max(0, Math.min(duration, rawTarget))
-            : Math.max(0, rawTarget);
-        seekBothPlayers(clampedTarget);
-        seekBaseTime.current = null;
-        accumulatedSeek.current = 0;
-        lastTapDirection.current = null;
-      }, 350);
+      triggerStepSeek(isForward);
     } else {
       lastTapDirection.current = isForward;
       singleTapTimer.current = setTimeout(() => {
@@ -464,12 +569,20 @@ const App = () => {
 
     return (
       <View style={styles.floatingMenu}>
-        <Text style={styles.floatingMenuTitle}>
-          {isAudio ? 'Audio Tracks 🎵' : 'Subtitles 💬'}
-        </Text>
+        <View style={styles.floatingMenuHeader}>
+          <Text style={styles.floatingMenuTitle}>
+            {isAudio ? 'Audio Tracks 🎵' : 'Subtitles 💬'}
+          </Text>
+          <FocusableButton
+            style={styles.menuCloseBtn}
+            onPress={() => setActiveMenu(null)}>
+            <Icon name="close" size={18} color="white" />
+          </FocusableButton>
+        </View>
         <ScrollView style={{ maxHeight: 280 }}>
           {!isAudio && (
-            <TouchableOpacity
+            <FocusableButton
+              hasTVPreferredFocus={true}
               style={styles.menuItem}
               onPress={() => handleSelectTextTrack({ type: 'disabled' })}>
               <Icon
@@ -479,10 +592,10 @@ const App = () => {
                 style={{ opacity: isSubtitleDisabled ? 1 : 0 }}
               />
               <Text style={styles.menuItemText}>Disable Subtitles</Text>
-            </TouchableOpacity>
+            </FocusableButton>
           )}
           {!isAudio && (
-            <TouchableOpacity
+            <FocusableButton
               style={styles.menuItem}
               onPress={handlePickSubtitleFile}>
               <Icon
@@ -495,10 +608,10 @@ const App = () => {
                   ? `File: ${externalSubtitle.name}`
                   : 'Select subtitle file 📂'}
               </Text>
-            </TouchableOpacity>
+            </FocusableButton>
           )}
           {!isAudio && !!externalSubtitle && !isExternalSubtitleSelected && (
-            <TouchableOpacity
+            <FocusableButton
               style={styles.menuItem}
               onPress={() =>
                 handleSelectTextTrack({
@@ -506,14 +619,20 @@ const App = () => {
                   value: externalSubtitle.name,
                 })
               }>
-              <Icon name="check" size={20} color="white" style={{ opacity: 0 }} />
+              <Icon
+                name="check"
+                size={20}
+                color="white"
+                style={{ opacity: 0 }}
+              />
               <Text style={styles.menuItemText} numberOfLines={1}>
                 Use: {externalSubtitle.name}
               </Text>
-            </TouchableOpacity>
+            </FocusableButton>
           )}
           {isAudio && (
-            <TouchableOpacity
+            <FocusableButton
+              hasTVPreferredFocus={true}
               style={styles.menuItem}
               onPress={handlePickAudioFile}>
               <Icon
@@ -526,10 +645,10 @@ const App = () => {
                   ? `File: ${externalAudio.name}`
                   : 'Select audio file 📂'}
               </Text>
-            </TouchableOpacity>
+            </FocusableButton>
           )}
           {isAudio && !!externalAudio && (
-            <TouchableOpacity
+            <FocusableButton
               style={styles.menuItem}
               onPress={() => {
                 setSelectedAudio({
@@ -547,76 +666,76 @@ const App = () => {
               <Text style={styles.menuItemText} numberOfLines={1}>
                 External: {externalAudio.name}
               </Text>
-            </TouchableOpacity>
+            </FocusableButton>
           )}
           {!isAudio && (
             <View style={styles.adjustRow}>
               <Text style={styles.adjustLabel}>Size</Text>
-              <TouchableOpacity
+              <FocusableButton
                 style={styles.adjustBtn}
                 onPress={() => setSubtitleSize(s => Math.max(10, s - 2))}>
                 <Icon name="remove" size={20} color="white" />
-              </TouchableOpacity>
+              </FocusableButton>
               <Text style={styles.adjustValue}>{subtitleSize}</Text>
-              <TouchableOpacity
+              <FocusableButton
                 style={styles.adjustBtn}
                 onPress={() => setSubtitleSize(s => Math.min(40, s + 2))}>
                 <Icon name="add" size={20} color="white" />
-              </TouchableOpacity>
+              </FocusableButton>
             </View>
           )}
           {!isAudio && (
             <View style={styles.adjustRow}>
               <Text style={styles.adjustLabel}>Delay</Text>
-              <TouchableOpacity
+              <FocusableButton
                 style={styles.adjustBtn}
                 onPress={() =>
                   setSubtitleDelay(d => Math.round((d - 0.5) * 10) / 10)
                 }>
                 <Icon name="remove" size={20} color="white" />
-              </TouchableOpacity>
+              </FocusableButton>
               <Text style={styles.adjustValue}>
                 {subtitleDelay >= 0
                   ? `+${subtitleDelay.toFixed(1)}s`
                   : `${subtitleDelay.toFixed(1)}s`}
               </Text>
-              <TouchableOpacity
+              <FocusableButton
                 style={styles.adjustBtn}
                 onPress={() =>
                   setSubtitleDelay(d => Math.round((d + 0.5) * 10) / 10)
                 }>
                 <Icon name="add" size={20} color="white" />
-              </TouchableOpacity>
+              </FocusableButton>
             </View>
           )}
           {isAudio && (
             <View style={styles.adjustRow}>
               <Text style={styles.adjustLabel}>Audio Delay</Text>
-              <TouchableOpacity
+              <FocusableButton
                 style={styles.adjustBtn}
                 onPress={() =>
                   setAudioDelay(d => Math.round((d - 0.25) * 100) / 100)
                 }>
                 <Icon name="remove" size={20} color="white" />
-              </TouchableOpacity>
+              </FocusableButton>
               <Text style={styles.adjustValue}>
                 {audioDelay >= 0
                   ? `+${audioDelay.toFixed(2)}s`
                   : `${audioDelay.toFixed(2)}s`}
               </Text>
-              <TouchableOpacity
+              <FocusableButton
                 style={styles.adjustBtn}
                 onPress={() =>
                   setAudioDelay(d => Math.round((d + 0.25) * 100) / 100)
                 }>
                 <Icon name="add" size={20} color="white" />
-              </TouchableOpacity>
+              </FocusableButton>
             </View>
           )}
           {isAudio && (
             <View style={styles.adjustRow}>
               <Text style={styles.adjustLabel}>Speed</Text>
-              <TouchableOpacity
+              <FocusableButton
                 style={styles.adjustBtn}
                 onPress={() =>
                   setPlaybackRate(r =>
@@ -624,9 +743,9 @@ const App = () => {
                   )
                 }>
                 <Icon name="remove" size={20} color="white" />
-              </TouchableOpacity>
+              </FocusableButton>
               <Text style={styles.adjustValue}>{playbackRate.toFixed(2)}x</Text>
-              <TouchableOpacity
+              <FocusableButton
                 style={styles.adjustBtn}
                 onPress={() =>
                   setPlaybackRate(r =>
@@ -634,7 +753,7 @@ const App = () => {
                   )
                 }>
                 <Icon name="add" size={20} color="white" />
-              </TouchableOpacity>
+              </FocusableButton>
             </View>
           )}
           {tracks.map((track, index) => {
@@ -645,7 +764,7 @@ const App = () => {
               : selectedText?.type === 'index' &&
                 String(selectedText?.value) === indexStr;
             return (
-              <TouchableOpacity
+              <FocusableButton
                 key={index}
                 style={styles.menuItem}
                 onPress={() => {
@@ -668,7 +787,7 @@ const App = () => {
                     : `Track ${index + 1}`}{' '}
                   - {track.title || 'Auto'}
                 </Text>
-              </TouchableOpacity>
+              </FocusableButton>
             );
           })}
         </ScrollView>
@@ -692,6 +811,7 @@ const App = () => {
           muted={isExternalAudioSelected}
           disableFocus={isExternalAudioSelected}
           rate={playbackRate}
+          focusable={false}
           onLoad={handleVideoLoad}
           onBuffer={(b: any) => setIsVideoBuffering(!!b?.isBuffering)}
           onAudioTracks={(data: any) => {
@@ -754,6 +874,7 @@ const App = () => {
             paused={isPaused || isVideoBuffering}
             rate={playbackRate}
             volume={1.0}
+            focusable={false}
             disableFocus={true}
             onLoad={() => {
               const target = Math.max(0, currentTime - audioDelay);
@@ -780,18 +901,22 @@ const App = () => {
           </View>
         )}
 
-        <View style={[StyleSheet.absoluteFill, { flexDirection: 'row' }]}>
-          <TouchableOpacity
-            style={{ flex: 1 }}
-            activeOpacity={1}
-            onPress={() => handleZoneTap(false)}
-          />
-          <TouchableOpacity
-            style={{ flex: 1 }}
-            activeOpacity={1}
-            onPress={() => handleZoneTap(true)}
-          />
-        </View>
+        {!IS_TV && (
+          <View style={[StyleSheet.absoluteFill, { flexDirection: 'row' }]}>
+            <TouchableOpacity
+              focusable={false}
+              style={{ flex: 1 }}
+              activeOpacity={1}
+              onPress={() => handleZoneTap(false)}
+            />
+            <TouchableOpacity
+              focusable={false}
+              style={{ flex: 1 }}
+              activeOpacity={1}
+              onPress={() => handleZoneTap(true)}
+            />
+          </View>
+        )}
 
         <Animated.View
           style={[
@@ -816,24 +941,56 @@ const App = () => {
         {showControls && (
           <View style={styles.controlsOverlay} pointerEvents="box-none">
             <View style={styles.playerTopBar}>
-              <TouchableOpacity onPress={closeInternalPlayer}>
+              <FocusableButton
+                style={styles.iconBtn}
+                onPress={closeInternalPlayer}>
                 <Icon name="arrow-back" size={28} color="white" />
-              </TouchableOpacity>
+              </FocusableButton>
               <Text style={styles.playerTitle} numberOfLines={1}>
                 {selectedFile.name}
               </Text>
+              {IS_TV && (
+                <FocusableButton
+                  style={styles.iconBtn}
+                  onPress={() => {
+                    setShowControls(false);
+                    setActiveMenu(null);
+                  }}>
+                  <Icon name="visibility-off" size={24} color="white" />
+                </FocusableButton>
+              )}
             </View>
-            <TouchableOpacity
-              onPress={() => setIsPaused(!isPaused)}
-              style={styles.centerPlayBtn}>
-              <Icon
-                name={isPaused ? 'play-arrow' : 'pause'}
-                size={60}
-                color="white"
-              />
-            </TouchableOpacity>
+
+            <View style={styles.centerControlsRow}>
+              {IS_TV && (
+                <FocusableButton
+                  style={styles.sideSeekBtn}
+                  onPress={() => triggerStepSeek(false)}>
+                  <Icon name="replay-10" size={38} color="white" />
+                </FocusableButton>
+              )}
+              <FocusableButton
+                hasTVPreferredFocus={true}
+                onPress={() => setIsPaused(!isPaused)}
+                style={styles.centerPlayBtn}>
+                <Icon
+                  name={isPaused ? 'play-arrow' : 'pause'}
+                  size={60}
+                  color="white"
+                />
+              </FocusableButton>
+              {IS_TV && (
+                <FocusableButton
+                  style={styles.sideSeekBtn}
+                  onPress={() => triggerStepSeek(true)}>
+                  <Icon name="forward-10" size={38} color="white" />
+                </FocusableButton>
+              )}
+            </View>
+
             <View style={styles.playerBottomArea}>
               <TouchableOpacity
+                focusable={false}
                 activeOpacity={1}
                 style={styles.progressBarBg}
                 onLayout={e => setProgressWidth(e.nativeEvent.layout.width)}
@@ -862,7 +1019,7 @@ const App = () => {
                   {formatTime(currentTime)} • {formatTime(duration)}
                 </Text>
                 <View style={{ flexDirection: 'row' }}>
-                  <TouchableOpacity
+                  <FocusableButton
                     style={styles.iconBtn}
                     onPress={() =>
                       setActiveMenu(activeMenu === 'audio' ? null : 'audio')
@@ -872,8 +1029,8 @@ const App = () => {
                       size={26}
                       color={activeMenu === 'audio' ? '#E50914' : 'white'}
                     />
-                  </TouchableOpacity>
-                  <TouchableOpacity
+                  </FocusableButton>
+                  <FocusableButton
                     style={styles.iconBtn}
                     onPress={() =>
                       setActiveMenu(
@@ -885,8 +1042,8 @@ const App = () => {
                       size={26}
                       color={activeMenu === 'subtitle' ? '#E50914' : 'white'}
                     />
-                  </TouchableOpacity>
-                  <TouchableOpacity
+                  </FocusableButton>
+                  <FocusableButton
                     style={styles.iconBtn}
                     onPress={handleZoomToggle}>
                     <Icon
@@ -896,16 +1053,18 @@ const App = () => {
                       size={26}
                       color={resizeMode === 'cover' ? '#E50914' : 'white'}
                     />
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    onPress={toggleFullscreen}
-                    style={styles.iconBtn}>
-                    <Icon
-                      name={isFullscreen ? 'fullscreen-exit' : 'fullscreen'}
-                      size={26}
-                      color="white"
-                    />
-                  </TouchableOpacity>
+                  </FocusableButton>
+                  {!IS_TV && (
+                    <FocusableButton
+                      onPress={toggleFullscreen}
+                      style={styles.iconBtn}>
+                      <Icon
+                        name={isFullscreen ? 'fullscreen-exit' : 'fullscreen'}
+                        size={26}
+                        color="white"
+                      />
+                    </FocusableButton>
+                  )}
                 </View>
               </View>
             </View>
@@ -920,19 +1079,22 @@ const App = () => {
     return (
       <View style={styles.selectionContainer}>
         <Text style={styles.selectionTitle}>{selectedFile.name}</Text>
-        <TouchableOpacity
+        <FocusableButton
+          hasTVPreferredFocus={true}
           style={styles.primaryButton}
           onPress={() => setPlayMode('internal')}>
           <Text style={styles.buttonText}>Play in App (Exo Player) 🍿</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
+        </FocusableButton>
+        <FocusableButton
           style={styles.secondaryButton}
           onPress={openInExternalPlayer}>
           <Text style={styles.buttonText}>Play in External Player 🎦</Text>
-        </TouchableOpacity>
-        <TouchableOpacity onPress={() => setSelectedFile(null)}>
-          <Text style={{ color: 'grey', marginTop: 20 }}>Back</Text>
-        </TouchableOpacity>
+        </FocusableButton>
+        <FocusableButton
+          style={styles.backTextButton}
+          onPress={() => setSelectedFile(null)}>
+          <Text style={{ color: '#CCC' }}>Back</Text>
+        </FocusableButton>
       </View>
     );
   }
@@ -948,9 +1110,9 @@ const App = () => {
         onChangeText={handleSearch}
       />
       {pathStack.length > 1 && (
-        <TouchableOpacity style={styles.backButton} onPress={goBack}>
+        <FocusableButton style={styles.backButton} onPress={goBack}>
           <Text style={{ color: 'white' }}>⬅️ Back</Text>
-        </TouchableOpacity>
+        </FocusableButton>
       )}
       {loading ? (
         <ActivityIndicator
@@ -962,8 +1124,9 @@ const App = () => {
         <FlatList
           data={filteredFiles}
           keyExtractor={(item, idx) => item.id || item.name || String(idx)}
-          renderItem={({ item }) => (
-            <TouchableOpacity
+          renderItem={({ item, index }) => (
+            <FocusableButton
+              hasTVPreferredFocus={index === 0}
               style={styles.itemCard}
               onPress={() => handlePress(item)}>
               <View style={{ flexDirection: 'row', alignItems: 'center' }}>
@@ -974,7 +1137,7 @@ const App = () => {
                   {item.name}
                 </Text>
               </View>
-            </TouchableOpacity>
+            </FocusableButton>
           )}
         />
       )}
@@ -998,13 +1161,17 @@ const styles = StyleSheet.create({
     marginBottom: 15,
     padding: 12,
     borderRadius: 8,
+    borderWidth: 2,
+    borderColor: 'transparent',
   },
   backButton: {
     backgroundColor: '#333',
     padding: 10,
     marginHorizontal: 15,
-    borderRadius: 5,
+    borderRadius: 8,
     marginBottom: 10,
+    borderWidth: 2,
+    borderColor: 'transparent',
   },
   itemCard: {
     backgroundColor: '#222',
@@ -1012,6 +1179,13 @@ const styles = StyleSheet.create({
     marginVertical: 5,
     marginHorizontal: 15,
     borderRadius: 8,
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  tvFocused: {
+    borderColor: '#E50914',
+    borderWidth: 2,
+    backgroundColor: 'rgba(229, 9, 20, 0.25)',
   },
   itemText: { color: '#FFF', fontSize: 16, flex: 1 },
   selectionContainer: {
@@ -1030,17 +1204,29 @@ const styles = StyleSheet.create({
   primaryButton: {
     backgroundColor: '#E50914',
     padding: 15,
-    width: 250,
+    width: 260,
     borderRadius: 8,
     alignItems: 'center',
+    borderWidth: 2,
+    borderColor: 'transparent',
   },
   secondaryButton: {
     backgroundColor: '#E06C00',
     padding: 15,
-    width: 250,
+    width: 260,
     borderRadius: 8,
     marginTop: 15,
     alignItems: 'center',
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  backTextButton: {
+    marginTop: 20,
+    paddingVertical: 10,
+    paddingHorizontal: 24,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: 'transparent',
   },
   buttonText: { color: '#FFF', fontWeight: 'bold' },
   playerWrapper: { flex: 1, backgroundColor: 'black' },
@@ -1084,24 +1270,41 @@ const styles = StyleSheet.create({
   seekText: { color: 'white', fontSize: 16, fontWeight: 'bold' },
   playerTopBar: {
     padding: 20,
-    paddingTop: 40,
+    paddingTop: 32,
     flexDirection: 'row',
     alignItems: 'center',
   },
   playerTitle: {
     color: 'white',
-    marginLeft: 15,
+    marginLeft: 12,
     fontSize: 16,
     fontWeight: '500',
     flex: 1,
+  },
+  centerControlsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 28,
   },
   centerPlayBtn: {
     alignSelf: 'center',
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.5)',
+    backgroundColor: 'rgba(0,0,0,0.55)',
     borderRadius: 50,
-    padding: 10,
+    padding: 12,
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  sideSeekBtn: {
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    borderRadius: 40,
+    padding: 12,
+    borderWidth: 2,
+    borderColor: 'transparent',
   },
   playerBottomArea: { paddingHorizontal: 20, paddingBottom: 30, width: '100%' },
   progressBarBg: {
@@ -1136,46 +1339,72 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   timeText: { color: 'white', fontSize: 14, fontWeight: '500' },
-  iconBtn: { padding: 10, marginLeft: 5 },
+  iconBtn: {
+    padding: 10,
+    marginLeft: 5,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
   floatingMenu: {
     position: 'absolute',
     bottom: 90,
     right: 20,
-    width: 280,
-    backgroundColor: 'rgba(28, 28, 30, 0.95)',
+    width: 300,
+    backgroundColor: 'rgba(28, 28, 30, 0.96)',
     borderRadius: 12,
     padding: 15,
     zIndex: 100,
   },
-  floatingMenuTitle: {
-    color: '#888',
-    fontSize: 14,
-    marginBottom: 10,
-    fontWeight: 'bold',
+  floatingMenuHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     borderBottomWidth: 1,
     borderBottomColor: '#444',
     paddingBottom: 10,
+    marginBottom: 10,
   },
-  menuItem: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12 },
-  menuItemText: { color: 'white', fontSize: 16, marginLeft: 10, flex: 1 },
+  floatingMenuTitle: {
+    color: '#AAA',
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  menuCloseBtn: {
+    padding: 4,
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  menuItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  menuItemText: { color: 'white', fontSize: 15, marginLeft: 10, flex: 1 },
   adjustRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 8 },
   adjustLabel: { color: '#AAA', fontSize: 14, width: 90 },
   adjustBtn: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     backgroundColor: '#333',
     justifyContent: 'center',
     alignItems: 'center',
+    borderWidth: 2,
+    borderColor: 'transparent',
   },
   adjustValue: {
     color: 'white',
     fontSize: 15,
     fontWeight: 'bold',
-    width: 60,
+    width: 64,
     textAlign: 'center',
   },
-  adjustHint: { color: '#777', fontSize: 12, paddingVertical: 6 },
 });
 
 export default App;
