@@ -81,6 +81,7 @@ const App = () => {
   const [resizeMode, setResizeMode] = useState<'contain' | 'cover'>('contain');
   const [showControls, setShowControls] = useState(true);
   const [isPaused, setIsPaused] = useState(false);
+  const [isVideoBuffering, setIsVideoBuffering] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1.0);
 
@@ -88,6 +89,9 @@ const App = () => {
   const [duration, setDuration] = useState(0);
   const [progressWidth, setProgressWidth] = useState(0);
   const videoRef = useRef<any>(null);
+  const externalAudioRef = useRef<any>(null);
+  const externalAudioTimeRef = useRef(0);
+  const lastAudioSyncMs = useRef(0);
   const switchingEpisode = useRef(false);
   const isLoggedIn = useRef(false);
   const lastSavedSec = useRef(-1);
@@ -95,18 +99,26 @@ const App = () => {
   const [audioTracks, setAudioTracks] = useState<any[]>([]);
   const [textTracks, setTextTracks] = useState<any[]>([]);
   const [selectedAudio, setSelectedAudio] = useState<any>(undefined);
-  const [selectedText, setSelectedText] = useState<any>(undefined);
+  const [selectedText, setSelectedText] = useState<any>({ type: 'disabled' });
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
 
-  const [subtitleSize, setSubtitleSize] = useState(18);
+  const [subtitleSize, setSubtitleSize] = useState(20);
   const [subtitleDelay, setSubtitleDelay] = useState(0);
+  const [audioDelay, setAudioDelay] = useState(0);
   const [externalSubtitle, setExternalSubtitle] = useState<{
     name: string;
     content: string;
   } | null>(null);
+  const [externalAudio, setExternalAudio] = useState<{
+    name: string;
+    uri: string;
+  } | null>(null);
 
   const isExternalSubtitleSelected =
     selectedText?.type === 'external' && !!externalSubtitle;
+
+  const isExternalAudioSelected =
+    selectedAudio?.type === 'external' && !!externalAudio;
 
   const subtitlesActive =
     !!selectedText &&
@@ -125,7 +137,12 @@ const App = () => {
       c => effectiveTime >= c.start && effectiveTime <= c.end,
     );
     return cue ? cue.text : '';
-  }, [isExternalSubtitleSelected, parsedExternalCues, currentTime, subtitleDelay]);
+  }, [
+    isExternalSubtitleSelected,
+    parsedExternalCues,
+    currentTime,
+    subtitleDelay,
+  ]);
 
   const [seekOverlay, setSeekOverlay] = useState({
     visible: false,
@@ -144,6 +161,15 @@ const App = () => {
   useEffect(() => {
     fetchDirectory('/0:/');
   }, []);
+
+  useEffect(() => {
+    if (isExternalAudioSelected && externalAudioRef.current) {
+      const target = Math.max(0, currentTime - audioDelay);
+      externalAudioRef.current.seek(target);
+      externalAudioTimeRef.current = target;
+      lastAudioSyncMs.current = Date.now();
+    }
+  }, [audioDelay, isExternalAudioSelected]);
 
   useEffect(() => {
     const backAction = () => {
@@ -211,13 +237,15 @@ const App = () => {
     switchingEpisode.current = false;
     lastSavedSec.current = -1;
     setSelectedAudio(undefined);
-    setSelectedText(undefined);
+    setSelectedText({ type: 'disabled' });
     setCurrentTime(0);
     setDuration(0);
     setResizeMode('contain');
     setSubtitleDelay(0);
+    setAudioDelay(0);
     setPlaybackRate(1.0);
     setExternalSubtitle(null);
+    setExternalAudio(null);
     setSelectedFile(file);
   };
 
@@ -299,6 +327,29 @@ const App = () => {
     }
   };
 
+  const handlePickAudioFile = async () => {
+    try {
+      const res = await SubtitleFileModule.pickAudioFile();
+      if (!res || !res.uri) return;
+      setExternalAudio({ name: res.name || 'External Audio', uri: res.uri });
+      setSelectedAudio({ type: 'external', value: res.name || 'External Audio' });
+      setActiveMenu(null);
+    } catch (e) {
+      Alert.alert('Error', 'Could not load audio file!');
+    }
+  };
+
+  const seekBothPlayers = (targetTime: number) => {
+    videoRef.current?.seek(targetTime);
+    setCurrentTime(targetTime);
+    if (isExternalAudioSelected && externalAudioRef.current) {
+      const audioTarget = Math.max(0, targetTime - audioDelay);
+      externalAudioRef.current.seek(audioTarget);
+      externalAudioTimeRef.current = audioTarget;
+      lastAudioSyncMs.current = Date.now();
+    }
+  };
+
   const handleZoneTap = (isForward: boolean) => {
     const now = Date.now();
     const DOUBLE_PRESS_DELAY = 300;
@@ -340,8 +391,7 @@ const App = () => {
           duration > 0
             ? Math.max(0, Math.min(duration, rawTarget))
             : Math.max(0, rawTarget);
-        videoRef.current?.seek(clampedTarget);
-        setCurrentTime(clampedTarget);
+        seekBothPlayers(clampedTarget);
         seekBaseTime.current = null;
         accumulatedSeek.current = 0;
         lastTapDirection.current = null;
@@ -359,8 +409,19 @@ const App = () => {
 
   const handleVideoLoad = async (meta: any) => {
     setDuration(meta.duration);
-    if (meta.audioTracks) setAudioTracks(meta.audioTracks);
-    if (meta.textTracks) setTextTracks(meta.textTracks);
+    if (meta.audioTracks) {
+      setAudioTracks(meta.audioTracks);
+      if (!selectedAudio && meta.audioTracks.length > 0) {
+        const selectedIdx = meta.audioTracks.findIndex((t: any) => t.selected);
+        setSelectedAudio({
+          type: 'index',
+          value: String(selectedIdx >= 0 ? selectedIdx : 0),
+        });
+      }
+    }
+    if (meta.textTracks) {
+      setTextTracks(meta.textTracks);
+    }
     try {
       const savedTimeStr = await AsyncStorage.getItem(
         `time_${selectedFile.name}`,
@@ -368,7 +429,7 @@ const App = () => {
       if (savedTimeStr) {
         const savedTime = parseFloat(savedTimeStr);
         if (savedTime > 0 && meta.duration - savedTime > 180) {
-          videoRef.current?.seek(savedTime);
+          seekBothPlayers(savedTime);
         }
       }
     } catch (e) {}
@@ -398,12 +459,15 @@ const App = () => {
     if (!activeMenu) return null;
     const isAudio = activeMenu === 'audio';
     const tracks = isAudio ? audioTracks : textTracks;
+    const isSubtitleDisabled =
+      !selectedText || selectedText.type === 'disabled';
+
     return (
       <View style={styles.floatingMenu}>
         <Text style={styles.floatingMenuTitle}>
-          {isAudio ? 'Audio & Speed 🎵' : 'Subtitles 💬'}
+          {isAudio ? 'Audio Tracks 🎵' : 'Subtitles 💬'}
         </Text>
-        <ScrollView style={{ maxHeight: 260 }}>
+        <ScrollView style={{ maxHeight: 280 }}>
           {!isAudio && (
             <TouchableOpacity
               style={styles.menuItem}
@@ -411,11 +475,8 @@ const App = () => {
               <Icon
                 name="check"
                 size={20}
-                color={
-                  selectedText?.type === 'disabled' || !selectedText
-                    ? 'white'
-                    : 'transparent'
-                }
+                color="white"
+                style={{ opacity: isSubtitleDisabled ? 1 : 0 }}
               />
               <Text style={styles.menuItemText}>Disable Subtitles</Text>
             </TouchableOpacity>
@@ -433,6 +494,58 @@ const App = () => {
                 {externalSubtitle
                   ? `File: ${externalSubtitle.name}`
                   : 'Select subtitle file 📂'}
+              </Text>
+            </TouchableOpacity>
+          )}
+          {!isAudio && !!externalSubtitle && !isExternalSubtitleSelected && (
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() =>
+                handleSelectTextTrack({
+                  type: 'external',
+                  value: externalSubtitle.name,
+                })
+              }>
+              <Icon name="check" size={20} color="white" style={{ opacity: 0 }} />
+              <Text style={styles.menuItemText} numberOfLines={1}>
+                Use: {externalSubtitle.name}
+              </Text>
+            </TouchableOpacity>
+          )}
+          {isAudio && (
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={handlePickAudioFile}>
+              <Icon
+                name="folder-open"
+                size={20}
+                color={isExternalAudioSelected ? '#E50914' : 'white'}
+              />
+              <Text style={styles.menuItemText} numberOfLines={1}>
+                {externalAudio
+                  ? `File: ${externalAudio.name}`
+                  : 'Select audio file 📂'}
+              </Text>
+            </TouchableOpacity>
+          )}
+          {isAudio && !!externalAudio && (
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => {
+                setSelectedAudio({
+                  type: 'external',
+                  value: externalAudio.name,
+                });
+                setActiveMenu(null);
+              }}>
+              <Icon
+                name="check"
+                size={20}
+                color="white"
+                style={{ opacity: isExternalAudioSelected ? 1 : 0 }}
+              />
+              <Text style={styles.menuItemText} numberOfLines={1}>
+                External: {externalAudio.name}
               </Text>
             </TouchableOpacity>
           )}
@@ -476,10 +589,29 @@ const App = () => {
               </TouchableOpacity>
             </View>
           )}
-          {!isAudio && !!externalSubtitle && (
-            <Text style={styles.adjustHint}>
-              Size & delay apply live to external subtitle file
-            </Text>
+          {isAudio && (
+            <View style={styles.adjustRow}>
+              <Text style={styles.adjustLabel}>Audio Delay</Text>
+              <TouchableOpacity
+                style={styles.adjustBtn}
+                onPress={() =>
+                  setAudioDelay(d => Math.round((d - 0.25) * 100) / 100)
+                }>
+                <Icon name="remove" size={20} color="white" />
+              </TouchableOpacity>
+              <Text style={styles.adjustValue}>
+                {audioDelay >= 0
+                  ? `+${audioDelay.toFixed(2)}s`
+                  : `${audioDelay.toFixed(2)}s`}
+              </Text>
+              <TouchableOpacity
+                style={styles.adjustBtn}
+                onPress={() =>
+                  setAudioDelay(d => Math.round((d + 0.25) * 100) / 100)
+                }>
+                <Icon name="add" size={20} color="white" />
+              </TouchableOpacity>
+            </View>
           )}
           {isAudio && (
             <View style={styles.adjustRow}>
@@ -527,7 +659,8 @@ const App = () => {
                 <Icon
                   name="check"
                   size={20}
-                  color={isSelected ? 'white' : 'transparent'}
+                  color="white"
+                  style={{ opacity: isSelected ? 1 : 0 }}
                 />
                 <Text style={styles.menuItemText} numberOfLines={1}>
                   {track.language
@@ -556,8 +689,11 @@ const App = () => {
           style={styles.videoPlayer}
           resizeMode={resizeMode}
           paused={isPaused}
+          muted={isExternalAudioSelected}
+          disableFocus={isExternalAudioSelected}
           rate={playbackRate}
           onLoad={handleVideoLoad}
+          onBuffer={(b: any) => setIsVideoBuffering(!!b?.isBuffering)}
           onAudioTracks={(data: any) => {
             const list = Array.isArray(data) ? data : data?.audioTracks;
             if (list && list.length) setAudioTracks(list);
@@ -576,11 +712,30 @@ const App = () => {
                 p.currentTime.toString(),
               );
             }
+            if (
+              isExternalAudioSelected &&
+              !isPaused &&
+              !isVideoBuffering &&
+              externalAudioRef.current
+            ) {
+              const expectedAudioTime = Math.max(0, p.currentTime - audioDelay);
+              const drift = Math.abs(
+                expectedAudioTime - externalAudioTimeRef.current,
+              );
+              const now = Date.now();
+              if (drift > 0.45 && now - lastAudioSyncMs.current > 2000) {
+                externalAudioRef.current.seek(expectedAudioTime);
+                externalAudioTimeRef.current = expectedAudioTime;
+                lastAudioSyncMs.current = now;
+              }
+            }
           }}
           onEnd={handleVideoEnd}
-          selectedAudioTrack={selectedAudio}
+          selectedAudioTrack={
+            isExternalAudioSelected ? { type: 'disabled' } : selectedAudio
+          }
           subtitleStyle={{
-            paddingBottom: resizeMode === 'cover' ? 70 : 16,
+            paddingBottom: resizeMode === 'cover' ? 70 : 18,
             fontSize: subtitleSize,
             subtitlesFollowVideo: resizeMode !== 'cover',
           }}
@@ -590,6 +745,28 @@ const App = () => {
           viewType={1}
           controls={false}
         />
+
+        {isExternalAudioSelected && !!externalAudio && (
+          <Video
+            key={externalAudio.uri}
+            ref={externalAudioRef}
+            source={{ uri: externalAudio.uri }}
+            paused={isPaused || isVideoBuffering}
+            rate={playbackRate}
+            volume={1.0}
+            disableFocus={true}
+            onLoad={() => {
+              const target = Math.max(0, currentTime - audioDelay);
+              externalAudioRef.current?.seek(target);
+              externalAudioTimeRef.current = target;
+              lastAudioSyncMs.current = Date.now();
+            }}
+            onProgress={(ap: any) => {
+              externalAudioTimeRef.current = ap.currentTime;
+            }}
+            style={{ width: 0, height: 0 }}
+          />
+        )}
 
         {isExternalSubtitleSelected && !!activeExternalSubtitleText && (
           <View style={styles.externalSubtitleContainer} pointerEvents="none">
@@ -627,7 +804,11 @@ const App = () => {
           ]}
           pointerEvents="none">
           <View style={styles.overlayBox}>
-            <Icon name={seekOverlay.icon || 'fast-forward'} size={40} color="white" />
+            <Icon
+              name={seekOverlay.icon || 'fast-forward'}
+              size={40}
+              color="white"
+            />
             <Text style={styles.seekText}>{seekOverlay.time} seconds</Text>
           </View>
         </Animated.View>
@@ -660,8 +841,7 @@ const App = () => {
                   if (progressWidth > 0 && duration > 0) {
                     const seekTime =
                       (e.nativeEvent.locationX / progressWidth) * duration;
-                    videoRef.current?.seek(seekTime);
-                    setCurrentTime(seekTime);
+                    seekBothPlayers(seekTime);
                   }
                 }}>
                 <View style={styles.progressBarTrack} />
@@ -875,10 +1055,11 @@ const styles = StyleSheet.create({
   },
   externalSubtitleText: {
     color: '#FFFFFF',
-    fontWeight: '600',
+    backgroundColor: 'transparent',
+    fontWeight: '700',
     textAlign: 'center',
     textShadowColor: 'rgba(0, 0, 0, 0.95)',
-    textShadowOffset: { width: 1, height: 1 },
+    textShadowOffset: { width: 1.5, height: 1.5 },
     textShadowRadius: 4,
   },
   controlsOverlay: {

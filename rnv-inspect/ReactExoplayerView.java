@@ -1517,7 +1517,8 @@ public class ReactExoplayerView extends FrameLayout implements
                     eventEmitter.onVideoLoad.invoke(duration, currentPosition, width, height,
                             audioTracks, textTracks, videoTracks, trackId );
                     
-                    updateSubtitleButtonVisibility();
+                    applyTransparentSubtitleStyle(exoPlayerView);
+        updateSubtitleButtonVisibility();
                 });
                 return;
             }
@@ -1527,7 +1528,8 @@ public class ReactExoplayerView extends FrameLayout implements
             eventEmitter.onVideoLoad.invoke(duration, currentPosition, width, height,
                     audioTracks, textTracks, videoTracks, trackId);
 
-            updateSubtitleButtonVisibility();
+            applyTransparentSubtitleStyle(exoPlayerView);
+        updateSubtitleButtonVisibility();
             refreshControlsStyles();
         }
     }
@@ -1887,6 +1889,7 @@ public class ReactExoplayerView extends FrameLayout implements
             }
         }
         
+        applyTransparentSubtitleStyle(exoPlayerView);
         updateSubtitleButtonVisibility();
     }
     
@@ -2191,7 +2194,8 @@ public class ReactExoplayerView extends FrameLayout implements
             // Give PlayerView time to update its controls
             mainHandler.postDelayed(() -> {
                 if (exoPlayerView != null) {
-                    updateSubtitleButtonVisibility();
+                    applyTransparentSubtitleStyle(exoPlayerView);
+        updateSubtitleButtonVisibility();
                 }
             }, 100);
         } catch (Exception e) {
@@ -2740,8 +2744,36 @@ public class ReactExoplayerView extends FrameLayout implements
         refreshControlsStyles();
     }
 
+    private void applyTransparentSubtitleStyle(View view) {
+        if (view == null) return;
+        try {
+            if (view instanceof androidx.media3.ui.SubtitleView) {
+                androidx.media3.ui.SubtitleView sv = (androidx.media3.ui.SubtitleView) view;
+                sv.setApplyEmbeddedStyles(false);
+                sv.setStyle(new androidx.media3.ui.CaptionStyleCompat(
+                        android.graphics.Color.WHITE,
+                        android.graphics.Color.TRANSPARENT,
+                        android.graphics.Color.TRANSPARENT,
+                        androidx.media3.ui.CaptionStyleCompat.EDGE_TYPE_OUTLINE,
+                        android.graphics.Color.BLACK,
+                        android.graphics.Typeface.DEFAULT_BOLD
+                ));
+            } else if (view instanceof ViewGroup) {
+                ViewGroup vg = (ViewGroup) view;
+                for (int i = 0; i < vg.getChildCount(); i++) {
+                    applyTransparentStyleToSubtitleViews(vg.getChildAt(i));
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private void applyTransparentStyleToSubtitleViews(View view) {
+        applyTransparentSubtitleStyle(view);
+    }
+
     public void setSubtitleStyle(SubtitleStyle style) {
         exoPlayerView.setSubtitleStyle(style);
+        applyTransparentSubtitleStyle(exoPlayerView);
     }
 
     public void setShutterColor(Integer color) {

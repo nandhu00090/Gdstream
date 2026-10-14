@@ -9,7 +9,7 @@ const targets = [
   path.join(__dirname, '../rnv-inspect/ReactExoplayerView.java'),
 ];
 
-const oldSnippet = `                    for (int groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+const oldTrackSnippet = `                    for (int groupIndex = 0; groupIndex < groups.length; groupIndex++) {
                         TrackGroup group = groups.get(groupIndex);
                         for (int trackIndex = 0; trackIndex < group.length; trackIndex++) {
                             Format format = group.getFormat(trackIndex);
@@ -26,7 +26,7 @@ const oldSnippet = `                    for (int groupIndex = 0; groupIndex < gr
                                 }
                             }`;
 
-const newSnippet = `                    int flatTrackIndex = 0;
+const newTrackSnippet = `                    int flatTrackIndex = 0;
                     for (int groupIndex = 0; groupIndex < groups.length; groupIndex++) {
                         TrackGroup group = groups.get(groupIndex);
                         for (int trackIndex = 0; trackIndex < group.length; trackIndex++) {
@@ -45,12 +45,71 @@ const newSnippet = `                    int flatTrackIndex = 0;
                             }
                             flatTrackIndex++;`;
 
+const oldSubtitleMethod = `    public void setSubtitleStyle(SubtitleStyle style) {
+        exoPlayerView.setSubtitleStyle(style);
+    }`;
+
+const newSubtitleMethod = `    private void applyTransparentSubtitleStyle(View view) {
+        if (view == null) return;
+        try {
+            if (view instanceof androidx.media3.ui.SubtitleView) {
+                androidx.media3.ui.SubtitleView sv = (androidx.media3.ui.SubtitleView) view;
+                sv.setApplyEmbeddedStyles(false);
+                sv.setStyle(new androidx.media3.ui.CaptionStyleCompat(
+                        android.graphics.Color.WHITE,
+                        android.graphics.Color.TRANSPARENT,
+                        android.graphics.Color.TRANSPARENT,
+                        androidx.media3.ui.CaptionStyleCompat.EDGE_TYPE_OUTLINE,
+                        android.graphics.Color.BLACK,
+                        android.graphics.Typeface.DEFAULT_BOLD
+                ));
+            } else if (view instanceof ViewGroup) {
+                ViewGroup vg = (ViewGroup) view;
+                for (int i = 0; i < vg.getChildCount(); i++) {
+                    applyTransparentStyleToSubtitleViews(vg.getChildAt(i));
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private void applyTransparentStyleToSubtitleViews(View view) {
+        applyTransparentSubtitleStyle(view);
+    }
+
+    public void setSubtitleStyle(SubtitleStyle style) {
+        exoPlayerView.setSubtitleStyle(style);
+        applyTransparentSubtitleStyle(exoPlayerView);
+    }`;
+
 for (const file of targets) {
   if (fs.existsSync(file)) {
-    const content = fs.readFileSync(file, 'utf8');
-    if (content.includes(oldSnippet)) {
-      fs.writeFileSync(file, content.replace(oldSnippet, newSnippet), 'utf8');
-      console.log('Patched subtitle track index selection in:', file);
+    let content = fs.readFileSync(file, 'utf8');
+    let changed = false;
+
+    if (content.includes(oldTrackSnippet)) {
+      content = content.replace(oldTrackSnippet, newTrackSnippet);
+      changed = true;
+    }
+
+    if (content.includes(oldSubtitleMethod)) {
+      content = content.replace(oldSubtitleMethod, newSubtitleMethod);
+      changed = true;
+    }
+
+    if (
+      content.includes('updateSubtitleButtonVisibility();') &&
+      !content.includes('applyTransparentSubtitleStyle(exoPlayerView);\n        updateSubtitleButtonVisibility();')
+    ) {
+      content = content.replace(
+        /updateSubtitleButtonVisibility\(\);/g,
+        'applyTransparentSubtitleStyle(exoPlayerView);\n        updateSubtitleButtonVisibility();',
+      );
+      changed = true;
+    }
+
+    if (changed) {
+      fs.writeFileSync(file, content, 'utf8');
+      console.log('Patched ReactExoplayerView in:', file);
     }
   }
 }
