@@ -533,7 +533,7 @@ const App = () => {
   const loadSavedTimesForFiles = useCallback(async (items: any[]) => {
     try {
       const keys = items.map(f => `time_${f.name}`);
-      const npKeys = items.map(f => `mediainfo_v2_${f.name}`);
+      const npKeys = items.map(f => `mediainfo_v3_${f.name}`);
       const [timePairs, miPairs] = await Promise.all([
         AsyncStorage.multiGet(keys),
         AsyncStorage.multiGet(npKeys),
@@ -553,7 +553,7 @@ const App = () => {
       miPairs.forEach(([k, val]) => {
         if (val) {
           try {
-            nextMiMap[k.replace(/^mediainfo_v2_/, '')] = JSON.parse(val);
+            nextMiMap[k.replace(/^mediainfo_v3_/, '')] = JSON.parse(val);
           } catch {}
         }
       });
@@ -732,7 +732,7 @@ const App = () => {
 
     const runOnDemandMediaInfo = async () => {
       if (mediaInfoMap[fileName]) return;
-      const cacheKey = `mediainfo_v2_${fileName}`;
+      const cacheKey = `mediainfo_v3_${fileName}`;
       try {
         const cached = await AsyncStorage.getItem(cacheKey);
         if (cached) {

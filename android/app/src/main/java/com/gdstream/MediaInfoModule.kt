@@ -1,6 +1,5 @@
 package com.gdstream
 
-import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.os.Build
@@ -9,11 +8,14 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileInputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 
 class MediaInfoModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -22,9 +24,41 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
 
     override fun getName(): String = "MediaInfoModule"
 
-    private fun formatLanguageName(code: String?): String {
-        if (code.isNullOrBlank() || code == "und" || code == "unk") return "Unknown"
-        val clean = code.trim().lowercase(Locale.ROOT)
+    private data class MkvTrack(
+        var trackType: Int = 0, // 1 = Video, 2 = Audio, 17 = Subtitle
+        var codecId: String = "",
+        var name: String = "",
+        var language: String = "",
+        var languageIetf: String = "",
+        var pixelWidth: Int = 0,
+        var pixelHeight: Int = 0,
+        var defaultDurationNs: Long = 0L,
+        var channels: Int = 0,
+        var bitDepth: Int = 0,
+        var colorTransfer: Int = 0,
+        var colorPrimaries: Int = 0,
+        var hasDoviConfig: Boolean = false,
+        var dvProfile: Int = -1,
+        var dvHasHdr10Base: Boolean = false
+    )
+
+    private data class HeaderParseResult(
+        val totalBytes: Long,
+        val durationSec: Double,
+        val tracks: List<MkvTrack>,
+        val hasDoviRecord: Boolean,
+        val dvProfile: Int,
+        val dvHasHdr10Base: Boolean,
+        val hasAtmosHint: Boolean
+    )
+
+    private fun formatLanguageName(rawCode: String?, trackTitle: String? = null): String {
+        val code = (rawCode ?: "")
+            .trim()
+            .lowercase(Locale.ROOT)
+            .substringBefore("-")
+            .substringBefore("_")
+
         val map = mapOf(
             "tam" to "Tamil", "ta" to "Tamil",
             "tel" to "Telugu", "te" to "Telugu",
@@ -49,14 +83,32 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             "pan" to "Punjabi", "pa" to "Punjabi",
             "urd" to "Urdu", "ur" to "Urdu"
         )
-        if (map.containsKey(clean)) return map[clean]!!
-        return try {
-            val loc = Locale(clean)
-            val disp = loc.getDisplayLanguage(Locale.ENGLISH)
-            if (disp.isNotBlank() && disp.lowercase(Locale.ROOT) != clean) disp
-            else clean.uppercase(Locale.ROOT)
-        } catch (_: Exception) {
-            clean.uppercase(Locale.ROOT)
+
+        if (code.isNotEmpty() && code != "und" && code != "unk") {
+            if (map.containsKey(code)) return map[code]!!
+            try {
+                val loc = Locale(code)
+                val disp = loc.getDisplayLanguage(Locale.ENGLISH)
+                if (disp.isNotBlank() && disp.lowercase(Locale.ROOT) != code) {
+                    return disp
+                }
+            } catch (_: Exception) {}
+        }
+
+        // Check track title if language tag was 'und' or missing
+        if (!trackTitle.isNullOrBlank()) {
+            val lowerTitle = trackTitle.lowercase(Locale.ROOT)
+            for ((_, langName) in map) {
+                if (lowerTitle.contains(langName.lowercase(Locale.ROOT))) {
+                    return langName
+                }
+            }
+        }
+
+        return if (code.isNotEmpty() && code != "und" && code != "unk") {
+            code.uppercase(Locale.ROOT)
+        } else {
+            "Unknown"
         }
     }
 
@@ -70,68 +122,389 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun formatAudioCodec(mime: String?, title: String?, headerHasAtmos: Boolean): String {
-        val m = (mime ?: "").lowercase(Locale.ROOT)
-        val t = (title ?: "").lowercase(Locale.ROOT)
-        val isAtmos = m.contains("joc") || t.contains("atmos") || (headerHasAtmos && m.contains("eac3"))
+    private fun formatMkvVideoCodec(codecId: String): String {
+        val c = codecId.uppercase(Locale.ROOT)
         return when {
-            isAtmos -> "Dolby Atmos (DD+)"
-            m.contains("eac3") -> "Dolby Digital Plus (DD+)"
-            m.contains("ac3") -> "Dolby Digital (AC3)"
-            m.contains("true-hd") || m.contains("truehd") ->
-                if (t.contains("atmos")) "Dolby TrueHD Atmos" else "Dolby TrueHD"
-            m.contains("dts.hd") || m.contains("dtshd") -> "DTS-HD MA"
-            m.contains("dts") -> "DTS"
-            m.contains("mp4a") || m.contains("aac") -> "AAC"
-            m.contains("flac") -> "FLAC"
-            m.contains("opus") -> "Opus"
-            m.contains("vorbis") -> "Vorbis"
-            m.contains("mpeg") -> "MP3"
-            else -> m.substringAfter("/").uppercase(Locale.ROOT).ifEmpty { "Audio" }
+            c.contains("HEVC") || c.contains("H265") || c.contains("MPEGH") -> "HEVC (H.265)"
+            c.contains("AVC") || c.contains("H264") || c.contains("MPEG4/ISO") -> "AVC (H.264)"
+            c.contains("AV1") -> "AV1"
+            c.contains("VP9") -> "VP9"
+            c.contains("MPEG2") -> "MPEG-2"
+            else -> c.removePrefix("V_").ifEmpty { "Video" }
         }
     }
 
-    private fun formatVideoCodec(mime: String?): String {
-        val m = (mime ?: "").lowercase(Locale.ROOT)
+    private fun formatMkvAudioCodec(codecId: String, title: String, hasAtmosHint: Boolean): String {
+        val c = codecId.uppercase(Locale.ROOT)
+        val t = title.lowercase(Locale.ROOT)
+        val isAtmos = t.contains("atmos") || (hasAtmosHint && (c.contains("EAC3") || c.contains("TRUEHD")))
         return when {
-            m.contains("dolby-vision") -> "HEVC (Dolby Vision)"
-            m.contains("hevc") || m.contains("h265") -> "HEVC (H.265)"
-            m.contains("avc") || m.contains("h264") -> "AVC (H.264)"
-            m.contains("av01") || m.contains("av1") -> "AV1"
-            m.contains("vp9") -> "VP9"
-            else -> m.substringAfter("/").uppercase(Locale.ROOT).ifEmpty { "Video" }
+            c.contains("TRUEHD") -> if (isAtmos) "Dolby TrueHD Atmos" else "Dolby TrueHD"
+            c.contains("EAC3") -> if (isAtmos) "Dolby Atmos (DD+)" else "Dolby Digital Plus (DD+)"
+            c.contains("AC3") -> "Dolby Digital (AC3)"
+            c.contains("DTS") -> when {
+                t.contains("hd") || t.contains("ma") || c.contains("HD") -> "DTS-HD MA"
+                t.contains("x") -> "DTS:X"
+                else -> "DTS"
+            }
+            c.contains("OPUS") -> "Opus"
+            c.contains("AAC") -> "AAC"
+            c.contains("FLAC") -> "FLAC"
+            c.contains("VORBIS") -> "Vorbis"
+            c.contains("MPEG/L3") || c.contains("MP3") -> "MP3"
+            c.contains("PCM") -> "PCM"
+            else -> c.removePrefix("A_").ifEmpty { "Audio" }
         }
     }
 
-    private fun formatSubCodec(mime: String?): String {
-        val m = (mime ?: "").lowercase(Locale.ROOT)
+    private fun formatMkvSubtitleCodec(codecId: String): String {
+        val c = codecId.uppercase(Locale.ROOT)
         return when {
-            m.contains("subrip") || m.contains("srt") -> "SRT"
-            m.contains("ssa") || m.contains("ass") -> "ASS"
-            m.contains("vtt") -> "VTT"
-            m.contains("pgs") -> "PGS"
-            m.contains("dvd") || m.contains("vobsub") -> "VOBSUB"
+            c.contains("UTF8") || c.contains("SUBRIP") || c.contains("ASCII") -> "SRT"
+            c.contains("ASS") || c.contains("SSA") -> "ASS"
+            c.contains("PGS") -> "PGS"
+            c.contains("VOBSUB") -> "VOBSUB"
+            c.contains("WEBVTT") || c.contains("VTT") -> "VTT"
+            c.contains("DVBSUB") -> "DVB"
             else -> "SUB"
         }
     }
 
-    private data class HeaderProbeResult(
-        val totalBytes: Long,
-        val hasDoviRecord: Boolean,
-        val dvProfile: Int,
-        val dvHasHdr10Base: Boolean,
-        val hasAtmosHint: Boolean
-    )
+    private fun extractBitrateHintFromTitle(title: String): String? {
+        val m = Regex("(\\d{2,4}\\s*k(?:bps)?)", RegexOption.IGNORE_CASE).find(title)
+        return m?.value
+    }
 
-    private fun probeHeaderBytes(urlStr: String): HeaderProbeResult {
+    // EBML VINT Readers
+    private fun readEbmlId(buf: ByteArray, pos: Int, limit: Int): Pair<Long, Int>? {
+        if (pos >= limit) return null
+        val b0 = buf[pos].toInt() and 0xFF
+        if (b0 == 0) return null
+        var mask = 0x80
+        var len = 1
+        while (len <= 4 && (b0 and mask) == 0) {
+            mask = mask shr 1
+            len++
+        }
+        if (len > 4 || pos + len > limit) return null
+        var id = b0.toLong()
+        for (i in 1 until len) {
+            id = (id shl 8) or ((buf[pos + i].toInt() and 0xFF).toLong())
+        }
+        return Pair(id, len)
+    }
+
+    private fun readEbmlSize(buf: ByteArray, pos: Int, limit: Int): Pair<Long, Int>? {
+        if (pos >= limit) return null
+        val b0 = buf[pos].toInt() and 0xFF
+        if (b0 == 0) return null
+        var mask = 0x80
+        var len = 1
+        while (len <= 8 && (b0 and mask) == 0) {
+            mask = mask shr 1
+            len++
+        }
+        if (len > 8 || pos + len > limit) return null
+        var size = (b0 and (mask - 1)).toLong()
+        var allOnes = (b0 and (mask - 1)) == (mask - 1)
+        for (i in 1 until len) {
+            val bi = buf[pos + i].toInt() and 0xFF
+            if (bi != 0xFF) allOnes = false
+            size = (size shl 8) or bi.toLong()
+        }
+        if (allOnes) {
+            return Pair(-1L, len) // Unknown / streaming size
+        }
+        return Pair(size, len)
+    }
+
+    private fun readEbmlUint(buf: ByteArray, pos: Int, len: Int): Long {
+        var v = 0L
+        for (i in 0 until len) {
+            v = (v shl 8) or ((buf[pos + i].toInt() and 0xFF).toLong())
+        }
+        return v
+    }
+
+    private fun readEbmlFloat(buf: ByteArray, pos: Int, len: Int): Double {
+        return try {
+            if (len == 4) {
+                ByteBuffer.wrap(buf, pos, 4).float.toDouble()
+            } else if (len == 8) {
+                ByteBuffer.wrap(buf, pos, 8).double
+            } else {
+                0.0
+            }
+        } catch (_: Exception) {
+            0.0
+        }
+    }
+
+    private fun readEbmlString(buf: ByteArray, pos: Int, len: Int): String {
+        if (len <= 0) return ""
+        var actualLen = len
+        while (actualLen > 0 && buf[pos + actualLen - 1].toInt() == 0) {
+            actualLen--
+        }
+        return String(buf, pos, actualLen, Charsets.UTF_8).trim()
+    }
+
+    private fun inspectDoviRecordBytes(
+        buf: ByteArray,
+        start: Int,
+        len: Int
+    ): Triple<Boolean, Int, Boolean> {
+        val end = minOf(buf.size, start + len)
+        for (offset in start..(end - 5)) {
+            val b0 = buf[offset].toInt() and 0xFF
+            val b1 = buf[offset + 1].toInt() and 0xFF
+            if (b0 == 1 && b1 == 0) {
+                val b2 = buf[offset + 2].toInt() and 0xFF
+                val b3 = buf[offset + 3].toInt() and 0xFF
+                val b4 = buf[offset + 4].toInt() and 0xFF
+                val profile = (b2 shr 1) and 0x7F
+                val blPresent = b3 and 0x01
+                val blCompatId = (b4 shr 4) and 0x0F
+                if (profile in 4..9) {
+                    val hasHdr10Base =
+                        (profile == 7 || profile == 8) &&
+                            blPresent == 1 &&
+                            (blCompatId == 1 || blCompatId == 2 || blCompatId == 4)
+                    return Triple(true, profile, hasHdr10Base)
+                }
+            }
+        }
+        return Triple(false, -1, false)
+    }
+
+    private fun parseMkvTracksAndInfo(buf: ByteArray, totalBytes: Long): HeaderParseResult {
+        val tracks = mutableListOf<MkvTrack>()
+        var timestampScale = 1_000_000L
+        var rawDuration = 0.0
+
+        val ascii = String(buf, Charsets.ISO_8859_1)
+        val hasAtmosHint =
+            ascii.contains("Atmos", ignoreCase = true) ||
+                ascii.contains("E-AC-3 JOC", ignoreCase = true)
+
+        var globalHasDovi = false
+        var globalDvProfile = -1
+        var globalDvHasHdr10Base = false
+
+        val markers = listOf("dvcC", "dvvC", "DOVI")
+        for (marker in markers) {
+            val idx = ascii.indexOf(marker)
+            if (idx >= 0 && idx + 8 < buf.size) {
+                globalHasDovi = true
+                val (ok, prof, hdrBase) = inspectDoviRecordBytes(
+                    buf,
+                    idx + 4,
+                    minOf(24, buf.size - (idx + 4))
+                )
+                if (ok) {
+                    globalDvProfile = prof
+                    globalDvHasHdr10Base = hdrBase
+                    break
+                }
+            }
+        }
+
+        fun parseColourBox(start: Int, limit: Int, track: MkvTrack) {
+            var p = start
+            while (p < limit) {
+                val idPair = readEbmlId(buf, p, limit) ?: break
+                p += idPair.second
+                val sizePair = readEbmlSize(buf, p, limit) ?: break
+                p += sizePair.second
+                val sz = sizePair.first.toInt()
+                if (sz < 0 || p + sz > limit) break
+                when (idPair.first) {
+                    0x55BAL -> track.colorTransfer = readEbmlUint(buf, p, sz).toInt()
+                    0x55BBL -> track.colorPrimaries = readEbmlUint(buf, p, sz).toInt()
+                }
+                p += sz
+            }
+        }
+
+        fun parseVideoBox(start: Int, limit: Int, track: MkvTrack) {
+            var p = start
+            while (p < limit) {
+                val idPair = readEbmlId(buf, p, limit) ?: break
+                p += idPair.second
+                val sizePair = readEbmlSize(buf, p, limit) ?: break
+                p += sizePair.second
+                val sz = sizePair.first.toInt()
+                if (sz < 0 || p + sz > limit) break
+                when (idPair.first) {
+                    0xB0L -> track.pixelWidth = readEbmlUint(buf, p, sz).toInt()
+                    0xBAL -> track.pixelHeight = readEbmlUint(buf, p, sz).toInt()
+                    0x55B0L -> parseColourBox(p, p + sz, track)
+                }
+                p += sz
+            }
+        }
+
+        fun parseAudioBox(start: Int, limit: Int, track: MkvTrack) {
+            var p = start
+            while (p < limit) {
+                val idPair = readEbmlId(buf, p, limit) ?: break
+                p += idPair.second
+                val sizePair = readEbmlSize(buf, p, limit) ?: break
+                p += sizePair.second
+                val sz = sizePair.first.toInt()
+                if (sz < 0 || p + sz > limit) break
+                when (idPair.first) {
+                    0x9FL -> track.channels = readEbmlUint(buf, p, sz).toInt()
+                    0x6264L -> track.bitDepth = readEbmlUint(buf, p, sz).toInt()
+                }
+                p += sz
+            }
+        }
+
+        fun parseBlockAdditionMapping(start: Int, limit: Int, track: MkvTrack) {
+            var p = start
+            while (p < limit) {
+                val idPair = readEbmlId(buf, p, limit) ?: break
+                p += idPair.second
+                val sizePair = readEbmlSize(buf, p, limit) ?: break
+                p += sizePair.second
+                val sz = sizePair.first.toInt()
+                if (sz < 0 || p + sz > limit) break
+                if (idPair.first == 0x41EDL && sz >= 5) {
+                    val (ok, prof, hdrBase) = inspectDoviRecordBytes(buf, p, sz)
+                    if (ok) {
+                        track.hasDoviConfig = true
+                        track.dvProfile = prof
+                        track.dvHasHdr10Base = hdrBase
+                    }
+                }
+                p += sz
+            }
+        }
+
+        fun parseTrackEntry(start: Int, limit: Int): MkvTrack {
+            val track = MkvTrack()
+            var p = start
+            while (p < limit) {
+                val idPair = readEbmlId(buf, p, limit) ?: break
+                p += idPair.second
+                val sizePair = readEbmlSize(buf, p, limit) ?: break
+                p += sizePair.second
+                val sz = sizePair.first.toInt()
+                if (sz < 0 || p + sz > limit) break
+                when (idPair.first) {
+                    0x83L -> track.trackType = readEbmlUint(buf, p, sz).toInt()
+                    0x86L -> track.codecId = readEbmlString(buf, p, sz)
+                    0x536EL -> track.name = readEbmlString(buf, p, sz)
+                    0x22B59CL -> track.language = readEbmlString(buf, p, sz)
+                    0x22B59DL -> track.languageIetf = readEbmlString(buf, p, sz)
+                    0x23E383L -> track.defaultDurationNs = readEbmlUint(buf, p, sz)
+                    0xE0L -> parseVideoBox(p, p + sz, track)
+                    0xE1L -> parseAudioBox(p, p + sz, track)
+                    0x41E4L -> parseBlockAdditionMapping(p, p + sz, track)
+                }
+                p += sz
+            }
+            return track
+        }
+
+        fun parseTracksMaster(start: Int, limit: Int) {
+            var p = start
+            while (p < limit) {
+                val idPair = readEbmlId(buf, p, limit) ?: break
+                p += idPair.second
+                val sizePair = readEbmlSize(buf, p, limit) ?: break
+                p += sizePair.second
+                val sz = sizePair.first.toInt()
+                if (sz < 0 || p + sz > limit) break
+                if (idPair.first == 0xAEL) {
+                    tracks.add(parseTrackEntry(p, p + sz))
+                }
+                p += sz
+            }
+        }
+
+        fun parseInfoMaster(start: Int, limit: Int) {
+            var p = start
+            while (p < limit) {
+                val idPair = readEbmlId(buf, p, limit) ?: break
+                p += idPair.second
+                val sizePair = readEbmlSize(buf, p, limit) ?: break
+                p += sizePair.second
+                val sz = sizePair.first.toInt()
+                if (sz < 0 || p + sz > limit) break
+                when (idPair.first) {
+                    0x2AD7B1L -> timestampScale = readEbmlUint(buf, p, sz)
+                    0x4489L -> rawDuration = readEbmlFloat(buf, p, sz)
+                }
+                p += sz
+            }
+        }
+
+        // Top-level EBML walk
+        var pos = 0
+        val limit = buf.size
+        while (pos < limit) {
+            val idPair = readEbmlId(buf, pos, limit) ?: break
+            pos += idPair.second
+            val sizePair = readEbmlSize(buf, pos, limit) ?: break
+            pos += sizePair.second
+            val sz = sizePair.first
+
+            if (idPair.first == 0x18538067L) {
+                // Step inside Segment
+                continue
+            }
+            if (idPair.first == 0x1F43B675L) {
+                // Reached media Cluster; header metadata is complete
+                break
+            }
+            if (sz < 0) break
+            val elemEnd = minOf(limit.toLong(), pos.toLong() + sz).toInt()
+            when (idPair.first) {
+                0x1549A966L -> parseInfoMaster(pos, elemEnd)
+                0x1654AE6BL -> parseTracksMaster(pos, elemEnd)
+            }
+            if (pos.toLong() + sz > limit) break
+            pos += sz.toInt()
+        }
+
+        val durationSec = if (rawDuration > 0.0) {
+            (rawDuration * timestampScale.toDouble()) / 1_000_000_000.0
+        } else {
+            0.0
+        }
+
+        for (t in tracks) {
+            if (t.hasDoviConfig) {
+                globalHasDovi = true
+                globalDvProfile = t.dvProfile
+                globalDvHasHdr10Base = t.dvHasHdr10Base
+            }
+        }
+
+        return HeaderParseResult(
+            totalBytes = totalBytes,
+            durationSec = durationSec,
+            tracks = tracks,
+            hasDoviRecord = globalHasDovi,
+            dvProfile = globalDvProfile,
+            dvHasHdr10Base = globalDvHasHdr10Base,
+            hasAtmosHint = hasAtmosHint
+        )
+    }
+
+    private fun fetchAndParseHeader(urlStr: String): HeaderParseResult {
+        val maxHeaderBytes = 640 * 1024 // 640 KB covers MKV Info + Tracks + Fonts/Cues
+
         if (urlStr.startsWith("file://") || urlStr.startsWith("/")) {
-            val f = java.io.File(urlStr.removePrefix("file://"))
+            val f = File(urlStr.removePrefix("file://"))
             val len = if (f.exists()) f.length() else 0L
-            val buf = ByteArray(minOf(len, 256 * 1024L).toInt())
+            val buf = ByteArray(minOf(len, maxHeaderBytes.toLong()).toInt())
             try {
-                java.io.FileInputStream(f).use { it.read(buf) }
+                FileInputStream(f).use { it.read(buf) }
             } catch (_: Exception) {}
-            return analyzeHeaderBuffer(buf, len)
+            return parseMkvTracksAndInfo(buf, len)
         }
 
         var conn: HttpURLConnection? = null
@@ -140,11 +513,11 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             var redirects = 0
             while (redirects < 5) {
                 conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 5000
-                    readTimeout = 5000
+                    connectTimeout = 6000
+                    readTimeout = 6000
                     instanceFollowRedirects = false
                     setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; GDStream/2.0)")
-                    setRequestProperty("Range", "bytes=0-262143")
+                    setRequestProperty("Range", "bytes=0-${maxHeaderBytes - 1}")
                 }
                 val code = conn.responseCode
                 if (code in 301..308) {
@@ -158,7 +531,9 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                 }
             }
 
-            if (conn == null) return HeaderProbeResult(0L, false, -1, false, false)
+            if (conn == null) {
+                return HeaderParseResult(0L, 0.0, emptyList(), false, -1, false, false)
+            }
 
             var totalBytes = 0L
             val contentRange = conn.getHeaderField("Content-Range")
@@ -169,217 +544,169 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                 totalBytes = conn.contentLengthLong.coerceAtLeast(0L)
             }
 
-            val out = java.io.ByteArrayOutputStream()
+            val out = ByteArrayOutputStream()
             conn.inputStream.use { input ->
                 val tmp = ByteArray(16 * 1024)
                 var read = 0
-                while (out.size() < 256 * 1024 && input.read(tmp).also { read = it } != -1) {
+                while (out.size() < maxHeaderBytes && input.read(tmp).also { read = it } != -1) {
                     out.write(tmp, 0, read)
                 }
             }
-            return analyzeHeaderBuffer(out.toByteArray(), totalBytes)
+            return parseMkvTracksAndInfo(out.toByteArray(), totalBytes)
         } catch (_: Exception) {
-            return HeaderProbeResult(0L, false, -1, false, false)
+            return HeaderParseResult(0L, 0.0, emptyList(), false, -1, false, false)
         } finally {
             conn?.disconnect()
         }
     }
 
-    private fun analyzeHeaderBuffer(buf: ByteArray, totalBytes: Long): HeaderProbeResult {
-        val ascii = String(buf, Charsets.ISO_8859_1)
-        val hasAtmos = ascii.contains("Atmos", ignoreCase = true) || ascii.contains("E-AC-3 JOC", ignoreCase = true)
-
-        var hasDovi = false
-        var dvProfile = -1
-        var dvHasHdr10Base = false
-
-        // Search for DOVI configuration box ('dvcC', 'dvvC', or MKV 'DOVI' block addition)
-        val markers = listOf("dvcC", "dvvC", "DOVI")
-        for (marker in markers) {
-            val idx = ascii.indexOf(marker)
-            if (idx >= 0 && idx + 8 < buf.size) {
-                hasDovi = true
-                // Look for 0x01 0x00 (dv_version_major=1, dv_version_minor=0) right after marker
-                for (offset in idx + 4..minOf(idx + 20, buf.size - 5)) {
-                    val b0 = buf[offset].toInt() and 0xFF
-                    val b1 = buf[offset + 1].toInt() and 0xFF
-                    if (b0 == 1 && b1 == 0) {
-                        val b2 = buf[offset + 2].toInt() and 0xFF
-                        val b3 = buf[offset + 3].toInt() and 0xFF
-                        val b4 = buf[offset + 4].toInt() and 0xFF
-                        val profile = (b2 shr 1) and 0x7F
-                        val blPresent = b3 and 0x01
-                        val blCompatId = (b4 shr 4) and 0x0F
-                        if (profile in 4..9) {
-                            dvProfile = profile
-                            // Profile 7 or Profile 8 with compatibility ID 1 or 4 has HDR10 base layer.
-                            // Profile 5 has proprietary IPTPQc2 base layer (DV-only, NO HDR10 base layer).
-                            dvHasHdr10Base = (profile == 7 || profile == 8) && blPresent == 1 && (blCompatId == 1 || blCompatId == 2 || blCompatId == 4)
-                            break
-                        }
-                    }
-                }
-            }
-        }
-
-        return HeaderProbeResult(totalBytes, hasDovi, dvProfile, dvHasHdr10Base, hasAtmos)
-    }
-
     @ReactMethod
     fun inspectMedia(url: String, fileName: String, promise: Promise) {
         inspectorPool.submit {
-            val extractor = MediaExtractor()
             try {
-                val future = inspectorPool.submit<HeaderProbeResult> {
-                    probeHeaderBytes(url)
-                }
-
-                if (url.startsWith("file://") || url.startsWith("/")) {
-                    extractor.setDataSource(url.removePrefix("file://"))
-                } else {
-                    val headers = mapOf(
-                        "User-Agent" to "Mozilla/5.0 (Linux; Android 14; GDStream/2.0)"
-                    )
-                    extractor.setDataSource(url, headers)
-                }
-
-                val probe = try {
-                    future.get(4, TimeUnit.SECONDS)
-                } catch (_: Exception) {
-                    HeaderProbeResult(0L, false, -1, false, false)
-                }
+                val parsed = fetchAndParseHeader(url)
 
                 var width = 0
                 var height = 0
                 var videoCodec = ""
-                var durationSec = 0.0
-                var frameRate = 0f
-                var hasDV = probe.hasDoviRecord
-                var hasHDR10 = probe.dvHasHdr10Base
-                var dvProfile = probe.dvProfile
+                var frameRate = 0.0
+                var durationSec = parsed.durationSec
+                var hasDV = parsed.hasDoviRecord
+                var hasHDR10 = parsed.dvHasHdr10Base
+                var dvProfile = parsed.dvProfile
+                var hasAtmos = parsed.hasAtmosHint
 
                 val audioList = Arguments.createArray()
                 val subtitleList = Arguments.createArray()
-                val audioLanguages = mutableSetOf<String>()
+                val audioLanguages = linkedSetOf<String>()
 
-                val trackCount = extractor.trackCount
-                for (i in 0 until trackCount) {
-                    val format = extractor.getTrackFormat(i)
-                    val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                if (parsed.tracks.isNotEmpty()) {
+                    // 1. Primary path: 100% accurate EBML TrackEntry data
+                    for (t in parsed.tracks) {
+                        when (t.trackType) {
+                            1 -> { // Video Track
+                                if (width == 0 && t.pixelWidth > 0) width = t.pixelWidth
+                                if (height == 0 && t.pixelHeight > 0) height = t.pixelHeight
+                                if (videoCodec.isEmpty() && t.codecId.isNotEmpty()) {
+                                    videoCodec = formatMkvVideoCodec(t.codecId)
+                                }
+                                if (frameRate == 0.0 && t.defaultDurationNs > 0L) {
+                                    frameRate = 1_000_000_000.0 / t.defaultDurationNs.toDouble()
+                                }
+                                // TransferCharacteristics 16 = PQ (HDR10), 18 = HLG
+                                if (t.colorTransfer == 16 || t.colorTransfer == 18) {
+                                    if (dvProfile != 5) {
+                                        hasHDR10 = true
+                                    }
+                                }
+                            }
+                            2 -> { // Audio Track
+                                val rawLang = t.languageIetf.ifBlank { t.language }
+                                val langName = formatLanguageName(rawLang, t.name)
+                                if (langName != "Unknown") {
+                                    audioLanguages.add(langName)
+                                }
+                                val codecName = formatMkvAudioCodec(t.codecId, t.name, parsed.hasAtmosHint)
+                                if (codecName.contains("Atmos", ignoreCase = true)) {
+                                    hasAtmos = true
+                                }
+                                val channelStr = formatChannelLayout(t.channels)
+                                val bitrateHint = extractBitrateHintFromTitle(t.name)
+                                val isOriginal = t.name.contains("Original", ignoreCase = true)
 
-                    if (durationSec <= 0 && format.containsKey(MediaFormat.KEY_DURATION)) {
-                        durationSec = format.getLong(MediaFormat.KEY_DURATION) / 1_000_000.0
+                                val summaryParts = mutableListOf<String>()
+                                summaryParts.add(if (isOriginal) "$langName (Original)" else langName)
+                                summaryParts.add(codecName)
+                                if (channelStr.isNotEmpty()) summaryParts.add(channelStr)
+                                if (!bitrateHint.isNullOrEmpty()) summaryParts.add(bitrateHint)
+
+                                val trackMap = Arguments.createMap().apply {
+                                    putString("language", langName)
+                                    putString("codec", codecName)
+                                    putString("channels", channelStr)
+                                    putInt("bitrateKbps", 0)
+                                    putString("summary", summaryParts.joinToString(" • "))
+                                }
+                                audioList.pushMap(trackMap)
+                            }
+                            17 -> { // Subtitle Track
+                                val rawLang = t.languageIetf.ifBlank { t.language }
+                                val langName = formatLanguageName(rawLang, t.name)
+                                val subFormat = formatMkvSubtitleCodec(t.codecId)
+                                val subMap = Arguments.createMap().apply {
+                                    putString("language", langName)
+                                    putString("format", subFormat)
+                                }
+                                subtitleList.pushMap(subMap)
+                            }
+                        }
                     }
-
-                    if (mime.startsWith("video/")) {
-                        if (width == 0 && format.containsKey(MediaFormat.KEY_WIDTH)) {
-                            width = format.getInteger(MediaFormat.KEY_WIDTH)
-                        }
-                        if (height == 0 && format.containsKey(MediaFormat.KEY_HEIGHT)) {
-                            height = format.getInteger(MediaFormat.KEY_HEIGHT)
-                        }
-                        if (frameRate == 0f && format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
-                            try {
-                                frameRate = format.getFloat(MediaFormat.KEY_FRAME_RATE)
-                            } catch (_: Exception) {
-                                try {
-                                    frameRate = format.getInteger(MediaFormat.KEY_FRAME_RATE).toFloat()
-                                } catch (_: Exception) {}
-                            }
-                        }
-
-                        if (videoCodec.isEmpty()) {
-                            videoCodec = formatVideoCodec(mime)
-                        }
-
-                        if (mime.equals("video/dolby-vision", ignoreCase = true)) {
-                            hasDV = true
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
-                                format.containsKey(MediaFormat.KEY_PROFILE)
-                            ) {
-                                val prof = format.getInteger(MediaFormat.KEY_PROFILE)
-                                if (prof == MediaCodecInfo.CodecProfileLevel.DolbyVisionProfileDvheStn) {
-                                    if (dvProfile == -1) dvProfile = 5
-                                } else if (prof == MediaCodecInfo.CodecProfileLevel.DolbyVisionProfileDvheSt ||
-                                    prof == MediaCodecInfo.CodecProfileLevel.DolbyVisionProfileDvheDtb
-                                ) {
-                                    if (dvProfile == -1) dvProfile = 8
-                                    hasHDR10 = true
-                                }
-                            }
-                        }
-
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
-                            format.containsKey(MediaFormat.KEY_COLOR_TRANSFER)
-                        ) {
-                            val transfer = format.getInteger(MediaFormat.KEY_COLOR_TRANSFER)
-                            // COLOR_TRANSFER_ST2084 (6 = PQ HDR10) or COLOR_TRANSFER_HLG (7)
-                            if (transfer == MediaFormat.COLOR_TRANSFER_ST2084 ||
-                                transfer == MediaFormat.COLOR_TRANSFER_HLG
-                            ) {
-                                // Only mark HDR10 if it's not a pure Profile 5 DV-only stream
-                                if (dvProfile != 5) {
-                                    hasHDR10 = true
-                                }
-                            }
-                        }
-                    } else if (mime.startsWith("audio/")) {
-                        val rawLang = if (format.containsKey(MediaFormat.KEY_LANGUAGE)) {
-                            format.getString(MediaFormat.KEY_LANGUAGE)
-                        } else null
-                        val title = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
-                            format.containsKey("title")
-                        ) {
-                            format.getString("title")
-                        } else null
-
-                        val langName = formatLanguageName(rawLang)
-                        if (langName != "Unknown") audioLanguages.add(langName)
-
-                        val channels = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
-                            format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        } else 0
-                        val channelStr = formatChannelLayout(channels)
-                        val codecName = formatAudioCodec(mime, title, probe.hasAtmosHint)
-                        val bitrateKbps = if (format.containsKey(MediaFormat.KEY_BIT_RATE)) {
-                            format.getInteger(MediaFormat.KEY_BIT_RATE) / 1000
-                        } else 0
-
-                        val trackMap = Arguments.createMap().apply {
-                            putString("language", langName)
-                            putString("codec", codecName)
-                            putString("channels", channelStr)
-                            putInt("bitrateKbps", bitrateKbps)
-                            putString(
-                                "summary",
-                                listOfNotNull(
-                                    langName,
-                                    codecName,
-                                    channelStr.ifEmpty { null }
-                                ).joinToString(" • ")
+                } else {
+                    // 2. Fallback path for .mp4 / non-EBML containers via MediaExtractor
+                    val extractor = MediaExtractor()
+                    try {
+                        if (url.startsWith("file://") || url.startsWith("/")) {
+                            extractor.setDataSource(url.removePrefix("file://"))
+                        } else {
+                            val headers = mapOf(
+                                "User-Agent" to "Mozilla/5.0 (Linux; Android 14; GDStream/2.0)"
                             )
+                            extractor.setDataSource(url, headers)
                         }
-                        audioList.pushMap(trackMap)
-                    } else if (mime.startsWith("text/") ||
-                        mime.contains("subrip") ||
-                        mime.contains("ssa") ||
-                        mime.contains("vtt") ||
-                        mime.contains("pgs") ||
-                        mime.contains("dvd")
-                    ) {
-                        val rawLang = if (format.containsKey(MediaFormat.KEY_LANGUAGE)) {
-                            format.getString(MediaFormat.KEY_LANGUAGE)
-                        } else null
-                        val langName = formatLanguageName(rawLang)
-                        val subMap = Arguments.createMap().apply {
-                            putString("language", langName)
-                            putString("format", formatSubCodec(mime))
+                        for (i in 0 until extractor.trackCount) {
+                            val format = extractor.getTrackFormat(i)
+                            val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                            if (durationSec <= 0 && format.containsKey(MediaFormat.KEY_DURATION)) {
+                                durationSec = format.getLong(MediaFormat.KEY_DURATION) / 1_000_000.0
+                            }
+                            if (mime.startsWith("video/")) {
+                                if (width == 0 && format.containsKey(MediaFormat.KEY_WIDTH)) {
+                                    width = format.getInteger(MediaFormat.KEY_WIDTH)
+                                }
+                                if (height == 0 && format.containsKey(MediaFormat.KEY_HEIGHT)) {
+                                    height = format.getInteger(MediaFormat.KEY_HEIGHT)
+                                }
+                                if (videoCodec.isEmpty()) {
+                                    videoCodec = when {
+                                        mime.contains("hevc") -> "HEVC (H.265)"
+                                        mime.contains("avc") -> "AVC (H.264)"
+                                        else -> "Video"
+                                    }
+                                }
+                            } else if (mime.startsWith("audio/")) {
+                                val rawLang = if (format.containsKey(MediaFormat.KEY_LANGUAGE)) {
+                                    format.getString(MediaFormat.KEY_LANGUAGE)
+                                } else null
+                                val langName = formatLanguageName(rawLang)
+                                if (langName != "Unknown") audioLanguages.add(langName)
+                                val ch = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                                    format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                                } else 0
+                                val chStr = formatChannelLayout(ch)
+                                val codecName = formatMkvAudioCodec(mime, "", parsed.hasAtmosHint)
+                                val trackMap = Arguments.createMap().apply {
+                                    putString("language", langName)
+                                    putString("codec", codecName)
+                                    putString("channels", chStr)
+                                    putInt("bitrateKbps", 0)
+                                    putString(
+                                        "summary",
+                                        listOfNotNull(langName, codecName, chStr.ifEmpty { null })
+                                            .joinToString(" • ")
+                                    )
+                                }
+                                audioList.pushMap(trackMap)
+                            }
                         }
-                        subtitleList.pushMap(subMap)
+                    } catch (_: Exception) {
+                    } finally {
+                        try {
+                            extractor.release()
+                        } catch (_: Exception) {}
                     }
                 }
 
-                // Fallback cross-check with filename if container omitted DV/HDR box flags
+                // Cross-check DV & HDR10 flags
                 val lowerName = fileName.lowercase(Locale.ROOT)
                 val nameHasDv = Regex("\\b(dv|dovi|dolby[ ._-]*vision)\\b").containsMatchIn(lowerName)
                 val nameHasHdr = Regex("\\b(hdr|hdr10|hdr10\\+)\\b").containsMatchIn(lowerName)
@@ -389,13 +716,12 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                     hasHDR10 = false
                 } else if (dvProfile == 7 || dvProfile == 8) {
                     hasDV = true
-                    if (nameHasHdr || probe.dvHasHdr10Base) {
+                    if (nameHasHdr || parsed.dvHasHdr10Base) {
                         hasHDR10 = true
                     }
                 } else {
                     if (nameHasDv) hasDV = true
-                    // Only mark hasHDR10 alongside DV if filename or container explicitly has HDR10
-                    if (hasDV && !nameHasHdr && !probe.dvHasHdr10Base) {
+                    if (hasDV && !nameHasHdr && !parsed.dvHasHdr10Base) {
                         hasHDR10 = false
                     } else if (nameHasHdr) {
                         hasHDR10 = true
@@ -420,13 +746,13 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                     putInt("height", height)
                     putString("resolution", resolutionLabel)
                     putString("videoCodec", videoCodec)
-                    putDouble("frameRate", frameRate.toDouble())
+                    putDouble("frameRate", frameRate)
                     putDouble("durationSec", durationSec)
-                    putDouble("totalBytes", probe.totalBytes.toDouble())
+                    putDouble("totalBytes", parsed.totalBytes.toDouble())
                     putBoolean("hasDV", hasDV)
                     putBoolean("hasHDR", hasHDR10)
                     putInt("dvProfile", dvProfile)
-                    putBoolean("hasAtmos", probe.hasAtmosHint)
+                    putBoolean("hasAtmos", hasAtmos)
                     putArray("audioTracks", audioList)
                     putArray("subtitleTracks", subtitleList)
                     putArray("languages", langArray)
@@ -434,10 +760,6 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                 promise.resolve(result)
             } catch (e: Exception) {
                 promise.reject("MEDIAINFO_ERROR", e.message)
-            } finally {
-                try {
-                    extractor.release()
-                } catch (_: Exception) {}
             }
         }
     }
