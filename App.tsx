@@ -33,7 +33,8 @@ const USERNAME = 'admin';
 const PASSWORD = '629175';
 const IS_TV = Platform.isTV;
 
-const DEFAULT_TMDB_API_KEY = '';
+// Direct Built-in TMDb API Key
+const TMDB_API_KEY = 'cc4e028567dd1bd804d650b891b86f6e';
 
 interface ParsedMediaInfo {
   rawName: string;
@@ -135,7 +136,7 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
   const year = yearMatch ? yearMatch[1] : '';
 
   const cutPattern =
-    /\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-ray|remux|web-dl|webdl|webrip|web|amzn|nf|snxt|it|hdtv|ddp\d|dd\+|aac|hevc|x264|x265|h\s*264|h\s*265|multi|dual|org)\b/i;
+    /\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-ray|remux|web-dl|webdl|webrip|web|amzn|nf|snxt|it|hdtv|ddp\d|dd\+|aac|hevc|x264|x265|h\s*264|h\s*265|multi|dual|org|fhd)\b/i;
 
   let titlePart = normalized;
 
@@ -156,6 +157,7 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
 
   titlePart = titlePart
     .replace(/\((?:19|20)\d{2}\)/g, '')
+    .replace(/\bmovie\b$/i, '')
     .replace(
       /\s+\b(tamil|malayalam|telugu|hindi|kannada|english|tam|mal|tel|hin|eng)\b$/i,
       '',
@@ -271,9 +273,6 @@ const App = () => {
   const [savedTimesMap, setSavedTimesMap] = useState<Record<string, number>>(
     {},
   );
-  const [tmdbKey, setTmdbKey] = useState(DEFAULT_TMDB_API_KEY);
-  const [showKeyModal, setShowKeyModal] = useState(false);
-  const [tempKeyInput, setTempKeyInput] = useState('');
 
   // Downloads State
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
@@ -383,12 +382,6 @@ const App = () => {
     if (IS_TV) {
       Orientation.lockToLandscape();
     }
-    AsyncStorage.getItem('gdstream_tmdb_key').then(savedKey => {
-      if (savedKey) {
-        setTmdbKey(savedKey);
-        setTempKeyInput(savedKey);
-      }
-    });
     if (VideoPlayerManager?.getSystemLevels) {
       VideoPlayerManager.getSystemLevels()
         .then((res: any) => {
@@ -456,10 +449,6 @@ const App = () => {
         setShowHdrChoiceModal(false);
         return true;
       }
-      if (showKeyModal) {
-        setShowKeyModal(false);
-        return true;
-      }
       if (playMode === 'internal') {
         if (isLocked) {
           setShowControls(true);
@@ -493,7 +482,6 @@ const App = () => {
     selectedFile,
     pathStack,
     activeMenu,
-    showKeyModal,
     showHdrChoiceModal,
     isLocked,
     activeTab,
@@ -517,13 +505,8 @@ const App = () => {
   }, []);
 
   const fetchSingleMetadata = useCallback(
-    async (
-      info: ParsedMediaInfo,
-      activeTmdbKey: string,
-    ): Promise<MediaMetadata | null> => {
-      const cacheKey = `meta_v3_${info.searchTitle.toLowerCase()}_${info.year}_${
-        activeTmdbKey ? 'tmdb' : 'imdb'
-      }`;
+    async (info: ParsedMediaInfo): Promise<MediaMetadata | null> => {
+      const cacheKey = `meta_v4_${info.searchTitle.toLowerCase()}_${info.year}`;
       try {
         const cached = await AsyncStorage.getItem(cacheKey);
         if (cached) {
@@ -531,9 +514,9 @@ const App = () => {
         }
       } catch {}
 
-      if (activeTmdbKey && activeTmdbKey.trim().length >= 20) {
+      if (TMDB_API_KEY && TMDB_API_KEY.trim().length >= 20) {
         try {
-          const key = activeTmdbKey.trim();
+          const key = TMDB_API_KEY.trim();
           const endpoint = info.seasonEpisode ? 'tv' : 'multi';
           const url = `https://api.themoviedb.org/3/search/${endpoint}?api_key=${encodeURIComponent(
             key,
@@ -638,13 +621,12 @@ const App = () => {
       for (const item of files) {
         if (cancelled) break;
         const itemKey = item.name;
-        const cacheCheckKey = `${itemKey}_${tmdbKey}`;
-        if (fetchedKeysRef.current.has(cacheCheckKey)) continue;
-        fetchedKeysRef.current.add(cacheCheckKey);
+        if (fetchedKeysRef.current.has(itemKey)) continue;
+        fetchedKeysRef.current.add(itemKey);
 
         const isFolder = !!item.mimeType?.includes('folder');
         const info = parseMediaFilename(item.name, isFolder);
-        const meta = await fetchSingleMetadata(info, tmdbKey);
+        const meta = await fetchSingleMetadata(info);
         if (meta && !cancelled) {
           setMetadataMap(prev => ({ ...prev, [itemKey]: meta }));
         }
@@ -655,15 +637,7 @@ const App = () => {
     return () => {
       cancelled = true;
     };
-  }, [files, tmdbKey, fetchSingleMetadata, loadSavedTimesForFiles]);
-
-  const saveTmdbKey = async () => {
-    const cleaned = tempKeyInput.trim();
-    setTmdbKey(cleaned);
-    fetchedKeysRef.current.clear();
-    await AsyncStorage.setItem('gdstream_tmdb_key', cleaned);
-    setShowKeyModal(false);
-  };
+  }, [files, fetchSingleMetadata, loadSavedTimesForFiles]);
 
   const seekBothPlayers = useCallback(
     (targetTime: number) => {
@@ -915,12 +889,16 @@ const App = () => {
         info.cleanTitle,
         meta?.poster || '',
       );
-      Alert.alert(
-        'Download Started ⚡',
-        `${info.cleanTitle} is downloading with 8x parallel turbo connections to Download/GDStream.`,
-      );
     } catch (e) {
       Alert.alert('Error', 'Could not start download!');
+    }
+  };
+
+  const handleOpenDownloadFolder = async () => {
+    try {
+      await DownloadEngine?.openDownloadFolder?.();
+    } catch (e) {
+      Alert.alert('Folder Path', 'Internal Storage / Download / GDStream');
     }
   };
 
@@ -1753,7 +1731,6 @@ const App = () => {
                       </Text>
                     </View>
                   )}
-                  {/* LIVE DOLBY VISION / HDR10 STATUS BADGE IN PLAYER */}
                   {(playerInfo.hasDV || playerInfo.hasHDR) && (
                     <TouchableOpacity
                       onPress={
@@ -2095,12 +2072,14 @@ const App = () => {
                 </Text>
               </FocusableButton>
             ) : dlTask.status === 'completed' ? (
-              <View style={styles.downloadedReadyCard}>
+              <FocusableButton
+                style={styles.downloadedReadyCard}
+                onPress={handleOpenDownloadFolder}>
                 <Icon name="check-circle" size={20} color="#46d369" />
                 <Text style={styles.downloadedReadyText}>
-                  Downloaded to Phone Storage (Download/GDStream)
+                  Saved in Download/GDStream • Tap to Open Folder
                 </Text>
-              </View>
+              </FocusableButton>
             ) : (
               <FocusableButton
                 style={styles.downloadProgressCard}
@@ -2160,10 +2139,13 @@ const App = () => {
             </FocusableButton>
             <Text style={styles.headerTitle}>Downloads</Text>
           </View>
-          <View style={styles.storageHintPill}>
-            <Icon name="folder" size={14} color="#F5C518" />
+          <FocusableButton
+            style={styles.storageHintPill}
+            onPress={handleOpenDownloadFolder}>
+            <Icon name="folder-open" size={16} color="#F5C518" />
             <Text style={styles.storageHintText}>Download/GDStream</Text>
-          </View>
+            <Icon name="open-in-new" size={13} color="#99A3B3" />
+          </FocusableButton>
         </View>
 
         {downloads.length === 0 ? (
@@ -2341,18 +2323,6 @@ const App = () => {
               name={viewMode === 'grid' ? 'view-list' : 'grid-view'}
               size={22}
               color="white"
-            />
-          </FocusableButton>
-          <FocusableButton
-            style={styles.headerIconBtn}
-            onPress={() => {
-              setTempKeyInput(tmdbKey);
-              setShowKeyModal(true);
-            }}>
-            <Icon
-              name="vpn-key"
-              size={20}
-              color={tmdbKey ? '#46d369' : '#AAA'}
             />
           </FocusableButton>
         </View>
@@ -2566,42 +2536,6 @@ const App = () => {
           }}
         />
       )}
-
-      <Modal
-        visible={showKeyModal}
-        transparent={true}
-        animationType="fade"
-        onRequestClose={() => setShowKeyModal(false)}>
-        <View style={styles.modalBackdrop}>
-          <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>TMDb API Key (Optional)</Text>
-            <Text style={styles.modalSub}>
-              Posters work automatically out of the box! Add a 32-character TMDb
-              API key if you also want 16:9 backdrops, ratings & movie plots.
-            </Text>
-            <TextInput
-              style={styles.modalInput}
-              placeholder="Paste TMDb API key..."
-              placeholderTextColor="#666"
-              value={tempKeyInput}
-              onChangeText={setTempKeyInput}
-              autoCapitalize="none"
-            />
-            <View style={styles.modalBtnRow}>
-              <TouchableOpacity
-                style={styles.modalCancelBtn}
-                onPress={() => setShowKeyModal(false)}>
-                <Text style={{ color: '#CCC' }}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.modalSaveBtn}
-                onPress={saveTmdbKey}>
-                <Text style={{ color: 'white', fontWeight: 'bold' }}>Save</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
     </View>
   );
 };
@@ -3078,7 +3012,6 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   rawFileName: { color: '#8F9BB0', fontSize: 12 },
-  // HDR vs DV Modal
   hdrModalCard: {
     width: '100%',
     maxWidth: 400,
@@ -3157,19 +3090,18 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     marginTop: 8,
   },
-  // Downloads Tab Styles
   storageHintPill: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
     backgroundColor: '#171B24',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
+    paddingHorizontal: 11,
+    paddingVertical: 7,
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: '#283040',
+    borderColor: '#2E3748',
   },
-  storageHintText: { color: '#C2CBD8', fontSize: 11, fontWeight: '700' },
+  storageHintText: { color: '#E2E8F0', fontSize: 12, fontWeight: '700' },
   emptyDownloadsBox: {
     flex: 1,
     alignItems: 'center',
@@ -3259,40 +3191,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 20,
   },
-  modalCard: {
-    width: '100%',
-    maxWidth: 380,
-    backgroundColor: '#181C24',
-    borderRadius: 14,
-    padding: 20,
-    borderWidth: 1,
-    borderColor: '#2D3545',
-  },
-  modalTitle: { color: 'white', fontSize: 17, fontWeight: '800' },
-  modalSub: { color: '#9AA5B5', fontSize: 13, marginTop: 6, lineHeight: 18 },
-  modalInput: {
-    backgroundColor: '#0E1117',
-    color: 'white',
-    borderRadius: 8,
-    padding: 12,
-    marginTop: 14,
-    borderWidth: 1,
-    borderColor: '#2E3748',
-  },
-  modalBtnRow: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: 10,
-    marginTop: 16,
-  },
-  modalCancelBtn: { paddingVertical: 10, paddingHorizontal: 16 },
-  modalSaveBtn: {
-    backgroundColor: '#E50914',
-    paddingVertical: 10,
-    paddingHorizontal: 20,
-    borderRadius: 8,
-  },
-  // PLAYER STYLES
   playerWrapper: { flex: 1, backgroundColor: 'black' },
   videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
   externalSubtitleContainer: {

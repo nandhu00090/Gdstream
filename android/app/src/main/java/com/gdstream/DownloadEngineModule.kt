@@ -1,7 +1,12 @@
 package com.gdstream
 
+import android.app.DownloadManager
+import android.content.Intent
 import android.media.MediaScannerConnection
+import android.net.Uri
 import android.os.Environment
+import android.os.StrictMode
+import android.provider.DocumentsContract
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -75,6 +80,53 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
         val fallback = File(reactContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "GDStream")
         fallback.mkdirs()
         return fallback
+    }
+
+    @ReactMethod
+    fun openDownloadFolder(promise: Promise) {
+        try {
+            val dir = getPublicDownloadDir()
+            dir.mkdirs()
+
+            val docUri = DocumentsContract.buildDocumentUri(
+                "com.android.externalstorage.documents",
+                "primary:Download/GDStream"
+            )
+
+            // 1. Try opening exact directory in Android DocumentsUI / System File Manager
+            try {
+                val docIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(docUri, DocumentsContract.Document.MIME_TYPE_DIR)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    putExtra(DocumentsContract.EXTRA_INITIAL_URI, docUri)
+                }
+                reactContext.startActivity(docIntent)
+                promise.resolve(true)
+                return
+            } catch (_: Exception) {}
+
+            // 2. Try opening folder path in third-party file managers (Solid Explorer, Cx File Explorer, Mi File Manager)
+            try {
+                val builder = StrictMode.VmPolicy.Builder()
+                StrictMode.setVmPolicy(builder.build())
+                val folderIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(Uri.fromFile(dir), "resource/folder")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                reactContext.startActivity(folderIntent)
+                promise.resolve(true)
+                return
+            } catch (_: Exception) {}
+
+            // 3. Fallback to system Downloads view
+            val dlIntent = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            reactContext.startActivity(dlIntent)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message)
+        }
     }
 
     private fun guessMimeType(fileName: String): String {
