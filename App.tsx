@@ -14,6 +14,8 @@ import {
   Animated,
   Platform,
   DeviceEventEmitter,
+  Image,
+  Modal,
 } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
@@ -27,13 +29,124 @@ const USERNAME = 'admin';
 const PASSWORD = '629175';
 const IS_TV = Platform.isTV;
 
+// Optional: You can also paste your 32-character TMDb API key directly here
+const DEFAULT_TMDB_API_KEY = '';
+
+interface ParsedMediaInfo {
+  rawName: string;
+  cleanTitle: string;
+  searchTitle: string;
+  year: string;
+  seasonEpisode: string;
+  resolution: string;
+  badges: string[];
+  isFolder: boolean;
+}
+
+interface MediaMetadata {
+  poster?: string;
+  backdrop?: string;
+  rating?: string;
+  overview?: string;
+  year?: string;
+  cast?: string;
+}
+
+const TYPO_FIXES: Record<string, string> = {
+  'attach on titan': 'Attack on Titan',
+};
+
+const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => {
+  const withoutExt = isFolder
+    ? name
+    : name.replace(/\.(mkv|mp4|avi|mov|webm|m4v|ts)$/i, '');
+
+  const normalized = withoutExt
+    .replace(/[._]+/g, ' ')
+    .replace(/\[.*?\]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  let resolution = '';
+  if (/\b(2160p|4k|uhd)\b/i.test(normalized)) resolution = '4K';
+  else if (/\b1080p\b/i.test(normalized)) resolution = '1080p';
+  else if (/\b720p\b/i.test(normalized)) resolution = '720p';
+  else if (/\b480p\b/i.test(normalized)) resolution = '480p';
+
+  const badges: string[] = [];
+  if (/\b(atmos)\b/i.test(normalized)) badges.push('Atmos');
+  if (/\b(dv|dovi|dolby\s*vision)\b/i.test(normalized)) badges.push('DV');
+  if (/\b(hdr|hdr10)\b/i.test(normalized)) badges.push('HDR');
+  if (/\b(remux)\b/i.test(normalized)) badges.push('REMUX');
+  else if (/\b(bluray|blu-ray)\b/i.test(normalized)) badges.push('BluRay');
+  else if (/\b(web-dl|webdl|web\s*dl|webrip)\b/i.test(normalized))
+    badges.push('WEB-DL');
+
+  if (/\b(h\s*265|x265|hevc)\b/i.test(normalized)) badges.push('HEVC');
+  if (/\b(multi|dual)\b/i.test(normalized)) badges.push('Multi Audio');
+  else if (/\b(tam|tamil)\b/i.test(normalized)) badges.push('Tamil');
+  else if (/\b(mal|malayalam)\b/i.test(normalized)) badges.push('Malayalam');
+  else if (/\b(hin|hindi)\b/i.test(normalized)) badges.push('Hindi');
+  else if (/\b(tel|telugu)\b/i.test(normalized)) badges.push('Telugu');
+
+  const seMatch = normalized.match(/\b(S\d{1,2}(?:\s*E\d{1,3})?|E\d{1,3}|Season\s*\d{1,2})\b/i);
+  const seasonEpisode = seMatch ? seMatch[1].replace(/\s+/g, '').toUpperCase() : '';
+
+  const yearMatch = normalized.match(/(?:^|[\s(])((?:19|20)\d{2})(?:[\s)]|$)/);
+  const year = yearMatch ? yearMatch[1] : '';
+
+  const cutPattern =
+    /\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-ray|remux|web-dl|webdl|webrip|web|amzn|nf|snxt|it|hdtv|ddp\d|dd\+|aac|hevc|x264|x265|h\s*264|h\s*265|multi|dual|org)\b/i;
+
+  let titlePart = normalized;
+
+  if (seMatch && seMatch.index !== undefined && seMatch.index > 1) {
+    titlePart = titlePart.slice(0, seMatch.index);
+  }
+  if (yearMatch && yearMatch.index !== undefined && yearMatch.index > 1) {
+    const beforeYear = normalized.slice(0, yearMatch.index);
+    if (beforeYear.length < titlePart.length) {
+      titlePart = beforeYear;
+    }
+  }
+
+  const cutMatch = titlePart.match(cutPattern);
+  if (cutMatch && cutMatch.index !== undefined && cutMatch.index > 1) {
+    titlePart = titlePart.slice(0, cutMatch.index);
+  }
+
+  titlePart = titlePart
+    .replace(/\((?:19|20)\d{2}\)/g, '')
+    .replace(
+      /\s+\b(tamil|malayalam|telugu|hindi|kannada|english|tam|mal|tel|hin|eng)\b$/i,
+      '',
+    )
+    .replace(/[-–—:([{\s]+$/, '')
+    .trim();
+
+  const cleanTitle = titlePart || normalized.slice(0, 40);
+  const lowerClean = cleanTitle.toLowerCase();
+  const searchTitle = TYPO_FIXES[lowerClean] || cleanTitle;
+
+  return {
+    rawName: name,
+    cleanTitle,
+    searchTitle,
+    year,
+    seasonEpisode,
+    resolution,
+    badges: badges.slice(0, 4),
+    isFolder,
+  };
+};
+
 const FocusableButton = ({
   style,
   focusedStyle,
   onPress,
   children,
   hasTVPreferredFocus,
-  activeOpacity = 0.8,
+  activeOpacity = 0.85,
   ...rest
 }: any) => {
   const [isFocused, setIsFocused] = useState(false);
@@ -107,6 +220,17 @@ const App = () => {
   const [pathStack, setPathStack] = useState(['/0:/']);
   const [currentPath, setCurrentPath] = useState('/0:/');
   const [searchQuery, setSearchQuery] = useState('');
+  const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
+
+  const [metadataMap, setMetadataMap] = useState<Record<string, MediaMetadata>>(
+    {},
+  );
+  const [savedTimesMap, setSavedTimesMap] = useState<Record<string, number>>(
+    {},
+  );
+  const [tmdbKey, setTmdbKey] = useState(DEFAULT_TMDB_API_KEY);
+  const [showKeyModal, setShowKeyModal] = useState(false);
+  const [tempKeyInput, setTempKeyInput] = useState('');
 
   const [selectedFile, setSelectedFile] = useState<any>(null);
   const [playMode, setPlayMode] = useState<string | null>(null);
@@ -127,6 +251,7 @@ const App = () => {
   const switchingEpisode = useRef(false);
   const isLoggedIn = useRef(false);
   const lastSavedSec = useRef(-1);
+  const fetchedKeysRef = useRef<Set<string>>(new Set());
 
   const [audioTracks, setAudioTracks] = useState<any[]>([]);
   const [textTracks, setTextTracks] = useState<any[]>([]);
@@ -194,6 +319,12 @@ const App = () => {
     if (IS_TV) {
       Orientation.lockToLandscape();
     }
+    AsyncStorage.getItem('gdstream_tmdb_key').then(savedKey => {
+      if (savedKey) {
+        setTmdbKey(savedKey);
+        setTempKeyInput(savedKey);
+      }
+    });
     fetchDirectory('/0:/');
   }, []);
 
@@ -208,6 +339,10 @@ const App = () => {
 
   useEffect(() => {
     const backAction = () => {
+      if (showKeyModal) {
+        setShowKeyModal(false);
+        return true;
+      }
       if (playMode === 'internal') {
         if (activeMenu) {
           setActiveMenu(null);
@@ -229,7 +364,160 @@ const App = () => {
       backAction,
     );
     return () => backHandler.remove();
-  }, [playMode, selectedFile, pathStack, activeMenu]);
+  }, [playMode, selectedFile, pathStack, activeMenu, showKeyModal]);
+
+  const loadSavedTimesForFiles = useCallback(async (items: any[]) => {
+    try {
+      const keys = items.map(f => `time_${f.name}`);
+      const pairs = await AsyncStorage.multiGet(keys);
+      const nextMap: Record<string, number> = {};
+      pairs.forEach(([k, val]) => {
+        if (val) {
+          const parsed = parseFloat(val);
+          if (parsed > 5) {
+            nextMap[k.replace(/^time_/, '')] = parsed;
+          }
+        }
+      });
+      setSavedTimesMap(prev => ({ ...prev, ...nextMap }));
+    } catch {}
+  }, []);
+
+  const fetchSingleMetadata = useCallback(
+    async (info: ParsedMediaInfo, activeTmdbKey: string): Promise<MediaMetadata | null> => {
+      const cacheKey = `meta_v3_${info.searchTitle.toLowerCase()}_${info.year}_${activeTmdbKey ? 'tmdb' : 'imdb'}`;
+      try {
+        const cached = await AsyncStorage.getItem(cacheKey);
+        if (cached) {
+          return JSON.parse(cached);
+        }
+      } catch {}
+
+      // 1. Try TMDb API if key is configured
+      if (activeTmdbKey && activeTmdbKey.trim().length >= 20) {
+        try {
+          const key = activeTmdbKey.trim();
+          const endpoint = info.seasonEpisode ? 'tv' : 'multi';
+          const url = `https://api.themoviedb.org/3/search/${endpoint}?api_key=${encodeURIComponent(
+            key,
+          )}&query=${encodeURIComponent(info.searchTitle)}${
+            info.year && endpoint === 'movie' ? `&year=${info.year}` : ''
+          }`;
+          const res = await axios.get(url, { timeout: 6000 });
+          const results = res.data?.results || [];
+          const match =
+            results.find((r: any) => {
+              const rYear = (r.release_date || r.first_air_date || '').slice(0, 4);
+              return info.year ? rYear === info.year : r.poster_path;
+            }) || results.find((r: any) => r.poster_path) || results[0];
+
+          if (match) {
+            const meta: MediaMetadata = {
+              poster: match.poster_path
+                ? `https://image.tmdb.org/t/p/w500${match.poster_path}`
+                : undefined,
+              backdrop: match.backdrop_path
+                ? `https://image.tmdb.org/t/p/w780${match.backdrop_path}`
+                : undefined,
+              rating:
+                match.vote_average && match.vote_average > 0
+                  ? Number(match.vote_average).toFixed(1)
+                  : undefined,
+              overview: match.overview || undefined,
+              year:
+                (match.release_date || match.first_air_date || '').slice(0, 4) ||
+                info.year,
+            };
+            if (meta.poster || meta.overview) {
+              await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
+              return meta;
+            }
+          }
+        } catch {}
+      }
+
+      // 2. Zero-Key Instant Fallback: IMDb Public Suggestion API
+      try {
+        const query = `${info.searchTitle} ${info.year}`.trim();
+        const cleanQ = query.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+        const firstChar = cleanQ.charAt(0) || 'a';
+        const imdbUrl = `https://v3.sg.media-imdb.com/suggestion/${firstChar}/${encodeURIComponent(
+          cleanQ.slice(0, 35),
+        )}.json`;
+        const res = await axios.get(imdbUrl, { timeout: 6000 });
+        const list: any[] = res.data?.d || [];
+        const validItems = list.filter((item: any) => item?.i?.imageUrl);
+        const match =
+          validItems.find(
+            (item: any) =>
+              info.year && String(item.y) === String(info.year),
+          ) ||
+          validItems[0];
+
+        if (match && match.i?.imageUrl) {
+          const rawImg: string = match.i.imageUrl;
+          const poster = rawImg.replace(
+            /\._V1_.*\.jpg$/i,
+            '._V1_QL75_UX500_.jpg',
+          );
+          const backdrop = rawImg.replace(
+            /\._V1_.*\.jpg$/i,
+            '._V1_QL75_UX1000_.jpg',
+          );
+          const meta: MediaMetadata = {
+            poster,
+            backdrop,
+            year: match.y ? String(match.y) : info.year,
+            cast: match.s || undefined,
+            overview: match.s
+              ? `${match.q ? `${match.q.toUpperCase()} • ` : ''}Starring: ${match.s}`
+              : undefined,
+          };
+          await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
+          return meta;
+        }
+      } catch {}
+
+      return null;
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!files.length) return;
+    let cancelled = false;
+
+    const enrichAll = async () => {
+      loadSavedTimesForFiles(files);
+      for (const item of files) {
+        if (cancelled) break;
+        const itemKey = item.name;
+        const cacheCheckKey = `${itemKey}_${tmdbKey}`;
+        if (fetchedKeysRef.current.has(cacheCheckKey)) continue;
+        fetchedKeysRef.current.add(cacheCheckKey);
+
+        const isFolder = !!item.mimeType?.includes('folder');
+        const info = parseMediaFilename(item.name, isFolder);
+        const meta = await fetchSingleMetadata(info, tmdbKey);
+        if (meta && !cancelled) {
+          setMetadataMap(prev => ({ ...prev, [itemKey]: meta }));
+        }
+      }
+    };
+
+    enrichAll();
+    return () => {
+      cancelled = true;
+    };
+  }, [files, tmdbKey, fetchSingleMetadata, loadSavedTimesForFiles]);
+
+  const saveTmdbKey = async () => {
+    const cleaned = tempKeyInput.trim();
+    setTmdbKey(cleaned);
+    fetchedKeysRef.current.clear();
+    await AsyncStorage.setItem('gdstream_tmdb_key', cleaned);
+    setShowKeyModal(false);
+  };
 
   const seekBothPlayers = useCallback(
     (targetTime: number) => {
@@ -285,23 +573,19 @@ const App = () => {
     [currentTime, duration, fadeAnim, seekBothPlayers],
   );
 
-  // Android TV Remote Key Handler during Video Playback
   useEffect(() => {
     if (playMode !== 'internal') return;
 
     const sub = DeviceEventEmitter.addListener('onTVRemoteKey', event => {
       const keyCode = event?.keyCode;
-      // Media Play/Pause (85), Media Play (126), Media Pause (127)
       if (keyCode === 85 || keyCode === 126 || keyCode === 127) {
         setIsPaused(p => !p);
         return;
       }
-      // Media Rewind (89)
       if (keyCode === 89) {
         triggerStepSeek(false);
         return;
       }
-      // Media Fast Forward (90)
       if (keyCode === 90) {
         triggerStepSeek(true);
         return;
@@ -309,13 +593,10 @@ const App = () => {
 
       if (activeMenu) return;
 
-      // When controls are hidden on TV, D-Pad controls playback directly
       if (!showControls) {
         if (keyCode === 21) {
-          // DPAD_LEFT
           triggerStepSeek(false);
         } else if (keyCode === 22) {
-          // DPAD_RIGHT
           triggerStepSeek(true);
         } else if (
           keyCode === 23 ||
@@ -323,7 +604,6 @@ const App = () => {
           keyCode === 19 ||
           keyCode === 20
         ) {
-          // DPAD_CENTER, ENTER, UP, DOWN -> Show controls
           setShowControls(true);
         }
       }
@@ -409,9 +689,17 @@ const App = () => {
 
   const handleSearch = (text: string) => {
     setSearchQuery(text);
-    const filtered = files.filter(file =>
-      file.name.toLowerCase().includes(text.toLowerCase()),
-    );
+    const q = text.toLowerCase();
+    const filtered = files.filter(file => {
+      const info = parseMediaFilename(
+        file.name,
+        !!file.mimeType?.includes('folder'),
+      );
+      return (
+        file.name.toLowerCase().includes(q) ||
+        info.cleanTitle.toLowerCase().includes(q)
+      );
+    });
     setFilteredFiles(filtered);
   };
 
@@ -446,7 +734,7 @@ const App = () => {
     }
     setActiveMenu(null);
     setPlayMode(null);
-    setSelectedFile(null);
+    loadSavedTimesForFiles(files);
   };
 
   const handleZoomToggle = () => {
@@ -558,6 +846,7 @@ const App = () => {
       }
     }
     closeInternalPlayer();
+    setSelectedFile(null);
   };
 
   const renderFloatingMenu = () => {
@@ -795,6 +1084,7 @@ const App = () => {
     );
   };
 
+  // 🔥 1. INTERNAL VIDEO PLAYER SCREEN 🔥
   if (selectedFile && playMode === 'internal') {
     const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
     return (
@@ -1075,160 +1365,837 @@ const App = () => {
     );
   }
 
+  // 🔥 2. NETFLIX-STYLE MOVIE DETAIL SCREEN 🔥
   if (selectedFile && playMode === null) {
+    const info = parseMediaFilename(selectedFile.name, false);
+    const meta = metadataMap[selectedFile.name];
+    const savedSec = savedTimesMap[selectedFile.name] || 0;
+    const bannerImage = meta?.backdrop || meta?.poster;
+
     return (
-      <View style={styles.selectionContainer}>
-        <Text style={styles.selectionTitle}>{selectedFile.name}</Text>
-        <FocusableButton
-          hasTVPreferredFocus={true}
-          style={styles.primaryButton}
-          onPress={() => setPlayMode('internal')}>
-          <Text style={styles.buttonText}>Play in App (Exo Player) 🍿</Text>
-        </FocusableButton>
-        <FocusableButton
-          style={styles.secondaryButton}
-          onPress={openInExternalPlayer}>
-          <Text style={styles.buttonText}>Play in External Player 🎦</Text>
-        </FocusableButton>
-        <FocusableButton
-          style={styles.backTextButton}
-          onPress={() => setSelectedFile(null)}>
-          <Text style={{ color: '#CCC' }}>Back</Text>
-        </FocusableButton>
-      </View>
+      <ScrollView
+        style={styles.detailScreen}
+        contentContainerStyle={{ paddingBottom: 40 }}>
+        <View style={styles.detailHero}>
+          {bannerImage ? (
+            <Image
+              source={{ uri: bannerImage }}
+              style={styles.detailBackdrop}
+              resizeMode="cover"
+            />
+          ) : (
+            <View style={styles.detailBackdropPlaceholder}>
+              <Text style={styles.placeholderMonogram}>
+                {info.cleanTitle.charAt(0).toUpperCase()}
+              </Text>
+            </View>
+          )}
+          <View style={styles.detailHeroShade} />
+
+          <FocusableButton
+            style={styles.detailBackTopBtn}
+            onPress={() => setSelectedFile(null)}>
+            <Icon name="arrow-back" size={24} color="white" />
+          </FocusableButton>
+        </View>
+
+        <View style={styles.detailContent}>
+          <View style={styles.detailHeaderRow}>
+            {meta?.poster ? (
+              <Image
+                source={{ uri: meta.poster }}
+                style={styles.detailPosterThumb}
+                resizeMode="cover"
+              />
+            ) : null}
+
+            <View style={{ flex: 1 }}>
+              <Text style={styles.detailTitle}>{info.cleanTitle}</Text>
+              <View style={styles.detailMetaRow}>
+                {!!(meta?.year || info.year) && (
+                  <Text style={styles.detailYearText}>
+                    {meta?.year || info.year}
+                  </Text>
+                )}
+                {!!info.seasonEpisode && (
+                  <View style={styles.seasonBadge}>
+                    <Text style={styles.seasonBadgeText}>
+                      {info.seasonEpisode}
+                    </Text>
+                  </View>
+                )}
+                {!!meta?.rating && (
+                  <View style={styles.ratingBadge}>
+                    <Text style={styles.ratingBadgeText}>★ {meta.rating}</Text>
+                  </View>
+                )}
+                {!!info.resolution && (
+                  <View style={styles.qualityBadge}>
+                    <Text style={styles.qualityBadgeText}>
+                      {info.resolution}
+                    </Text>
+                  </View>
+                )}
+              </View>
+
+              {info.badges.length > 0 && (
+                <View style={styles.badgeWrapRow}>
+                  {info.badges.map((b, idx) => (
+                    <View key={idx} style={styles.techChip}>
+                      <Text style={styles.techChipText}>{b}</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+            </View>
+          </View>
+
+          {!!meta?.overview && (
+            <Text style={styles.detailOverview}>{meta.overview}</Text>
+          )}
+
+          <View style={styles.detailActionButtons}>
+            <FocusableButton
+              hasTVPreferredFocus={true}
+              style={styles.primaryPlayButton}
+              onPress={() => setPlayMode('internal')}>
+              <Icon name="play-arrow" size={26} color="white" />
+              <Text style={styles.primaryPlayButtonText}>
+                {savedSec > 10
+                  ? `Resume Play (${formatTime(savedSec)})`
+                  : 'Play in App (ExoPlayer)'}
+              </Text>
+            </FocusableButton>
+
+            <FocusableButton
+              style={styles.secondaryPlayButton}
+              onPress={openInExternalPlayer}>
+              <Icon name="open-in-new" size={20} color="white" />
+              <Text style={styles.secondaryPlayButtonText}>
+                Open in External Player
+              </Text>
+            </FocusableButton>
+          </View>
+
+          <View style={styles.rawFileBox}>
+            <Text style={styles.rawFileLabel}>SOURCE FILE</Text>
+            <Text style={styles.rawFileName}>{selectedFile.name}</Text>
+          </View>
+        </View>
+      </ScrollView>
     );
   }
 
+  // 🔥 3. POSTER CATALOG HOME SCREEN 🔥
+  const numColumns = viewMode === 'grid' ? (IS_TV ? 5 : 2) : 1;
+
   return (
     <View style={styles.container}>
-      <Text style={styles.headerTitle}>GDStream 🍿</Text>
-      <TextInput
-        style={styles.searchBar}
-        placeholder="Search movies / episodes..."
-        placeholderTextColor="#888"
-        value={searchQuery}
-        onChangeText={handleSearch}
-      />
+      <View style={styles.topHeaderBar}>
+        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <View style={styles.logoMark}>
+            <Text style={styles.logoMarkText}>G</Text>
+          </View>
+          <Text style={styles.headerTitle}>GDStream</Text>
+        </View>
+
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          <FocusableButton
+            style={styles.headerIconBtn}
+            onPress={() =>
+              setViewMode(prev => (prev === 'grid' ? 'list' : 'grid'))
+            }>
+            <Icon
+              name={viewMode === 'grid' ? 'view-list' : 'grid-view'}
+              size={22}
+              color="white"
+            />
+          </FocusableButton>
+          <FocusableButton
+            style={styles.headerIconBtn}
+            onPress={() => {
+              setTempKeyInput(tmdbKey);
+              setShowKeyModal(true);
+            }}>
+            <Icon
+              name="vpn-key"
+              size={20}
+              color={tmdbKey ? '#46d369' : '#AAA'}
+            />
+          </FocusableButton>
+        </View>
+      </View>
+
+      <View style={styles.searchRow}>
+        <Icon
+          name="search"
+          size={20}
+          color="#888"
+          style={{ marginLeft: 12 }}
+        />
+        <TextInput
+          style={styles.searchBarInput}
+          placeholder="Search movies, series, 4K, Tamil..."
+          placeholderTextColor="#777"
+          value={searchQuery}
+          onChangeText={handleSearch}
+        />
+        {!!searchQuery && (
+          <TouchableOpacity
+            onPress={() => handleSearch('')}
+            style={{ padding: 8 }}>
+            <Icon name="close" size={18} color="#AAA" />
+          </TouchableOpacity>
+        )}
+      </View>
+
       {pathStack.length > 1 && (
-        <FocusableButton style={styles.backButton} onPress={goBack}>
-          <Text style={{ color: 'white' }}>⬅️ Back</Text>
+        <FocusableButton style={styles.backFolderBar} onPress={goBack}>
+          <Icon name="arrow-back" size={18} color="white" />
+          <Text style={styles.backFolderText} numberOfLines={1}>
+            Back • {decodeURIComponent(currentPath)}
+          </Text>
         </FocusableButton>
       )}
+
       {loading ? (
         <ActivityIndicator
           size="large"
           color="#E50914"
-          style={{ marginTop: 50 }}
+          style={{ marginTop: 60 }}
         />
       ) : (
         <FlatList
+          key={`catalog-${viewMode}-${numColumns}`}
           data={filteredFiles}
+          numColumns={numColumns}
+          contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
           keyExtractor={(item, idx) => item.id || item.name || String(idx)}
-          renderItem={({ item, index }) => (
-            <FocusableButton
-              hasTVPreferredFocus={index === 0}
-              style={styles.itemCard}
-              onPress={() => handlePress(item)}>
-              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                <Text style={{ fontSize: 24, marginRight: 10 }}>
-                  {item.mimeType?.includes('folder') ? '📁' : '🎬'}
-                </Text>
-                <Text style={styles.itemText} numberOfLines={2}>
-                  {item.name}
-                </Text>
-              </View>
-            </FocusableButton>
-          )}
+          renderItem={({ item, index }) => {
+            const isFolder = !!item.mimeType?.includes('folder');
+            const info = parseMediaFilename(item.name, isFolder);
+            const meta = metadataMap[item.name];
+            const savedSec = savedTimesMap[item.name] || 0;
+
+            if (viewMode === 'list') {
+              return (
+                <FocusableButton
+                  hasTVPreferredFocus={index === 0}
+                  style={styles.listCard}
+                  onPress={() => handlePress(item)}>
+                  {meta?.poster ? (
+                    <Image
+                      source={{ uri: meta.poster }}
+                      style={styles.listPosterThumb}
+                      resizeMode="cover"
+                    />
+                  ) : (
+                    <View style={styles.listPosterFallback}>
+                      <Icon
+                        name={isFolder ? 'folder' : 'movie'}
+                        size={26}
+                        color={isFolder ? '#F5C518' : '#E50914'}
+                      />
+                    </View>
+                  )}
+                  <View style={styles.listCardBody}>
+                    <Text style={styles.listCardTitle} numberOfLines={1}>
+                      {info.cleanTitle}
+                    </Text>
+                    <View style={styles.listCardMetaRow}>
+                      {!!(meta?.year || info.year) && (
+                        <Text style={styles.cardSubText}>
+                          {meta?.year || info.year}
+                        </Text>
+                      )}
+                      {!!info.seasonEpisode && (
+                        <Text style={styles.cardSeasonTag}>
+                          {info.seasonEpisode}
+                        </Text>
+                      )}
+                      {!!info.resolution && (
+                        <Text style={styles.cardQualityTag}>
+                          {info.resolution}
+                        </Text>
+                      )}
+                      {info.badges.slice(0, 2).map((b, i) => (
+                        <Text key={i} style={styles.cardBadgeMini}>
+                          {b}
+                        </Text>
+                      ))}
+                    </View>
+                  </View>
+                </FocusableButton>
+              );
+            }
+
+            return (
+              <FocusableButton
+                hasTVPreferredFocus={index === 0}
+                style={styles.posterCard}
+                onPress={() => handlePress(item)}>
+                <View style={styles.posterImageContainer}>
+                  {meta?.poster ? (
+                    <Image
+                      source={{ uri: meta.poster }}
+                      style={styles.posterImage}
+                      resizeMode="cover"
+                    />
+                  ) : (
+                    <View style={styles.posterFallback}>
+                      <Icon
+                        name={isFolder ? 'folder-special' : 'local-movies'}
+                        size={38}
+                        color={isFolder ? '#F5C518' : '#E50914'}
+                      />
+                      <Text
+                        style={styles.posterFallbackTitle}
+                        numberOfLines={3}>
+                        {info.cleanTitle}
+                      </Text>
+                    </View>
+                  )}
+
+                  <View style={styles.posterTopBadges}>
+                    {isFolder ? (
+                      <View style={styles.folderPill}>
+                        <Text style={styles.folderPillText}>
+                          {info.seasonEpisode || 'SERIES'}
+                        </Text>
+                      </View>
+                    ) : info.seasonEpisode ? (
+                      <View style={styles.folderPill}>
+                        <Text style={styles.folderPillText}>
+                          {info.seasonEpisode}
+                        </Text>
+                      </View>
+                    ) : meta?.rating ? (
+                      <View style={styles.ratingPill}>
+                        <Text style={styles.ratingPillText}>
+                          ★ {meta.rating}
+                        </Text>
+                      </View>
+                    ) : (
+                      <View />
+                    )}
+
+                    {!!info.resolution && (
+                      <View
+                        style={[
+                          styles.resPill,
+                          info.resolution === '4K' && styles.resPill4K,
+                        ]}>
+                        <Text style={styles.resPillText}>
+                          {info.resolution}
+                        </Text>
+                      </View>
+                    )}
+                  </View>
+
+                  {savedSec > 10 && (
+                    <View style={styles.resumeBarBg}>
+                      <View style={styles.resumeBarFill} />
+                    </View>
+                  )}
+                </View>
+
+                <View style={styles.posterCardFooter}>
+                  <Text style={styles.posterTitle} numberOfLines={1}>
+                    {info.cleanTitle}
+                  </Text>
+                  <View style={styles.posterSubRow}>
+                    <Text style={styles.posterYear}>
+                      {meta?.year || info.year || (isFolder ? 'Folder' : 'Movie')}
+                    </Text>
+                    {info.badges.slice(0, 2).map((b, idx) => (
+                      <Text key={idx} style={styles.posterMiniTag}>
+                        • {b}
+                      </Text>
+                    ))}
+                  </View>
+                </View>
+              </FocusableButton>
+            );
+          }}
         />
       )}
+
+      <Modal
+        visible={showKeyModal}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setShowKeyModal(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>TMDb API Key (Optional)</Text>
+            <Text style={styles.modalSub}>
+              Posters work automatically out of the box! Add a 32-character TMDb
+              API key if you also want 16:9 backdrops, ratings & movie plots.
+            </Text>
+            <TextInput
+              style={styles.modalInput}
+              placeholder="Paste TMDb API key..."
+              placeholderTextColor="#666"
+              value={tempKeyInput}
+              onChangeText={setTempKeyInput}
+              autoCapitalize="none"
+            />
+            <View style={styles.modalBtnRow}>
+              <TouchableOpacity
+                style={styles.modalCancelBtn}
+                onPress={() => setShowKeyModal(false)}>
+                <Text style={{ color: '#CCC' }}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalSaveBtn}
+                onPress={saveTmdbKey}>
+                <Text style={{ color: 'white', fontWeight: 'bold' }}>Save</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 };
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#141414', paddingTop: 40 },
+  container: { flex: 1, backgroundColor: '#0B0C10', paddingTop: 38 },
+  topHeaderBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    marginBottom: 12,
+  },
+  logoMark: {
+    width: 30,
+    height: 30,
+    borderRadius: 7,
+    backgroundColor: '#E50914',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 9,
+  },
+  logoMarkText: { color: 'white', fontSize: 18, fontWeight: '900' },
   headerTitle: {
-    color: '#E50914',
-    fontSize: 24,
-    fontWeight: 'bold',
-    textAlign: 'center',
-    marginBottom: 10,
+    color: '#FFFFFF',
+    fontSize: 22,
+    fontWeight: '800',
+    letterSpacing: 0.4,
   },
-  searchBar: {
-    backgroundColor: '#222',
+  headerIconBtn: {
+    padding: 8,
+    borderRadius: 8,
+    backgroundColor: '#1A1D24',
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  searchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#161920',
+    marginHorizontal: 14,
+    marginBottom: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#262B36',
+  },
+  searchBarInput: {
+    flex: 1,
     color: 'white',
-    marginHorizontal: 15,
-    marginBottom: 15,
-    padding: 12,
-    borderRadius: 8,
-    borderWidth: 2,
-    borderColor: 'transparent',
+    paddingVertical: 11,
+    paddingHorizontal: 10,
+    fontSize: 15,
   },
-  backButton: {
-    backgroundColor: '#333',
-    padding: 10,
-    marginHorizontal: 15,
+  backFolderBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#181C24',
+    paddingVertical: 9,
+    paddingHorizontal: 14,
+    marginHorizontal: 14,
     borderRadius: 8,
     marginBottom: 10,
+    gap: 8,
     borderWidth: 2,
     borderColor: 'transparent',
   },
-  itemCard: {
-    backgroundColor: '#222',
-    padding: 18,
-    marginVertical: 5,
-    marginHorizontal: 15,
-    borderRadius: 8,
+  backFolderText: { color: '#DDD', fontSize: 13, fontWeight: '600', flex: 1 },
+  posterCard: {
+    flex: 1,
+    margin: 6,
+    backgroundColor: '#14171F',
+    borderRadius: 12,
+    overflow: 'hidden',
     borderWidth: 2,
-    borderColor: 'transparent',
+    borderColor: '#1F2430',
+  },
+  posterImageContainer: {
+    width: '100%',
+    aspectRatio: 2 / 3,
+    backgroundColor: '#191D26',
+    position: 'relative',
+  },
+  posterImage: { width: '100%', height: '100%' },
+  posterFallback: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 14,
+    backgroundColor: '#171B24',
+  },
+  posterFallbackTitle: {
+    color: '#D5DCE6',
+    fontSize: 14,
+    fontWeight: '700',
+    textAlign: 'center',
+    marginTop: 10,
+  },
+  posterTopBadges: {
+    position: 'absolute',
+    top: 8,
+    left: 8,
+    right: 8,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  folderPill: {
+    backgroundColor: 'rgba(245, 197, 24, 0.92)',
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 5,
+  },
+  folderPillText: { color: '#000', fontSize: 10, fontWeight: '900' },
+  ratingPill: {
+    backgroundColor: 'rgba(0, 0, 0, 0.78)',
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 5,
+    borderWidth: 1,
+    borderColor: 'rgba(245, 197, 24, 0.45)',
+  },
+  ratingPillText: { color: '#F5C518', fontSize: 10, fontWeight: '800' },
+  resPill: {
+    backgroundColor: 'rgba(15, 20, 28, 0.85)',
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    borderRadius: 5,
+    borderWidth: 1,
+    borderColor: '#3A4454',
+  },
+  resPill4K: {
+    backgroundColor: '#E50914',
+    borderColor: '#FF4B55',
+  },
+  resPillText: { color: '#FFF', fontSize: 10, fontWeight: '900' },
+  resumeBarBg: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    height: 4,
+    backgroundColor: 'rgba(255,255,255,0.25)',
+  },
+  resumeBarFill: {
+    width: '45%',
+    height: '100%',
+    backgroundColor: '#E50914',
+  },
+  posterCardFooter: {
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+  },
+  posterTitle: {
+    color: '#F2F5F8',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  posterSubRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    marginTop: 3,
+    gap: 4,
+  },
+  posterYear: { color: '#8A94A6', fontSize: 11, fontWeight: '600' },
+  posterMiniTag: { color: '#A5B0C2', fontSize: 11 },
+  listCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#14171F',
+    marginHorizontal: 6,
+    marginVertical: 5,
+    padding: 10,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: '#1F2430',
+  },
+  listPosterThumb: {
+    width: 52,
+    height: 76,
+    borderRadius: 6,
+    backgroundColor: '#1E222B',
+  },
+  listPosterFallback: {
+    width: 52,
+    height: 76,
+    borderRadius: 6,
+    backgroundColor: '#1E222B',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  listCardBody: { flex: 1, marginLeft: 12 },
+  listCardTitle: { color: '#FFF', fontSize: 16, fontWeight: '700' },
+  listCardMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 6,
+  },
+  cardSubText: { color: '#99A3B3', fontSize: 12, fontWeight: '600' },
+  cardSeasonTag: {
+    backgroundColor: '#293242',
+    color: '#FFD166',
+    fontSize: 11,
+    fontWeight: '700',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  cardQualityTag: {
+    backgroundColor: '#E50914',
+    color: '#FFF',
+    fontSize: 11,
+    fontWeight: '800',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  cardBadgeMini: {
+    backgroundColor: '#1F2531',
+    color: '#C2CBD8',
+    fontSize: 11,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
   },
   tvFocused: {
     borderColor: '#E50914',
     borderWidth: 2,
-    backgroundColor: 'rgba(229, 9, 20, 0.25)',
+    backgroundColor: 'rgba(229, 9, 20, 0.22)',
   },
-  itemText: { color: '#FFF', fontSize: 16, flex: 1 },
-  selectionContainer: {
+  detailScreen: { flex: 1, backgroundColor: '#0B0C10' },
+  detailHero: {
+    width: '100%',
+    height: 240,
+    backgroundColor: '#141821',
+    position: 'relative',
+  },
+  detailBackdrop: { width: '100%', height: '100%' },
+  detailBackdropPlaceholder: {
     flex: 1,
-    backgroundColor: '#141414',
-    justifyContent: 'center',
     alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#181D29',
+  },
+  placeholderMonogram: {
+    color: 'rgba(229, 9, 20, 0.35)',
+    fontSize: 84,
+    fontWeight: '900',
+  },
+  detailHeroShade: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    top: 0,
+    backgroundColor: 'rgba(11, 12, 16, 0.45)',
+  },
+  detailBackTopBtn: {
+    position: 'absolute',
+    top: 40,
+    left: 16,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  detailContent: {
+    paddingHorizontal: 18,
+    marginTop: -36,
+  },
+  detailHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 14,
+  },
+  detailPosterThumb: {
+    width: 105,
+    height: 156,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: '#2A3140',
+    backgroundColor: '#161922',
+  },
+  detailTitle: {
+    color: '#FFFFFF',
+    fontSize: 22,
+    fontWeight: '800',
+    lineHeight: 28,
+  },
+  detailMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 8,
+  },
+  detailYearText: { color: '#B0BAC9', fontSize: 14, fontWeight: '700' },
+  seasonBadge: {
+    backgroundColor: '#F5C518',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 5,
+  },
+  seasonBadgeText: { color: '#000', fontSize: 12, fontWeight: '800' },
+  ratingBadge: {
+    backgroundColor: '#1E2533',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 5,
+    borderWidth: 1,
+    borderColor: '#F5C518',
+  },
+  ratingBadgeText: { color: '#F5C518', fontSize: 12, fontWeight: '800' },
+  qualityBadge: {
+    backgroundColor: '#E50914',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 5,
+  },
+  qualityBadgeText: { color: '#FFF', fontSize: 12, fontWeight: '900' },
+  badgeWrapRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 10,
+  },
+  techChip: {
+    backgroundColor: '#1A202C',
+    borderWidth: 1,
+    borderColor: '#2E3748',
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  techChipText: { color: '#D1D9E6', fontSize: 12, fontWeight: '600' },
+  detailOverview: {
+    color: '#C4CDD9',
+    fontSize: 14,
+    lineHeight: 21,
+    marginTop: 18,
+  },
+  detailActionButtons: {
+    marginTop: 22,
+    gap: 12,
+  },
+  primaryPlayButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#E50914',
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+    gap: 8,
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  primaryPlayButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  secondaryPlayButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#1E2430',
+    paddingVertical: 13,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+    gap: 8,
+    borderWidth: 2,
+    borderColor: '#2E3748',
+  },
+  secondaryPlayButtonText: {
+    color: '#E2E8F0',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  rawFileBox: {
+    marginTop: 24,
+    padding: 12,
+    borderRadius: 8,
+    backgroundColor: '#13161E',
+    borderWidth: 1,
+    borderColor: '#222834',
+  },
+  rawFileLabel: {
+    color: '#6C7789',
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 1,
+    marginBottom: 4,
+  },
+  rawFileName: { color: '#8F9BB0', fontSize: 12 },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.75)',
+    alignItems: 'center',
+    justifyContent: 'center',
     padding: 20,
   },
-  selectionTitle: {
-    color: '#FFF',
-    fontSize: 18,
-    textAlign: 'center',
-    marginBottom: 40,
+  modalCard: {
+    width: '100%',
+    maxWidth: 380,
+    backgroundColor: '#181C24',
+    borderRadius: 14,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#2D3545',
   },
-  primaryButton: {
+  modalTitle: { color: 'white', fontSize: 17, fontWeight: '800' },
+  modalSub: { color: '#9AA5B5', fontSize: 13, marginTop: 6, lineHeight: 18 },
+  modalInput: {
+    backgroundColor: '#0E1117',
+    color: 'white',
+    borderRadius: 8,
+    padding: 12,
+    marginTop: 14,
+    borderWidth: 1,
+    borderColor: '#2E3748',
+  },
+  modalBtnRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+    marginTop: 16,
+  },
+  modalCancelBtn: { paddingVertical: 10, paddingHorizontal: 16 },
+  modalSaveBtn: {
     backgroundColor: '#E50914',
-    padding: 15,
-    width: 260,
-    borderRadius: 8,
-    alignItems: 'center',
-    borderWidth: 2,
-    borderColor: 'transparent',
-  },
-  secondaryButton: {
-    backgroundColor: '#E06C00',
-    padding: 15,
-    width: 260,
-    borderRadius: 8,
-    marginTop: 15,
-    alignItems: 'center',
-    borderWidth: 2,
-    borderColor: 'transparent',
-  },
-  backTextButton: {
-    marginTop: 20,
     paddingVertical: 10,
-    paddingHorizontal: 24,
+    paddingHorizontal: 20,
     borderRadius: 8,
-    borderWidth: 2,
-    borderColor: 'transparent',
   },
-  buttonText: { color: '#FFF', fontWeight: 'bold' },
   playerWrapper: { flex: 1, backgroundColor: 'black' },
   videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
   externalSubtitleContainer: {
