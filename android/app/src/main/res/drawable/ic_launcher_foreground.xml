@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Red Rounded Badge -->
+    <path
+        android:fillColor="#E50914"
+        android:pathData="M34,24L74,24C79.5,24 84,28.5 84,34L84,74C84,79.5 79.5,84 74,84L34,84C28.5,84 24,79.5 24,74L24,34C24,28.5 28.5,24 34,24Z" />
+    <!-- White Play Triangle Emblem -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M44,38L44,70L70,54Z" />
+</vector>

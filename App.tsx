@@ -19,6 +19,7 @@ import {
   PanResponder,
   Dimensions,
   StatusBar,
+  RefreshControl,
 } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
@@ -146,8 +147,6 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
   };
 };
 
-// FocusableButton only enables TV focus rings when running on Android TV,
-// preventing phone TextInput from losing focus during search re-renders.
 const FocusableButton = ({
   style,
   focusedStyle,
@@ -225,6 +224,7 @@ const App = () => {
   const [files, setFiles] = useState<any[]>([]);
   const [filteredFiles, setFilteredFiles] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [pathStack, setPathStack] = useState(['/0:/']);
   const [currentPath, setCurrentPath] = useState('/0:/');
   const [searchQuery, setSearchQuery] = useState('');
@@ -360,10 +360,9 @@ const App = () => {
         })
         .catch(() => {});
     }
-    fetchDirectory('/0:/');
+    fetchDirectory('/0:/', false);
   }, []);
 
-  // Automatically enter landscape fullscreen when opening internal player on phone
   useEffect(() => {
     if (playMode === 'internal') {
       Orientation.lockToLandscape();
@@ -695,8 +694,12 @@ const App = () => {
     isLoggedIn.current = true;
   };
 
-  const fetchDirectory = async (path: string) => {
-    setLoading(true);
+  const fetchDirectory = async (path: string, isPullRefresh = false) => {
+    if (isPullRefresh) {
+      setRefreshing(true);
+    } else {
+      setLoading(true);
+    }
     try {
       await ensureLoggedIn(false);
       let response = await axios.post(`${BASE_URL}${path}`, { page_index: 0 });
@@ -705,17 +708,41 @@ const App = () => {
         response = await axios.post(`${BASE_URL}${path}`, { page_index: 0 });
       }
       if (response.data?.data?.files) {
-        setFiles(response.data.data.files);
-        setFilteredFiles(response.data.data.files);
+        const incomingFiles = response.data.data.files;
+        setFiles(incomingFiles);
+        if (searchQuery.trim()) {
+          const q = searchQuery.toLowerCase();
+          setFilteredFiles(
+            incomingFiles.filter((file: any) => {
+              const info = parseMediaFilename(
+                file.name,
+                !!file.mimeType?.includes('folder'),
+              );
+              return (
+                file.name.toLowerCase().includes(q) ||
+                info.cleanTitle.toLowerCase().includes(q)
+              );
+            }),
+          );
+        } else {
+          setFilteredFiles(incomingFiles);
+        }
         setCurrentPath(path);
-        setSearchQuery('');
+        if (!isPullRefresh) {
+          setSearchQuery('');
+        }
       }
     } catch (error) {
       Alert.alert('Error', 'Folder load aagala!');
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   };
+
+  const handleRefresh = useCallback(() => {
+    fetchDirectory(currentPath, true);
+  }, [currentPath, searchQuery]);
 
   const getStreamUrl = (file: any) => {
     if (!file) return '';
@@ -748,7 +775,7 @@ const App = () => {
     if (item.mimeType?.includes('folder')) {
       const newPath = `${currentPath}${encodeURIComponent(item.name)}/`;
       setPathStack([...pathStack, newPath]);
-      fetchDirectory(newPath);
+      fetchDirectory(newPath, false);
     } else {
       openFile(item);
     }
@@ -758,7 +785,7 @@ const App = () => {
     if (pathStack.length > 1) {
       const newStack = pathStack.slice(0, -1);
       setPathStack(newStack);
-      fetchDirectory(newStack[newStack.length - 1]);
+      fetchDirectory(newStack[newStack.length - 1], false);
     }
   };
 
@@ -897,7 +924,7 @@ const App = () => {
     [isLocked, triggerStepSeek],
   );
 
-  // Gesture Responder: Left Vertical Swipe = Brightness, Right Vertical Swipe = Volume, Tap = Seek/Toggle
+  // Gesture Responder: Left Vertical Swipe = Brightness (Left HUD), Right Vertical Swipe = Volume (Right HUD)
   const gestureStartRef = useRef({
     side: 'left' as 'left' | 'right',
     startVal: 0.5,
@@ -1404,7 +1431,6 @@ const App = () => {
           </View>
         )}
 
-        {/* Touch & Swipe Surface (Left Swipe = Brightness, Right Swipe = Volume, Double Tap = 10s Seek) */}
         {!IS_TV && (
           <View
             style={StyleSheet.absoluteFill}
@@ -1412,9 +1438,16 @@ const App = () => {
           />
         )}
 
-        {/* Vertical Brightness / Volume Indicator Pill */}
+        {/* Left Side Brightness HUD & Right Side Volume HUD */}
         {gestureIndicator.visible && (
-          <View style={styles.gestureHudContainer} pointerEvents="none">
+          <View
+            style={[
+              styles.gestureHudContainer,
+              gestureIndicator.type === 'brightness'
+                ? styles.gestureHudLeft
+                : styles.gestureHudRight,
+            ]}
+            pointerEvents="none">
             <View style={styles.gestureHudPill}>
               <Icon
                 name={
@@ -1442,7 +1475,6 @@ const App = () => {
           </View>
         )}
 
-        {/* Double-Tap Seek Ripple Overlay */}
         <Animated.View
           style={[
             styles.seekOverlay,
@@ -1469,7 +1501,6 @@ const App = () => {
           </View>
         </Animated.View>
 
-        {/* Locked Screen Minimal Overlay */}
         {showControls && isLocked && (
           <View style={styles.lockedOverlay} pointerEvents="box-none">
             <FocusableButton
@@ -1481,10 +1512,8 @@ const App = () => {
           </View>
         )}
 
-        {/* NETFLIX PLAYER CONTROLS OVERLAY */}
         {showControls && !isLocked && (
           <View style={styles.controlsOverlay} pointerEvents="box-none">
-            {/* Top Bar */}
             <View style={styles.netflixTopBar}>
               <FocusableButton
                 style={styles.netflixCircleBtn}
@@ -1541,7 +1570,6 @@ const App = () => {
               </View>
             </View>
 
-            {/* Center 3-Button Transport Controls */}
             <View style={styles.netflixCenterRow} pointerEvents="box-none">
               <FocusableButton
                 style={styles.netflixSeekCircleBtn}
@@ -1554,7 +1582,7 @@ const App = () => {
                 onPress={() => setIsPaused(!isPaused)}
                 style={styles.netflixMainPlayBtn}>
                 {isVideoBuffering ? (
-                  <ActivityIndicator size="large" color="#E50914" />
+                  <ActivityIndicator size="large" color="#FFFFFF" />
                 ) : (
                   <Icon
                     name={isPaused ? 'play-arrow' : 'pause'}
@@ -1571,7 +1599,6 @@ const App = () => {
               </FocusableButton>
             </View>
 
-            {/* Bottom Scrubber & Labeled Action Bar */}
             <View style={styles.netflixBottomContainer}>
               <View style={styles.netflixScrubberRow}>
                 <Text style={styles.netflixTimeLabel}>
@@ -1686,7 +1713,9 @@ const App = () => {
                     style={styles.netflixActionPill}>
                     <Icon
                       name={
-                        isFullscreen ? 'screen-lock-rotation' : 'StayCurrentLandscape'
+                        isFullscreen
+                          ? 'screen-lock-rotation'
+                          : 'screen-rotation'
                       }
                       size={20}
                       color="white"
@@ -1834,12 +1863,17 @@ const App = () => {
       <View style={styles.topHeaderBar}>
         <View style={{ flexDirection: 'row', alignItems: 'center' }}>
           <View style={styles.logoMark}>
-            <Text style={styles.logoMarkText}>G</Text>
+            <Text style={styles.logoMarkText}>▶</Text>
           </View>
           <Text style={styles.headerTitle}>GDStream</Text>
         </View>
 
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          <FocusableButton
+            style={styles.headerIconBtn}
+            onPress={handleRefresh}>
+            <Icon name="refresh" size={21} color="white" />
+          </FocusableButton>
           <FocusableButton
             style={styles.headerIconBtn}
             onPress={() =>
@@ -1913,6 +1947,15 @@ const App = () => {
           numColumns={numColumns}
           keyboardShouldPersistTaps="handled"
           removeClippedSubviews={false}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={handleRefresh}
+              tintColor="#E50914"
+              colors={['#E50914']}
+              progressBackgroundColor="#181C24"
+            />
+          }
           contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
           keyExtractor={(item, idx) => item.id || item.name || String(idx)}
           renderItem={({ item, index }) => {
@@ -2123,7 +2166,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginRight: 9,
   },
-  logoMarkText: { color: 'white', fontSize: 18, fontWeight: '900' },
+  logoMarkText: { color: 'white', fontSize: 15, fontWeight: '900' },
   headerTitle: {
     color: '#FFFFFF',
     fontSize: 22,
@@ -2568,13 +2611,20 @@ const styles = StyleSheet.create({
     bottom: 0,
     left: 0,
     right: 0,
-    alignItems: 'center',
     justifyContent: 'center',
   },
+  gestureHudLeft: {
+    alignItems: 'flex-start',
+    paddingLeft: 42,
+  },
+  gestureHudRight: {
+    alignItems: 'flex-end',
+    paddingRight: 42,
+  },
   gestureHudPill: {
-    width: 64,
-    paddingVertical: 16,
-    borderRadius: 32,
+    width: 60,
+    paddingVertical: 14,
+    borderRadius: 30,
     backgroundColor: 'rgba(15, 17, 23, 0.88)',
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.14)',
@@ -2584,7 +2634,7 @@ const styles = StyleSheet.create({
   },
   gestureBarTrack: {
     width: 7,
-    height: 110,
+    height: 105,
     backgroundColor: 'rgba(255,255,255,0.2)',
     borderRadius: 4,
     overflow: 'hidden',
