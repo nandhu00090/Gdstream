@@ -10,7 +10,8 @@ class VideoPlayerPackage : ReactPackage {
         return listOf(
             VideoPlayerModule(reactContext),
             SubtitleFileModule(reactContext),
-            DownloadEngineModule(reactContext)
+            DownloadEngineModule(reactContext),
+            MediaInfoModule(reactContext)
         )
     }
 

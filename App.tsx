@@ -27,7 +27,12 @@ import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const { VideoPlayerManager, SubtitleFileModule, DownloadEngine } = NativeModules;
+const {
+  VideoPlayerManager,
+  SubtitleFileModule,
+  DownloadEngine,
+  MediaInfoModule,
+} = NativeModules;
 const BASE_URL = 'https://movies-and-series.ambalartssb01.workers.dev';
 const USERNAME = 'admin';
 const PASSWORD = '629175';
@@ -56,6 +61,32 @@ interface MediaMetadata {
   overview?: string;
   year?: string;
   cast?: string;
+}
+
+interface RealMediaInfo {
+  width: number;
+  height: number;
+  resolution: string;
+  videoCodec: string;
+  frameRate: number;
+  durationSec: number;
+  totalBytes: number;
+  hasDV: boolean;
+  hasHDR: boolean;
+  dvProfile: number;
+  hasAtmos: boolean;
+  audioTracks: Array<{
+    language: string;
+    codec: string;
+    channels: string;
+    bitrateKbps: number;
+    summary: string;
+  }>;
+  subtitleTracks: Array<{
+    language: string;
+    format: string;
+  }>;
+  languages: string[];
 }
 
 interface DownloadItem {
@@ -87,6 +118,14 @@ const formatBytes = (bytes: number) => {
     idx++;
   }
   return `${val.toFixed(idx >= 3 ? 2 : 1)} ${units[idx]}`;
+};
+
+const formatRuntime = (seconds: number) => {
+  if (!seconds || seconds <= 0) return '';
+  const totalMin = Math.round(seconds / 60);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
 };
 
 const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => {
@@ -270,6 +309,10 @@ const App = () => {
   const [metadataMap, setMetadataMap] = useState<Record<string, MediaMetadata>>(
     {},
   );
+  const [mediaInfoMap, setMediaInfoMap] = useState<
+    Record<string, RealMediaInfo>
+  >({});
+  const [scanningMediaInfo, setScanningMediaInfo] = useState(false);
   const [savedTimesMap, setSavedTimesMap] = useState<Record<string, number>>(
     {},
   );
@@ -490,9 +533,13 @@ const App = () => {
   const loadSavedTimesForFiles = useCallback(async (items: any[]) => {
     try {
       const keys = items.map(f => `time_${f.name}`);
-      const pairs = await AsyncStorage.multiGet(keys);
+      const npKeys = items.map(f => `mediainfo_v2_${f.name}`);
+      const [timePairs, miPairs] = await Promise.all([
+        AsyncStorage.multiGet(keys),
+        AsyncStorage.multiGet(npKeys),
+      ]);
       const nextMap: Record<string, number> = {};
-      pairs.forEach(([k, val]) => {
+      timePairs.forEach(([k, val]) => {
         if (val) {
           const parsed = parseFloat(val);
           if (parsed > 5) {
@@ -501,6 +548,18 @@ const App = () => {
         }
       });
       setSavedTimesMap(prev => ({ ...prev, ...nextMap }));
+
+      const nextMiMap: Record<string, RealMediaInfo> = {};
+      miPairs.forEach(([k, val]) => {
+        if (val) {
+          try {
+            nextMiMap[k.replace(/^mediainfo_v2_/, '')] = JSON.parse(val);
+          } catch {}
+        }
+      });
+      if (Object.keys(nextMiMap).length > 0) {
+        setMediaInfoMap(prev => ({ ...prev, ...nextMiMap }));
+      }
     } catch {}
   }, []);
 
@@ -638,6 +697,76 @@ const App = () => {
       cancelled = true;
     };
   }, [files, fetchSingleMetadata, loadSavedTimesForFiles]);
+
+  const getStreamUrl = useCallback(
+    (file: any) => {
+      if (!file) return '';
+      if (file.localPath) {
+        return file.localPath.startsWith('file://')
+          ? file.localPath
+          : `file://${file.localPath}`;
+      }
+      const completedDl = downloads.find(
+        d => d.fileName === file.name && d.status === 'completed' && d.filePath,
+      );
+      if (completedDl) {
+        return `file://${completedDl.filePath}`;
+      }
+      if (file.link) {
+        return file.link.startsWith('http')
+          ? file.link
+          : `${BASE_URL}${file.link.startsWith('/') ? '' : '/'}${file.link}`;
+      }
+      return `${BASE_URL}${currentPath}${encodeURIComponent(file.name)}`;
+    },
+    [downloads, currentPath],
+  );
+
+  // 🔥 ON-DEMAND SINGLE-MOVIE MEDIAINFO SCANNER (Only runs when Detail Page opens!) 🔥
+  useEffect(() => {
+    if (!selectedFile || playMode !== null) return;
+    const fileName = selectedFile.name;
+    if (!fileName) return;
+
+    let cancelled = false;
+
+    const runOnDemandMediaInfo = async () => {
+      if (mediaInfoMap[fileName]) return;
+      const cacheKey = `mediainfo_v2_${fileName}`;
+      try {
+        const cached = await AsyncStorage.getItem(cacheKey);
+        if (cached) {
+          const parsed: RealMediaInfo = JSON.parse(cached);
+          if (!cancelled) {
+            setMediaInfoMap(prev => ({ ...prev, [fileName]: parsed }));
+          }
+          return;
+        }
+      } catch {}
+
+      if (!MediaInfoModule?.inspectMedia) return;
+      setScanningMediaInfo(true);
+      try {
+        const streamUrl = getStreamUrl(selectedFile);
+        const res: RealMediaInfo = await MediaInfoModule.inspectMedia(
+          streamUrl,
+          fileName,
+        );
+        if (res && !cancelled) {
+          setMediaInfoMap(prev => ({ ...prev, [fileName]: res }));
+          await AsyncStorage.setItem(cacheKey, JSON.stringify(res));
+        }
+      } catch {
+      } finally {
+        if (!cancelled) setScanningMediaInfo(false);
+      }
+    };
+
+    runOnDemandMediaInfo();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedFile, playMode, mediaInfoMap, getStreamUrl]);
 
   const seekBothPlayers = useCallback(
     (targetTime: number) => {
@@ -791,27 +920,6 @@ const App = () => {
     fetchDirectory(currentPath, true);
   }, [currentPath, searchQuery]);
 
-  const getStreamUrl = (file: any) => {
-    if (!file) return '';
-    if (file.localPath) {
-      return file.localPath.startsWith('file://')
-        ? file.localPath
-        : `file://${file.localPath}`;
-    }
-    const completedDl = downloads.find(
-      d => d.fileName === file.name && d.status === 'completed' && d.filePath,
-    );
-    if (completedDl) {
-      return `file://${completedDl.filePath}`;
-    }
-    if (file.link) {
-      return file.link.startsWith('http')
-        ? file.link
-        : `${BASE_URL}${file.link.startsWith('/') ? '' : '/'}${file.link}`;
-    }
-    return `${BASE_URL}${currentPath}${encodeURIComponent(file.name)}`;
-  };
-
   const getRemoteDownloadUrl = (file: any) => {
     if (!file) return '';
     if (file.link) {
@@ -849,12 +957,23 @@ const App = () => {
     setPlayMode('internal');
   };
 
+  // 🔥 SMART POPUP: Only ask when BOTH DV and HDR10 exist! 🔥
   const handlePlayInAppPress = (fileToPlay = selectedFile) => {
     if (!fileToPlay) return;
     const info = parseMediaFilename(fileToPlay.name, false);
-    if (info.hasDV) {
+    const realMi = mediaInfoMap[fileToPlay.name];
+
+    const effectiveHasDV = realMi ? realMi.hasDV : info.hasDV;
+    const effectiveHasHDR = realMi ? realMi.hasHDR : info.hasHDR;
+
+    if (effectiveHasDV && effectiveHasHDR) {
+      // Both Dolby Vision & HDR10 exist -> Let user choose!
       setShowHdrChoiceModal(true);
-    } else if (info.hasHDR) {
+    } else if (effectiveHasDV) {
+      // Only Dolby Vision exists -> Play directly in DV without popup!
+      startPlaybackWithMode('dv');
+    } else if (effectiveHasHDR) {
+      // Only HDR10 exists -> Play directly in HDR10 without popup!
       startPlaybackWithMode('hdr');
     } else {
       startPlaybackWithMode('sdr');
@@ -1518,6 +1637,10 @@ const App = () => {
     const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
     const remainingTime = Math.max(0, duration - currentTime);
     const playerInfo = parseMediaFilename(selectedFile.name, false);
+    const realMi = mediaInfoMap[selectedFile.name];
+    const effectiveHasDV = realMi ? realMi.hasDV : playerInfo.hasDV;
+    const effectiveHasHDR = realMi ? realMi.hasHDR : playerInfo.hasHDR;
+    const canSwitchDvHdr = effectiveHasDV && effectiveHasHDR;
 
     return (
       <View style={styles.playerWrapper}>
@@ -1724,17 +1847,17 @@ const App = () => {
                       {playerInfo.seasonEpisode}
                     </Text>
                   )}
-                  {!!playerInfo.resolution && (
+                  {!!(realMi?.resolution || playerInfo.resolution) && (
                     <View style={styles.netflixMiniBadge}>
                       <Text style={styles.netflixMiniBadgeText}>
-                        {playerInfo.resolution}
+                        {realMi?.resolution || playerInfo.resolution}
                       </Text>
                     </View>
                   )}
-                  {(playerInfo.hasDV || playerInfo.hasHDR) && (
+                  {(effectiveHasDV || effectiveHasHDR) && (
                     <TouchableOpacity
                       onPress={
-                        playerInfo.hasDV ? toggleLiveHdrModeInPlayer : undefined
+                        canSwitchDvHdr ? toggleLiveHdrModeInPlayer : undefined
                       }
                       style={[
                         styles.liveHdrStatusPill,
@@ -1921,7 +2044,7 @@ const App = () => {
                   </Text>
                 </FocusableButton>
 
-                {playerInfo.hasDV && (
+                {canSwitchDvHdr && (
                   <FocusableButton
                     style={styles.netflixActionPill}
                     onPress={toggleLiveHdrModeInPlayer}>
@@ -1949,13 +2072,43 @@ const App = () => {
     );
   }
 
-  // 🔥 2. MOVIE DETAIL SCREEN 🔥
+  // 🔥 2. MOVIE DETAIL SCREEN (With On-Demand Real MediaInfo!) 🔥
   if (selectedFile && playMode === null) {
     const info = parseMediaFilename(selectedFile.name, false);
     const meta = metadataMap[selectedFile.name];
+    const realMi = mediaInfoMap[selectedFile.name];
     const savedSec = savedTimesMap[selectedFile.name] || 0;
     const bannerImage = meta?.backdrop || meta?.poster;
     const dlTask = downloads.find(d => d.fileName === selectedFile.name);
+
+    const effectiveResolution = realMi?.resolution || info.resolution;
+    const effectiveHasDV = realMi ? realMi.hasDV : info.hasDV;
+    const effectiveHasHDR = realMi ? realMi.hasHDR : info.hasHDR;
+
+    const topChips: string[] = [];
+    if (realMi?.hasAtmos || info.badges.includes('Atmos')) {
+      topChips.push('Atmos');
+    }
+    if (effectiveHasDV) topChips.push('DV');
+    if (effectiveHasHDR) topChips.push('HDR10');
+    if (realMi?.videoCodec) {
+      topChips.push(
+        realMi.videoCodec.includes('HEVC') ? 'HEVC' : realMi.videoCodec,
+      );
+    } else if (info.badges.includes('HEVC')) {
+      topChips.push('HEVC');
+    }
+    info.badges.forEach(b => {
+      if (
+        b !== 'DV' &&
+        b !== 'HDR' &&
+        b !== 'Atmos' &&
+        b !== 'HEVC' &&
+        !topChips.includes(b)
+      ) {
+        topChips.push(b);
+      }
+    });
 
     return (
       <ScrollView
@@ -2015,18 +2168,18 @@ const App = () => {
                     <Text style={styles.ratingBadgeText}>★ {meta.rating}</Text>
                   </View>
                 )}
-                {!!info.resolution && (
+                {!!effectiveResolution && (
                   <View style={styles.qualityBadge}>
                     <Text style={styles.qualityBadgeText}>
-                      {info.resolution}
+                      {effectiveResolution}
                     </Text>
                   </View>
                 )}
               </View>
 
-              {info.badges.length > 0 && (
+              {topChips.length > 0 && (
                 <View style={styles.badgeWrapRow}>
-                  {info.badges.map((b, idx) => (
+                  {topChips.map((b, idx) => (
                     <View key={idx} style={styles.techChip}>
                       <Text style={styles.techChipText}>{b}</Text>
                     </View>
@@ -2067,9 +2220,7 @@ const App = () => {
                 style={styles.downloadActionBtn}
                 onPress={() => handleStartDownload(selectedFile)}>
                 <Icon name="file-download" size={22} color="#46d369" />
-                <Text style={styles.downloadActionText}>
-                  Download Movie (8x Turbo)
-                </Text>
+                <Text style={styles.downloadActionText}>Download</Text>
               </FocusableButton>
             ) : dlTask.status === 'completed' ? (
               <FocusableButton
@@ -2090,7 +2241,7 @@ const App = () => {
                 <View style={styles.dlCardHeaderRow}>
                   <Text style={styles.dlCardStatusText}>
                     {dlTask.status === 'downloading'
-                      ? `Downloading (${dlTask.threadsCount}x Turbo) • ${formatBytes(
+                      ? `Downloading • ${formatBytes(
                           dlTask.speedBytesPerSec,
                         )}/s`
                       : `Download ${dlTask.status.toUpperCase()}`}
@@ -2115,9 +2266,109 @@ const App = () => {
             )}
           </View>
 
-          <View style={styles.rawFileBox}>
-            <Text style={styles.rawFileLabel}>SOURCE FILE</Text>
-            <Text style={styles.rawFileName}>{selectedFile.name}</Text>
+          {/* 🔥 ON-DEMAND REAL MEDIAINFO CARD 🔥 */}
+          <View style={styles.mediaInfoCard}>
+            <View style={styles.mediaInfoHeaderRow}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                <Icon name="memory" size={16} color="#E50914" />
+                <Text style={styles.mediaInfoHeaderTitle}>
+                  MEDIAINFO TECHNICAL SPECS
+                </Text>
+              </View>
+              {scanningMediaInfo && (
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  <ActivityIndicator size="small" color="#E50914" />
+                  <Text style={styles.scanningText}>Scanning stream...</Text>
+                </View>
+              )}
+            </View>
+
+            {realMi ? (
+              <View style={{ gap: 10, marginTop: 8 }}>
+                <View style={styles.miSpecRow}>
+                  <Text style={styles.miSpecLabel}>VIDEO</Text>
+                  <Text style={styles.miSpecValue}>
+                    {[
+                      realMi.width > 0
+                        ? `${realMi.width}×${realMi.height} (${realMi.resolution})`
+                        : effectiveResolution,
+                      realMi.videoCodec,
+                      realMi.hasDV && realMi.hasHDR
+                        ? 'Dolby Vision + HDR10'
+                        : realMi.hasDV
+                        ? 'Dolby Vision (Single Layer)'
+                        : realMi.hasHDR
+                        ? 'HDR10'
+                        : 'SDR',
+                      realMi.frameRate > 0
+                        ? `${realMi.frameRate.toFixed(2).replace(/\.00$/, '')} fps`
+                        : null,
+                    ]
+                      .filter(Boolean)
+                      .join(' • ')}
+                  </Text>
+                </View>
+
+                {(realMi.totalBytes > 0 || realMi.durationSec > 0) && (
+                  <View style={styles.miSpecRow}>
+                    <Text style={styles.miSpecLabel}>FILE & TIME</Text>
+                    <Text style={styles.miSpecValue}>
+                      {[
+                        realMi.totalBytes > 0
+                          ? formatBytes(realMi.totalBytes)
+                          : null,
+                        realMi.durationSec > 0
+                          ? formatRuntime(realMi.durationSec)
+                          : null,
+                      ]
+                        .filter(Boolean)
+                        .join(' • ')}
+                    </Text>
+                  </View>
+                )}
+
+                {realMi.audioTracks && realMi.audioTracks.length > 0 && (
+                  <View style={styles.miSpecRow}>
+                    <Text style={styles.miSpecLabel}>
+                      AUDIO ({realMi.audioTracks.length})
+                    </Text>
+                    <View style={styles.miTrackPillWrap}>
+                      {realMi.audioTracks.map((at, idx) => (
+                        <View key={idx} style={styles.miAudioPill}>
+                          <Text style={styles.miAudioPillText}>
+                            {at.summary}
+                          </Text>
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+                )}
+
+                {realMi.subtitleTracks && realMi.subtitleTracks.length > 0 && (
+                  <View style={styles.miSpecRow}>
+                    <Text style={styles.miSpecLabel}>
+                      SUBTITLES ({realMi.subtitleTracks.length})
+                    </Text>
+                    <View style={styles.miTrackPillWrap}>
+                      {realMi.subtitleTracks.map((st, idx) => (
+                        <View key={idx} style={styles.miSubPill}>
+                          <Text style={styles.miSubPillText}>
+                            {st.language} ({st.format})
+                          </Text>
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+                )}
+              </View>
+            ) : !scanningMediaInfo ? (
+              <Text style={styles.rawFileName}>{selectedFile.name}</Text>
+            ) : null}
+
+            <View style={styles.sourceFileDivider}>
+              <Text style={styles.rawFileLabel}>SOURCE FILE</Text>
+              <Text style={styles.rawFileName}>{selectedFile.name}</Text>
+            </View>
           </View>
         </View>
         {renderHdrChoiceModal()}
@@ -2153,9 +2404,9 @@ const App = () => {
             <Icon name="cloud-download" size={56} color="#3A4454" />
             <Text style={styles.emptyDownloadsTitle}>No Downloads Yet</Text>
             <Text style={styles.emptyDownloadsSub}>
-              Movies you download are saved with 8x parallel turbo speed directly
-              to your phone's Download/GDStream folder so you can watch offline
-              in GDStream or any media player.
+              Movies you download are saved directly to your phone's
+              Download/GDStream folder so you can watch offline in GDStream or
+              any media player.
             </Text>
           </View>
         ) : (
@@ -2390,7 +2641,9 @@ const App = () => {
             const isFolder = !!item.mimeType?.includes('folder');
             const info = parseMediaFilename(item.name, isFolder);
             const meta = metadataMap[item.name];
+            const realMi = mediaInfoMap[item.name];
             const savedSec = savedTimesMap[item.name] || 0;
+            const cardRes = realMi?.resolution || info.resolution;
 
             if (viewMode === 'list') {
               return (
@@ -2428,10 +2681,8 @@ const App = () => {
                           {info.seasonEpisode}
                         </Text>
                       )}
-                      {!!info.resolution && (
-                        <Text style={styles.cardQualityTag}>
-                          {info.resolution}
-                        </Text>
+                      {!!cardRes && (
+                        <Text style={styles.cardQualityTag}>{cardRes}</Text>
                       )}
                       {info.badges.slice(0, 2).map((b, i) => (
                         <Text key={i} style={styles.cardBadgeMini}>
@@ -2494,15 +2745,13 @@ const App = () => {
                       <View />
                     )}
 
-                    {!!info.resolution && (
+                    {!!cardRes && (
                       <View
                         style={[
                           styles.resPill,
-                          info.resolution === '4K' && styles.resPill4K,
+                          cardRes === '4K' && styles.resPill4K,
                         ]}>
-                        <Text style={styles.resPillText}>
-                          {info.resolution}
-                        </Text>
+                        <Text style={styles.resPillText}>{cardRes}</Text>
                       </View>
                     )}
                   </View>
@@ -2524,7 +2773,10 @@ const App = () => {
                         info.year ||
                         (isFolder ? 'Folder' : 'Movie')}
                     </Text>
-                    {info.badges.slice(0, 2).map((b, idx) => (
+                    {(realMi?.languages?.length
+                      ? realMi.languages.slice(0, 2)
+                      : info.badges.slice(0, 2)
+                    ).map((b, idx) => (
                       <Text key={idx} style={styles.posterMiniTag}>
                         • {b}
                       </Text>
@@ -2996,13 +3248,83 @@ const styles = StyleSheet.create({
     borderRadius: 3,
   },
   dlCardSubText: { color: '#99A3B3', fontSize: 11, marginTop: 2 },
-  rawFileBox: {
+  // MediaInfo Card Styles
+  mediaInfoCard: {
     marginTop: 24,
-    padding: 12,
-    borderRadius: 8,
-    backgroundColor: '#13161E',
+    padding: 14,
+    borderRadius: 12,
+    backgroundColor: '#12151E',
     borderWidth: 1,
-    borderColor: '#222834',
+    borderColor: '#232A38',
+  },
+  mediaInfoHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+  },
+  mediaInfoHeaderTitle: {
+    color: '#9BA6B8',
+    fontSize: 11,
+    fontWeight: '900',
+    letterSpacing: 0.9,
+  },
+  scanningText: {
+    color: '#E50914',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  miSpecRow: {
+    marginTop: 4,
+  },
+  miSpecLabel: {
+    color: '#6C7789',
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.8,
+    marginBottom: 4,
+  },
+  miSpecValue: {
+    color: '#E2E8F0',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  miTrackPillWrap: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  miAudioPill: {
+    backgroundColor: '#1A202E',
+    borderWidth: 1,
+    borderColor: '#2E384D',
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 6,
+  },
+  miAudioPillText: {
+    color: '#D8E1EE',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  miSubPill: {
+    backgroundColor: '#171C26',
+    borderWidth: 1,
+    borderColor: '#283040',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  miSubPillText: {
+    color: '#A8B3C5',
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  sourceFileDivider: {
+    marginTop: 14,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#1E2430',
   },
   rawFileLabel: {
     color: '#6C7789',
