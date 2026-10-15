@@ -2,7 +2,6 @@ package com.gdstream
 
 import android.media.MediaExtractor
 import android.media.MediaFormat
-import android.os.Build
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -11,11 +10,13 @@ import com.facebook.react.bridge.ReactMethod
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
+import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 class MediaInfoModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -25,21 +26,31 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
     override fun getName(): String = "MediaInfoModule"
 
     private data class MkvTrack(
+        var trackNumber: Int = 0,
+        var trackUid: Long = 0L,
         var trackType: Int = 0, // 1 = Video, 2 = Audio, 17 = Subtitle
         var codecId: String = "",
         var name: String = "",
-        var language: String = "",
+        // Per Matroska spec, default Language (0x22B59C) when omitted is "eng"
+        var language: String = "eng",
         var languageIetf: String = "",
         var pixelWidth: Int = 0,
         var pixelHeight: Int = 0,
         var defaultDurationNs: Long = 0L,
         var channels: Int = 0,
+        var sampleRate: Double = 0.0,
         var bitDepth: Int = 0,
         var colorTransfer: Int = 0,
         var colorPrimaries: Int = 0,
         var hasDoviConfig: Boolean = false,
         var dvProfile: Int = -1,
-        var dvHasHdr10Base: Boolean = false
+        var dvHasHdr10Base: Boolean = false,
+        // Populated from real bitstream frames & MKV statistics tags:
+        var realBitrateBps: Long = 0L,
+        var bitstreamChannels: Int = 0,
+        var bitstreamHasAtmos: Boolean = false,
+        var bitstreamSubCodec: String = "",
+        var frameInspected: Boolean = false
     )
 
     private data class HeaderParseResult(
@@ -48,9 +59,259 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         val tracks: List<MkvTrack>,
         val hasDoviRecord: Boolean,
         val dvProfile: Int,
-        val dvHasHdr10Base: Boolean,
-        val hasAtmosHint: Boolean
+        val dvHasHdr10Base: Boolean
     )
+
+    private class BitReader(private val data: ByteArray, startByte: Int, private val limitByte: Int) {
+        var bytePos = startByte
+        var bitPos = 0
+
+        fun bitsRemaining(): Int = ((limitByte - bytePos) * 8) - bitPos
+
+        fun readBit(): Int {
+            if (bytePos >= limitByte) return 0
+            val bit = (data[bytePos].toInt() shr (7 - bitPos)) and 1
+            bitPos++
+            if (bitPos == 8) {
+                bitPos = 0
+                bytePos++
+            }
+            return bit
+        }
+
+        fun readBits(n: Int): Int {
+            var v = 0
+            for (i in 0 until n) {
+                v = (v shl 1) or readBit()
+            }
+            return v
+        }
+
+        fun skipBits(n: Int) {
+            val total = bitPos + n
+            bytePos += total shr 3
+            bitPos = total and 7
+        }
+    }
+
+    // Standard AC-3 (bsid <= 8) bitrate table in kbps indexed by (frmsizecod / 2)
+    private val ac3BitrateTableKbps = intArrayOf(
+        32, 40, 48, 56, 64, 80, 96, 112, 128, 160,
+        192, 224, 256, 320, 384, 448, 512, 576, 640
+    )
+
+    // Channel count by acmod (0..7)
+    private val acmodChannels = intArrayOf(2, 1, 2, 3, 3, 4, 4, 5)
+
+    /**
+     * Parses an actual AC-3 / E-AC-3 syncframe (0x0B77) per ATSC A/52B & ETSI TS 103 420
+     * to extract the 100% real bitrate, real channel count, and real Dolby Atmos (JOC) flag.
+     */
+    private fun inspectAc3OrEac3Frame(buf: ByteArray, start: Int, len: Int, track: MkvTrack) {
+        val end = minOf(buf.size, start + len)
+        var syncOffset = -1
+        for (i in start..minOf(end - 16, start + 64)) {
+            if ((buf[i].toInt() and 0xFF) == 0x0B && (buf[i + 1].toInt() and 0xFF) == 0x77) {
+                syncOffset = i
+                break
+            }
+        }
+        if (syncOffset < 0) return
+
+        val bsid = (buf[syncOffset + 5].toInt() and 0xFF) shr 3
+        if (bsid in 11..16) {
+            // E-AC-3 (Dolby Digital Plus) Bitstream
+            val br = BitReader(buf, syncOffset + 2, end)
+            val strmtyp = br.readBits(2)
+            br.skipBits(3) // substreamid
+            val frmsiz = br.readBits(11)
+            val frameSizeBytes = (frmsiz + 1) * 2
+            val fscod = br.readBits(2)
+            val sampleRate: Int
+            val numblkscod: Int
+            if (fscod == 3) {
+                val fscod2 = br.readBits(2)
+                sampleRate = when (fscod2) {
+                    0 -> 24000
+                    1 -> 22050
+                    2 -> 16000
+                    else -> 48000
+                }
+                numblkscod = 3
+            } else {
+                sampleRate = when (fscod) {
+                    0 -> 48000
+                    1 -> 44100
+                    2 -> 32000
+                    else -> 48000
+                }
+                numblkscod = br.readBits(2)
+            }
+            val numBlocks = when (numblkscod) {
+                0 -> 1
+                1 -> 2
+                2 -> 3
+                else -> 6
+            }
+            val acmod = br.readBits(3)
+            val lfeon = br.readBits(1)
+            br.skipBits(5) // bsid
+
+            val chCount = acmodChannels[acmod] + lfeon
+            if (chCount > 0) track.bitstreamChannels = chCount
+
+            val exactBps = ((frameSizeBytes.toLong() * 8L * sampleRate.toLong()) / (numBlocks.toLong() * 256L))
+            if (exactBps in 32_000L..6_144_000L) {
+                track.realBitrateBps = exactBps
+            }
+
+            // Step through bsi() to reach addbsie (ETSI TS 103 420 Atmos JOC flag)
+            br.skipBits(5) // dialnorm
+            if (br.readBit() == 1) br.skipBits(8) // compre -> compr
+            if (acmod == 0) {
+                br.skipBits(5) // dialnorm2
+                if (br.readBit() == 1) br.skipBits(8) // compr2e -> compr2
+            }
+            if (strmtyp == 1) {
+                if (br.readBit() == 1) br.skipBits(16) // chanmape -> chanmap
+            }
+            if (br.readBit() == 1) { // mixmdate
+                if (acmod > 2) br.skipBits(2) // dmixmod
+                if ((acmod and 1) != 0 && acmod > 2) br.skipBits(6) // ltrtcmixlev + lorocmixlev
+                if ((acmod and 4) != 0) br.skipBits(6) // ltrtsurmixlev + lorosurmixlev
+                if (lfeon == 1) {
+                    if (br.readBit() == 1) br.skipBits(5) // lfemixlevcode
+                }
+                if (strmtyp == 0) {
+                    if (br.readBit() == 1) br.skipBits(6) // pgmscle
+                    if (acmod == 0) {
+                        if (br.readBit() == 1) br.skipBits(6) // pgmscl2e
+                    }
+                    if (br.readBit() == 1) br.skipBits(6) // extpgmscle
+                    when (br.readBits(2)) { // mixdef
+                        1 -> br.skipBits(5)
+                        2 -> br.skipBits(12)
+                        3 -> {
+                            val mixdeflen = br.readBits(5)
+                            br.skipBits((mixdeflen + 2) * 8)
+                        }
+                    }
+                    if (acmod < 2) {
+                        if (br.readBit() == 1) br.skipBits(14) // paninfoe
+                        if (acmod == 0) {
+                            if (br.readBit() == 1) br.skipBits(14) // paninfo2e
+                        }
+                    }
+                    if (br.readBit() == 1) { // frmmixcfginfoe
+                        if (numblkscod == 0) {
+                            br.skipBits(5)
+                        } else {
+                            for (b in 0 until numBlocks) {
+                                if (br.readBit() == 1) br.skipBits(5)
+                            }
+                        }
+                    }
+                }
+            }
+            if (br.readBit() == 1) { // infomdate
+                br.skipBits(5) // bsmod (3) + copyrightb (1) + origbs (1)
+                if (acmod == 2) br.skipBits(4) // dsurmod + dheadphonmod
+                if (acmod >= 6) br.skipBits(2) // dsurexmod
+                if (br.readBit() == 1) br.skipBits(8) // audprodie
+                if (acmod == 0) {
+                    if (br.readBit() == 1) br.skipBits(8) // audprodi2e
+                }
+                if (fscod < 3) br.skipBits(1) // sourcefscod
+            }
+            if (strmtyp == 0 && numblkscod != 3) {
+                br.skipBits(1) // convsync
+            }
+            if (strmtyp == 2) {
+                if (br.readBit() == 1) br.skipBits(6) // blkid -> frmsizecod
+            }
+            if (br.bitsRemaining() >= 7) {
+                val addbsie = br.readBit()
+                if (addbsie == 1) {
+                    val addbsil = br.readBits(6)
+                    val addbsiLen = addbsil + 1
+                    if (addbsiLen >= 2 && br.bitsRemaining() >= 16) {
+                        val b0 = br.readBits(8)
+                        val b1 = br.readBits(8)
+                        // ETSI TS 103 420: flag_ec3_extension_type_a (bit 0 of b0) == 1
+                        // and complexity_index_type_a (b1) in 1..16 indicates Dolby Atmos JOC!
+                        if ((b0 and 0x01) == 1 && b1 in 1..16) {
+                            track.bitstreamHasAtmos = true
+                        }
+                    }
+                }
+            }
+            track.frameInspected = true
+        } else if (bsid in 1..8) {
+            // Standard AC-3 (Dolby Digital) Bitstream
+            val b4 = buf[syncOffset + 4].toInt() and 0xFF
+            val frmsizecod = b4 and 0x3F
+            val rateIdx = frmsizecod shr 1
+            if (rateIdx in ac3BitrateTableKbps.indices) {
+                track.realBitrateBps = ac3BitrateTableKbps[rateIdx].toLong() * 1000L
+            }
+            val br = BitReader(buf, syncOffset + 5, end)
+            br.skipBits(8) // bsid (5) + bsmod (3)
+            val acmod = br.readBits(3)
+            if ((acmod and 1) != 0 && acmod != 1) br.skipBits(2)
+            if ((acmod and 4) != 0) br.skipBits(2)
+            if (acmod == 2) br.skipBits(2)
+            val lfeon = br.readBit()
+            val chCount = acmodChannels[acmod] + lfeon
+            if (chCount > 0) track.bitstreamChannels = chCount
+            track.frameInspected = true
+        }
+    }
+
+    private fun inspectTrueHdOrDtsFrame(buf: ByteArray, start: Int, len: Int, track: MkvTrack) {
+        val end = minOf(buf.size, start + len)
+        val c = track.codecId.uppercase(Locale.ROOT)
+        if (c.contains("TRUEHD")) {
+            // Look for Dolby TrueHD Major Sync word 0xF8726FBB
+            for (i in start..(end - 16)) {
+                if ((buf[i].toInt() and 0xFF) == 0xF8 &&
+                    (buf[i + 1].toInt() and 0xFF) == 0x72 &&
+                    (buf[i + 2].toInt() and 0xFF) == 0x6F &&
+                    (buf[i + 3].toInt() and 0xFF) == 0xBB
+                ) {
+                    // In TrueHD major sync: byte + 11 bit 7 or fourth substream indicates Atmos
+                    val flags = buf[i + 11].toInt() and 0xFF
+                    if ((flags and 0x80) != 0 || (buf[i + 10].toInt() and 0x0F) >= 3) {
+                        track.bitstreamHasAtmos = true
+                    }
+                    track.frameInspected = true
+                    break
+                }
+            }
+        } else if (c.contains("DTS")) {
+            for (i in start..(end - 16)) {
+                // DTS Core syncword 0x7FFE8001
+                if ((buf[i].toInt() and 0xFF) == 0x7F &&
+                    (buf[i + 1].toInt() and 0xFF) == 0xFE &&
+                    (buf[i + 2].toInt() and 0xFF) == 0x80 &&
+                    (buf[i + 3].toInt() and 0xFF) == 0x01
+                ) {
+                    track.frameInspected = true
+                }
+                // DTS-HD Substream syncword 0x64582025
+                if ((buf[i].toInt() and 0xFF) == 0x64 &&
+                    (buf[i + 1].toInt() and 0xFF) == 0x58 &&
+                    (buf[i + 2].toInt() and 0xFF) == 0x20 &&
+                    (buf[i + 3].toInt() and 0xFF) == 0x25
+                ) {
+                    track.bitstreamSubCodec = "DTS-HD MA"
+                    track.frameInspected = true
+                    break
+                }
+            }
+        } else {
+            track.frameInspected = true
+        }
+    }
 
     private fun formatLanguageName(rawCode: String?, trackTitle: String? = null): String {
         val code = (rawCode ?: "")
@@ -95,9 +356,11 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             } catch (_: Exception) {}
         }
 
-        // Check track title if language tag was 'und' or missing
         if (!trackTitle.isNullOrBlank()) {
             val lowerTitle = trackTitle.lowercase(Locale.ROOT)
+            if (lowerTitle.contains("british") || lowerTitle.contains("uk") || lowerTitle.contains("sdh")) {
+                return "English"
+            }
             for ((_, langName) in map) {
                 if (lowerTitle.contains(langName.lowercase(Locale.ROOT))) {
                     return langName
@@ -108,7 +371,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         return if (code.isNotEmpty() && code != "und" && code != "unk") {
             code.uppercase(Locale.ROOT)
         } else {
-            "Unknown"
+            "English"
         }
     }
 
@@ -119,6 +382,16 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             6 -> "5.1 ch"
             8 -> "7.1 ch"
             else -> if (channels > 0) "$channels ch" else ""
+        }
+    }
+
+    private fun formatBitrate(bps: Long): String {
+        if (bps <= 0L) return ""
+        val kbps = (bps / 1000.0).roundToInt()
+        return if (kbps >= 10000) {
+            String.format(Locale.US, "%.1f Mbps", bps / 1_000_000.0)
+        } else {
+            "$kbps kbps"
         }
     }
 
@@ -134,17 +407,17 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun formatMkvAudioCodec(codecId: String, title: String, hasAtmosHint: Boolean): String {
-        val c = codecId.uppercase(Locale.ROOT)
-        val t = title.lowercase(Locale.ROOT)
-        val isAtmos = t.contains("atmos") || (hasAtmosHint && (c.contains("EAC3") || c.contains("TRUEHD")))
+    private fun formatRealAudioCodec(track: MkvTrack): String {
+        if (track.bitstreamSubCodec.isNotEmpty()) return track.bitstreamSubCodec
+        val c = track.codecId.uppercase(Locale.ROOT)
         return when {
-            c.contains("TRUEHD") -> if (isAtmos) "Dolby TrueHD Atmos" else "Dolby TrueHD"
-            c.contains("EAC3") -> if (isAtmos) "Dolby Atmos (DD+)" else "Dolby Digital Plus (DD+)"
+            c.contains("TRUEHD") ->
+                if (track.bitstreamHasAtmos) "Dolby TrueHD Atmos" else "Dolby TrueHD"
+            c.contains("EAC3") ->
+                if (track.bitstreamHasAtmos) "Dolby Atmos (DD+)" else "Dolby Digital Plus (DD+)"
             c.contains("AC3") -> "Dolby Digital (AC3)"
             c.contains("DTS") -> when {
-                t.contains("hd") || t.contains("ma") || c.contains("HD") -> "DTS-HD MA"
-                t.contains("x") -> "DTS:X"
+                c.contains("HD") || track.realBitrateBps > 1_550_000L -> "DTS-HD MA"
                 else -> "DTS"
             }
             c.contains("OPUS") -> "Opus"
@@ -168,11 +441,6 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             c.contains("DVBSUB") -> "DVB"
             else -> "SUB"
         }
-    }
-
-    private fun extractBitrateHintFromTitle(title: String): String? {
-        val m = Regex("(\\d{2,4}\\s*k(?:bps)?)", RegexOption.IGNORE_CASE).find(title)
-        return m?.value
     }
 
     // EBML VINT Readers
@@ -213,7 +481,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             size = (size shl 8) or bi.toLong()
         }
         if (allOnes) {
-            return Pair(-1L, len) // Unknown / streaming size
+            return Pair(-1L, len)
         }
         return Pair(size, len)
     }
@@ -277,16 +545,199 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         return Triple(false, -1, false)
     }
 
-    private fun parseMkvTracksAndInfo(buf: ByteArray, totalBytes: Long): HeaderParseResult {
+    /**
+     * Parses Matroska Tags (0x1254C367) to extract mkvmerge's exact per-track BPS (bitrate).
+     */
+    private fun parseMkvTagsIntoMap(buf: ByteArray, start: Int, limit: Int, bpsByUid: MutableMap<Long, Long>) {
+        fun parseSimpleTag(sStart: Int, sLimit: Int): Pair<String, String> {
+            var p = sStart
+            var k = ""
+            var v = ""
+            while (p < sLimit) {
+                val idPair = readEbmlId(buf, p, sLimit) ?: break
+                p += idPair.second
+                val sizePair = readEbmlSize(buf, p, sLimit) ?: break
+                p += sizePair.second
+                val sz = sizePair.first.toInt()
+                if (sz < 0 || p + sz > sLimit) break
+                when (idPair.first) {
+                    0x45A3L -> k = readEbmlString(buf, p, sz)
+                    0x4487L -> v = readEbmlString(buf, p, sz)
+                }
+                p += sz
+            }
+            return Pair(k, v)
+        }
+
+        fun parseSingleTag(tStart: Int, tLimit: Int) {
+            var p = tStart
+            var targetUid = 0L
+            var bpsVal = 0L
+            while (p < tLimit) {
+                val idPair = readEbmlId(buf, p, tLimit) ?: break
+                p += idPair.second
+                val sizePair = readEbmlSize(buf, p, tLimit) ?: break
+                p += sizePair.second
+                val sz = sizePair.first.toInt()
+                if (sz < 0 || p + sz > tLimit) break
+                when (idPair.first) {
+                    0x63C0L -> { // Targets
+                        var tp = p
+                        val tEnd = p + sz
+                        while (tp < tEnd) {
+                            val tid = readEbmlId(buf, tp, tEnd) ?: break
+                            tp += tid.second
+                            val tszPair = readEbmlSize(buf, tp, tEnd) ?: break
+                            tp += tszPair.second
+                            val tsz = tszPair.first.toInt()
+                            if (tsz < 0 || tp + tsz > tEnd) break
+                            if (tid.first == 0x63C5L) { // TargetTrackUID
+                                targetUid = readEbmlUint(buf, tp, tsz)
+                            }
+                            tp += tsz
+                        }
+                    }
+                    0x67C8L -> { // SimpleTag
+                        val (k, v) = parseSimpleTag(p, p + sz)
+                        if (k.equals("BPS", ignoreCase = true) || k.startsWith("BPS-", ignoreCase = true)) {
+                            bpsVal = v.toLongOrNull() ?: 0L
+                        }
+                    }
+                }
+                p += sz
+            }
+            if (targetUid != 0L && bpsVal > 0L) {
+                bpsByUid[targetUid] = bpsVal
+            }
+        }
+
+        var p = start
+        while (p < limit) {
+            val idPair = readEbmlId(buf, p, limit) ?: break
+            p += idPair.second
+            val sizePair = readEbmlSize(buf, p, limit) ?: break
+            p += sizePair.second
+            val sz = sizePair.first.toInt()
+            if (sz < 0 || p + sz > limit) break
+            if (idPair.first == 0x7373L) { // Tag
+                parseSingleTag(p, p + sz)
+            }
+            p += sz
+        }
+    }
+
+    /**
+     * Scans a buffer (e.g., tail 64 KB of an MKV file) for the Tags master element (0x1254C367).
+     */
+    private fun scanBufferForMkvTags(buf: ByteArray, bpsByUid: MutableMap<Long, Long>) {
+        var i = 0
+        val end = buf.size - 8
+        while (i < end) {
+            if ((buf[i].toInt() and 0xFF) == 0x12 &&
+                (buf[i + 1].toInt() and 0xFF) == 0x54 &&
+                (buf[i + 2].toInt() and 0xFF) == 0xC3 &&
+                (buf[i + 3].toInt() and 0xFF) == 0x67
+            ) {
+                val sizePair = readEbmlSize(buf, i + 4, buf.size)
+                if (sizePair != null && sizePair.first > 0) {
+                    val contentStart = i + 4 + sizePair.second
+                    val contentEnd = minOf(buf.size.toLong(), contentStart.toLong() + sizePair.first).toInt()
+                    parseMkvTagsIntoMap(buf, contentStart, contentEnd, bpsByUid)
+                    break
+                }
+            }
+            i++
+        }
+    }
+
+    /**
+     * Inspects actual audio packets inside an MKV Cluster (0x1F43B675) to extract
+     * real bitstream codecs, Atmos JOC flags, channels, and bitrates per track.
+     */
+    private fun parseClusterAudioFrames(
+        buf: ByteArray,
+        start: Int,
+        limit: Int,
+        trackByNum: Map<Int, MkvTrack>
+    ) {
+        var p = start
+        while (p < limit) {
+            if (trackByNum.values.all { it.trackType != 2 || it.frameInspected }) break
+
+            val idPair = readEbmlId(buf, p, limit) ?: break
+            p += idPair.second
+            val sizePair = readEbmlSize(buf, p, limit) ?: break
+            p += sizePair.second
+            val sz = sizePair.first.toInt()
+            if (sz < 0) break
+            val elemEnd = minOf(limit, p + sz)
+
+            if (idPair.first == 0xA3L) { // SimpleBlock
+                val trkVint = readEbmlSize(buf, p, elemEnd)
+                if (trkVint != null) {
+                    val trackNum = trkVint.first.toInt()
+                    val track = trackByNum[trackNum]
+                    if (track != null && track.trackType == 2 && !track.frameInspected) {
+                        val headerLen = trkVint.second + 3 // trackVint + timecode(2) + flags(1)
+                        val payloadPos = p + headerLen
+                        val payloadLen = elemEnd - payloadPos
+                        if (payloadLen > 16) {
+                            val c = track.codecId.uppercase(Locale.ROOT)
+                            if (c.contains("EAC3") || c.contains("AC3")) {
+                                inspectAc3OrEac3Frame(buf, payloadPos, payloadLen, track)
+                            } else {
+                                inspectTrueHdOrDtsFrame(buf, payloadPos, payloadLen, track)
+                            }
+                        }
+                    }
+                }
+            } else if (idPair.first == 0xA0L) { // BlockGroup
+                var bp = p
+                while (bp < elemEnd) {
+                    val bid = readEbmlId(buf, bp, elemEnd) ?: break
+                    bp += bid.second
+                    val bszPair = readEbmlSize(buf, bp, elemEnd) ?: break
+                    bp += bszPair.second
+                    val bsz = bszPair.first.toInt()
+                    if (bsz < 0 || bp + bsz > elemEnd) break
+                    if (bid.first == 0xA1L) { // Block
+                        val trkVint = readEbmlSize(buf, bp, bp + bsz)
+                        if (trkVint != null) {
+                            val trackNum = trkVint.first.toInt()
+                            val track = trackByNum[trackNum]
+                            if (track != null && track.trackType == 2 && !track.frameInspected) {
+                                val payloadPos = bp + trkVint.second + 3
+                                val payloadLen = (bp + bsz) - payloadPos
+                                if (payloadLen > 16) {
+                                    val c = track.codecId.uppercase(Locale.ROOT)
+                                    if (c.contains("EAC3") || c.contains("AC3")) {
+                                        inspectAc3OrEac3Frame(buf, payloadPos, payloadLen, track)
+                                    } else {
+                                        inspectTrueHdOrDtsFrame(buf, payloadPos, payloadLen, track)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    bp += bsz
+                }
+            }
+            if (p + sz > limit) break
+            p += sz
+        }
+    }
+
+    private fun parseMkvHeaderAndClusters(
+        buf: ByteArray,
+        tailBuf: ByteArray?,
+        totalBytes: Long
+    ): HeaderParseResult {
         val tracks = mutableListOf<MkvTrack>()
+        val bpsByUid = mutableMapOf<Long, Long>()
         var timestampScale = 1_000_000L
         var rawDuration = 0.0
 
         val ascii = String(buf, Charsets.ISO_8859_1)
-        val hasAtmosHint =
-            ascii.contains("Atmos", ignoreCase = true) ||
-                ascii.contains("E-AC-3 JOC", ignoreCase = true)
-
         var globalHasDovi = false
         var globalDvProfile = -1
         var globalDvHasHdr10Base = false
@@ -355,6 +806,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                 if (sz < 0 || p + sz > limit) break
                 when (idPair.first) {
                     0x9FL -> track.channels = readEbmlUint(buf, p, sz).toInt()
+                    0xB5L -> track.sampleRate = readEbmlFloat(buf, p, sz)
                     0x6264L -> track.bitDepth = readEbmlUint(buf, p, sz).toInt()
                 }
                 p += sz
@@ -393,6 +845,8 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                 val sz = sizePair.first.toInt()
                 if (sz < 0 || p + sz > limit) break
                 when (idPair.first) {
+                    0xD7L -> track.trackNumber = readEbmlUint(buf, p, sz).toInt()
+                    0x73C5L -> track.trackUid = readEbmlUint(buf, p, sz)
                     0x83L -> track.trackType = readEbmlUint(buf, p, sz).toInt()
                     0x86L -> track.codecId = readEbmlString(buf, p, sz)
                     0x536EL -> track.name = readEbmlString(buf, p, sz)
@@ -441,7 +895,9 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             }
         }
 
-        // Top-level EBML walk
+        val trackByNum = mutableMapOf<Int, MkvTrack>()
+
+        // Walk EBML top-level & Segment children (including first Cluster for real audio frames)
         var pos = 0
         val limit = buf.size
         while (pos < limit) {
@@ -455,18 +911,45 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                 // Step inside Segment
                 continue
             }
-            if (idPair.first == 0x1F43B675L) {
-                // Reached media Cluster; header metadata is complete
-                break
-            }
-            if (sz < 0) break
-            val elemEnd = minOf(limit.toLong(), pos.toLong() + sz).toInt()
+            val elemEnd = if (sz < 0) limit else minOf(limit.toLong(), pos.toLong() + sz).toInt()
             when (idPair.first) {
                 0x1549A966L -> parseInfoMaster(pos, elemEnd)
-                0x1654AE6BL -> parseTracksMaster(pos, elemEnd)
+                0x1654AE6BL -> {
+                    parseTracksMaster(pos, elemEnd)
+                    for (t in tracks) {
+                        if (t.trackNumber > 0) trackByNum[t.trackNumber] = t
+                    }
+                }
+                0x1254C367L -> parseMkvTagsIntoMap(pos, elemEnd, bpsByUid)
+                0x1F43B675L -> {
+                    // Inspect real audio frames inside the Cluster!
+                    parseClusterAudioFrames(buf, pos, elemEnd, trackByNum)
+                    if (trackByNum.values.all { it.trackType != 2 || it.frameInspected }) {
+                        break
+                    }
+                }
             }
-            if (pos.toLong() + sz > limit) break
+            if (sz < 0 || pos.toLong() + sz > limit) break
             pos += sz.toInt()
+        }
+
+        if (tailBuf != null) {
+            scanBufferForMkvTags(tailBuf, bpsByUid)
+        }
+
+        for (t in tracks) {
+            if (t.realBitrateBps <= 0L && t.trackUid != 0L) {
+                val tagBps = bpsByUid[t.trackUid] ?: 0L
+                if (tagBps > 0L) t.realBitrateBps = tagBps
+            }
+            if (t.bitstreamChannels > 0) {
+                t.channels = t.bitstreamChannels
+            }
+            if (t.hasDoviConfig) {
+                globalHasDovi = true
+                globalDvProfile = t.dvProfile
+                globalDvHasHdr10Base = t.dvHasHdr10Base
+            }
         }
 
         val durationSec = if (rawDuration > 0.0) {
@@ -475,64 +958,68 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             0.0
         }
 
-        for (t in tracks) {
-            if (t.hasDoviConfig) {
-                globalHasDovi = true
-                globalDvProfile = t.dvProfile
-                globalDvHasHdr10Base = t.dvHasHdr10Base
-            }
-        }
-
         return HeaderParseResult(
             totalBytes = totalBytes,
             durationSec = durationSec,
             tracks = tracks,
             hasDoviRecord = globalHasDovi,
             dvProfile = globalDvProfile,
-            dvHasHdr10Base = globalDvHasHdr10Base,
-            hasAtmosHint = hasAtmosHint
+            dvHasHdr10Base = globalDvHasHdr10Base
         )
     }
 
+    private fun openRangeConnection(urlStr: String, rangeHeader: String): HttpURLConnection? {
+        var currentUrl = urlStr
+        var redirects = 0
+        while (redirects < 5) {
+            val conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 6000
+                readTimeout = 6000
+                instanceFollowRedirects = false
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; GDStream/2.0)")
+                setRequestProperty("Range", rangeHeader)
+            }
+            val code = conn.responseCode
+            if (code in 301..308) {
+                val loc = conn.getHeaderField("Location")
+                conn.disconnect()
+                if (loc.isNullOrEmpty()) return null
+                currentUrl = URL(URL(currentUrl), loc).toString()
+                redirects++
+            } else {
+                return conn
+            }
+        }
+        return null
+    }
+
     private fun fetchAndParseHeader(urlStr: String): HeaderParseResult {
-        val maxHeaderBytes = 640 * 1024 // 640 KB covers MKV Info + Tracks + Fonts/Cues
+        val maxHeaderBytes = 1024 * 1024 // 1 MB covers EBML Header + Tracks + First Cluster packets
+        val tailBytesSize = 64 * 1024    // 64 KB at end of file covers mkvmerge Tags (BPS)
 
         if (urlStr.startsWith("file://") || urlStr.startsWith("/")) {
             val f = File(urlStr.removePrefix("file://"))
             val len = if (f.exists()) f.length() else 0L
-            val buf = ByteArray(minOf(len, maxHeaderBytes.toLong()).toInt())
+            val headBuf = ByteArray(minOf(len, maxHeaderBytes.toLong()).toInt())
+            var tailBuf: ByteArray? = null
             try {
-                FileInputStream(f).use { it.read(buf) }
+                FileInputStream(f).use { it.read(headBuf) }
+                if (len > maxHeaderBytes + tailBytesSize) {
+                    tailBuf = ByteArray(tailBytesSize)
+                    RandomAccessFile(f, "r").use { raf ->
+                        raf.seek(len - tailBytesSize)
+                        raf.readFully(tailBuf)
+                    }
+                }
             } catch (_: Exception) {}
-            return parseMkvTracksAndInfo(buf, len)
+            return parseMkvHeaderAndClusters(headBuf, tailBuf, len)
         }
 
         var conn: HttpURLConnection? = null
         try {
-            var currentUrl = urlStr
-            var redirects = 0
-            while (redirects < 5) {
-                conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 6000
-                    readTimeout = 6000
-                    instanceFollowRedirects = false
-                    setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; GDStream/2.0)")
-                    setRequestProperty("Range", "bytes=0-${maxHeaderBytes - 1}")
-                }
-                val code = conn.responseCode
-                if (code in 301..308) {
-                    val loc = conn.getHeaderField("Location")
-                    conn.disconnect()
-                    if (loc.isNullOrEmpty()) break
-                    currentUrl = URL(URL(currentUrl), loc).toString()
-                    redirects++
-                } else {
-                    break
-                }
-            }
-
+            conn = openRangeConnection(urlStr, "bytes=0-${maxHeaderBytes - 1}")
             if (conn == null) {
-                return HeaderParseResult(0L, 0.0, emptyList(), false, -1, false, false)
+                return HeaderParseResult(0L, 0.0, emptyList(), false, -1, false)
             }
 
             var totalBytes = 0L
@@ -552,9 +1039,35 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                     out.write(tmp, 0, read)
                 }
             }
-            return parseMkvTracksAndInfo(out.toByteArray(), totalBytes)
+            val headBytes = out.toByteArray()
+
+            // Also fetch last 64 KB for MKV Tags (BPS table) if needed
+            var tailBytes: ByteArray? = null
+            if (totalBytes > maxHeaderBytes + tailBytesSize) {
+                var tailConn: HttpURLConnection? = null
+                try {
+                    val tailStart = totalBytes - tailBytesSize
+                    tailConn = openRangeConnection(urlStr, "bytes=$tailStart-${totalBytes - 1}")
+                    if (tailConn != null && tailConn.responseCode in 200..299) {
+                        val tailOut = ByteArrayOutputStream()
+                        tailConn.inputStream.use { input ->
+                            val tmp = ByteArray(16 * 1024)
+                            var read = 0
+                            while (tailOut.size() < tailBytesSize && input.read(tmp).also { read = it } != -1) {
+                                tailOut.write(tmp, 0, read)
+                            }
+                        }
+                        tailBytes = tailOut.toByteArray()
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    tailConn?.disconnect()
+                }
+            }
+
+            return parseMkvHeaderAndClusters(headBytes, tailBytes, totalBytes)
         } catch (_: Exception) {
-            return HeaderParseResult(0L, 0.0, emptyList(), false, -1, false, false)
+            return HeaderParseResult(0L, 0.0, emptyList(), false, -1, false)
         } finally {
             conn?.disconnect()
         }
@@ -569,19 +1082,19 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                 var width = 0
                 var height = 0
                 var videoCodec = ""
+                var videoBitrateStr = ""
                 var frameRate = 0.0
                 var durationSec = parsed.durationSec
                 var hasDV = parsed.hasDoviRecord
                 var hasHDR10 = parsed.dvHasHdr10Base
                 var dvProfile = parsed.dvProfile
-                var hasAtmos = parsed.hasAtmosHint
+                var hasAtmos = false
 
                 val audioList = Arguments.createArray()
                 val subtitleList = Arguments.createArray()
                 val audioLanguages = linkedSetOf<String>()
 
                 if (parsed.tracks.isNotEmpty()) {
-                    // 1. Primary path: 100% accurate EBML TrackEntry data
                     for (t in parsed.tracks) {
                         when (t.trackType) {
                             1 -> { // Video Track
@@ -590,41 +1103,42 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                                 if (videoCodec.isEmpty() && t.codecId.isNotEmpty()) {
                                     videoCodec = formatMkvVideoCodec(t.codecId)
                                 }
+                                if (videoBitrateStr.isEmpty() && t.realBitrateBps > 0L) {
+                                    videoBitrateStr = formatBitrate(t.realBitrateBps)
+                                }
                                 if (frameRate == 0.0 && t.defaultDurationNs > 0L) {
                                     frameRate = 1_000_000_000.0 / t.defaultDurationNs.toDouble()
                                 }
-                                // TransferCharacteristics 16 = PQ (HDR10), 18 = HLG
                                 if (t.colorTransfer == 16 || t.colorTransfer == 18) {
                                     if (dvProfile != 5) {
                                         hasHDR10 = true
                                     }
                                 }
                             }
-                            2 -> { // Audio Track
+                            2 -> { // Audio Track (Pure Bitstream & Container Specs Only!)
                                 val rawLang = t.languageIetf.ifBlank { t.language }
                                 val langName = formatLanguageName(rawLang, t.name)
-                                if (langName != "Unknown") {
-                                    audioLanguages.add(langName)
-                                }
-                                val codecName = formatMkvAudioCodec(t.codecId, t.name, parsed.hasAtmosHint)
-                                if (codecName.contains("Atmos", ignoreCase = true)) {
+                                audioLanguages.add(langName)
+
+                                val codecName = formatRealAudioCodec(t)
+                                if (t.bitstreamHasAtmos) {
                                     hasAtmos = true
                                 }
                                 val channelStr = formatChannelLayout(t.channels)
-                                val bitrateHint = extractBitrateHintFromTitle(t.name)
-                                val isOriginal = t.name.contains("Original", ignoreCase = true)
+                                val bitrateStr = formatBitrate(t.realBitrateBps)
+                                val bitrateKbps = (t.realBitrateBps / 1000L).toInt()
 
                                 val summaryParts = mutableListOf<String>()
-                                summaryParts.add(if (isOriginal) "$langName (Original)" else langName)
+                                summaryParts.add(langName)
                                 summaryParts.add(codecName)
                                 if (channelStr.isNotEmpty()) summaryParts.add(channelStr)
-                                if (!bitrateHint.isNullOrEmpty()) summaryParts.add(bitrateHint)
+                                if (bitrateStr.isNotEmpty()) summaryParts.add(bitrateStr)
 
                                 val trackMap = Arguments.createMap().apply {
                                     putString("language", langName)
                                     putString("codec", codecName)
                                     putString("channels", channelStr)
-                                    putInt("bitrateKbps", 0)
+                                    putInt("bitrateKbps", bitrateKbps)
                                     putString("summary", summaryParts.joinToString(" • "))
                                 }
                                 audioList.pushMap(trackMap)
@@ -642,7 +1156,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                         }
                     }
                 } else {
-                    // 2. Fallback path for .mp4 / non-EBML containers via MediaExtractor
+                    // Fallback for MP4 containers via MediaExtractor
                     val extractor = MediaExtractor()
                     try {
                         if (url.startsWith("file://") || url.startsWith("/")) {
@@ -676,23 +1190,40 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                             } else if (mime.startsWith("audio/")) {
                                 val rawLang = if (format.containsKey(MediaFormat.KEY_LANGUAGE)) {
                                     format.getString(MediaFormat.KEY_LANGUAGE)
-                                } else null
+                                } else "eng"
                                 val langName = formatLanguageName(rawLang)
-                                if (langName != "Unknown") audioLanguages.add(langName)
+                                audioLanguages.add(langName)
                                 val ch = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
                                     format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                                 } else 0
                                 val chStr = formatChannelLayout(ch)
-                                val codecName = formatMkvAudioCodec(mime, "", parsed.hasAtmosHint)
+                                val brBps = if (format.containsKey(MediaFormat.KEY_BIT_RATE)) {
+                                    format.getInteger(MediaFormat.KEY_BIT_RATE).toLong()
+                                } else 0L
+                                val brStr = formatBitrate(brBps)
+                                val codecName = when {
+                                    mime.contains("eac3") && mime.contains("joc") -> {
+                                        hasAtmos = true
+                                        "Dolby Atmos (DD+)"
+                                    }
+                                    mime.contains("eac3") -> "Dolby Digital Plus (DD+)"
+                                    mime.contains("ac3") -> "Dolby Digital (AC3)"
+                                    mime.contains("mp4a") || mime.contains("aac") -> "AAC"
+                                    else -> "Audio"
+                                }
                                 val trackMap = Arguments.createMap().apply {
                                     putString("language", langName)
                                     putString("codec", codecName)
                                     putString("channels", chStr)
-                                    putInt("bitrateKbps", 0)
+                                    putInt("bitrateKbps", (brBps / 1000L).toInt())
                                     putString(
                                         "summary",
-                                        listOfNotNull(langName, codecName, chStr.ifEmpty { null })
-                                            .joinToString(" • ")
+                                        listOfNotNull(
+                                            langName,
+                                            codecName,
+                                            chStr.ifEmpty { null },
+                                            brStr.ifEmpty { null }
+                                        ).joinToString(" • ")
                                     )
                                 }
                                 audioList.pushMap(trackMap)
@@ -706,24 +1237,12 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                     }
                 }
 
-                // Cross-check DV & HDR10 flags
-                val lowerName = fileName.lowercase(Locale.ROOT)
-                val nameHasDv = Regex("\\b(dv|dovi|dolby[ ._-]*vision)\\b").containsMatchIn(lowerName)
-                val nameHasHdr = Regex("\\b(hdr|hdr10|hdr10\\+)\\b").containsMatchIn(lowerName)
-
                 if (dvProfile == 5) {
                     hasDV = true
                     hasHDR10 = false
                 } else if (dvProfile == 7 || dvProfile == 8) {
                     hasDV = true
-                    if (nameHasHdr || parsed.dvHasHdr10Base) {
-                        hasHDR10 = true
-                    }
-                } else {
-                    if (nameHasDv) hasDV = true
-                    if (hasDV && !nameHasHdr && !parsed.dvHasHdr10Base) {
-                        hasHDR10 = false
-                    } else if (nameHasHdr) {
+                    if (parsed.dvHasHdr10Base) {
                         hasHDR10 = true
                     }
                 }
@@ -736,6 +1255,12 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                     else -> ""
                 }
 
+                val finalVideoCodecLabel = if (videoBitrateStr.isNotEmpty()) {
+                    "$videoCodec @ $videoBitrateStr"
+                } else {
+                    videoCodec
+                }
+
                 val langArray = Arguments.createArray()
                 for (l in audioLanguages) {
                     langArray.pushString(l)
@@ -745,7 +1270,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                     putInt("width", width)
                     putInt("height", height)
                     putString("resolution", resolutionLabel)
-                    putString("videoCodec", videoCodec)
+                    putString("videoCodec", finalVideoCodecLabel)
                     putDouble("frameRate", frameRate)
                     putDouble("durationSec", durationSec)
                     putDouble("totalBytes", parsed.totalBytes.toDouble())
