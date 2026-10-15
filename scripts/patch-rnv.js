@@ -45,6 +45,41 @@ const newTrackSnippet = `                    int flatTrackIndex = 0;
                             }
                             flatTrackIndex++;`;
 
+const renderersReplacement = `        DefaultRenderersFactory renderersFactory =
+                new DefaultRenderersFactory(getContext())
+                        .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+                        .setEnableDecoderFallback(true)
+                        .setMediaCodecSelector((mimeType, requiresSecureDecoder, requiresTunnelingDecoder) -> {
+                            String hdrPref = "auto";
+                            try {
+                                Class<?> modCls = Class.forName("com.gdstream.VideoPlayerModule");
+                                java.lang.reflect.Field f = modCls.getDeclaredField("preferredHdrMode");
+                                Object val = f.get(null);
+                                if (val instanceof String) hdrPref = (String) val;
+                            } catch (Exception ignored) {}
+
+                            if (androidx.media3.common.MimeTypes.VIDEO_DOLBY_VISION.equals(mimeType)) {
+                                if ("hdr".equalsIgnoreCase(hdrPref)) {
+                                    return MediaCodecUtil.getDecoderInfos(
+                                            androidx.media3.common.MimeTypes.VIDEO_H265,
+                                            requiresSecureDecoder,
+                                            requiresTunnelingDecoder);
+                                }
+                                List<MediaCodecInfo> dvCodecs = MediaCodecUtil.getDecoderInfos(
+                                        mimeType, requiresSecureDecoder, requiresTunnelingDecoder);
+                                if (dvCodecs.isEmpty()) {
+                                    return MediaCodecUtil.getDecoderInfos(
+                                            androidx.media3.common.MimeTypes.VIDEO_H265,
+                                            requiresSecureDecoder,
+                                            requiresTunnelingDecoder);
+                                }
+                                return dvCodecs;
+                            }
+                            return MediaCodecUtil.getDecoderInfos(
+                                    mimeType, requiresSecureDecoder, requiresTunnelingDecoder);
+                        })
+                        .forceEnableMediaCodecAsynchronousQueueing();`;
+
 const oldSubtitleMethod = `    public void setSubtitleStyle(SubtitleStyle style) {
         exoPlayerView.setSubtitleStyle(style);
     }`;
@@ -84,16 +119,18 @@ const newSubtitleMethod = `    private void applyTransparentSubtitleStyle(View v
 for (const file of targets) {
   if (fs.existsSync(file)) {
     let content = fs.readFileSync(file, 'utf8');
-    let changed = false;
 
     if (content.includes(oldTrackSnippet)) {
       content = content.replace(oldTrackSnippet, newTrackSnippet);
-      changed = true;
     }
+
+    content = content.replace(
+      /DefaultRenderersFactory renderersFactory =[\s\S]*?\.forceEnableMediaCodecAsynchronousQueueing\(\);/,
+      renderersReplacement,
+    );
 
     if (content.includes(oldSubtitleMethod)) {
       content = content.replace(oldSubtitleMethod, newSubtitleMethod);
-      changed = true;
     }
 
     if (
@@ -104,12 +141,9 @@ for (const file of targets) {
         /updateSubtitleButtonVisibility\(\);/g,
         'applyTransparentSubtitleStyle(exoPlayerView);\n        updateSubtitleButtonVisibility();',
       );
-      changed = true;
     }
 
-    if (changed) {
-      fs.writeFileSync(file, content, 'utf8');
-      console.log('Patched ReactExoplayerView in:', file);
-    }
+    fs.writeFileSync(file, content, 'utf8');
+    console.log('Patched Dolby Vision / HDR selector & Subtitles in:', file);
   }
 }

@@ -730,10 +730,39 @@ public class ReactExoplayerView extends FrameLayout implements
             this.bandwidthMeter = config.getBandwidthMeter();
         }
 
-        DefaultRenderersFactory renderersFactory =
+                DefaultRenderersFactory renderersFactory =
                 new DefaultRenderersFactory(getContext())
-                        .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
+                        .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
                         .setEnableDecoderFallback(true)
+                        .setMediaCodecSelector((mimeType, requiresSecureDecoder, requiresTunnelingDecoder) -> {
+                            String hdrPref = "auto";
+                            try {
+                                Class<?> modCls = Class.forName("com.gdstream.VideoPlayerModule");
+                                java.lang.reflect.Field f = modCls.getDeclaredField("preferredHdrMode");
+                                Object val = f.get(null);
+                                if (val instanceof String) hdrPref = (String) val;
+                            } catch (Exception ignored) {}
+
+                            if (androidx.media3.common.MimeTypes.VIDEO_DOLBY_VISION.equals(mimeType)) {
+                                if ("hdr".equalsIgnoreCase(hdrPref)) {
+                                    return MediaCodecUtil.getDecoderInfos(
+                                            androidx.media3.common.MimeTypes.VIDEO_H265,
+                                            requiresSecureDecoder,
+                                            requiresTunnelingDecoder);
+                                }
+                                List<MediaCodecInfo> dvCodecs = MediaCodecUtil.getDecoderInfos(
+                                        mimeType, requiresSecureDecoder, requiresTunnelingDecoder);
+                                if (dvCodecs.isEmpty()) {
+                                    return MediaCodecUtil.getDecoderInfos(
+                                            androidx.media3.common.MimeTypes.VIDEO_H265,
+                                            requiresSecureDecoder,
+                                            requiresTunnelingDecoder);
+                                }
+                                return dvCodecs;
+                            }
+                            return MediaCodecUtil.getDecoderInfos(
+                                    mimeType, requiresSecureDecoder, requiresTunnelingDecoder);
+                        })
                         .forceEnableMediaCodecAsynchronousQueueing();
 
         DefaultMediaSourceFactory mediaSourceFactory;

@@ -1,10 +1,16 @@
 package com.gdstream
 
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
+import android.media.MediaCodecList
 import android.net.Uri
+import android.os.Build
+import android.os.StrictMode
+import android.provider.MediaStore
 import android.provider.Settings
+import android.view.Display
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -12,6 +18,7 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.UiThreadUtil
 import com.facebook.react.modules.core.DeviceEventManagerModule
+import java.io.File
 import kotlin.math.roundToInt
 
 class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
@@ -23,6 +30,10 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
     companion object {
         @Volatile
         private var instance: VideoPlayerModule? = null
+
+        @JvmField
+        @Volatile
+        var preferredHdrMode: String = "dv"
 
         fun sendKeyEvent(keyCode: Int, action: Int) {
             val module = instance ?: return
@@ -44,14 +55,105 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
     }
 
     @ReactMethod
+    fun setPreferredHdrMode(mode: String, promise: Promise) {
+        preferredHdrMode = mode.lowercase()
+        promise.resolve(preferredHdrMode)
+    }
+
+    @ReactMethod
+    fun getDeviceHdrCapabilities(promise: Promise) {
+        try {
+            var hasDvDecoder = false
+            var hasHevcHdrDecoder = false
+            val codecList = MediaCodecList(MediaCodecList.ALL_CODECS)
+            for (info in codecList.codecInfos) {
+                if (info.isEncoder) continue
+                for (type in info.supportedTypes) {
+                    if (type.equals("video/dolby-vision", ignoreCase = true)) {
+                        hasDvDecoder = true
+                    }
+                    if (type.equals("video/hevc", ignoreCase = true)) {
+                        hasHevcHdrDecoder = true
+                    }
+                }
+            }
+
+            var displaySupportsDv = false
+            var displaySupportsHdr10 = false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                val activity = reactApplicationContext.currentActivity
+                @Suppress("DEPRECATION")
+                val hdrTypes = activity?.windowManager?.defaultDisplay?.hdrCapabilities?.supportedHdrTypes
+                if (hdrTypes != null) {
+                    for (t in hdrTypes) {
+                        if (t == Display.HdrCapabilities.HDR_TYPE_DOLBY_VISION) displaySupportsDv = true
+                        if (t == Display.HdrCapabilities.HDR_TYPE_HDR10 || t == Display.HdrCapabilities.HDR_TYPE_HDR10_PLUS) {
+                            displaySupportsHdr10 = true
+                        }
+                    }
+                }
+            }
+
+            val map = Arguments.createMap().apply {
+                putBoolean("dolbyVision", hasDvDecoder || displaySupportsDv)
+                putBoolean("hdr10", hasHevcHdrDecoder || displaySupportsHdr10)
+                putString("preferredMode", preferredHdrMode)
+            }
+            promise.resolve(map)
+        } catch (e: Exception) {
+            val map = Arguments.createMap().apply {
+                putBoolean("dolbyVision", true)
+                putBoolean("hdr10", true)
+                putString("preferredMode", preferredHdrMode)
+            }
+            promise.resolve(map)
+        }
+    }
+
+    private fun resolvePlayableUri(urlOrPath: String): Uri {
+        if (urlOrPath.startsWith("/") || urlOrPath.startsWith("file://")) {
+            val cleanPath = urlOrPath.removePrefix("file://")
+            val file = File(cleanPath)
+            try {
+                val projection = arrayOf(MediaStore.Video.Media._ID)
+                val selection = "${MediaStore.Video.Media.DATA} = ?"
+                val selectionArgs = arrayOf(file.absolutePath)
+                reactApplicationContext.contentResolver.query(
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                    projection,
+                    selection,
+                    selectionArgs,
+                    null
+                )?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val id = cursor.getLong(0)
+                        return ContentUris.withAppendedId(
+                            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                            id
+                        )
+                    }
+                }
+            } catch (_: Exception) {}
+
+            val builder = StrictMode.VmPolicy.Builder()
+            StrictMode.setVmPolicy(builder.build())
+            return Uri.fromFile(file)
+        }
+        return Uri.parse(urlOrPath)
+    }
+
+    @ReactMethod
     fun playVideo(url: String, promise: Promise) {
         try {
-            val intent = Intent(Intent.ACTION_VIEW)
-            intent.setDataAndType(Uri.parse(url), "video/*")
-            intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            val playableUri = resolvePlayableUri(url)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(playableUri, "video/*")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
 
-            val chooser = Intent.createChooser(intent, "Choose Player 🍿")
-            chooser.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            val chooser = Intent.createChooser(intent, "Choose Player 🍿").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
 
             reactApplicationContext.startActivity(chooser)
             promise.resolve(true)

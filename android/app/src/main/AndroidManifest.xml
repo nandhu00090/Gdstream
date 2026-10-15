@@ -1,6 +1,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
 
     <uses-feature
         android:name="android.hardware.touchscreen"
@@ -17,6 +23,7 @@
       android:banner="@mipmap/ic_launcher"
       android:allowBackup="false"
       android:largeHeap="true"
+      android:requestLegacyExternalStorage="true"
       android:theme="@style/AppTheme"
       android:usesCleartextTraffic="${usesCleartextTraffic}"
       android:supportsRtl="true">
@@ -26,6 +33,7 @@
         android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|navigation"
         android:launchMode="singleTask"
         android:windowSoftInputMode="adjustResize"
+        android:colorMode="hdr"
         android:exported="true">
         <intent-filter>
             <action android:name="android.intent.action.MAIN" />

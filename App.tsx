@@ -27,7 +27,7 @@ import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const { VideoPlayerManager, SubtitleFileModule } = NativeModules;
+const { VideoPlayerManager, SubtitleFileModule, DownloadEngine } = NativeModules;
 const BASE_URL = 'https://movies-and-series.ambalartssb01.workers.dev';
 const USERNAME = 'admin';
 const PASSWORD = '629175';
@@ -43,6 +43,8 @@ interface ParsedMediaInfo {
   seasonEpisode: string;
   resolution: string;
   badges: string[];
+  hasDV: boolean;
+  hasHDR: boolean;
   isFolder: boolean;
 }
 
@@ -55,8 +57,35 @@ interface MediaMetadata {
   cast?: string;
 }
 
+interface DownloadItem {
+  id: string;
+  fileName: string;
+  title: string;
+  poster: string;
+  url: string;
+  filePath: string;
+  totalBytes: number;
+  downloadedBytes: number;
+  speedBytesPerSec: number;
+  progress: number;
+  status: 'downloading' | 'paused' | 'completed' | 'error';
+  threadsCount: number;
+}
+
 const TYPO_FIXES: Record<string, string> = {
   'attach on titan': 'Attack on Titan',
+};
+
+const formatBytes = (bytes: number) => {
+  if (!bytes || bytes <= 0) return '0 MB';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let val = bytes;
+  let idx = 0;
+  while (val >= 1024 && idx < units.length - 1) {
+    val /= 1024;
+    idx++;
+  }
+  return `${val.toFixed(idx >= 3 ? 2 : 1)} ${units[idx]}`;
 };
 
 const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => {
@@ -76,10 +105,13 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
   else if (/\b720p\b/i.test(normalized)) resolution = '720p';
   else if (/\b480p\b/i.test(normalized)) resolution = '480p';
 
+  const hasDV = /\b(dv|dovi|dolby\s*vision)\b/i.test(normalized);
+  const hasHDR = /\b(hdr|hdr10|hdr10\+)\b/i.test(normalized);
+
   const badges: string[] = [];
   if (/\b(atmos)\b/i.test(normalized)) badges.push('Atmos');
-  if (/\b(dv|dovi|dolby\s*vision)\b/i.test(normalized)) badges.push('DV');
-  if (/\b(hdr|hdr10)\b/i.test(normalized)) badges.push('HDR');
+  if (hasDV) badges.push('DV');
+  if (hasHDR) badges.push('HDR');
   if (/\b(remux)\b/i.test(normalized)) badges.push('REMUX');
   else if (/\b(bluray|blu-ray)\b/i.test(normalized)) badges.push('BluRay');
   else if (/\b(web-dl|webdl|web\s*dl|webrip)\b/i.test(normalized))
@@ -143,6 +175,8 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
     seasonEpisode,
     resolution,
     badges: badges.slice(0, 4),
+    hasDV,
+    hasHDR,
     isFolder,
   };
 };
@@ -229,6 +263,7 @@ const App = () => {
   const [currentPath, setCurrentPath] = useState('/0:/');
   const [searchQuery, setSearchQuery] = useState('');
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
+  const [activeTab, setActiveTab] = useState<'catalog' | 'downloads'>('catalog');
 
   const [metadataMap, setMetadataMap] = useState<Record<string, MediaMetadata>>(
     {},
@@ -239,6 +274,14 @@ const App = () => {
   const [tmdbKey, setTmdbKey] = useState(DEFAULT_TMDB_API_KEY);
   const [showKeyModal, setShowKeyModal] = useState(false);
   const [tempKeyInput, setTempKeyInput] = useState('');
+
+  // Downloads State
+  const [downloads, setDownloads] = useState<DownloadItem[]>([]);
+
+  // Dolby Vision vs HDR10 Mode State
+  const [activeHdrMode, setActiveHdrMode] = useState<'dv' | 'hdr' | 'sdr'>('dv');
+  const [showHdrChoiceModal, setShowHdrChoiceModal] = useState(false);
+  const [playerInstanceKey, setPlayerInstanceKey] = useState(0);
 
   const [selectedFile, setSelectedFile] = useState<any>(null);
   const [playMode, setPlayMode] = useState<string | null>(null);
@@ -360,7 +403,21 @@ const App = () => {
         })
         .catch(() => {});
     }
+    if (DownloadEngine?.getDownloads) {
+      DownloadEngine.getDownloads()
+        .then((list: DownloadItem[]) => {
+          if (Array.isArray(list)) setDownloads(list);
+        })
+        .catch(() => {});
+    }
+    const dlSub = DeviceEventEmitter.addListener(
+      'onDownloadUpdate',
+      (list: DownloadItem[]) => {
+        if (Array.isArray(list)) setDownloads([...list]);
+      },
+    );
     fetchDirectory('/0:/', false);
+    return () => dlSub.remove();
   }, []);
 
   useEffect(() => {
@@ -395,6 +452,10 @@ const App = () => {
 
   useEffect(() => {
     const backAction = () => {
+      if (showHdrChoiceModal) {
+        setShowHdrChoiceModal(false);
+        return true;
+      }
       if (showKeyModal) {
         setShowKeyModal(false);
         return true;
@@ -413,6 +474,9 @@ const App = () => {
       } else if (selectedFile) {
         setSelectedFile(null);
         return true;
+      } else if (activeTab === 'downloads') {
+        setActiveTab('catalog');
+        return true;
       } else if (pathStack.length > 1) {
         goBack();
         return true;
@@ -424,7 +488,16 @@ const App = () => {
       backAction,
     );
     return () => backHandler.remove();
-  }, [playMode, selectedFile, pathStack, activeMenu, showKeyModal, isLocked]);
+  }, [
+    playMode,
+    selectedFile,
+    pathStack,
+    activeMenu,
+    showKeyModal,
+    showHdrChoiceModal,
+    isLocked,
+    activeTab,
+  ]);
 
   const loadSavedTimesForFiles = useCallback(async (items: any[]) => {
     try {
@@ -746,6 +819,27 @@ const App = () => {
 
   const getStreamUrl = (file: any) => {
     if (!file) return '';
+    if (file.localPath) {
+      return file.localPath.startsWith('file://')
+        ? file.localPath
+        : `file://${file.localPath}`;
+    }
+    const completedDl = downloads.find(
+      d => d.fileName === file.name && d.status === 'completed' && d.filePath,
+    );
+    if (completedDl) {
+      return `file://${completedDl.filePath}`;
+    }
+    if (file.link) {
+      return file.link.startsWith('http')
+        ? file.link
+        : `${BASE_URL}${file.link.startsWith('/') ? '' : '/'}${file.link}`;
+    }
+    return `${BASE_URL}${currentPath}${encodeURIComponent(file.name)}`;
+  };
+
+  const getRemoteDownloadUrl = (file: any) => {
+    if (!file) return '';
     if (file.link) {
       return file.link.startsWith('http')
         ? file.link
@@ -769,6 +863,65 @@ const App = () => {
     setExternalSubtitle(null);
     setExternalAudio(null);
     setSelectedFile(file);
+  };
+
+  const startPlaybackWithMode = async (mode: 'dv' | 'hdr' | 'sdr') => {
+    setShowHdrChoiceModal(false);
+    setActiveHdrMode(mode);
+    try {
+      await VideoPlayerManager?.setPreferredHdrMode?.(mode);
+    } catch {}
+    setPlayerInstanceKey(k => k + 1);
+    setPlayMode('internal');
+  };
+
+  const handlePlayInAppPress = (fileToPlay = selectedFile) => {
+    if (!fileToPlay) return;
+    const info = parseMediaFilename(fileToPlay.name, false);
+    if (info.hasDV) {
+      setShowHdrChoiceModal(true);
+    } else if (info.hasHDR) {
+      startPlaybackWithMode('hdr');
+    } else {
+      startPlaybackWithMode('sdr');
+    }
+  };
+
+  const toggleLiveHdrModeInPlayer = async () => {
+    const nextMode = activeHdrMode === 'dv' ? 'hdr' : 'dv';
+    const resumeSec = currentTime;
+    if (resumeSec > 2 && selectedFile?.name) {
+      await AsyncStorage.setItem(
+        `time_${selectedFile.name}`,
+        resumeSec.toString(),
+      );
+    }
+    setActiveHdrMode(nextMode);
+    try {
+      await VideoPlayerManager?.setPreferredHdrMode?.(nextMode);
+    } catch {}
+    setPlayerInstanceKey(k => k + 1);
+  };
+
+  const handleStartDownload = async (file: any) => {
+    if (!file) return;
+    const info = parseMediaFilename(file.name, false);
+    const meta = metadataMap[file.name];
+    const url = getRemoteDownloadUrl(file);
+    try {
+      await DownloadEngine?.startDownload(
+        url,
+        file.name,
+        info.cleanTitle,
+        meta?.poster || '',
+      );
+      Alert.alert(
+        'Download Started ⚡',
+        `${info.cleanTitle} is downloading with 8x parallel turbo connections to Download/GDStream.`,
+      );
+    } catch (e) {
+      Alert.alert('Error', 'Could not start download!');
+    }
   };
 
   const handlePress = (item: any) => {
@@ -812,8 +965,8 @@ const App = () => {
     [files],
   );
 
-  const openInExternalPlayer = async () => {
-    const url = getStreamUrl(selectedFile);
+  const openInExternalPlayer = async (targetFile = selectedFile) => {
+    const url = getStreamUrl(targetFile);
     try {
       await VideoPlayerManager.playVideo(url);
     } catch (e) {
@@ -924,7 +1077,6 @@ const App = () => {
     [isLocked, triggerStepSeek],
   );
 
-  // Gesture Responder: Left Vertical Swipe = Brightness (Left HUD), Right Vertical Swipe = Volume (Right HUD)
   const gestureStartRef = useRef({
     side: 'left' as 'left' | 'right',
     startVal: 0.5,
@@ -1078,6 +1230,70 @@ const App = () => {
     }
     closeInternalPlayer();
     setSelectedFile(null);
+  };
+
+  const renderHdrChoiceModal = () => {
+    if (!showHdrChoiceModal || !selectedFile) return null;
+    const info = parseMediaFilename(selectedFile.name, false);
+    return (
+      <Modal
+        visible={showHdrChoiceModal}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setShowHdrChoiceModal(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.hdrModalCard}>
+            <Text style={styles.hdrModalEyebrow}>SELECT DISPLAY FORMAT</Text>
+            <Text style={styles.hdrModalTitle}>{info.cleanTitle}</Text>
+            <Text style={styles.hdrModalSub}>
+              This title contains both Dolby Vision and HDR10 streams. Choose
+              which hardware engine you want to play with:
+            </Text>
+
+            <FocusableButton
+              hasTVPreferredFocus={true}
+              style={styles.dvOptionBtn}
+              onPress={() => startPlaybackWithMode('dv')}>
+              <View style={styles.dvOptionBadge}>
+                <Text style={styles.dvOptionBadgeText}>DOLBY VISION</Text>
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.hdrOptionTitle}>
+                  Play in Dolby Vision (DV)
+                </Text>
+                <Text style={styles.hdrOptionDesc}>
+                  Dynamic scene-by-scene metadata via hardware DV decoder
+                </Text>
+              </View>
+              <Icon name="play-circle-fill" size={28} color="#E50914" />
+            </FocusableButton>
+
+            <FocusableButton
+              style={styles.hdr10OptionBtn}
+              onPress={() => startPlaybackWithMode('hdr')}>
+              <View style={styles.hdr10OptionBadge}>
+                <Text style={styles.hdr10OptionBadgeText}>HDR10</Text>
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.hdrOptionTitle}>Play in HDR10</Text>
+                <Text style={styles.hdrOptionDesc}>
+                  10-bit HEVC High Dynamic Range base layer
+                </Text>
+              </View>
+              <Icon name="play-circle-outline" size={28} color="#F5C518" />
+            </FocusableButton>
+
+            <TouchableOpacity
+              style={styles.hdrCancelBtn}
+              onPress={() => setShowHdrChoiceModal(false)}>
+              <Text style={{ color: '#99A3B3', fontWeight: '700' }}>
+                Cancel
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+    );
   };
 
   const renderFloatingMenu = () => {
@@ -1319,7 +1535,7 @@ const App = () => {
     );
   };
 
-  // 🔥 1. NETFLIX-STYLE INTERNAL VIDEO PLAYER SCREEN 🔥
+  // 🔥 1. INTERNAL VIDEO PLAYER SCREEN 🔥
   if (selectedFile && playMode === 'internal') {
     const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
     const remainingTime = Math.max(0, duration - currentTime);
@@ -1329,7 +1545,7 @@ const App = () => {
       <View style={styles.playerWrapper}>
         <StatusBar hidden={true} />
         <Video
-          key={selectedFile.link || selectedFile.name}
+          key={`${selectedFile.link || selectedFile.name}-${playerInstanceKey}-${activeHdrMode}`}
           ref={videoRef}
           source={{
             uri: getStreamUrl(selectedFile),
@@ -1392,7 +1608,7 @@ const App = () => {
           selectedTextTrack={
             subtitlesActive ? selectedText : { type: 'disabled' }
           }
-          viewType={1}
+          viewType={0}
           controls={false}
         />
 
@@ -1438,7 +1654,6 @@ const App = () => {
           />
         )}
 
-        {/* Left Side Brightness HUD & Right Side Volume HUD */}
         {gestureIndicator.visible && (
           <View
             style={[
@@ -1538,11 +1753,42 @@ const App = () => {
                       </Text>
                     </View>
                   )}
-                  {playerInfo.badges.slice(0, 2).map((b, i) => (
-                    <Text key={i} style={styles.netflixMetaDotText}>
-                      • {b}
-                    </Text>
-                  ))}
+                  {/* LIVE DOLBY VISION / HDR10 STATUS BADGE IN PLAYER */}
+                  {(playerInfo.hasDV || playerInfo.hasHDR) && (
+                    <TouchableOpacity
+                      onPress={
+                        playerInfo.hasDV ? toggleLiveHdrModeInPlayer : undefined
+                      }
+                      style={[
+                        styles.liveHdrStatusPill,
+                        activeHdrMode === 'dv'
+                          ? styles.liveDvPill
+                          : styles.liveHdr10Pill,
+                      ]}>
+                      <Icon
+                        name={
+                          activeHdrMode === 'dv' ? 'auto-awesome' : 'wb-sunny'
+                        }
+                        size={11}
+                        color={activeHdrMode === 'dv' ? '#FFD700' : '#000'}
+                      />
+                      <Text
+                        style={[
+                          styles.liveHdrStatusText,
+                          activeHdrMode === 'hdr' && { color: '#000' },
+                        ]}>
+                        {activeHdrMode === 'dv' ? 'DOLBY VISION' : 'HDR10'}
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                  {playerInfo.badges
+                    .filter(b => b !== 'DV' && b !== 'HDR')
+                    .slice(0, 2)
+                    .map((b, i) => (
+                      <Text key={i} style={styles.netflixMetaDotText}>
+                        • {b}
+                      </Text>
+                    ))}
                 </View>
               </View>
 
@@ -1698,29 +1944,23 @@ const App = () => {
                   </Text>
                 </FocusableButton>
 
+                {playerInfo.hasDV && (
+                  <FocusableButton
+                    style={styles.netflixActionPill}
+                    onPress={toggleLiveHdrModeInPlayer}>
+                    <Icon name="hdr-on" size={20} color="#F5C518" />
+                    <Text style={styles.netflixActionText}>
+                      Mode: {activeHdrMode.toUpperCase()}
+                    </Text>
+                  </FocusableButton>
+                )}
+
                 {!!nextEpisodeFile && (
                   <FocusableButton
                     style={styles.netflixNextEpPill}
                     onPress={playNextEpisode}>
                     <Icon name="skip-next" size={22} color="black" />
                     <Text style={styles.netflixNextEpText}>Next Ep</Text>
-                  </FocusableButton>
-                )}
-
-                {!IS_TV && (
-                  <FocusableButton
-                    onPress={toggleFullscreen}
-                    style={styles.netflixActionPill}>
-                    <Icon
-                      name={
-                        isFullscreen
-                          ? 'screen-lock-rotation'
-                          : 'screen-rotation'
-                      }
-                      size={20}
-                      color="white"
-                    />
-                    <Text style={styles.netflixActionText}>Rotate</Text>
                   </FocusableButton>
                 )}
               </View>
@@ -1732,12 +1972,13 @@ const App = () => {
     );
   }
 
-  // 🔥 2. NETFLIX-STYLE MOVIE DETAIL SCREEN 🔥
+  // 🔥 2. MOVIE DETAIL SCREEN 🔥
   if (selectedFile && playMode === null) {
     const info = parseMediaFilename(selectedFile.name, false);
     const meta = metadataMap[selectedFile.name];
     const savedSec = savedTimesMap[selectedFile.name] || 0;
     const bannerImage = meta?.backdrop || meta?.poster;
+    const dlTask = downloads.find(d => d.fileName === selectedFile.name);
 
     return (
       <ScrollView
@@ -1826,23 +2067,73 @@ const App = () => {
             <FocusableButton
               hasTVPreferredFocus={true}
               style={styles.primaryPlayButton}
-              onPress={() => setPlayMode('internal')}>
+              onPress={() => handlePlayInAppPress(selectedFile)}>
               <Icon name="play-arrow" size={26} color="white" />
               <Text style={styles.primaryPlayButtonText}>
                 {savedSec > 10
-                  ? `Resume Play (${formatTime(savedSec)})`
-                  : 'Play in App (Netflix Player)'}
+                  ? `Resume in App (${formatTime(savedSec)})`
+                  : 'Play in App'}
               </Text>
             </FocusableButton>
 
             <FocusableButton
               style={styles.secondaryPlayButton}
-              onPress={openInExternalPlayer}>
+              onPress={() => openInExternalPlayer(selectedFile)}>
               <Icon name="open-in-new" size={20} color="white" />
               <Text style={styles.secondaryPlayButtonText}>
                 Open in External Player
               </Text>
             </FocusableButton>
+
+            {!dlTask ? (
+              <FocusableButton
+                style={styles.downloadActionBtn}
+                onPress={() => handleStartDownload(selectedFile)}>
+                <Icon name="file-download" size={22} color="#46d369" />
+                <Text style={styles.downloadActionText}>
+                  Download Movie (8x Turbo)
+                </Text>
+              </FocusableButton>
+            ) : dlTask.status === 'completed' ? (
+              <View style={styles.downloadedReadyCard}>
+                <Icon name="check-circle" size={20} color="#46d369" />
+                <Text style={styles.downloadedReadyText}>
+                  Downloaded to Phone Storage (Download/GDStream)
+                </Text>
+              </View>
+            ) : (
+              <FocusableButton
+                style={styles.downloadProgressCard}
+                onPress={() => {
+                  setSelectedFile(null);
+                  setActiveTab('downloads');
+                }}>
+                <View style={styles.dlCardHeaderRow}>
+                  <Text style={styles.dlCardStatusText}>
+                    {dlTask.status === 'downloading'
+                      ? `Downloading (${dlTask.threadsCount}x Turbo) • ${formatBytes(
+                          dlTask.speedBytesPerSec,
+                        )}/s`
+                      : `Download ${dlTask.status.toUpperCase()}`}
+                  </Text>
+                  <Text style={styles.dlCardPercentText}>
+                    {dlTask.progress.toFixed(1)}%
+                  </Text>
+                </View>
+                <View style={styles.dlProgressBarBg}>
+                  <View
+                    style={[
+                      styles.dlProgressBarFill,
+                      { width: `${dlTask.progress}%` },
+                    ]}
+                  />
+                </View>
+                <Text style={styles.dlCardSubText}>
+                  {formatBytes(dlTask.downloadedBytes)} /{' '}
+                  {formatBytes(dlTask.totalBytes)} • Tap to open Downloads
+                </Text>
+              </FocusableButton>
+            )}
           </View>
 
           <View style={styles.rawFileBox}>
@@ -1850,12 +2141,165 @@ const App = () => {
             <Text style={styles.rawFileName}>{selectedFile.name}</Text>
           </View>
         </View>
+        {renderHdrChoiceModal()}
       </ScrollView>
     );
   }
 
-  // 🔥 3. POSTER CATALOG HOME SCREEN 🔥
+  // 🔥 3. DOWNLOADS TAB SCREEN 🔥
+  if (activeTab === 'downloads') {
+    return (
+      <View style={styles.container}>
+        <StatusBar hidden={false} barStyle="light-content" />
+        <View style={styles.topHeaderBar}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <FocusableButton
+              style={styles.headerIconBtn}
+              onPress={() => setActiveTab('catalog')}>
+              <Icon name="arrow-back" size={22} color="white" />
+            </FocusableButton>
+            <Text style={styles.headerTitle}>Downloads</Text>
+          </View>
+          <View style={styles.storageHintPill}>
+            <Icon name="folder" size={14} color="#F5C518" />
+            <Text style={styles.storageHintText}>Download/GDStream</Text>
+          </View>
+        </View>
+
+        {downloads.length === 0 ? (
+          <View style={styles.emptyDownloadsBox}>
+            <Icon name="cloud-download" size={56} color="#3A4454" />
+            <Text style={styles.emptyDownloadsTitle}>No Downloads Yet</Text>
+            <Text style={styles.emptyDownloadsSub}>
+              Movies you download are saved with 8x parallel turbo speed directly
+              to your phone's Download/GDStream folder so you can watch offline
+              in GDStream or any media player.
+            </Text>
+          </View>
+        ) : (
+          <FlatList
+            data={downloads}
+            contentContainerStyle={{ padding: 14, paddingBottom: 40 }}
+            keyExtractor={item => item.id}
+            renderItem={({ item }) => {
+              const isRunning = item.status === 'downloading';
+              const isDone = item.status === 'completed';
+              return (
+                <View style={styles.dlItemCard}>
+                  <View style={{ flexDirection: 'row', gap: 12 }}>
+                    {item.poster ? (
+                      <Image
+                        source={{ uri: item.poster }}
+                        style={styles.dlPosterThumb}
+                        resizeMode="cover"
+                      />
+                    ) : (
+                      <View style={styles.dlPosterFallback}>
+                        <Icon name="movie" size={28} color="#E50914" />
+                      </View>
+                    )}
+
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.dlItemTitle} numberOfLines={1}>
+                        {item.title}
+                      </Text>
+                      <Text style={styles.dlItemFile} numberOfLines={1}>
+                        {item.fileName}
+                      </Text>
+
+                      <View style={styles.dlProgressBarBg}>
+                        <View
+                          style={[
+                            styles.dlProgressBarFill,
+                            {
+                              width: `${item.progress}%`,
+                              backgroundColor: isDone ? '#46d369' : '#E50914',
+                            },
+                          ]}
+                        />
+                      </View>
+
+                      <View style={styles.dlStatsRow}>
+                        <Text style={styles.dlStatsText}>
+                          {formatBytes(item.downloadedBytes)} /{' '}
+                          {formatBytes(item.totalBytes)} (
+                          {item.progress.toFixed(1)}%)
+                        </Text>
+                        <Text style={styles.dlSpeedText}>
+                          {isRunning
+                            ? `⚡ ${formatBytes(item.speedBytesPerSec)}/s`
+                            : item.status.toUpperCase()}
+                        </Text>
+                      </View>
+                    </View>
+                  </View>
+
+                  <View style={styles.dlActionsRow}>
+                    {isDone ? (
+                      <>
+                        <FocusableButton
+                          style={styles.dlPrimaryBtn}
+                          onPress={() => {
+                            const localFileObj = {
+                              name: item.fileName,
+                              localPath: item.filePath,
+                            };
+                            openFile(localFileObj);
+                            handlePlayInAppPress(localFileObj);
+                          }}>
+                          <Icon name="play-arrow" size={20} color="white" />
+                          <Text style={styles.dlBtnText}>Play in App</Text>
+                        </FocusableButton>
+
+                        <FocusableButton
+                          style={styles.dlSecondaryBtn}
+                          onPress={() =>
+                            openInExternalPlayer({
+                              name: item.fileName,
+                              localPath: item.filePath,
+                            })
+                          }>
+                          <Icon name="open-in-new" size={18} color="white" />
+                          <Text style={styles.dlBtnText}>External Player</Text>
+                        </FocusableButton>
+                      </>
+                    ) : isRunning ? (
+                      <FocusableButton
+                        style={styles.dlSecondaryBtn}
+                        onPress={() => DownloadEngine?.pauseDownload(item.id)}>
+                        <Icon name="pause" size={18} color="white" />
+                        <Text style={styles.dlBtnText}>Pause</Text>
+                      </FocusableButton>
+                    ) : (
+                      <FocusableButton
+                        style={styles.dlPrimaryBtn}
+                        onPress={() => DownloadEngine?.resumeDownload(item.id)}>
+                        <Icon name="play-arrow" size={18} color="white" />
+                        <Text style={styles.dlBtnText}>Resume</Text>
+                      </FocusableButton>
+                    )}
+
+                    <FocusableButton
+                      style={styles.dlDeleteBtn}
+                      onPress={() => DownloadEngine?.deleteDownload(item.id)}>
+                      <Icon name="delete-outline" size={20} color="#ff6b6b" />
+                    </FocusableButton>
+                  </View>
+                </View>
+              );
+            }}
+          />
+        )}
+        {renderHdrChoiceModal()}
+      </View>
+    );
+  }
+
+  // 🔥 4. POSTER CATALOG HOME SCREEN 🔥
   const numColumns = viewMode === 'grid' ? (IS_TV ? 5 : 2) : 1;
+  const activeDownloadsCount = downloads.filter(
+    d => d.status === 'downloading',
+  ).length;
 
   return (
     <View style={styles.container}>
@@ -1869,6 +2313,20 @@ const App = () => {
         </View>
 
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          <FocusableButton
+            style={styles.headerIconBtn}
+            onPress={() => setActiveTab('downloads')}>
+            <Icon
+              name="file-download"
+              size={22}
+              color={activeDownloadsCount > 0 ? '#46d369' : 'white'}
+            />
+            {downloads.length > 0 && (
+              <View style={styles.dlBadgeDot}>
+                <Text style={styles.dlBadgeDotText}>{downloads.length}</Text>
+              </View>
+            )}
+          </FocusableButton>
           <FocusableButton
             style={styles.headerIconBtn}
             onPress={handleRefresh}>
@@ -2179,7 +2637,21 @@ const styles = StyleSheet.create({
     backgroundColor: '#1A1D24',
     borderWidth: 2,
     borderColor: 'transparent',
+    position: 'relative',
   },
+  dlBadgeDot: {
+    position: 'absolute',
+    top: -4,
+    right: -4,
+    backgroundColor: '#E50914',
+    minWidth: 16,
+    height: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 3,
+  },
+  dlBadgeDotText: { color: 'white', fontSize: 9, fontWeight: '900' },
   searchRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -2529,6 +3001,67 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '700',
   },
+  downloadActionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#141B24',
+    paddingVertical: 13,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+    gap: 8,
+    borderWidth: 1.5,
+    borderColor: 'rgba(70, 211, 105, 0.45)',
+  },
+  downloadActionText: {
+    color: '#46d369',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  downloadedReadyCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(70, 211, 105, 0.12)',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 10,
+    gap: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(70, 211, 105, 0.4)',
+  },
+  downloadedReadyText: {
+    color: '#46d369',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  downloadProgressCard: {
+    backgroundColor: '#151922',
+    padding: 14,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#2B3344',
+  },
+  dlCardHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  dlCardStatusText: { color: '#46d369', fontSize: 12, fontWeight: '800' },
+  dlCardPercentText: { color: 'white', fontSize: 12, fontWeight: '800' },
+  dlProgressBarBg: {
+    height: 6,
+    backgroundColor: '#252C3A',
+    borderRadius: 3,
+    overflow: 'hidden',
+    marginVertical: 6,
+  },
+  dlProgressBarFill: {
+    height: '100%',
+    backgroundColor: '#E50914',
+    borderRadius: 3,
+  },
+  dlCardSubText: { color: '#99A3B3', fontSize: 11, marginTop: 2 },
   rawFileBox: {
     marginTop: 24,
     padding: 12,
@@ -2545,9 +3078,183 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   rawFileName: { color: '#8F9BB0', fontSize: 12 },
+  // HDR vs DV Modal
+  hdrModalCard: {
+    width: '100%',
+    maxWidth: 400,
+    backgroundColor: '#141821',
+    borderRadius: 16,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#2D3546',
+  },
+  hdrModalEyebrow: {
+    color: '#E50914',
+    fontSize: 11,
+    fontWeight: '900',
+    letterSpacing: 1.2,
+  },
+  hdrModalTitle: {
+    color: 'white',
+    fontSize: 20,
+    fontWeight: '800',
+    marginTop: 4,
+  },
+  hdrModalSub: {
+    color: '#9AA5B5',
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 6,
+    marginBottom: 16,
+  },
+  dvOptionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1B1F2C',
+    padding: 14,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderColor: '#7C4DFF',
+    gap: 12,
+    marginBottom: 12,
+  },
+  dvOptionBadge: {
+    backgroundColor: '#5E35B1',
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 6,
+  },
+  dvOptionBadgeText: {
+    color: '#FFD700',
+    fontSize: 10,
+    fontWeight: '900',
+  },
+  hdr10OptionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1B1F2C',
+    padding: 14,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderColor: '#F5C518',
+    gap: 12,
+  },
+  hdr10OptionBadge: {
+    backgroundColor: '#F5C518',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+  },
+  hdr10OptionBadgeText: {
+    color: '#000',
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  hdrOptionTitle: { color: 'white', fontSize: 15, fontWeight: '800' },
+  hdrOptionDesc: { color: '#99A3B3', fontSize: 11, marginTop: 2 },
+  hdrCancelBtn: {
+    alignItems: 'center',
+    paddingVertical: 12,
+    marginTop: 8,
+  },
+  // Downloads Tab Styles
+  storageHintPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#171B24',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#283040',
+  },
+  storageHintText: { color: '#C2CBD8', fontSize: 11, fontWeight: '700' },
+  emptyDownloadsBox: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 34,
+  },
+  emptyDownloadsTitle: {
+    color: 'white',
+    fontSize: 18,
+    fontWeight: '800',
+    marginTop: 14,
+  },
+  emptyDownloadsSub: {
+    color: '#8C97A8',
+    fontSize: 13,
+    textAlign: 'center',
+    lineHeight: 20,
+    marginTop: 8,
+  },
+  dlItemCard: {
+    backgroundColor: '#14171F',
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#232938',
+  },
+  dlPosterThumb: {
+    width: 60,
+    height: 88,
+    borderRadius: 8,
+    backgroundColor: '#1E222B',
+  },
+  dlPosterFallback: {
+    width: 60,
+    height: 88,
+    borderRadius: 8,
+    backgroundColor: '#1E222B',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  dlItemTitle: { color: 'white', fontSize: 16, fontWeight: '800' },
+  dlItemFile: { color: '#8A94A6', fontSize: 11, marginTop: 2 },
+  dlStatsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 4,
+  },
+  dlStatsText: { color: '#A5B0C2', fontSize: 11, fontWeight: '600' },
+  dlSpeedText: { color: '#46d369', fontSize: 11, fontWeight: '800' },
+  dlActionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 12,
+  },
+  dlPrimaryBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#E50914',
+    paddingVertical: 9,
+    borderRadius: 8,
+    gap: 6,
+  },
+  dlSecondaryBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#222836',
+    paddingVertical: 9,
+    borderRadius: 8,
+    gap: 6,
+  },
+  dlDeleteBtn: {
+    padding: 9,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255, 107, 107, 0.12)',
+  },
+  dlBtnText: { color: 'white', fontSize: 13, fontWeight: '700' },
   modalBackdrop: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.75)',
+    backgroundColor: 'rgba(0,0,0,0.78)',
     alignItems: 'center',
     justifyContent: 'center',
     padding: 20,
@@ -2585,7 +3292,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     borderRadius: 8,
   },
-  // NETFLIX PLAYER STYLES
+  // PLAYER STYLES
   playerWrapper: { flex: 1, backgroundColor: 'black' },
   videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
   externalSubtitleContainer: {
@@ -2733,7 +3440,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
-    marginTop: 3,
+    marginTop: 4,
   },
   netflixEpisodeTag: {
     color: '#F5C518',
@@ -2743,13 +3450,35 @@ const styles = StyleSheet.create({
   netflixMiniBadge: {
     backgroundColor: '#E50914',
     paddingHorizontal: 6,
-    paddingVertical: 1,
+    paddingVertical: 2,
     borderRadius: 4,
   },
   netflixMiniBadgeText: {
     color: 'white',
     fontSize: 10,
     fontWeight: '900',
+  },
+  liveHdrStatusPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  liveDvPill: {
+    backgroundColor: '#5E35B1',
+    borderWidth: 1,
+    borderColor: '#FFD700',
+  },
+  liveHdr10Pill: {
+    backgroundColor: '#F5C518',
+  },
+  liveHdrStatusText: {
+    color: '#FFD700',
+    fontSize: 10,
+    fontWeight: '900',
+    letterSpacing: 0.4,
   },
   netflixMetaDotText: {
     color: '#D0D6E0',
