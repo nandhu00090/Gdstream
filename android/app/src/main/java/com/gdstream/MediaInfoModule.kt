@@ -920,7 +920,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                         if (t.trackNumber > 0) trackByNum[t.trackNumber] = t
                     }
                 }
-                0x1254C367L -> parseMkvTagsIntoMap(pos, elemEnd, bpsByUid)
+                0x1254C367L -> parseMkvTagsIntoMap(buf, pos, elemEnd, bpsByUid)
                 0x1F43B675L -> {
                     // Inspect real audio frames inside the Cluster!
                     parseClusterAudioFrames(buf, pos, elemEnd, trackByNum)
