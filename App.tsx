@@ -16,6 +16,9 @@ import {
   DeviceEventEmitter,
   Image,
   Modal,
+  PanResponder,
+  Dimensions,
+  StatusBar,
 } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
@@ -29,7 +32,6 @@ const USERNAME = 'admin';
 const PASSWORD = '629175';
 const IS_TV = Platform.isTV;
 
-// Optional: You can also paste your 32-character TMDb API key directly here
 const DEFAULT_TMDB_API_KEY = '';
 
 interface ParsedMediaInfo {
@@ -89,8 +91,12 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
   else if (/\b(hin|hindi)\b/i.test(normalized)) badges.push('Hindi');
   else if (/\b(tel|telugu)\b/i.test(normalized)) badges.push('Telugu');
 
-  const seMatch = normalized.match(/\b(S\d{1,2}(?:\s*E\d{1,3})?|E\d{1,3}|Season\s*\d{1,2})\b/i);
-  const seasonEpisode = seMatch ? seMatch[1].replace(/\s+/g, '').toUpperCase() : '';
+  const seMatch = normalized.match(
+    /\b(S\d{1,2}(?:\s*E\d{1,3})?|E\d{1,3}|Season\s*\d{1,2})\b/i,
+  );
+  const seasonEpisode = seMatch
+    ? seMatch[1].replace(/\s+/g, '').toUpperCase()
+    : '';
 
   const yearMatch = normalized.match(/(?:^|[\s(])((?:19|20)\d{2})(?:[\s)]|$)/);
   const year = yearMatch ? yearMatch[1] : '';
@@ -140,28 +146,30 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
   };
 };
 
+// FocusableButton only enables TV focus rings when running on Android TV,
+// preventing phone TextInput from losing focus during search re-renders.
 const FocusableButton = ({
   style,
   focusedStyle,
   onPress,
   children,
   hasTVPreferredFocus,
-  activeOpacity = 0.85,
+  activeOpacity = 0.8,
   ...rest
 }: any) => {
   const [isFocused, setIsFocused] = useState(false);
   return (
     <TouchableOpacity
-      focusable={true}
-      hasTVPreferredFocus={hasTVPreferredFocus}
+      focusable={IS_TV ? true : undefined}
+      hasTVPreferredFocus={IS_TV ? hasTVPreferredFocus : undefined}
       activeOpacity={activeOpacity}
       onPress={onPress}
-      onFocus={() => setIsFocused(true)}
-      onBlur={() => setIsFocused(false)}
+      onFocus={IS_TV ? () => setIsFocused(true) : undefined}
+      onBlur={IS_TV ? () => setIsFocused(false) : undefined}
       style={[
         style,
-        isFocused && styles.tvFocused,
-        isFocused && focusedStyle,
+        IS_TV && isFocused && styles.tvFocused,
+        IS_TV && isFocused && focusedStyle,
       ]}
       {...rest}>
       {children}
@@ -236,10 +244,23 @@ const App = () => {
   const [playMode, setPlayMode] = useState<string | null>(null);
   const [resizeMode, setResizeMode] = useState<'contain' | 'cover'>('contain');
   const [showControls, setShowControls] = useState(true);
+  const [isLocked, setIsLocked] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [isVideoBuffering, setIsVideoBuffering] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(IS_TV);
   const [playbackRate, setPlaybackRate] = useState(1.0);
+
+  // Brightness & Volume Swipe State
+  const [brightnessLevel, setBrightnessLevel] = useState(0.65);
+  const [volumeLevel, setVolumeLevel] = useState(0.8);
+  const brightnessRef = useRef(0.65);
+  const volumeRef = useRef(0.8);
+  const [gestureIndicator, setGestureIndicator] = useState<{
+    visible: boolean;
+    type: 'brightness' | 'volume';
+    value: number;
+  }>({ visible: false, type: 'volume', value: 0.8 });
+  const gestureHideTimer = useRef<any>(null);
 
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -325,8 +346,44 @@ const App = () => {
         setTempKeyInput(savedKey);
       }
     });
+    if (VideoPlayerManager?.getSystemLevels) {
+      VideoPlayerManager.getSystemLevels()
+        .then((res: any) => {
+          if (typeof res?.brightness === 'number') {
+            setBrightnessLevel(res.brightness);
+            brightnessRef.current = res.brightness;
+          }
+          if (typeof res?.volume === 'number') {
+            setVolumeLevel(res.volume);
+            volumeRef.current = res.volume;
+          }
+        })
+        .catch(() => {});
+    }
     fetchDirectory('/0:/');
   }, []);
+
+  // Automatically enter landscape fullscreen when opening internal player on phone
+  useEffect(() => {
+    if (playMode === 'internal') {
+      Orientation.lockToLandscape();
+      setIsFullscreen(true);
+      if (VideoPlayerManager?.getSystemLevels) {
+        VideoPlayerManager.getSystemLevels()
+          .then((res: any) => {
+            if (typeof res?.brightness === 'number') {
+              setBrightnessLevel(res.brightness);
+              brightnessRef.current = res.brightness;
+            }
+            if (typeof res?.volume === 'number') {
+              setVolumeLevel(res.volume);
+              volumeRef.current = res.volume;
+            }
+          })
+          .catch(() => {});
+      }
+    }
+  }, [playMode]);
 
   useEffect(() => {
     if (isExternalAudioSelected && externalAudioRef.current) {
@@ -344,6 +401,10 @@ const App = () => {
         return true;
       }
       if (playMode === 'internal') {
+        if (isLocked) {
+          setShowControls(true);
+          return true;
+        }
         if (activeMenu) {
           setActiveMenu(null);
           return true;
@@ -364,7 +425,7 @@ const App = () => {
       backAction,
     );
     return () => backHandler.remove();
-  }, [playMode, selectedFile, pathStack, activeMenu, showKeyModal]);
+  }, [playMode, selectedFile, pathStack, activeMenu, showKeyModal, isLocked]);
 
   const loadSavedTimesForFiles = useCallback(async (items: any[]) => {
     try {
@@ -384,8 +445,13 @@ const App = () => {
   }, []);
 
   const fetchSingleMetadata = useCallback(
-    async (info: ParsedMediaInfo, activeTmdbKey: string): Promise<MediaMetadata | null> => {
-      const cacheKey = `meta_v3_${info.searchTitle.toLowerCase()}_${info.year}_${activeTmdbKey ? 'tmdb' : 'imdb'}`;
+    async (
+      info: ParsedMediaInfo,
+      activeTmdbKey: string,
+    ): Promise<MediaMetadata | null> => {
+      const cacheKey = `meta_v3_${info.searchTitle.toLowerCase()}_${info.year}_${
+        activeTmdbKey ? 'tmdb' : 'imdb'
+      }`;
       try {
         const cached = await AsyncStorage.getItem(cacheKey);
         if (cached) {
@@ -393,7 +459,6 @@ const App = () => {
         }
       } catch {}
 
-      // 1. Try TMDb API if key is configured
       if (activeTmdbKey && activeTmdbKey.trim().length >= 20) {
         try {
           const key = activeTmdbKey.trim();
@@ -407,9 +472,14 @@ const App = () => {
           const results = res.data?.results || [];
           const match =
             results.find((r: any) => {
-              const rYear = (r.release_date || r.first_air_date || '').slice(0, 4);
+              const rYear = (r.release_date || r.first_air_date || '').slice(
+                0,
+                4,
+              );
               return info.year ? rYear === info.year : r.poster_path;
-            }) || results.find((r: any) => r.poster_path) || results[0];
+            }) ||
+            results.find((r: any) => r.poster_path) ||
+            results[0];
 
           if (match) {
             const meta: MediaMetadata = {
@@ -425,8 +495,10 @@ const App = () => {
                   : undefined,
               overview: match.overview || undefined,
               year:
-                (match.release_date || match.first_air_date || '').slice(0, 4) ||
-                info.year,
+                (match.release_date || match.first_air_date || '').slice(
+                  0,
+                  4,
+                ) || info.year,
             };
             if (meta.poster || meta.overview) {
               await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
@@ -436,10 +508,12 @@ const App = () => {
         } catch {}
       }
 
-      // 2. Zero-Key Instant Fallback: IMDb Public Suggestion API
       try {
         const query = `${info.searchTitle} ${info.year}`.trim();
-        const cleanQ = query.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+        const cleanQ = query
+          .toLowerCase()
+          .replace(/[^a-z0-9\s]/g, '')
+          .trim();
         const firstChar = cleanQ.charAt(0) || 'a';
         const imdbUrl = `https://v3.sg.media-imdb.com/suggestion/${firstChar}/${encodeURIComponent(
           cleanQ.slice(0, 35),
@@ -449,10 +523,8 @@ const App = () => {
         const validItems = list.filter((item: any) => item?.i?.imageUrl);
         const match =
           validItems.find(
-            (item: any) =>
-              info.year && String(item.y) === String(info.year),
-          ) ||
-          validItems[0];
+            (item: any) => info.year && String(item.y) === String(info.year),
+          ) || validItems[0];
 
         if (match && match.i?.imageUrl) {
           const rawImg: string = match.i.imageUrl;
@@ -470,7 +542,9 @@ const App = () => {
             year: match.y ? String(match.y) : info.year,
             cast: match.s || undefined,
             overview: match.s
-              ? `${match.q ? `${match.q.toUpperCase()} • ` : ''}Starring: ${match.s}`
+              ? `${match.q ? `${match.q.toUpperCase()} • ` : ''}Starring: ${
+                  match.s
+                }`
               : undefined,
           };
           await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
@@ -545,7 +619,7 @@ const App = () => {
 
       setSeekOverlay({
         visible: true,
-        icon: isForward ? 'fast-forward' : 'fast-rewind',
+        icon: isForward ? 'replay-10' : 'replay-10',
         time: totalSeek,
         position: isForward ? 'right' : 'left',
       });
@@ -664,6 +738,7 @@ const App = () => {
     setSubtitleDelay(0);
     setAudioDelay(0);
     setPlaybackRate(1.0);
+    setIsLocked(false);
     setExternalSubtitle(null);
     setExternalAudio(null);
     setSelectedFile(file);
@@ -687,21 +762,28 @@ const App = () => {
     }
   };
 
-  const handleSearch = (text: string) => {
-    setSearchQuery(text);
-    const q = text.toLowerCase();
-    const filtered = files.filter(file => {
-      const info = parseMediaFilename(
-        file.name,
-        !!file.mimeType?.includes('folder'),
-      );
-      return (
-        file.name.toLowerCase().includes(q) ||
-        info.cleanTitle.toLowerCase().includes(q)
-      );
-    });
-    setFilteredFiles(filtered);
-  };
+  const handleSearch = useCallback(
+    (text: string) => {
+      setSearchQuery(text);
+      if (!text.trim()) {
+        setFilteredFiles(files);
+        return;
+      }
+      const q = text.toLowerCase();
+      const filtered = files.filter(file => {
+        const info = parseMediaFilename(
+          file.name,
+          !!file.mimeType?.includes('folder'),
+        );
+        return (
+          file.name.toLowerCase().includes(q) ||
+          info.cleanTitle.toLowerCase().includes(q)
+        );
+      });
+      setFilteredFiles(filtered);
+    },
+    [files],
+  );
 
   const openInExternalPlayer = async () => {
     const url = getStreamUrl(selectedFile);
@@ -732,6 +814,7 @@ const App = () => {
       Orientation.lockToPortrait();
       setIsFullscreen(false);
     }
+    setIsLocked(false);
     setActiveMenu(null);
     setPlayMode(null);
     loadSavedTimesForFiles(files);
@@ -739,6 +822,13 @@ const App = () => {
 
   const handleZoomToggle = () => {
     setResizeMode(prev => (prev === 'contain' ? 'cover' : 'contain'));
+  };
+
+  const cyclePlaybackSpeed = () => {
+    const speeds = [0.75, 1.0, 1.25, 1.5, 2.0];
+    const idx = speeds.indexOf(playbackRate);
+    const next = speeds[(idx + 1) % speeds.length];
+    setPlaybackRate(next);
   };
 
   const handleSelectTextTrack = (track: any) => {
@@ -778,27 +868,126 @@ const App = () => {
     }
   };
 
-  const handleZoneTap = (isForward: boolean) => {
-    const now = Date.now();
-    const DOUBLE_PRESS_DELAY = 300;
-
-    if (
-      now - lastTapTime.current < DOUBLE_PRESS_DELAY &&
-      (lastTapDirection.current === null ||
-        lastTapDirection.current === isForward)
-    ) {
-      clearTimeout(singleTapTimer.current);
-      triggerStepSeek(isForward);
-    } else {
-      lastTapDirection.current = isForward;
-      singleTapTimer.current = setTimeout(() => {
+  const handleZoneTap = useCallback(
+    (isForward: boolean) => {
+      if (isLocked) {
         setShowControls(prev => !prev);
-        setActiveMenu(null);
-        lastTapDirection.current = null;
-      }, DOUBLE_PRESS_DELAY);
-    }
-    lastTapTime.current = now;
-  };
+        return;
+      }
+      const now = Date.now();
+      const DOUBLE_PRESS_DELAY = 280;
+
+      if (
+        now - lastTapTime.current < DOUBLE_PRESS_DELAY &&
+        (lastTapDirection.current === null ||
+          lastTapDirection.current === isForward)
+      ) {
+        clearTimeout(singleTapTimer.current);
+        triggerStepSeek(isForward);
+      } else {
+        lastTapDirection.current = isForward;
+        singleTapTimer.current = setTimeout(() => {
+          setShowControls(prev => !prev);
+          setActiveMenu(null);
+          lastTapDirection.current = null;
+        }, DOUBLE_PRESS_DELAY);
+      }
+      lastTapTime.current = now;
+    },
+    [isLocked, triggerStepSeek],
+  );
+
+  // Gesture Responder: Left Vertical Swipe = Brightness, Right Vertical Swipe = Volume, Tap = Seek/Toggle
+  const gestureStartRef = useRef({
+    side: 'left' as 'left' | 'right',
+    startVal: 0.5,
+    isSwiping: false,
+  });
+
+  const handleZoneTapRef = useRef(handleZoneTap);
+  useEffect(() => {
+    handleZoneTapRef.current = handleZoneTap;
+  }, [handleZoneTap]);
+
+  const isLockedRef = useRef(isLocked);
+  useEffect(() => {
+    isLockedRef.current = isLocked;
+  }, [isLocked]);
+
+  const playerPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: () => true,
+        onPanResponderGrant: evt => {
+          const screenW = Dimensions.get('window').width || 800;
+          const x = evt.nativeEvent.pageX;
+          const side = x < screenW / 2 ? 'left' : 'right';
+          gestureStartRef.current = {
+            side,
+            startVal:
+              side === 'left' ? brightnessRef.current : volumeRef.current,
+            isSwiping: false,
+          };
+        },
+        onPanResponderMove: (_, gestureState) => {
+          if (isLockedRef.current) return;
+          const { dy, dx } = gestureState;
+          if (
+            !gestureStartRef.current.isSwiping &&
+            Math.abs(dy) > 12 &&
+            Math.abs(dy) > Math.abs(dx)
+          ) {
+            gestureStartRef.current.isSwiping = true;
+            clearTimeout(singleTapTimer.current);
+          }
+
+          if (gestureStartRef.current.isSwiping) {
+            const screenH = Dimensions.get('window').height || 400;
+            const delta = -dy / (screenH * 0.65);
+            const nextVal = Math.max(
+              0,
+              Math.min(1, gestureStartRef.current.startVal + delta),
+            );
+
+            clearTimeout(gestureHideTimer.current);
+
+            if (gestureStartRef.current.side === 'left') {
+              brightnessRef.current = nextVal;
+              setBrightnessLevel(nextVal);
+              VideoPlayerManager?.setSystemBrightness?.(nextVal);
+              setGestureIndicator({
+                visible: true,
+                type: 'brightness',
+                value: nextVal,
+              });
+            } else {
+              volumeRef.current = nextVal;
+              setVolumeLevel(nextVal);
+              VideoPlayerManager?.setSystemVolume?.(nextVal);
+              setGestureIndicator({
+                visible: true,
+                type: 'volume',
+                value: nextVal,
+              });
+            }
+          }
+        },
+        onPanResponderRelease: evt => {
+          if (gestureStartRef.current.isSwiping) {
+            gestureHideTimer.current = setTimeout(() => {
+              setGestureIndicator(prev => ({ ...prev, visible: false }));
+            }, 900);
+          } else {
+            const screenW = Dimensions.get('window').width || 800;
+            const isForward = evt.nativeEvent.pageX >= screenW / 2;
+            handleZoneTapRef.current(isForward);
+          }
+          gestureStartRef.current.isSwiping = false;
+        },
+      }),
+    [],
+  );
 
   const handleVideoLoad = async (meta: any) => {
     setDuration(meta.duration);
@@ -828,6 +1017,26 @@ const App = () => {
     } catch (e) {}
   };
 
+  const nextEpisodeFile = useMemo(() => {
+    if (!selectedFile) return null;
+    const currentIndex = filteredFiles.findIndex(
+      f => f.name === selectedFile.name,
+    );
+    if (currentIndex !== -1 && currentIndex + 1 < filteredFiles.length) {
+      const candidate = filteredFiles[currentIndex + 1];
+      if (!candidate.mimeType?.includes('folder')) {
+        return candidate;
+      }
+    }
+    return null;
+  }, [selectedFile, filteredFiles]);
+
+  const playNextEpisode = () => {
+    if (!nextEpisodeFile) return;
+    openFile(nextEpisodeFile);
+    setPlayMode('internal');
+  };
+
   const handleVideoEnd = async () => {
     if (switchingEpisode.current) return;
     switchingEpisode.current = true;
@@ -835,15 +1044,10 @@ const App = () => {
       await AsyncStorage.removeItem(`time_${selectedFile?.name}`);
     } catch (e) {}
     const episodeRegex = /[Ss]\d+[Ee]\d+/;
-    if (episodeRegex.test(selectedFile?.name || '')) {
-      const currentIndex = filteredFiles.findIndex(
-        f => f.name === selectedFile?.name,
-      );
-      if (currentIndex !== -1 && currentIndex + 1 < filteredFiles.length) {
-        openFile(filteredFiles[currentIndex + 1]);
-        setPlayMode('internal');
-        return;
-      }
+    if (episodeRegex.test(selectedFile?.name || '') && nextEpisodeFile) {
+      openFile(nextEpisodeFile);
+      setPlayMode('internal');
+      return;
     }
     closeInternalPlayer();
     setSelectedFile(null);
@@ -857,238 +1061,246 @@ const App = () => {
       !selectedText || selectedText.type === 'disabled';
 
     return (
-      <View style={styles.floatingMenu}>
-        <View style={styles.floatingMenuHeader}>
-          <Text style={styles.floatingMenuTitle}>
-            {isAudio ? 'Audio Tracks 🎵' : 'Subtitles 💬'}
-          </Text>
-          <FocusableButton
-            style={styles.menuCloseBtn}
-            onPress={() => setActiveMenu(null)}>
-            <Icon name="close" size={18} color="white" />
-          </FocusableButton>
-        </View>
-        <ScrollView style={{ maxHeight: 280 }}>
-          {!isAudio && (
+      <View style={styles.netflixSheetOverlay}>
+        <View style={styles.floatingMenu}>
+          <View style={styles.floatingMenuHeader}>
+            <Text style={styles.floatingMenuTitle}>
+              {isAudio ? 'Audio & Playback Speed' : 'Subtitles & Captions'}
+            </Text>
             <FocusableButton
-              hasTVPreferredFocus={true}
-              style={styles.menuItem}
-              onPress={() => handleSelectTextTrack({ type: 'disabled' })}>
-              <Icon
-                name="check"
-                size={20}
-                color="white"
-                style={{ opacity: isSubtitleDisabled ? 1 : 0 }}
-              />
-              <Text style={styles.menuItemText}>Disable Subtitles</Text>
+              style={styles.menuCloseBtn}
+              onPress={() => setActiveMenu(null)}>
+              <Icon name="close" size={20} color="white" />
             </FocusableButton>
-          )}
-          {!isAudio && (
-            <FocusableButton
-              style={styles.menuItem}
-              onPress={handlePickSubtitleFile}>
-              <Icon
-                name="folder-open"
-                size={20}
-                color={isExternalSubtitleSelected ? '#E50914' : 'white'}
-              />
-              <Text style={styles.menuItemText} numberOfLines={1}>
-                {externalSubtitle
-                  ? `File: ${externalSubtitle.name}`
-                  : 'Select subtitle file 📂'}
-              </Text>
-            </FocusableButton>
-          )}
-          {!isAudio && !!externalSubtitle && !isExternalSubtitleSelected && (
-            <FocusableButton
-              style={styles.menuItem}
-              onPress={() =>
-                handleSelectTextTrack({
-                  type: 'external',
-                  value: externalSubtitle.name,
-                })
-              }>
-              <Icon
-                name="check"
-                size={20}
-                color="white"
-                style={{ opacity: 0 }}
-              />
-              <Text style={styles.menuItemText} numberOfLines={1}>
-                Use: {externalSubtitle.name}
-              </Text>
-            </FocusableButton>
-          )}
-          {isAudio && (
-            <FocusableButton
-              hasTVPreferredFocus={true}
-              style={styles.menuItem}
-              onPress={handlePickAudioFile}>
-              <Icon
-                name="folder-open"
-                size={20}
-                color={isExternalAudioSelected ? '#E50914' : 'white'}
-              />
-              <Text style={styles.menuItemText} numberOfLines={1}>
-                {externalAudio
-                  ? `File: ${externalAudio.name}`
-                  : 'Select audio file 📂'}
-              </Text>
-            </FocusableButton>
-          )}
-          {isAudio && !!externalAudio && (
-            <FocusableButton
-              style={styles.menuItem}
-              onPress={() => {
-                setSelectedAudio({
-                  type: 'external',
-                  value: externalAudio.name,
-                });
-                setActiveMenu(null);
-              }}>
-              <Icon
-                name="check"
-                size={20}
-                color="white"
-                style={{ opacity: isExternalAudioSelected ? 1 : 0 }}
-              />
-              <Text style={styles.menuItemText} numberOfLines={1}>
-                External: {externalAudio.name}
-              </Text>
-            </FocusableButton>
-          )}
-          {!isAudio && (
-            <View style={styles.adjustRow}>
-              <Text style={styles.adjustLabel}>Size</Text>
+          </View>
+          <ScrollView style={{ maxHeight: 250 }}>
+            {!isAudio && (
               <FocusableButton
-                style={styles.adjustBtn}
-                onPress={() => setSubtitleSize(s => Math.max(10, s - 2))}>
-                <Icon name="remove" size={20} color="white" />
+                hasTVPreferredFocus={true}
+                style={styles.menuItem}
+                onPress={() => handleSelectTextTrack({ type: 'disabled' })}>
+                <Icon
+                  name="check"
+                  size={20}
+                  color="#E50914"
+                  style={{ opacity: isSubtitleDisabled ? 1 : 0 }}
+                />
+                <Text style={styles.menuItemText}>Off (Disable Subtitles)</Text>
               </FocusableButton>
-              <Text style={styles.adjustValue}>{subtitleSize}</Text>
+            )}
+            {!isAudio && (
               <FocusableButton
-                style={styles.adjustBtn}
-                onPress={() => setSubtitleSize(s => Math.min(40, s + 2))}>
-                <Icon name="add" size={20} color="white" />
+                style={styles.menuItem}
+                onPress={handlePickSubtitleFile}>
+                <Icon
+                  name="folder-open"
+                  size={20}
+                  color={isExternalSubtitleSelected ? '#E50914' : 'white'}
+                />
+                <Text style={styles.menuItemText} numberOfLines={1}>
+                  {externalSubtitle
+                    ? `File: ${externalSubtitle.name}`
+                    : 'Load External Subtitle (.srt / .vtt) 📂'}
+                </Text>
               </FocusableButton>
-            </View>
-          )}
-          {!isAudio && (
-            <View style={styles.adjustRow}>
-              <Text style={styles.adjustLabel}>Delay</Text>
+            )}
+            {!isAudio && !!externalSubtitle && !isExternalSubtitleSelected && (
               <FocusableButton
-                style={styles.adjustBtn}
+                style={styles.menuItem}
                 onPress={() =>
-                  setSubtitleDelay(d => Math.round((d - 0.5) * 10) / 10)
+                  handleSelectTextTrack({
+                    type: 'external',
+                    value: externalSubtitle.name,
+                  })
                 }>
-                <Icon name="remove" size={20} color="white" />
+                <Icon
+                  name="check"
+                  size={20}
+                  color="#E50914"
+                  style={{ opacity: 0 }}
+                />
+                <Text style={styles.menuItemText} numberOfLines={1}>
+                  Use: {externalSubtitle.name}
+                </Text>
               </FocusableButton>
-              <Text style={styles.adjustValue}>
-                {subtitleDelay >= 0
-                  ? `+${subtitleDelay.toFixed(1)}s`
-                  : `${subtitleDelay.toFixed(1)}s`}
-              </Text>
+            )}
+            {isAudio && (
               <FocusableButton
-                style={styles.adjustBtn}
-                onPress={() =>
-                  setSubtitleDelay(d => Math.round((d + 0.5) * 10) / 10)
-                }>
-                <Icon name="add" size={20} color="white" />
+                hasTVPreferredFocus={true}
+                style={styles.menuItem}
+                onPress={handlePickAudioFile}>
+                <Icon
+                  name="folder-open"
+                  size={20}
+                  color={isExternalAudioSelected ? '#E50914' : 'white'}
+                />
+                <Text style={styles.menuItemText} numberOfLines={1}>
+                  {externalAudio
+                    ? `File: ${externalAudio.name}`
+                    : 'Load External Audio File 📂'}
+                </Text>
               </FocusableButton>
-            </View>
-          )}
-          {isAudio && (
-            <View style={styles.adjustRow}>
-              <Text style={styles.adjustLabel}>Audio Delay</Text>
+            )}
+            {isAudio && !!externalAudio && (
               <FocusableButton
-                style={styles.adjustBtn}
-                onPress={() =>
-                  setAudioDelay(d => Math.round((d - 0.25) * 100) / 100)
-                }>
-                <Icon name="remove" size={20} color="white" />
-              </FocusableButton>
-              <Text style={styles.adjustValue}>
-                {audioDelay >= 0
-                  ? `+${audioDelay.toFixed(2)}s`
-                  : `${audioDelay.toFixed(2)}s`}
-              </Text>
-              <FocusableButton
-                style={styles.adjustBtn}
-                onPress={() =>
-                  setAudioDelay(d => Math.round((d + 0.25) * 100) / 100)
-                }>
-                <Icon name="add" size={20} color="white" />
-              </FocusableButton>
-            </View>
-          )}
-          {isAudio && (
-            <View style={styles.adjustRow}>
-              <Text style={styles.adjustLabel}>Speed</Text>
-              <FocusableButton
-                style={styles.adjustBtn}
-                onPress={() =>
-                  setPlaybackRate(r =>
-                    Math.max(0.5, Math.round((r - 0.25) * 100) / 100),
-                  )
-                }>
-                <Icon name="remove" size={20} color="white" />
-              </FocusableButton>
-              <Text style={styles.adjustValue}>{playbackRate.toFixed(2)}x</Text>
-              <FocusableButton
-                style={styles.adjustBtn}
-                onPress={() =>
-                  setPlaybackRate(r =>
-                    Math.min(2.0, Math.round((r + 0.25) * 100) / 100),
-                  )
-                }>
-                <Icon name="add" size={20} color="white" />
-              </FocusableButton>
-            </View>
-          )}
-          {tracks.map((track, index) => {
-            const indexStr = String(index);
-            const isSelected = isAudio
-              ? selectedAudio?.type === 'index' &&
-                String(selectedAudio?.value) === indexStr
-              : selectedText?.type === 'index' &&
-                String(selectedText?.value) === indexStr;
-            return (
-              <FocusableButton
-                key={index}
                 style={styles.menuItem}
                 onPress={() => {
-                  if (isAudio) {
-                    setSelectedAudio({ type: 'index', value: indexStr });
-                    setActiveMenu(null);
-                  } else {
-                    handleSelectTextTrack({ type: 'index', value: indexStr });
-                  }
+                  setSelectedAudio({
+                    type: 'external',
+                    value: externalAudio.name,
+                  });
+                  setActiveMenu(null);
                 }}>
                 <Icon
                   name="check"
                   size={20}
-                  color="white"
-                  style={{ opacity: isSelected ? 1 : 0 }}
+                  color="#E50914"
+                  style={{ opacity: isExternalAudioSelected ? 1 : 0 }}
                 />
                 <Text style={styles.menuItemText} numberOfLines={1}>
-                  {track.language
-                    ? track.language.toUpperCase()
-                    : `Track ${index + 1}`}{' '}
-                  - {track.title || 'Auto'}
+                  External: {externalAudio.name}
                 </Text>
               </FocusableButton>
-            );
-          })}
-        </ScrollView>
+            )}
+            {!isAudio && (
+              <View style={styles.adjustRow}>
+                <Text style={styles.adjustLabel}>Font Size</Text>
+                <FocusableButton
+                  style={styles.adjustBtn}
+                  onPress={() => setSubtitleSize(s => Math.max(10, s - 2))}>
+                  <Icon name="remove" size={20} color="white" />
+                </FocusableButton>
+                <Text style={styles.adjustValue}>{subtitleSize}sp</Text>
+                <FocusableButton
+                  style={styles.adjustBtn}
+                  onPress={() => setSubtitleSize(s => Math.min(40, s + 2))}>
+                  <Icon name="add" size={20} color="white" />
+                </FocusableButton>
+              </View>
+            )}
+            {!isAudio && (
+              <View style={styles.adjustRow}>
+                <Text style={styles.adjustLabel}>Sync Delay</Text>
+                <FocusableButton
+                  style={styles.adjustBtn}
+                  onPress={() =>
+                    setSubtitleDelay(d => Math.round((d - 0.5) * 10) / 10)
+                  }>
+                  <Icon name="remove" size={20} color="white" />
+                </FocusableButton>
+                <Text style={styles.adjustValue}>
+                  {subtitleDelay >= 0
+                    ? `+${subtitleDelay.toFixed(1)}s`
+                    : `${subtitleDelay.toFixed(1)}s`}
+                </Text>
+                <FocusableButton
+                  style={styles.adjustBtn}
+                  onPress={() =>
+                    setSubtitleDelay(d => Math.round((d + 0.5) * 10) / 10)
+                  }>
+                  <Icon name="add" size={20} color="white" />
+                </FocusableButton>
+              </View>
+            )}
+            {isAudio && (
+              <View style={styles.adjustRow}>
+                <Text style={styles.adjustLabel}>Audio Sync</Text>
+                <FocusableButton
+                  style={styles.adjustBtn}
+                  onPress={() =>
+                    setAudioDelay(d => Math.round((d - 0.25) * 100) / 100)
+                  }>
+                  <Icon name="remove" size={20} color="white" />
+                </FocusableButton>
+                <Text style={styles.adjustValue}>
+                  {audioDelay >= 0
+                    ? `+${audioDelay.toFixed(2)}s`
+                    : `${audioDelay.toFixed(2)}s`}
+                </Text>
+                <FocusableButton
+                  style={styles.adjustBtn}
+                  onPress={() =>
+                    setAudioDelay(d => Math.round((d + 0.25) * 100) / 100)
+                  }>
+                  <Icon name="add" size={20} color="white" />
+                </FocusableButton>
+              </View>
+            )}
+            {isAudio && (
+              <View style={styles.adjustRow}>
+                <Text style={styles.adjustLabel}>Speed</Text>
+                <FocusableButton
+                  style={styles.adjustBtn}
+                  onPress={() =>
+                    setPlaybackRate(r =>
+                      Math.max(0.5, Math.round((r - 0.25) * 100) / 100),
+                    )
+                  }>
+                  <Icon name="remove" size={20} color="white" />
+                </FocusableButton>
+                <Text style={styles.adjustValue}>
+                  {playbackRate.toFixed(2)}x
+                </Text>
+                <FocusableButton
+                  style={styles.adjustBtn}
+                  onPress={() =>
+                    setPlaybackRate(r =>
+                      Math.min(2.0, Math.round((r + 0.25) * 100) / 100),
+                    )
+                  }>
+                  <Icon name="add" size={20} color="white" />
+                </FocusableButton>
+              </View>
+            )}
+            {tracks.map((track, index) => {
+              const indexStr = String(index);
+              const isSelected = isAudio
+                ? selectedAudio?.type === 'index' &&
+                  String(selectedAudio?.value) === indexStr
+                : selectedText?.type === 'index' &&
+                  String(selectedText?.value) === indexStr;
+              return (
+                <FocusableButton
+                  key={index}
+                  style={styles.menuItem}
+                  onPress={() => {
+                    if (isAudio) {
+                      setSelectedAudio({ type: 'index', value: indexStr });
+                      setActiveMenu(null);
+                    } else {
+                      handleSelectTextTrack({ type: 'index', value: indexStr });
+                    }
+                  }}>
+                  <Icon
+                    name="check"
+                    size={20}
+                    color="#E50914"
+                    style={{ opacity: isSelected ? 1 : 0 }}
+                  />
+                  <Text style={styles.menuItemText} numberOfLines={1}>
+                    {track.language
+                      ? track.language.toUpperCase()
+                      : `Track ${index + 1}`}{' '}
+                    • {track.title || 'Default'}
+                  </Text>
+                </FocusableButton>
+              );
+            })}
+          </ScrollView>
+        </View>
       </View>
     );
   };
 
-  // 🔥 1. INTERNAL VIDEO PLAYER SCREEN 🔥
+  // 🔥 1. NETFLIX-STYLE INTERNAL VIDEO PLAYER SCREEN 🔥
   if (selectedFile && playMode === 'internal') {
     const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
+    const remainingTime = Math.max(0, duration - currentTime);
+    const playerInfo = parseMediaFilename(selectedFile.name, false);
+
     return (
       <View style={styles.playerWrapper}>
+        <StatusBar hidden={true} />
         <Video
           key={selectedFile.link || selectedFile.name}
           ref={videoRef}
@@ -1098,6 +1310,7 @@ const App = () => {
           style={styles.videoPlayer}
           resizeMode={resizeMode}
           paused={isPaused}
+          volume={volumeLevel}
           muted={isExternalAudioSelected}
           disableFocus={isExternalAudioSelected}
           rate={playbackRate}
@@ -1145,7 +1358,7 @@ const App = () => {
             isExternalAudioSelected ? { type: 'disabled' } : selectedAudio
           }
           subtitleStyle={{
-            paddingBottom: resizeMode === 'cover' ? 70 : 18,
+            paddingBottom: resizeMode === 'cover' ? 70 : 20,
             fontSize: subtitleSize,
             subtitlesFollowVideo: resizeMode !== 'cover',
           }}
@@ -1163,7 +1376,7 @@ const App = () => {
             source={{ uri: externalAudio.uri }}
             paused={isPaused || isVideoBuffering}
             rate={playbackRate}
-            volume={1.0}
+            volume={volumeLevel}
             focusable={false}
             disableFocus={true}
             onLoad={() => {
@@ -1191,23 +1404,45 @@ const App = () => {
           </View>
         )}
 
+        {/* Touch & Swipe Surface (Left Swipe = Brightness, Right Swipe = Volume, Double Tap = 10s Seek) */}
         {!IS_TV && (
-          <View style={[StyleSheet.absoluteFill, { flexDirection: 'row' }]}>
-            <TouchableOpacity
-              focusable={false}
-              style={{ flex: 1 }}
-              activeOpacity={1}
-              onPress={() => handleZoneTap(false)}
-            />
-            <TouchableOpacity
-              focusable={false}
-              style={{ flex: 1 }}
-              activeOpacity={1}
-              onPress={() => handleZoneTap(true)}
-            />
+          <View
+            style={StyleSheet.absoluteFill}
+            {...playerPanResponder.panHandlers}
+          />
+        )}
+
+        {/* Vertical Brightness / Volume Indicator Pill */}
+        {gestureIndicator.visible && (
+          <View style={styles.gestureHudContainer} pointerEvents="none">
+            <View style={styles.gestureHudPill}>
+              <Icon
+                name={
+                  gestureIndicator.type === 'brightness'
+                    ? 'wb-sunny'
+                    : gestureIndicator.value === 0
+                    ? 'volume-off'
+                    : 'volume-up'
+                }
+                size={22}
+                color="#E50914"
+              />
+              <View style={styles.gestureBarTrack}>
+                <View
+                  style={[
+                    styles.gestureBarFill,
+                    { height: `${Math.round(gestureIndicator.value * 100)}%` },
+                  ]}
+                />
+              </View>
+              <Text style={styles.gestureHudText}>
+                {Math.round(gestureIndicator.value * 100)}%
+              </Text>
+            </View>
           </View>
         )}
 
+        {/* Double-Tap Seek Ripple Overlay */}
         <Animated.View
           style={[
             styles.seekOverlay,
@@ -1218,144 +1453,247 @@ const App = () => {
             },
           ]}
           pointerEvents="none">
-          <View style={styles.overlayBox}>
+          <View style={styles.netflixSeekBubble}>
             <Icon
-              name={seekOverlay.icon || 'fast-forward'}
-              size={40}
+              name={
+                seekOverlay.position === 'right' ? 'forward-10' : 'replay-10'
+              }
+              size={42}
               color="white"
             />
-            <Text style={styles.seekText}>{seekOverlay.time} seconds</Text>
+            <Text style={styles.seekText}>
+              {seekOverlay.position === 'right'
+                ? `+${seekOverlay.time}s`
+                : `-${seekOverlay.time}s`}
+            </Text>
           </View>
         </Animated.View>
 
-        {showControls && (
+        {/* Locked Screen Minimal Overlay */}
+        {showControls && isLocked && (
+          <View style={styles.lockedOverlay} pointerEvents="box-none">
+            <FocusableButton
+              style={styles.unlockPillBtn}
+              onPress={() => setIsLocked(false)}>
+              <Icon name="lock" size={20} color="#E50914" />
+              <Text style={styles.unlockPillText}>Tap to Unlock Screen</Text>
+            </FocusableButton>
+          </View>
+        )}
+
+        {/* NETFLIX PLAYER CONTROLS OVERLAY */}
+        {showControls && !isLocked && (
           <View style={styles.controlsOverlay} pointerEvents="box-none">
-            <View style={styles.playerTopBar}>
+            {/* Top Bar */}
+            <View style={styles.netflixTopBar}>
               <FocusableButton
-                style={styles.iconBtn}
+                style={styles.netflixCircleBtn}
                 onPress={closeInternalPlayer}>
-                <Icon name="arrow-back" size={28} color="white" />
+                <Icon name="arrow-back" size={24} color="white" />
               </FocusableButton>
-              <Text style={styles.playerTitle} numberOfLines={1}>
-                {selectedFile.name}
-              </Text>
-              {IS_TV && (
-                <FocusableButton
-                  style={styles.iconBtn}
-                  onPress={() => {
-                    setShowControls(false);
-                    setActiveMenu(null);
-                  }}>
-                  <Icon name="visibility-off" size={24} color="white" />
-                </FocusableButton>
-              )}
+
+              <View style={styles.netflixTitleCenter}>
+                <Text style={styles.netflixMainTitle} numberOfLines={1}>
+                  {playerInfo.cleanTitle}
+                </Text>
+                <View style={styles.netflixSubMetaRow}>
+                  {!!playerInfo.seasonEpisode && (
+                    <Text style={styles.netflixEpisodeTag}>
+                      {playerInfo.seasonEpisode}
+                    </Text>
+                  )}
+                  {!!playerInfo.resolution && (
+                    <View style={styles.netflixMiniBadge}>
+                      <Text style={styles.netflixMiniBadgeText}>
+                        {playerInfo.resolution}
+                      </Text>
+                    </View>
+                  )}
+                  {playerInfo.badges.slice(0, 2).map((b, i) => (
+                    <Text key={i} style={styles.netflixMetaDotText}>
+                      • {b}
+                    </Text>
+                  ))}
+                </View>
+              </View>
+
+              <View style={styles.netflixTopRightRow}>
+                {!IS_TV && (
+                  <FocusableButton
+                    style={styles.netflixCircleBtn}
+                    onPress={() => {
+                      setIsLocked(true);
+                      setActiveMenu(null);
+                    }}>
+                    <Icon name="lock-open" size={20} color="white" />
+                  </FocusableButton>
+                )}
+                {IS_TV && (
+                  <FocusableButton
+                    style={styles.netflixCircleBtn}
+                    onPress={() => {
+                      setShowControls(false);
+                      setActiveMenu(null);
+                    }}>
+                    <Icon name="visibility-off" size={20} color="white" />
+                  </FocusableButton>
+                )}
+              </View>
             </View>
 
-            <View style={styles.centerControlsRow}>
-              {IS_TV && (
-                <FocusableButton
-                  style={styles.sideSeekBtn}
-                  onPress={() => triggerStepSeek(false)}>
-                  <Icon name="replay-10" size={38} color="white" />
-                </FocusableButton>
-              )}
+            {/* Center 3-Button Transport Controls */}
+            <View style={styles.netflixCenterRow} pointerEvents="box-none">
+              <FocusableButton
+                style={styles.netflixSeekCircleBtn}
+                onPress={() => triggerStepSeek(false)}>
+                <Icon name="replay-10" size={40} color="white" />
+              </FocusableButton>
+
               <FocusableButton
                 hasTVPreferredFocus={true}
                 onPress={() => setIsPaused(!isPaused)}
-                style={styles.centerPlayBtn}>
-                <Icon
-                  name={isPaused ? 'play-arrow' : 'pause'}
-                  size={60}
-                  color="white"
-                />
+                style={styles.netflixMainPlayBtn}>
+                {isVideoBuffering ? (
+                  <ActivityIndicator size="large" color="#E50914" />
+                ) : (
+                  <Icon
+                    name={isPaused ? 'play-arrow' : 'pause'}
+                    size={54}
+                    color="white"
+                  />
+                )}
               </FocusableButton>
-              {IS_TV && (
-                <FocusableButton
-                  style={styles.sideSeekBtn}
-                  onPress={() => triggerStepSeek(true)}>
-                  <Icon name="forward-10" size={38} color="white" />
-                </FocusableButton>
-              )}
+
+              <FocusableButton
+                style={styles.netflixSeekCircleBtn}
+                onPress={() => triggerStepSeek(true)}>
+                <Icon name="forward-10" size={40} color="white" />
+              </FocusableButton>
             </View>
 
-            <View style={styles.playerBottomArea}>
-              <TouchableOpacity
-                focusable={false}
-                activeOpacity={1}
-                style={styles.progressBarBg}
-                onLayout={e => setProgressWidth(e.nativeEvent.layout.width)}
-                onPress={e => {
-                  if (progressWidth > 0 && duration > 0) {
-                    const seekTime =
-                      (e.nativeEvent.locationX / progressWidth) * duration;
-                    seekBothPlayers(seekTime);
-                  }
-                }}>
-                <View style={styles.progressBarTrack} />
-                <View
-                  style={[
-                    styles.progressBarFill,
-                    { width: `${progressPercent}%` },
-                  ]}
-                  pointerEvents="none"
-                />
-                <View
-                  style={[styles.progressDot, { left: `${progressPercent}%` }]}
-                  pointerEvents="none"
-                />
-              </TouchableOpacity>
-              <View style={styles.playerBottomControls}>
-                <Text style={styles.timeText}>
-                  {formatTime(currentTime)} • {formatTime(duration)}
+            {/* Bottom Scrubber & Labeled Action Bar */}
+            <View style={styles.netflixBottomContainer}>
+              <View style={styles.netflixScrubberRow}>
+                <Text style={styles.netflixTimeLabel}>
+                  {formatTime(currentTime)}
                 </Text>
-                <View style={{ flexDirection: 'row' }}>
+
+                <TouchableOpacity
+                  focusable={false}
+                  activeOpacity={1}
+                  style={styles.netflixProgressHitBox}
+                  onLayout={e => setProgressWidth(e.nativeEvent.layout.width)}
+                  onPress={e => {
+                    if (progressWidth > 0 && duration > 0) {
+                      const seekTime =
+                        (e.nativeEvent.locationX / progressWidth) * duration;
+                      seekBothPlayers(seekTime);
+                    }
+                  }}>
+                  <View style={styles.netflixProgressTrack} />
+                  <View
+                    style={[
+                      styles.netflixProgressFill,
+                      { width: `${progressPercent}%` },
+                    ]}
+                    pointerEvents="none"
+                  />
+                  <View
+                    style={[
+                      styles.netflixProgressThumb,
+                      { left: `${progressPercent}%` },
+                    ]}
+                    pointerEvents="none"
+                  />
+                </TouchableOpacity>
+
+                <Text style={styles.netflixTimeLabel}>
+                  -{formatTime(remainingTime)}
+                </Text>
+              </View>
+
+              <View style={styles.netflixActionRow}>
+                <FocusableButton
+                  style={[
+                    styles.netflixActionPill,
+                    activeMenu === 'audio' && styles.netflixActionPillActive,
+                  ]}
+                  onPress={() =>
+                    setActiveMenu(activeMenu === 'audio' ? null : 'audio')
+                  }>
+                  <Icon
+                    name="audiotrack"
+                    size={20}
+                    color={activeMenu === 'audio' ? '#E50914' : 'white'}
+                  />
+                  <Text style={styles.netflixActionText}>Audio</Text>
+                </FocusableButton>
+
+                <FocusableButton
+                  style={[
+                    styles.netflixActionPill,
+                    activeMenu === 'subtitle' && styles.netflixActionPillActive,
+                  ]}
+                  onPress={() =>
+                    setActiveMenu(
+                      activeMenu === 'subtitle' ? null : 'subtitle',
+                    )
+                  }>
+                  <Icon
+                    name="subtitles"
+                    size={20}
+                    color={activeMenu === 'subtitle' ? '#E50914' : 'white'}
+                  />
+                  <Text style={styles.netflixActionText}>Subtitles</Text>
+                </FocusableButton>
+
+                <FocusableButton
+                  style={styles.netflixActionPill}
+                  onPress={cyclePlaybackSpeed}>
+                  <Icon name="speed" size={20} color="white" />
+                  <Text style={styles.netflixActionText}>
+                    Speed ({playbackRate}x)
+                  </Text>
+                </FocusableButton>
+
+                <FocusableButton
+                  style={styles.netflixActionPill}
+                  onPress={handleZoomToggle}>
+                  <Icon
+                    name={
+                      resizeMode === 'contain' ? 'aspect-ratio' : 'crop-free'
+                    }
+                    size={20}
+                    color={resizeMode === 'cover' ? '#E50914' : 'white'}
+                  />
+                  <Text style={styles.netflixActionText}>
+                    {resizeMode === 'contain' ? 'Fit' : 'Zoom'}
+                  </Text>
+                </FocusableButton>
+
+                {!!nextEpisodeFile && (
                   <FocusableButton
-                    style={styles.iconBtn}
-                    onPress={() =>
-                      setActiveMenu(activeMenu === 'audio' ? null : 'audio')
-                    }>
-                    <Icon
-                      name="audiotrack"
-                      size={26}
-                      color={activeMenu === 'audio' ? '#E50914' : 'white'}
-                    />
+                    style={styles.netflixNextEpPill}
+                    onPress={playNextEpisode}>
+                    <Icon name="skip-next" size={22} color="black" />
+                    <Text style={styles.netflixNextEpText}>Next Ep</Text>
                   </FocusableButton>
+                )}
+
+                {!IS_TV && (
                   <FocusableButton
-                    style={styles.iconBtn}
-                    onPress={() =>
-                      setActiveMenu(
-                        activeMenu === 'subtitle' ? null : 'subtitle',
-                      )
-                    }>
-                    <Icon
-                      name="closed-caption"
-                      size={26}
-                      color={activeMenu === 'subtitle' ? '#E50914' : 'white'}
-                    />
-                  </FocusableButton>
-                  <FocusableButton
-                    style={styles.iconBtn}
-                    onPress={handleZoomToggle}>
+                    onPress={toggleFullscreen}
+                    style={styles.netflixActionPill}>
                     <Icon
                       name={
-                        resizeMode === 'contain' ? 'aspect-ratio' : 'crop-free'
+                        isFullscreen ? 'screen-lock-rotation' : 'StayCurrentLandscape'
                       }
-                      size={26}
-                      color={resizeMode === 'cover' ? '#E50914' : 'white'}
+                      size={20}
+                      color="white"
                     />
+                    <Text style={styles.netflixActionText}>Rotate</Text>
                   </FocusableButton>
-                  {!IS_TV && (
-                    <FocusableButton
-                      onPress={toggleFullscreen}
-                      style={styles.iconBtn}>
-                      <Icon
-                        name={isFullscreen ? 'fullscreen-exit' : 'fullscreen'}
-                        size={26}
-                        color="white"
-                      />
-                    </FocusableButton>
-                  )}
-                </View>
+                )}
               </View>
             </View>
           </View>
@@ -1376,6 +1714,7 @@ const App = () => {
       <ScrollView
         style={styles.detailScreen}
         contentContainerStyle={{ paddingBottom: 40 }}>
+        <StatusBar hidden={false} barStyle="light-content" />
         <View style={styles.detailHero}>
           {bannerImage ? (
             <Image
@@ -1463,7 +1802,7 @@ const App = () => {
               <Text style={styles.primaryPlayButtonText}>
                 {savedSec > 10
                   ? `Resume Play (${formatTime(savedSec)})`
-                  : 'Play in App (ExoPlayer)'}
+                  : 'Play in App (Netflix Player)'}
               </Text>
             </FocusableButton>
 
@@ -1491,6 +1830,7 @@ const App = () => {
 
   return (
     <View style={styles.container}>
+      <StatusBar hidden={false} barStyle="light-content" />
       <View style={styles.topHeaderBar}>
         <View style={{ flexDirection: 'row', alignItems: 'center' }}>
           <View style={styles.logoMark}>
@@ -1539,6 +1879,8 @@ const App = () => {
           placeholderTextColor="#777"
           value={searchQuery}
           onChangeText={handleSearch}
+          autoCorrect={false}
+          returnKeyType="search"
         />
         {!!searchQuery && (
           <TouchableOpacity
@@ -1569,6 +1911,8 @@ const App = () => {
           key={`catalog-${viewMode}-${numColumns}`}
           data={filteredFiles}
           numColumns={numColumns}
+          keyboardShouldPersistTaps="handled"
+          removeClippedSubviews={false}
           contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
           keyExtractor={(item, idx) => item.id || item.name || String(idx)}
           renderItem={({ item, index }) => {
@@ -1580,7 +1924,7 @@ const App = () => {
             if (viewMode === 'list') {
               return (
                 <FocusableButton
-                  hasTVPreferredFocus={index === 0}
+                  hasTVPreferredFocus={index === 0 && !searchQuery}
                   style={styles.listCard}
                   onPress={() => handlePress(item)}>
                   {meta?.poster ? (
@@ -1631,7 +1975,7 @@ const App = () => {
 
             return (
               <FocusableButton
-                hasTVPreferredFocus={index === 0}
+                hasTVPreferredFocus={index === 0 && !searchQuery}
                 style={styles.posterCard}
                 onPress={() => handlePress(item)}>
                 <View style={styles.posterImageContainer}>
@@ -1705,7 +2049,9 @@ const App = () => {
                   </Text>
                   <View style={styles.posterSubRow}>
                     <Text style={styles.posterYear}>
-                      {meta?.year || info.year || (isFolder ? 'Folder' : 'Movie')}
+                      {meta?.year ||
+                        info.year ||
+                        (isFolder ? 'Folder' : 'Movie')}
                     </Text>
                     {info.badges.slice(0, 2).map((b, idx) => (
                       <Text key={idx} style={styles.posterMiniTag}>
@@ -2196,13 +2542,14 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     borderRadius: 8,
   },
+  // NETFLIX PLAYER STYLES
   playerWrapper: { flex: 1, backgroundColor: 'black' },
   videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
   externalSubtitleContainer: {
     position: 'absolute',
     left: 24,
     right: 24,
-    bottom: 42,
+    bottom: 52,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -2215,14 +2562,76 @@ const styles = StyleSheet.create({
     textShadowOffset: { width: 1.5, height: 1.5 },
     textShadowRadius: 4,
   },
+  gestureHudContainer: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  gestureHudPill: {
+    width: 64,
+    paddingVertical: 16,
+    borderRadius: 32,
+    backgroundColor: 'rgba(15, 17, 23, 0.88)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.14)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  gestureBarTrack: {
+    width: 7,
+    height: 110,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    borderRadius: 4,
+    overflow: 'hidden',
+    justifyContent: 'flex-end',
+  },
+  gestureBarFill: {
+    width: '100%',
+    backgroundColor: '#E50914',
+    borderRadius: 4,
+  },
+  gestureHudText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
+  },
   controlsOverlay: {
     position: 'absolute',
     top: 0,
     left: 0,
     bottom: 0,
     right: 0,
-    backgroundColor: 'rgba(0,0,0,0.4)',
+    backgroundColor: 'rgba(0, 0, 0, 0.48)',
     justifyContent: 'space-between',
+  },
+  lockedOverlay: {
+    position: 'absolute',
+    bottom: 32,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  unlockPillBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: 'rgba(15, 17, 23, 0.9)',
+    paddingVertical: 11,
+    paddingHorizontal: 22,
+    borderRadius: 999,
+    borderWidth: 1.5,
+    borderColor: '#E50914',
+  },
+  unlockPillText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: '700',
   },
   seekOverlay: {
     position: 'absolute',
@@ -2231,117 +2640,226 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     justifyContent: 'center',
-    paddingHorizontal: 50,
+    paddingHorizontal: 60,
   },
-  overlayBox: { alignItems: 'center' },
-  seekText: { color: 'white', fontSize: 16, fontWeight: 'bold' },
-  playerTopBar: {
-    padding: 20,
-    paddingTop: 32,
+  netflixSeekBubble: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.55)',
+    width: 92,
+    height: 92,
+    borderRadius: 46,
+  },
+  seekText: { color: 'white', fontSize: 13, fontWeight: '800', marginTop: 2 },
+  netflixTopBar: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 22,
+    paddingTop: 18,
   },
-  playerTitle: {
-    color: 'white',
-    marginLeft: 12,
-    fontSize: 16,
-    fontWeight: '500',
+  netflixCircleBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: 'rgba(20, 22, 30, 0.72)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,255,255,0.12)',
+  },
+  netflixTitleCenter: {
     flex: 1,
+    alignItems: 'center',
+    paddingHorizontal: 14,
   },
-  centerControlsRow: {
+  netflixMainTitle: {
+    color: '#FFFFFF',
+    fontSize: 17,
+    fontWeight: '800',
+    letterSpacing: 0.3,
+  },
+  netflixSubMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 3,
+  },
+  netflixEpisodeTag: {
+    color: '#F5C518',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  netflixMiniBadge: {
+    backgroundColor: '#E50914',
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+    borderRadius: 4,
+  },
+  netflixMiniBadgeText: {
+    color: 'white',
+    fontSize: 10,
+    fontWeight: '900',
+  },
+  netflixMetaDotText: {
+    color: '#D0D6E0',
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  netflixTopRightRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  netflixCenterRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 28,
+    gap: 54,
   },
-  centerPlayBtn: {
-    alignSelf: 'center',
-    justifyContent: 'center',
+  netflixSeekCircleBtn: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: 'rgba(18, 20, 28, 0.6)',
     alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.55)',
-    borderRadius: 50,
-    padding: 12,
-    borderWidth: 2,
-    borderColor: 'transparent',
-  },
-  sideSeekBtn: {
     justifyContent: 'center',
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,255,255,0.16)',
+  },
+  netflixMainPlayBtn: {
+    width: 82,
+    height: 82,
+    borderRadius: 41,
+    backgroundColor: 'rgba(229, 9, 20, 0.9)',
     alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.55)',
-    borderRadius: 40,
-    padding: 12,
-    borderWidth: 2,
-    borderColor: 'transparent',
-  },
-  playerBottomArea: { paddingHorizontal: 20, paddingBottom: 30, width: '100%' },
-  progressBarBg: {
-    height: 30,
     justifyContent: 'center',
-    marginBottom: 5,
+    borderWidth: 2,
+    borderColor: 'rgba(255,255,255,0.25)',
+  },
+  netflixBottomContainer: {
+    paddingHorizontal: 22,
+    paddingBottom: 18,
     width: '100%',
   },
-  progressBarTrack: {
-    height: 6,
-    backgroundColor: 'rgba(255,255,255,0.3)',
-    borderRadius: 3,
-  },
-  progressBarFill: {
-    height: 6,
-    backgroundColor: '#E50914',
-    borderRadius: 3,
-    position: 'absolute',
-  },
-  progressDot: {
-    position: 'absolute',
-    width: 16,
-    height: 16,
-    borderRadius: 8,
-    backgroundColor: 'white',
-    top: 7,
-    marginLeft: -8,
-  },
-  playerBottomControls: {
+  netflixScrubberRow: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
+    gap: 12,
+    marginBottom: 10,
   },
-  timeText: { color: 'white', fontSize: 14, fontWeight: '500' },
-  iconBtn: {
-    padding: 10,
-    marginLeft: 5,
-    borderRadius: 8,
+  netflixTimeLabel: {
+    color: '#E6ECF5',
+    fontSize: 12,
+    fontWeight: '700',
+    minWidth: 52,
+    textAlign: 'center',
+  },
+  netflixProgressHitBox: {
+    flex: 1,
+    height: 28,
+    justifyContent: 'center',
+  },
+  netflixProgressTrack: {
+    height: 4,
+    backgroundColor: 'rgba(255,255,255,0.28)',
+    borderRadius: 2,
+  },
+  netflixProgressFill: {
+    height: 4,
+    backgroundColor: '#E50914',
+    borderRadius: 2,
+    position: 'absolute',
+  },
+  netflixProgressThumb: {
+    position: 'absolute',
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: '#E50914',
+    top: 7,
+    marginLeft: -7,
     borderWidth: 2,
-    borderColor: 'transparent',
+    borderColor: '#FFFFFF',
+  },
+  netflixActionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-around',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  netflixActionPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: 7,
+    paddingHorizontal: 13,
+    borderRadius: 999,
+    backgroundColor: 'rgba(22, 25, 34, 0.78)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.12)',
+  },
+  netflixActionPillActive: {
+    borderColor: '#E50914',
+    backgroundColor: 'rgba(229, 9, 20, 0.2)',
+  },
+  netflixActionText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  netflixNextEpPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingVertical: 7,
+    paddingHorizontal: 14,
+    borderRadius: 999,
+    backgroundColor: '#FFFFFF',
+  },
+  netflixNextEpText: {
+    color: '#000000',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  netflixSheetOverlay: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 100,
   },
   floatingMenu: {
-    position: 'absolute',
-    bottom: 90,
-    right: 20,
-    width: 300,
-    backgroundColor: 'rgba(28, 28, 30, 0.96)',
-    borderRadius: 12,
-    padding: 15,
-    zIndex: 100,
+    width: 340,
+    maxWidth: '90%',
+    backgroundColor: '#14171F',
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#2B3242',
   },
   floatingMenuHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     borderBottomWidth: 1,
-    borderBottomColor: '#444',
+    borderBottomColor: '#262C3A',
     paddingBottom: 10,
     marginBottom: 10,
   },
   floatingMenuTitle: {
-    color: '#AAA',
-    fontSize: 14,
-    fontWeight: 'bold',
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '800',
   },
   menuCloseBtn: {
     padding: 4,
     borderRadius: 6,
-    borderWidth: 2,
-    borderColor: 'transparent',
   },
   menuItem: {
     flexDirection: 'row',
@@ -2349,27 +2867,23 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 8,
     borderRadius: 8,
-    borderWidth: 2,
-    borderColor: 'transparent',
   },
-  menuItemText: { color: 'white', fontSize: 15, marginLeft: 10, flex: 1 },
+  menuItemText: { color: 'white', fontSize: 14, marginLeft: 10, flex: 1 },
   adjustRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 8 },
-  adjustLabel: { color: '#AAA', fontSize: 14, width: 90 },
+  adjustLabel: { color: '#AAA', fontSize: 13, width: 95, fontWeight: '600' },
   adjustBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: '#333',
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: '#232936',
     justifyContent: 'center',
     alignItems: 'center',
-    borderWidth: 2,
-    borderColor: 'transparent',
   },
   adjustValue: {
     color: 'white',
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: 'bold',
-    width: 64,
+    width: 68,
     textAlign: 'center',
   },
 });
