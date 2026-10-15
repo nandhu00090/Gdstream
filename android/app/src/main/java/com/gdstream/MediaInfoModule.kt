@@ -172,7 +172,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             val out = java.io.ByteArrayOutputStream()
             conn.inputStream.use { input ->
                 val tmp = ByteArray(16 * 1024)
-                var read: Int
+                var read = 0
                 while (out.size() < 256 * 1024 && input.read(tmp).also { read = it } != -1) {
                     out.write(tmp, 0, read)
                 }
