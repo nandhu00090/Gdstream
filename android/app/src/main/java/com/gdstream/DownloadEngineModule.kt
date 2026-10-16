@@ -21,11 +21,13 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.roundToInt
 
 class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -66,6 +68,37 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
 
     override fun getName(): String = "DownloadEngine"
 
+    private fun formatShortBytes(bytes: Long): String {
+        if (bytes <= 0L) return "0 MB"
+        val mb = bytes / (1024.0 * 1024.0)
+        return if (mb >= 1024.0) {
+            String.format(Locale.US, "%.2f GB", mb / 1024.0)
+        } else {
+            String.format(Locale.US, "%.1f MB", mb)
+        }
+    }
+
+    private fun syncForegroundService() {
+        val activeTasks = tasks.values.filter { it.status == "downloading" }
+        if (activeTasks.isEmpty()) {
+            DownloadForegroundService.stopService(reactContext)
+            return
+        }
+        val primary = activeTasks.first()
+        val total = primary.totalBytes
+        val done = primary.downloadedBytes.get()
+        val pct = if (total > 0L) ((done * 100L) / total).toInt().coerceIn(0, 100) else 0
+        val totalSpeed = activeTasks.sumOf { it.speedBytesPerSec }
+
+        val title = if (activeTasks.size == 1) {
+            primary.title
+        } else {
+            "Downloading ${activeTasks.size} Movies"
+        }
+        val subtitle = "$pct\% •${formatShortBytes(done)} / ${formatShortBytes(total)} •${formatShortBytes(totalSpeed)}/s"
+        DownloadForegroundService.updateService(reactContext, title, subtitle, pct)
+    }
+
     private fun getPublicDownloadDir(): File {
         val pubDownload = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val gdDir = File(pubDownload, "GDStream")
@@ -93,7 +126,6 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                 "primary:Download/GDStream"
             )
 
-            // 1. Try opening exact directory in Android DocumentsUI / System File Manager
             try {
                 val docIntent = Intent(Intent.ACTION_VIEW).apply {
                     setDataAndType(docUri, DocumentsContract.Document.MIME_TYPE_DIR)
@@ -105,7 +137,6 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                 return
             } catch (_: Exception) {}
 
-            // 2. Try opening folder path in third-party file managers (Solid Explorer, Cx File Explorer, Mi File Manager)
             try {
                 val builder = StrictMode.VmPolicy.Builder()
                 StrictMode.setVmPolicy(builder.build())
@@ -118,7 +149,6 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                 return
             } catch (_: Exception) {}
 
-            // 3. Fallback to system Downloads view
             val dlIntent = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
@@ -323,6 +353,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
         )
 
         tasks[safeName] = task
+        syncForegroundService()
         emitUpdate()
         promise.resolve(taskToMap(task))
 
@@ -342,6 +373,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                 f.cancel(true)
             }
             persistTasks()
+            syncForegroundService()
             emitUpdate()
             promise.resolve(taskToMap(task))
         } else {
@@ -363,6 +395,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
         task.stopRequested.set(false)
         task.status = "downloading"
         task.speedBytesPerSec = 0L
+        syncForegroundService()
         emitUpdate()
         promise.resolve(taskToMap(task))
 
@@ -385,6 +418,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                 scanMediaFile(task.filePath, task.fileName)
             } catch (_: Exception) {}
             persistTasks()
+            syncForegroundService()
             emitUpdate()
         }
         promise.resolve(true)
@@ -395,11 +429,12 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
         var redirects = 0
         while (redirects < 6) {
             val conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 15000
-                readTimeout = 20000
+                connectTimeout = 20000
+                readTimeout = 30000
                 instanceFollowRedirects = false
                 setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; GDStream/2.0)")
                 setRequestProperty("Accept-Encoding", "identity")
+                setRequestProperty("Connection", "keep-alive")
                 if (rangeHeader != null) {
                     setRequestProperty("Range", rangeHeader)
                 }
@@ -469,6 +504,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                 }
                 task.downloadedBytes.set(0L)
                 persistTasks()
+                syncForegroundService()
                 emitUpdate()
             } else {
                 var sum = 0L
@@ -478,6 +514,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                     }
                 }
                 task.downloadedBytes.set(sum)
+                syncForegroundService()
             }
 
             task.futures.clear()
@@ -488,7 +525,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                 var tick = 0
                 while (!task.stopRequested.get() && task.status == "downloading") {
                     try {
-                        Thread.sleep(450)
+                        Thread.sleep(500)
                     } catch (_: InterruptedException) {
                         break
                     }
@@ -503,7 +540,12 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                     lastTime = now
                     emitUpdate()
                     tick++
-                    if (tick % 5 == 0) persistTasks()
+                    if (tick % 2 == 0) {
+                        syncForegroundService()
+                    }
+                    if (tick % 6 == 0) {
+                        persistTasks()
+                    }
                 }
             }
 
@@ -533,6 +575,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
 
             if (task.status == "paused") {
                 persistTasks()
+                syncForegroundService()
                 emitUpdate()
                 return
             }
@@ -545,10 +588,12 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                 task.status = "completed"
                 persistTasks()
                 scanMediaFile(task.filePath, task.fileName)
+                syncForegroundService()
                 emitUpdate()
             } else if (task.status != "paused") {
                 task.status = "error"
                 persistTasks()
+                syncForegroundService()
                 emitUpdate()
             }
         } catch (e: Exception) {
@@ -556,6 +601,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                 task.status = "error"
                 task.speedBytesPerSec = 0L
                 persistTasks()
+                syncForegroundService()
                 emitUpdate()
             }
         }
@@ -567,7 +613,8 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
         useRange: Boolean
     ): Boolean {
         var attempts = 0
-        while (attempts < 4 && !task.stopRequested.get()) {
+        // High resilience (up to 30 retries) so background network switches never drop the download
+        while (attempts < 30 && !task.stopRequested.get()) {
             var conn: HttpURLConnection? = null
             try {
                 if (chunk.current > chunk.end) return true
@@ -576,15 +623,16 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                 val code = conn.responseCode
                 if (code !in 200..299) {
                     attempts++
-                    Thread.sleep(600L * attempts)
+                    Thread.sleep(minOf(5000L, 700L * attempts))
                     continue
                 }
 
+                var madeProgressInAttempt = false
                 conn.inputStream.use { input ->
                     RandomAccessFile(File(task.filePath), "rw").use { raf ->
                         raf.seek(chunk.current)
                         val buffer = ByteArray(64 * 1024)
-                        var bytesRead: Int
+                        var bytesRead = 0
                         while (!task.stopRequested.get()) {
                             bytesRead = input.read(buffer)
                             if (bytesRead == -1) break
@@ -598,9 +646,15 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                             raf.write(buffer, 0, toWrite)
                             chunk.current += toWrite
                             task.downloadedBytes.addAndGet(toWrite.toLong())
+                            madeProgressInAttempt = true
                             if (chunk.end != Long.MAX_VALUE && chunk.current > chunk.end) break
                         }
                     }
+                }
+
+                if (madeProgressInAttempt) {
+                    // Reset retry counter whenever bytes are successfully received
+                    attempts = 0
                 }
 
                 if (task.stopRequested.get()) return false
@@ -611,7 +665,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                 if (task.stopRequested.get()) return false
                 attempts++
                 try {
-                    Thread.sleep(600L * attempts)
+                    Thread.sleep(minOf(5000L, 700L * attempts))
                 } catch (_: InterruptedException) {
                     return false
                 }

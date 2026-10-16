@@ -810,10 +810,17 @@ const App = () => {
     );
   }, [files, savedTimesMap]);
 
-  // All Playable Video Episodes in the Current Folder (for In-Player Episodes Drawer)
+  // Only populate Episodes list when the currently playing file is an actual Series Episode
   const playableFolderEpisodes = useMemo(() => {
-    return files.filter(f => !f.mimeType?.includes('folder'));
-  }, [files]);
+    if (!selectedFile) return [];
+    const currentInfo = parseMediaFilename(selectedFile.name, false);
+    if (!currentInfo.seasonEpisode) return [];
+    return files.filter(f => {
+      if (f.mimeType?.includes('folder')) return false;
+      const fInfo = parseMediaFilename(f.name, false);
+      return !!fInfo.seasonEpisode;
+    });
+  }, [files, selectedFile]);
 
   const getStreamUrl = useCallback(
     (file: any) => {
@@ -3271,7 +3278,8 @@ const styles = StyleSheet.create({
   backFolderText: { color: '#DDD', fontSize: 13, fontWeight: '600', flex: 1 },
   posterCard: {
     flex: 1,
-    margin: 6,
+    maxWidth: IS_TV ? '18.6%' : '47%',
+    margin: '1.5%',
     backgroundColor: '#14171F',
     borderRadius: 12,
     overflow: 'hidden',
