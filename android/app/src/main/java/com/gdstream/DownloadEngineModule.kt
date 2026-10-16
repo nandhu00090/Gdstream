@@ -95,7 +95,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
         } else {
             "Downloading ${activeTasks.size} Movies"
         }
-        val subtitle = "$pct\% •${formatShortBytes(done)} / ${formatShortBytes(total)} •${formatShortBytes(totalSpeed)}/s"
+        val subtitle = "$pct% •${formatShortBytes(done)} / ${formatShortBytes(total)} •${formatShortBytes(totalSpeed)}/s"
         DownloadForegroundService.updateService(reactContext, title, subtitle, pct)
     }
 
@@ -323,7 +323,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
         poster: String?,
         promise: Promise
     ) {
-        val safeName = fileName.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+        val safeName = fileName.replace(Regex("[\\\/:*?\"<>|]"), "_")
         val existing = tasks[safeName]
         if (existing != null && existing.status == "downloading") {
             promise.resolve(taskToMap(existing))
