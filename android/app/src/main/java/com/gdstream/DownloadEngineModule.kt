@@ -27,7 +27,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.math.roundToInt
 
 class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -68,6 +67,19 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
 
     override fun getName(): String = "DownloadEngine"
 
+    private fun sanitizeFileName(raw: String): String {
+        val forbidden = "/:*?<>|"
+        val sb = StringBuilder(raw.length)
+        for (ch in raw) {
+            if (forbidden.indexOf(ch) >= 0 || ch.code == 92 || ch.code == 34) {
+                sb.append('_')
+            } else {
+                sb.append(ch)
+            }
+        }
+        return sb.toString()
+    }
+
     private fun formatShortBytes(bytes: Long): String {
         if (bytes <= 0L) return "0 MB"
         val mb = bytes / (1024.0 * 1024.0)
@@ -93,9 +105,11 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
         val title = if (activeTasks.size == 1) {
             primary.title
         } else {
-            "Downloading ${activeTasks.size} Movies"
+            "Downloading " + activeTasks.size + " Movies"
         }
-        val subtitle = "$pct% •${formatShortBytes(done)} / ${formatShortBytes(total)} •${formatShortBytes(totalSpeed)}/s"
+        val subtitle = pct.toString() + "% • " +
+            formatShortBytes(done) + " / " + formatShortBytes(total) +
+            " • " + formatShortBytes(totalSpeed) + "/s"
         DownloadForegroundService.updateService(reactContext, title, subtitle, pct)
     }
 
@@ -323,7 +337,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
         poster: String?,
         promise: Promise
     ) {
-        val safeName = fileName.replace(Regex("[\\\/:*?\"<>|]"), "_")
+        val safeName = sanitizeFileName(fileName)
         val existing = tasks[safeName]
         if (existing != null && existing.status == "downloading") {
             promise.resolve(taskToMap(existing))
@@ -613,7 +627,6 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
         useRange: Boolean
     ): Boolean {
         var attempts = 0
-        // High resilience (up to 30 retries) so background network switches never drop the download
         while (attempts < 30 && !task.stopRequested.get()) {
             var conn: HttpURLConnection? = null
             try {
@@ -653,7 +666,6 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                 }
 
                 if (madeProgressInAttempt) {
-                    // Reset retry counter whenever bytes are successfully received
                     attempts = 0
                 }
 
