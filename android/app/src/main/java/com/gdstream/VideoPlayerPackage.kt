@@ -11,7 +11,8 @@ class VideoPlayerPackage : ReactPackage {
             VideoPlayerModule(reactContext),
             SubtitleFileModule(reactContext),
             DownloadEngineModule(reactContext),
-            MediaInfoModule(reactContext)
+            MediaInfoModule(reactContext),
+            SecurityVaultModule(reactContext)
         )
     }
 

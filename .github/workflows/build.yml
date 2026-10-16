@@ -26,7 +26,18 @@ jobs:
           java-version: '17'
 
       - name: Install dependencies
-        run: npm install
+        run: npm install --no-audit
+
+      - name: Ensure Private Release Keystore
+        run: |
+          if [ ! -f android/app/gdstream-release.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore android/app/gdstream-release.keystore \
+              -alias gdstreamkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass gdstream2026 -keypass gdstream2026 \
+              -dname "CN=GDStream, OU=Media, O=GDStream, L=Chennai, ST=TN, C=IN"
+          fi
 
       - name: Build Android Release APK
         run: |

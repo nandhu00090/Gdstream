@@ -1,5 +1,6 @@
 package com.gdstream
 
+import android.app.PictureInPictureParams
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
@@ -10,6 +11,7 @@ import android.os.Build
 import android.os.StrictMode
 import android.provider.MediaStore
 import android.provider.Settings
+import android.util.Rational
 import android.view.Display
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
@@ -58,6 +60,26 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
     fun setPreferredHdrMode(mode: String, promise: Promise) {
         preferredHdrMode = mode.lowercase()
         promise.resolve(preferredHdrMode)
+    }
+
+    @ReactMethod
+    fun enterPiP(promise: Promise) {
+        UiThreadUtil.runOnUiThread {
+            try {
+                val activity = reactApplicationContext.currentActivity
+                if (activity != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    val params = PictureInPictureParams.Builder()
+                        .setAspectRatio(Rational(16, 9))
+                        .build()
+                    val entered = activity.enterPictureInPictureMode(params)
+                    promise.resolve(entered)
+                } else {
+                    promise.resolve(false)
+                }
+            } catch (e: Exception) {
+                promise.resolve(false)
+            }
+        }
     }
 
     @ReactMethod

@@ -32,14 +32,10 @@ const {
   SubtitleFileModule,
   DownloadEngine,
   MediaInfoModule,
+  SecurityVault,
 } = NativeModules;
-const BASE_URL = 'https://movies-and-series.ambalartssb01.workers.dev';
-const USERNAME = 'admin';
-const PASSWORD = '629175';
-const IS_TV = Platform.isTV;
 
-// Direct Built-in TMDb API Key
-const TMDB_API_KEY = 'cc4e028567dd1bd804d650b891b86f6e';
+const IS_TV = Platform.isTV;
 
 interface ParsedMediaInfo {
   rawName: string;
@@ -107,6 +103,15 @@ interface DownloadItem {
 const TYPO_FIXES: Record<string, string> = {
   'attach on titan': 'Attack on Titan',
 };
+
+const FILTER_CATEGORIES = [
+  { id: 'all', label: 'All' },
+  { id: 'movies', label: 'Movies 🎬' },
+  { id: 'series', label: 'Series 📁' },
+  { id: '4k', label: '4K UHD' },
+  { id: 'dv', label: 'Dolby Vision' },
+  { id: 'watchlist', label: 'My List ❤️' },
+];
 
 const formatBytes = (bytes: number) => {
   if (!bytes || bytes <= 0) return '0 MB';
@@ -296,16 +301,32 @@ const parseSubtitleFile = (raw: string) => {
 };
 
 const App = () => {
+  // Encrypted Native Vault Reference (No plaintext credentials in JS bundle!)
+  const vaultRef = useRef<{
+    baseUrl: string;
+    username: string;
+    password: string;
+    tmdbKey: string;
+  }>({
+    baseUrl: '',
+    username: '',
+    password: '',
+    tmdbKey: '',
+  });
+  const [vaultReady, setVaultReady] = useState(false);
+  const [securityCompromised, setSecurityCompromised] = useState(false);
+
   const [files, setFiles] = useState<any[]>([]);
-  const [filteredFiles, setFilteredFiles] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [pathStack, setPathStack] = useState(['/0:/']);
   const [currentPath, setCurrentPath] = useState('/0:/');
   const [searchQuery, setSearchQuery] = useState('');
+  const [activeCategory, setActiveCategory] = useState('all');
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
   const [activeTab, setActiveTab] = useState<'catalog' | 'downloads'>('catalog');
 
+  const [watchlist, setWatchlist] = useState<Record<string, boolean>>({});
   const [metadataMap, setMetadataMap] = useState<Record<string, MediaMetadata>>(
     {},
   );
@@ -421,10 +442,18 @@ const App = () => {
   const lastTapTime = useRef(0);
   const lastTapDirection = useRef<boolean | null>(null);
 
+  // Initialize Native Security Vault & Boot App
   useEffect(() => {
     if (IS_TV) {
       Orientation.lockToLandscape();
     }
+
+    AsyncStorage.getItem('gdstream_watchlist_v1')
+      .then(saved => {
+        if (saved) setWatchlist(JSON.parse(saved));
+      })
+      .catch(() => {});
+
     if (VideoPlayerManager?.getSystemLevels) {
       VideoPlayerManager.getSystemLevels()
         .then((res: any) => {
@@ -439,6 +468,7 @@ const App = () => {
         })
         .catch(() => {});
     }
+
     if (DownloadEngine?.getDownloads) {
       DownloadEngine.getDownloads()
         .then((list: DownloadItem[]) => {
@@ -446,14 +476,54 @@ const App = () => {
         })
         .catch(() => {});
     }
+
     const dlSub = DeviceEventEmitter.addListener(
       'onDownloadUpdate',
       (list: DownloadItem[]) => {
         if (Array.isArray(list)) setDownloads([...list]);
       },
     );
-    fetchDirectory('/0:/', false);
+
+    const initVaultAndFetch = async () => {
+      try {
+        if (SecurityVault?.getVaultConfig) {
+          const cfg = await SecurityVault.getVaultConfig();
+          if (cfg?.compromised) {
+            setSecurityCompromised(true);
+            setLoading(false);
+            return;
+          }
+          vaultRef.current = {
+            baseUrl: cfg?.baseUrl || '',
+            username: cfg?.username || '',
+            password: cfg?.password || '',
+            tmdbKey: cfg?.tmdbKey || '',
+          };
+        }
+        setVaultReady(true);
+        fetchDirectory('/0:/', false);
+      } catch {
+        setLoading(false);
+      }
+    };
+
+    initVaultAndFetch();
     return () => dlSub.remove();
+  }, []);
+
+  const toggleWatchlist = useCallback(async (fileName: string) => {
+    setWatchlist(prev => {
+      const next = { ...prev };
+      if (next[fileName]) {
+        delete next[fileName];
+      } else {
+        next[fileName] = true;
+      }
+      AsyncStorage.setItem('gdstream_watchlist_v1', JSON.stringify(next)).catch(
+        () => {},
+      );
+      return next;
+    });
   }, []);
 
   useEffect(() => {
@@ -573,9 +643,10 @@ const App = () => {
         }
       } catch {}
 
-      if (TMDB_API_KEY && TMDB_API_KEY.trim().length >= 20) {
+      const tmdbKey = vaultRef.current.tmdbKey;
+      if (tmdbKey && tmdbKey.trim().length >= 20) {
         try {
-          const key = TMDB_API_KEY.trim();
+          const key = tmdbKey.trim();
           const endpoint = info.seasonEpisode ? 'tv' : 'multi';
           const url = `https://api.themoviedb.org/3/search/${endpoint}?api_key=${encodeURIComponent(
             key,
@@ -672,7 +743,7 @@ const App = () => {
   );
 
   useEffect(() => {
-    if (!files.length) return;
+    if (!files.length || !vaultReady) return;
     let cancelled = false;
 
     const enrichAll = async () => {
@@ -696,7 +767,53 @@ const App = () => {
     return () => {
       cancelled = true;
     };
-  }, [files, fetchSingleMetadata, loadSavedTimesForFiles]);
+  }, [files, vaultReady, fetchSingleMetadata, loadSavedTimesForFiles]);
+
+  // Dynamic Filtered Catalog based on Search Query + Category Filter Chip
+  const displayedFiles = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return files.filter(file => {
+      const isFolder = !!file.mimeType?.includes('folder');
+      const info = parseMediaFilename(file.name, isFolder);
+      const realMi = mediaInfoMap[file.name];
+
+      if (q) {
+        const matchesSearch =
+          file.name.toLowerCase().includes(q) ||
+          info.cleanTitle.toLowerCase().includes(q);
+        if (!matchesSearch) return false;
+      }
+
+      switch (activeCategory) {
+        case 'movies':
+          return !isFolder && !info.seasonEpisode;
+        case 'series':
+          return isFolder || !!info.seasonEpisode;
+        case '4k':
+          return (realMi?.resolution || info.resolution) === '4K';
+        case 'dv':
+          return realMi ? realMi.hasDV : info.hasDV;
+        case 'watchlist':
+          return !!watchlist[file.name];
+        default:
+          return true;
+      }
+    });
+  }, [files, searchQuery, activeCategory, mediaInfoMap, watchlist]);
+
+  // Continue Watching Items (Files in current directory with saved progress > 15s)
+  const continueWatchingItems = useMemo(() => {
+    return files.filter(
+      f =>
+        !f.mimeType?.includes('folder') &&
+        (savedTimesMap[f.name] || 0) > 15,
+    );
+  }, [files, savedTimesMap]);
+
+  // All Playable Video Episodes in the Current Folder (for In-Player Episodes Drawer)
+  const playableFolderEpisodes = useMemo(() => {
+    return files.filter(f => !f.mimeType?.includes('folder'));
+  }, [files]);
 
   const getStreamUrl = useCallback(
     (file: any) => {
@@ -712,17 +829,18 @@ const App = () => {
       if (completedDl) {
         return `file://${completedDl.filePath}`;
       }
+      const baseUrl = vaultRef.current.baseUrl;
       if (file.link) {
         return file.link.startsWith('http')
           ? file.link
-          : `${BASE_URL}${file.link.startsWith('/') ? '' : '/'}${file.link}`;
+          : `${baseUrl}${file.link.startsWith('/') ? '' : '/'}${file.link}`;
       }
-      return `${BASE_URL}${currentPath}${encodeURIComponent(file.name)}`;
+      return `${baseUrl}${currentPath}${encodeURIComponent(file.name)}`;
     },
     [downloads, currentPath],
   );
 
-  // 🔥 ON-DEMAND SINGLE-MOVIE MEDIAINFO SCANNER (Only runs when Detail Page opens!) 🔥
+  // On-Demand Single-Movie MediaInfo Scanner (Only runs when Detail Page opens!)
   useEffect(() => {
     if (!selectedFile || playMode !== null) return;
     const fileName = selectedFile.name;
@@ -863,14 +981,23 @@ const App = () => {
 
   const ensureLoggedIn = async (force = false) => {
     if (isLoggedIn.current && !force) return;
-    const loginData = `username=${USERNAME}&password=${PASSWORD}`;
-    await axios.post(`${BASE_URL}/login`, loginData, {
+    const { baseUrl, username, password } = vaultRef.current;
+    if (!baseUrl) return;
+    const loginData = `username=${encodeURIComponent(
+      username,
+    )}&password=${encodeURIComponent(password)}`;
+    await axios.post(`${baseUrl}/login`, loginData, {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     });
     isLoggedIn.current = true;
   };
 
   const fetchDirectory = async (path: string, isPullRefresh = false) => {
+    const { baseUrl } = vaultRef.current;
+    if (!baseUrl) {
+      setLoading(false);
+      return;
+    }
     if (isPullRefresh) {
       setRefreshing(true);
     } else {
@@ -878,31 +1005,14 @@ const App = () => {
     }
     try {
       await ensureLoggedIn(false);
-      let response = await axios.post(`${BASE_URL}${path}`, { page_index: 0 });
+      let response = await axios.post(`${baseUrl}${path}`, { page_index: 0 });
       if (!response.data?.data?.files) {
         await ensureLoggedIn(true);
-        response = await axios.post(`${BASE_URL}${path}`, { page_index: 0 });
+        response = await axios.post(`${baseUrl}${path}`, { page_index: 0 });
       }
       if (response.data?.data?.files) {
         const incomingFiles = response.data.data.files;
         setFiles(incomingFiles);
-        if (searchQuery.trim()) {
-          const q = searchQuery.toLowerCase();
-          setFilteredFiles(
-            incomingFiles.filter((file: any) => {
-              const info = parseMediaFilename(
-                file.name,
-                !!file.mimeType?.includes('folder'),
-              );
-              return (
-                file.name.toLowerCase().includes(q) ||
-                info.cleanTitle.toLowerCase().includes(q)
-              );
-            }),
-          );
-        } else {
-          setFilteredFiles(incomingFiles);
-        }
         setCurrentPath(path);
         if (!isPullRefresh) {
           setSearchQuery('');
@@ -918,16 +1028,17 @@ const App = () => {
 
   const handleRefresh = useCallback(() => {
     fetchDirectory(currentPath, true);
-  }, [currentPath, searchQuery]);
+  }, [currentPath]);
 
   const getRemoteDownloadUrl = (file: any) => {
     if (!file) return '';
+    const baseUrl = vaultRef.current.baseUrl;
     if (file.link) {
       return file.link.startsWith('http')
         ? file.link
-        : `${BASE_URL}${file.link.startsWith('/') ? '' : '/'}${file.link}`;
+        : `${baseUrl}${file.link.startsWith('/') ? '' : '/'}${file.link}`;
     }
-    return `${BASE_URL}${currentPath}${encodeURIComponent(file.name)}`;
+    return `${baseUrl}${currentPath}${encodeURIComponent(file.name)}`;
   };
 
   const openFile = (file: any) => {
@@ -957,7 +1068,6 @@ const App = () => {
     setPlayMode('internal');
   };
 
-  // 🔥 SMART POPUP: Only ask when BOTH DV and HDR10 exist! 🔥
   const handlePlayInAppPress = (fileToPlay = selectedFile) => {
     if (!fileToPlay) return;
     const info = parseMediaFilename(fileToPlay.name, false);
@@ -967,13 +1077,10 @@ const App = () => {
     const effectiveHasHDR = realMi ? realMi.hasHDR : info.hasHDR;
 
     if (effectiveHasDV && effectiveHasHDR) {
-      // Both Dolby Vision & HDR10 exist -> Let user choose!
       setShowHdrChoiceModal(true);
     } else if (effectiveHasDV) {
-      // Only Dolby Vision exists -> Play directly in DV without popup!
       startPlaybackWithMode('dv');
     } else if (effectiveHasHDR) {
-      // Only HDR10 exists -> Play directly in HDR10 without popup!
       startPlaybackWithMode('hdr');
     } else {
       startPlaybackWithMode('sdr');
@@ -994,6 +1101,14 @@ const App = () => {
       await VideoPlayerManager?.setPreferredHdrMode?.(nextMode);
     } catch {}
     setPlayerInstanceKey(k => k + 1);
+  };
+
+  const handleEnterPiP = async () => {
+    try {
+      setActiveMenu(null);
+      setShowControls(false);
+      await VideoPlayerManager?.enterPiP?.();
+    } catch {}
   };
 
   const handleStartDownload = async (file: any) => {
@@ -1039,50 +1154,12 @@ const App = () => {
     }
   };
 
-  const handleSearch = useCallback(
-    (text: string) => {
-      setSearchQuery(text);
-      if (!text.trim()) {
-        setFilteredFiles(files);
-        return;
-      }
-      const q = text.toLowerCase();
-      const filtered = files.filter(file => {
-        const info = parseMediaFilename(
-          file.name,
-          !!file.mimeType?.includes('folder'),
-        );
-        return (
-          file.name.toLowerCase().includes(q) ||
-          info.cleanTitle.toLowerCase().includes(q)
-        );
-      });
-      setFilteredFiles(filtered);
-    },
-    [files],
-  );
-
   const openInExternalPlayer = async (targetFile = selectedFile) => {
     const url = getStreamUrl(targetFile);
     try {
       await VideoPlayerManager.playVideo(url);
     } catch (e) {
       Alert.alert('Error', 'Player illai!');
-    }
-  };
-
-  const toggleFullscreen = () => {
-    if (IS_TV) {
-      Orientation.lockToLandscape();
-      setIsFullscreen(true);
-      return;
-    }
-    if (isFullscreen) {
-      Orientation.lockToPortrait();
-      setIsFullscreen(false);
-    } else {
-      Orientation.lockToLandscape();
-      setIsFullscreen(true);
     }
   };
 
@@ -1295,17 +1372,14 @@ const App = () => {
 
   const nextEpisodeFile = useMemo(() => {
     if (!selectedFile) return null;
-    const currentIndex = filteredFiles.findIndex(
+    const currentIndex = playableFolderEpisodes.findIndex(
       f => f.name === selectedFile.name,
     );
-    if (currentIndex !== -1 && currentIndex + 1 < filteredFiles.length) {
-      const candidate = filteredFiles[currentIndex + 1];
-      if (!candidate.mimeType?.includes('folder')) {
-        return candidate;
-      }
+    if (currentIndex !== -1 && currentIndex + 1 < playableFolderEpisodes.length) {
+      return playableFolderEpisodes[currentIndex + 1];
     }
     return null;
-  }, [selectedFile, filteredFiles]);
+  }, [selectedFile, playableFolderEpisodes]);
 
   const playNextEpisode = () => {
     if (!nextEpisodeFile) return;
@@ -1328,6 +1402,19 @@ const App = () => {
     closeInternalPlayer();
     setSelectedFile(null);
   };
+
+  if (securityCompromised) {
+    return (
+      <View style={styles.securityAlertScreen}>
+        <Icon name="security" size={58} color="#E50914" />
+        <Text style={styles.securityAlertTitle}>Security Shield Active</Text>
+        <Text style={styles.securityAlertSub}>
+          Debugger or hooking environment detected. Please close any debugging or
+          packet inspection tools and restart GDStream.
+        </Text>
+      </View>
+    );
+  }
 
   const renderHdrChoiceModal = () => {
     if (!showHdrChoiceModal || !selectedFile) return null;
@@ -1395,6 +1482,72 @@ const App = () => {
 
   const renderFloatingMenu = () => {
     if (!activeMenu) return null;
+
+    if (activeMenu === 'episodes') {
+      return (
+        <View style={styles.netflixSheetOverlay}>
+          <View style={[styles.floatingMenu, { width: 400 }]}>
+            <View style={styles.floatingMenuHeader}>
+              <Text style={styles.floatingMenuTitle}>
+                Episodes ({playableFolderEpisodes.length})
+              </Text>
+              <FocusableButton
+                style={styles.menuCloseBtn}
+                onPress={() => setActiveMenu(null)}>
+                <Icon name="close" size={20} color="white" />
+              </FocusableButton>
+            </View>
+            <ScrollView style={{ maxHeight: 270 }}>
+              {playableFolderEpisodes.map((ep, idx) => {
+                const epInfo = parseMediaFilename(ep.name, false);
+                const isCurrent = ep.name === selectedFile?.name;
+                return (
+                  <FocusableButton
+                    key={ep.id || ep.name || idx}
+                    hasTVPreferredFocus={isCurrent}
+                    style={[
+                      styles.menuItem,
+                      isCurrent && { backgroundColor: 'rgba(229,9,20,0.18)' },
+                    ]}
+                    onPress={() => {
+                      setActiveMenu(null);
+                      if (!isCurrent) {
+                        openFile(ep);
+                        setPlayMode('internal');
+                      }
+                    }}>
+                    <Icon
+                      name={isCurrent ? 'play-circle-fill' : 'play-circle-outline'}
+                      size={22}
+                      color={isCurrent ? '#E50914' : '#AAA'}
+                    />
+                    <View style={{ flex: 1, marginLeft: 10 }}>
+                      <Text
+                        style={[
+                          styles.menuItemText,
+                          { marginLeft: 0 },
+                          isCurrent && { color: '#E50914', fontWeight: '800' },
+                        ]}
+                        numberOfLines={1}>
+                        {epInfo.seasonEpisode
+                          ? `${epInfo.seasonEpisode} • ${epInfo.cleanTitle}`
+                          : ep.name}
+                      </Text>
+                      <Text
+                        style={{ color: '#7D8799', fontSize: 11 }}
+                        numberOfLines={1}>
+                        {ep.name}
+                      </Text>
+                    </View>
+                  </FocusableButton>
+                );
+              })}
+            </ScrollView>
+          </View>
+        </View>
+      );
+    }
+
     const isAudio = activeMenu === 'audio';
     const tracks = isAudio ? audioTracks : textTracks;
     const isSubtitleDisabled =
@@ -1896,6 +2049,17 @@ const App = () => {
                 {!IS_TV && (
                   <FocusableButton
                     style={styles.netflixCircleBtn}
+                    onPress={handleEnterPiP}>
+                    <Icon
+                      name="picture-in-picture-alt"
+                      size={20}
+                      color="white"
+                    />
+                  </FocusableButton>
+                )}
+                {!IS_TV && (
+                  <FocusableButton
+                    style={styles.netflixCircleBtn}
                     onPress={() => {
                       setIsLocked(true);
                       setActiveMenu(null);
@@ -2020,6 +2184,27 @@ const App = () => {
                   <Text style={styles.netflixActionText}>Subtitles</Text>
                 </FocusableButton>
 
+                {playableFolderEpisodes.length > 1 && (
+                  <FocusableButton
+                    style={[
+                      styles.netflixActionPill,
+                      activeMenu === 'episodes' &&
+                        styles.netflixActionPillActive,
+                    ]}
+                    onPress={() =>
+                      setActiveMenu(
+                        activeMenu === 'episodes' ? null : 'episodes',
+                      )
+                    }>
+                    <Icon
+                      name="video-library"
+                      size={19}
+                      color={activeMenu === 'episodes' ? '#E50914' : 'white'}
+                    />
+                    <Text style={styles.netflixActionText}>Episodes</Text>
+                  </FocusableButton>
+                )}
+
                 <FocusableButton
                   style={styles.netflixActionPill}
                   onPress={cyclePlaybackSpeed}>
@@ -2072,7 +2257,7 @@ const App = () => {
     );
   }
 
-  // 🔥 2. MOVIE DETAIL SCREEN (With On-Demand Real MediaInfo!) 🔥
+  // 🔥 2. MOVIE DETAIL SCREEN 🔥
   if (selectedFile && playMode === null) {
     const info = parseMediaFilename(selectedFile.name, false);
     const meta = metadataMap[selectedFile.name];
@@ -2080,6 +2265,7 @@ const App = () => {
     const savedSec = savedTimesMap[selectedFile.name] || 0;
     const bannerImage = meta?.backdrop || meta?.poster;
     const dlTask = downloads.find(d => d.fileName === selectedFile.name);
+    const isFav = !!watchlist[selectedFile.name];
 
     const effectiveResolution = realMi?.resolution || info.resolution;
     const effectiveHasDV = realMi ? realMi.hasDV : info.hasDV;
@@ -2135,6 +2321,16 @@ const App = () => {
             style={styles.detailBackTopBtn}
             onPress={() => setSelectedFile(null)}>
             <Icon name="arrow-back" size={24} color="white" />
+          </FocusableButton>
+
+          <FocusableButton
+            style={styles.detailFavTopBtn}
+            onPress={() => toggleWatchlist(selectedFile.name)}>
+            <Icon
+              name={isFav ? 'favorite' : 'favorite-border'}
+              size={22}
+              color={isFav ? '#E50914' : 'white'}
+            />
           </FocusableButton>
         </View>
 
@@ -2206,14 +2402,33 @@ const App = () => {
               </Text>
             </FocusableButton>
 
-            <FocusableButton
-              style={styles.secondaryPlayButton}
-              onPress={() => openInExternalPlayer(selectedFile)}>
-              <Icon name="open-in-new" size={20} color="white" />
-              <Text style={styles.secondaryPlayButtonText}>
-                Open in External Player
-              </Text>
-            </FocusableButton>
+            <View style={{ flexDirection: 'row', gap: 10 }}>
+              <FocusableButton
+                style={[styles.secondaryPlayButton, { flex: 1 }]}
+                onPress={() => openInExternalPlayer(selectedFile)}>
+                <Icon name="open-in-new" size={20} color="white" />
+                <Text style={styles.secondaryPlayButtonText}>
+                  External Player
+                </Text>
+              </FocusableButton>
+
+              <FocusableButton
+                style={[
+                  styles.secondaryPlayButton,
+                  { paddingHorizontal: 16 },
+                  isFav && { borderColor: '#E50914' },
+                ]}
+                onPress={() => toggleWatchlist(selectedFile.name)}>
+                <Icon
+                  name={isFav ? 'favorite' : 'favorite-border'}
+                  size={20}
+                  color={isFav ? '#E50914' : 'white'}
+                />
+                <Text style={styles.secondaryPlayButtonText}>
+                  {isFav ? 'Saved' : 'My List'}
+                </Text>
+              </FocusableButton>
+            </View>
 
             {!dlTask ? (
               <FocusableButton
@@ -2266,7 +2481,6 @@ const App = () => {
             )}
           </View>
 
-          {/* 🔥 ON-DEMAND REAL MEDIAINFO CARD 🔥 */}
           <View style={styles.mediaInfoCard}>
             <View style={styles.mediaInfoHeaderRow}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
@@ -2591,17 +2805,46 @@ const App = () => {
           placeholder="Search movies, series, 4K, Tamil..."
           placeholderTextColor="#777"
           value={searchQuery}
-          onChangeText={handleSearch}
+          onChangeText={setSearchQuery}
           autoCorrect={false}
           returnKeyType="search"
         />
         {!!searchQuery && (
           <TouchableOpacity
-            onPress={() => handleSearch('')}
+            onPress={() => setSearchQuery('')}
             style={{ padding: 8 }}>
             <Icon name="close" size={18} color="#AAA" />
           </TouchableOpacity>
         )}
+      </View>
+
+      {/* Category Filter Chips */}
+      <View style={{ marginBottom: 10 }}>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={{ paddingHorizontal: 14, gap: 8 }}>
+          {FILTER_CATEGORIES.map(cat => {
+            const isSelected = activeCategory === cat.id;
+            return (
+              <FocusableButton
+                key={cat.id}
+                style={[
+                  styles.filterChip,
+                  isSelected && styles.filterChipActive,
+                ]}
+                onPress={() => setActiveCategory(cat.id)}>
+                <Text
+                  style={[
+                    styles.filterChipText,
+                    isSelected && styles.filterChipTextActive,
+                  ]}>
+                  {cat.label}
+                </Text>
+              </FocusableButton>
+            );
+          })}
+        </ScrollView>
       </View>
 
       {pathStack.length > 1 && (
@@ -2622,10 +2865,71 @@ const App = () => {
       ) : (
         <FlatList
           key={`catalog-${viewMode}-${numColumns}`}
-          data={filteredFiles}
+          data={displayedFiles}
           numColumns={numColumns}
           keyboardShouldPersistTaps="handled"
           removeClippedSubviews={false}
+          ListHeaderComponent={
+            !searchQuery &&
+            activeCategory === 'all' &&
+            continueWatchingItems.length > 0 ? (
+              <View style={styles.cwSection}>
+                <Text style={styles.cwSectionTitle}>Continue Watching ⏯️</Text>
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  contentContainerStyle={{ gap: 10, paddingHorizontal: 6 }}>
+                  {continueWatchingItems.map((cwItem, idx) => {
+                    const cwInfo = parseMediaFilename(cwItem.name, false);
+                    const cwMeta = metadataMap[cwItem.name];
+                    const cwSec = savedTimesMap[cwItem.name] || 0;
+                    const imgUri = cwMeta?.backdrop || cwMeta?.poster;
+                    return (
+                      <FocusableButton
+                        key={cwItem.id || cwItem.name || idx}
+                        style={styles.cwCard}
+                        onPress={() => {
+                          openFile(cwItem);
+                          handlePlayInAppPress(cwItem);
+                        }}>
+                        <View style={styles.cwImageWrap}>
+                          {imgUri ? (
+                            <Image
+                              source={{ uri: imgUri }}
+                              style={styles.cwImage}
+                              resizeMode="cover"
+                            />
+                          ) : (
+                            <View style={styles.cwFallback}>
+                              <Icon
+                                name="play-circle-outline"
+                                size={32}
+                                color="#E50914"
+                              />
+                            </View>
+                          )}
+                          <View style={styles.cwPlayBadge}>
+                            <Icon name="play-arrow" size={18} color="white" />
+                          </View>
+                          <View style={styles.resumeBarBg}>
+                            <View style={styles.resumeBarFill} />
+                          </View>
+                        </View>
+                        <View style={styles.cwFooter}>
+                          <Text style={styles.cwTitle} numberOfLines={1}>
+                            {cwInfo.cleanTitle}
+                          </Text>
+                          <Text style={styles.cwTimeText}>
+                            Resume • {formatTime(cwSec)}
+                          </Text>
+                        </View>
+                      </FocusableButton>
+                    );
+                  })}
+                </ScrollView>
+              </View>
+            ) : null
+          }
           refreshControl={
             <RefreshControl
               refreshing={refreshing}
@@ -2644,6 +2948,7 @@ const App = () => {
             const realMi = mediaInfoMap[item.name];
             const savedSec = savedTimesMap[item.name] || 0;
             const cardRes = realMi?.resolution || info.resolution;
+            const isFav = !!watchlist[item.name];
 
             if (viewMode === 'list') {
               return (
@@ -2756,6 +3061,12 @@ const App = () => {
                     )}
                   </View>
 
+                  {isFav && (
+                    <View style={styles.posterFavBadge}>
+                      <Icon name="favorite" size={13} color="#E50914" />
+                    </View>
+                  )}
+
                   {savedSec > 10 && (
                     <View style={styles.resumeBarBg}>
                       <View style={styles.resumeBarFill} />
@@ -2788,12 +3099,33 @@ const App = () => {
           }}
         />
       )}
+      {renderHdrChoiceModal()}
     </View>
   );
 };
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0B0C10', paddingTop: 38 },
+  securityAlertScreen: {
+    flex: 1,
+    backgroundColor: '#0B0C10',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 32,
+  },
+  securityAlertTitle: {
+    color: 'white',
+    fontSize: 20,
+    fontWeight: '800',
+    marginTop: 14,
+  },
+  securityAlertSub: {
+    color: '#99A3B3',
+    fontSize: 13,
+    textAlign: 'center',
+    lineHeight: 20,
+    marginTop: 8,
+  },
   topHeaderBar: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -2843,7 +3175,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: '#161920',
     marginHorizontal: 14,
-    marginBottom: 12,
+    marginBottom: 10,
     borderRadius: 10,
     borderWidth: 1,
     borderColor: '#262B36',
@@ -2855,6 +3187,74 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     fontSize: 15,
   },
+  filterChip: {
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 999,
+    backgroundColor: '#151821',
+    borderWidth: 1,
+    borderColor: '#262C3A',
+  },
+  filterChipActive: {
+    backgroundColor: '#E50914',
+    borderColor: '#FF4B55',
+  },
+  filterChipText: {
+    color: '#B0BAC9',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  filterChipTextActive: {
+    color: '#FFFFFF',
+    fontWeight: '800',
+  },
+  cwSection: {
+    marginBottom: 14,
+  },
+  cwSectionTitle: {
+    color: '#F2F5F8',
+    fontSize: 15,
+    fontWeight: '800',
+    marginLeft: 6,
+    marginBottom: 8,
+  },
+  cwCard: {
+    width: 190,
+    backgroundColor: '#14171F',
+    borderRadius: 10,
+    overflow: 'hidden',
+    borderWidth: 1.5,
+    borderColor: '#222836',
+  },
+  cwImageWrap: {
+    width: '100%',
+    height: 106,
+    backgroundColor: '#191D26',
+    position: 'relative',
+  },
+  cwImage: { width: '100%', height: '100%' },
+  cwFallback: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cwPlayBadge: {
+    position: 'absolute',
+    right: 8,
+    bottom: 10,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: 'rgba(229,9,20,0.92)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cwFooter: {
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+  },
+  cwTitle: { color: 'white', fontSize: 13, fontWeight: '700' },
+  cwTimeText: { color: '#E50914', fontSize: 11, fontWeight: '700', marginTop: 2 },
   backFolderBar: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -2907,6 +3307,17 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
+  },
+  posterFavBadge: {
+    position: 'absolute',
+    bottom: 8,
+    right: 8,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: 'rgba(11,12,16,0.82)',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   folderPill: {
     backgroundColor: 'rgba(245, 197, 24, 0.92)',
@@ -3065,6 +3476,19 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 40,
     left: 16,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  detailFavTopBtn: {
+    position: 'absolute',
+    top: 40,
+    right: 16,
     width: 42,
     height: 42,
     borderRadius: 21,
@@ -3248,7 +3672,6 @@ const styles = StyleSheet.create({
     borderRadius: 3,
   },
   dlCardSubText: { color: '#99A3B3', fontSize: 11, marginTop: 2 },
-  // MediaInfo Card Styles
   mediaInfoCard: {
     marginTop: 24,
     padding: 14,
