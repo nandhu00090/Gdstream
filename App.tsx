@@ -110,6 +110,15 @@ const formatRuntime = (seconds: number) => {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 };
 
+const formatTime = (seconds: number) => {
+  if (isNaN(seconds) || seconds < 0) return '00:00';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) return `${h}:${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
+  return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
+};
+
 const formatRemainingLabel = (savedSec: number, totalDur: number) => {
   if (totalDur > savedSec + 30) {
     const remSec = totalDur - savedSec;
@@ -119,6 +128,24 @@ const formatRemainingLabel = (savedSec: number, totalDur: number) => {
     return h > 0 ? `${h}h ${m}m left` : `${m}m left`;
   }
   return `at ${formatTime(savedSec)}`;
+};
+
+const getVersionTag = (name: string): string => {
+  const n = name.toUpperCase();
+  const tags: string[] = [];
+  if (/\bREMUX\b/.test(n)) tags.push('BluRay REMUX');
+  else if (/\b(BLURAY|BLU-RAY|BDRIP|BRRIP)\b/.test(n)) tags.push('BluRay');
+  else if (/\b(WEB-DL|WEBDL|WEB\s*DL)\b/.test(n)) tags.push('WEB-DL');
+  else if (/\bWEBRIP\b/.test(n)) tags.push('WEBRip');
+  else tags.push('Standard');
+
+  if (/\b(2160P|4K|UHD)\b/.test(n)) tags.push('4K');
+  else if (/\b1080P\b/.test(n)) tags.push('1080p');
+  else if (/\b720P\b/.test(n)) tags.push('720p');
+
+  if (/\b(DV|DOVI|DOLBY\s*VISION)\b/.test(n)) tags.push('DV');
+  if (/\b(HDR10\+|HDR10|HDR)\b/.test(n)) tags.push('HDR');
+  return tags.join(' • ');
 };
 
 const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => {
@@ -214,15 +241,6 @@ const FocusableButton = ({ style, focusedStyle, onPress, children, hasTVPreferre
   );
 };
 
-const formatTime = (seconds: number) => {
-  if (isNaN(seconds) || seconds < 0) return '00:00';
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  if (h > 0) return `${h}:${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
-  return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
-};
-
 const parseCueTime = (ts: string) => {
   const m = ts.trim().match(/(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{1,3})/);
   if (!m) return -1;
@@ -265,7 +283,6 @@ const App = () => {
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
   const [activeTab, setActiveTab] = useState<'catalog' | 'downloads'>('catalog');
 
-  // Crunchyroll / Netflix Season Selector State
   const [seasonFolders, setSeasonFolders] = useState<SeasonFolderItem[]>([]);
   const [activeSeason, setActiveSeason] = useState<SeasonFolderItem | null>(null);
   const [seriesParentTitle, setSeriesParentTitle] = useState('');
@@ -284,6 +301,7 @@ const App = () => {
   const [playerInstanceKey, setPlayerInstanceKey] = useState(0);
 
   const [selectedFile, setSelectedFile] = useState<any>(null);
+  const [versionGroup, setVersionGroup] = useState<any[]>([]);
   const [playMode, setPlayMode] = useState<string | null>(null);
   const [resizeMode, setResizeMode] = useState<'contain' | 'cover'>('contain');
   const [showControls, setShowControls] = useState(true);
@@ -352,7 +370,6 @@ const App = () => {
   const persistPlaybackProgress = useCallback((fileName: string | undefined, sec: number, dur: number) => {
     if (!fileName || sec <= 3) return;
     if (dur > 0 && dur - sec < 90) {
-      // Completed watching (>98% or within last 90s) -> Clear resume state
       AsyncStorage.removeItem(`time_${fileName}`).catch(() => {});
       setSavedTimesMap(prev => {
         const next = { ...prev };
@@ -496,6 +513,7 @@ const App = () => {
         return true;
       } else if (selectedFile) {
         setSelectedFile(null);
+        setVersionGroup([]);
         return true;
       } else if (activeTab === 'downloads') {
         setActiveTab('catalog');
@@ -592,7 +610,7 @@ const App = () => {
     return () => { cancelled = true; };
   }, [files, vaultReady, fetchSingleMetadata, loadSavedTimesForFiles]);
 
-  // Filtered + Sorted Catalog (Default: Newest first on Homepage, Episode order inside Season folders)
+  // Filtered + Sorted + Multi-Version Grouped Catalog
   const displayedFiles = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     const filtered = files.filter((file) => {
@@ -601,7 +619,15 @@ const App = () => {
       const realMi = mediaInfoMap[file.name];
 
       if (q) {
-        const matchesSearch = file.name.toLowerCase().includes(q) || info.cleanTitle.toLowerCase().includes(q);
+        // Match ONLY Movie Title, Year, or Episode Tag (Never match raw filename codecs like HEVC)
+        const titleLower = info.cleanTitle.toLowerCase();
+        const titleWords = titleLower.split(/\s+/);
+        const queryWords = q.split(/\s+/).filter(Boolean);
+        const matchesSearch =
+          titleLower.includes(q) ||
+          queryWords.every(qw => titleWords.some(tw => tw.startsWith(qw))) ||
+          info.year.toLowerCase().startsWith(q) ||
+          info.seasonEpisode.toLowerCase().includes(q);
         if (!matchesSearch) return false;
       }
       switch (activeCategory) {
@@ -621,7 +647,6 @@ const App = () => {
       modMs: item.modifiedTime ? Date.parse(item.modifiedTime) || 0 : 0,
     }));
 
-    // Inside a Series Season folder -> sort by Episode number ascending (E01, E02, E03...)
     const isEpisodeFolder = seasonFolders.length > 0 || (indexed.length > 1 && indexed.every(x => x.info.episodeNum > 0));
     if (isEpisodeFolder && sortBy === 'newest') {
       indexed.sort((a, b) => {
@@ -634,7 +659,6 @@ const App = () => {
     if (sortBy === 'az') {
       indexed.sort((a, b) => a.info.cleanTitle.localeCompare(b.info.cleanTitle));
     } else {
-      // 'newest': Sort by Drive modifiedTime descending; fallback to reverse index so newly added items appear first
       indexed.sort((a, b) => {
         if (a.modMs > 0 && b.modMs > 0 && a.modMs !== b.modMs) {
           return b.modMs - a.modMs;
@@ -642,7 +666,33 @@ const App = () => {
         return b.originalIndex - a.originalIndex;
       });
     }
-    return indexed.map(x => x.item);
+
+    // Group multiple versions of the same movie (e.g. Evil Dead Burn WEB-DL + BluRay) into 1 Card
+    const groupedMap = new Map<string, any[]>();
+    const mergedOrder: any[] = [];
+    for (const entry of indexed) {
+      const { item, info } = entry;
+      if (info.isFolder || info.seasonEpisode || info.episodeNum > 0) {
+        mergedOrder.push(item);
+      } else {
+        const key = `${info.cleanTitle.toLowerCase()}|${info.year}`;
+        if (!groupedMap.has(key)) {
+          groupedMap.set(key, [item]);
+          mergedOrder.push(item);
+        } else {
+          groupedMap.get(key)!.push(item);
+        }
+      }
+    }
+
+    return mergedOrder.map(item => {
+      const isFolder = !!item.mimeType?.includes('folder');
+      const info = parseMediaFilename(item.name, isFolder);
+      if (info.isFolder || info.seasonEpisode || info.episodeNum > 0) return item;
+      const key = `${info.cleanTitle.toLowerCase()}|${info.year}`;
+      const vers = groupedMap.get(key) || [item];
+      return vers.length > 1 ? { ...item, _versions: vers } : item;
+    });
   }, [files, searchQuery, activeCategory, sortBy, seasonFolders, mediaInfoMap, watchlist]);
 
   const continueWatchingItems = useMemo(() => {
@@ -670,54 +720,58 @@ const App = () => {
     return `${baseUrl}${currentPath}${encodeURIComponent(file.name)}`;
   }, [downloads, currentPath]);
 
+  // Automatically scan MediaInfo for ALL versions in versionGroup when Detail Page opens
   useEffect(() => {
     if (!selectedFile || playMode !== null) return;
-    const fileName = selectedFile.name;
-    if (!fileName) return;
+    const targets = versionGroup.length > 1 ? versionGroup : [selectedFile];
     let cancelled = false;
 
-    const runOnDemandMediaInfo = async () => {
-      if (mediaInfoMap[fileName]) {
-        if (mediaInfoMap[fileName].durationSec > 0) {
-          setSavedDurationsMap(prev => ({ ...prev, [fileName]: mediaInfoMap[fileName].durationSec }));
+    const runMultiMediaInfo = async () => {
+      for (const fileObj of targets) {
+        if (cancelled || !fileObj?.name) break;
+        const fName = fileObj.name;
+        if (mediaInfoMap[fName]) {
+          if (mediaInfoMap[fName].durationSec > 0) {
+            setSavedDurationsMap(prev => ({ ...prev, [fName]: mediaInfoMap[fName].durationSec }));
+          }
+          continue;
         }
-        return;
-      }
-      const cacheKey = `mediainfo_v4_${fileName}`;
-      try {
-        const cached = await AsyncStorage.getItem(cacheKey);
-        if (cached) {
-          const parsed: RealMediaInfo = JSON.parse(cached);
-          if (!cancelled) {
-            setMediaInfoMap(prev => ({ ...prev, [fileName]: parsed }));
-            if (parsed.durationSec > 0) {
-              setSavedDurationsMap(prev => ({ ...prev, [fileName]: parsed.durationSec }));
+        const cacheKey = `mediainfo_v4_${fName}`;
+        try {
+          const cached = await AsyncStorage.getItem(cacheKey);
+          if (cached) {
+            const parsed: RealMediaInfo = JSON.parse(cached);
+            if (!cancelled) {
+              setMediaInfoMap(prev => ({ ...prev, [fName]: parsed }));
+              if (parsed.durationSec > 0) {
+                setSavedDurationsMap(prev => ({ ...prev, [fName]: parsed.durationSec }));
+              }
             }
+            continue;
           }
-          return;
-        }
-      } catch {}
+        } catch {}
 
-      if (!MediaInfoModule?.inspectMedia) return;
-      setScanningMediaInfo(true);
-      try {
-        const streamUrl = getStreamUrl(selectedFile);
-        const res: RealMediaInfo = await MediaInfoModule.inspectMedia(streamUrl, fileName);
-        if (res && !cancelled) {
-          setMediaInfoMap(prev => ({ ...prev, [fileName]: res }));
-          if (res.durationSec > 0) {
-            setSavedDurationsMap(prev => ({ ...prev, [fileName]: res.durationSec }));
-            AsyncStorage.setItem(`dur_${fileName}`, res.durationSec.toString()).catch(() => {});
+        if (!MediaInfoModule?.inspectMedia) continue;
+        if (fName === selectedFile.name) setScanningMediaInfo(true);
+        try {
+          const streamUrl = getStreamUrl(fileObj);
+          const res: RealMediaInfo = await MediaInfoModule.inspectMedia(streamUrl, fName);
+          if (res && !cancelled) {
+            setMediaInfoMap(prev => ({ ...prev, [fName]: res }));
+            if (res.durationSec > 0) {
+              setSavedDurationsMap(prev => ({ ...prev, [fName]: res.durationSec }));
+              AsyncStorage.setItem(`dur_${fName}`, res.durationSec.toString()).catch(() => {});
+            }
+            await AsyncStorage.setItem(cacheKey, JSON.stringify(res));
           }
-          await AsyncStorage.setItem(cacheKey, JSON.stringify(res));
+        } catch {} finally {
+          if (!cancelled && fName === selectedFile.name) setScanningMediaInfo(false);
         }
-      } catch {} finally {
-        if (!cancelled) setScanningMediaInfo(false);
       }
     };
-    runOnDemandMediaInfo();
+    runMultiMediaInfo();
     return () => { cancelled = true; };
-  }, [selectedFile, playMode, mediaInfoMap, getStreamUrl]);
+  }, [selectedFile, versionGroup, playMode, mediaInfoMap, getStreamUrl]);
 
   const seekBothPlayers = useCallback((targetTime: number) => {
     videoRef.current?.seek(targetTime);
@@ -796,7 +850,6 @@ const App = () => {
     return response.data?.data?.files || [];
   };
 
-  // Crunchyroll / Netflix Style Directory Loader: Auto-detects Season folders & loads Season 1 directly!
   const fetchDirectory = async (path: string, isPullRefresh = false, isSeasonSwitch = false) => {
     const { baseUrl } = vaultRef.current;
     if (!baseUrl) { setLoading(false); return; }
@@ -823,8 +876,6 @@ const App = () => {
           }
         }
 
-        // If this series folder contains Season subfolders (e.g. S01, S02, S03, S04),
-        // auto-enter Season 1 and enable the top Season selector!
         if (path !== '/0:/' && detectedSeasons.length > 0 && videoFiles.length === 0) {
           detectedSeasons.sort((a, b) => a.seasonNum - b.seasonNum);
           const targetSeason = (isPullRefresh && activeSeason)
@@ -964,7 +1015,9 @@ const App = () => {
       setPathStack([...pathStack, newPath]);
       fetchDirectory(newPath, false, false);
     } else {
-      openFile(item);
+      const vers = item._versions && item._versions.length > 1 ? item._versions : [item];
+      setVersionGroup(vers);
+      openFile(vers[0]);
     }
   };
 
@@ -1157,6 +1210,7 @@ const App = () => {
     }
     closeInternalPlayer();
     setSelectedFile(null);
+    setVersionGroup([]);
   };
 
   if (securityCompromised) {
@@ -1420,6 +1474,13 @@ const App = () => {
           disableFocus={isExternalAudioSelected}
           rate={playbackRate}
           focusable={false}
+          bufferConfig={{
+            minBufferMs: 3000,
+            maxBufferMs: 8000,
+            bufferForPlaybackMs: 1000,
+            bufferForPlaybackAfterRebufferMs: 2000,
+            maxHeapAllocationPercent: 0.12,
+          }}
           onLoad={handleVideoLoad}
           onBuffer={(b: any) => setIsVideoBuffering(!!b?.isBuffering)}
           onAudioTracks={(data: any) => {
@@ -1677,7 +1738,7 @@ const App = () => {
             </View>
           )}
           <View style={styles.detailHeroShade} />
-          <FocusableButton style={styles.detailBackTopBtn} onPress={() => setSelectedFile(null)}>
+          <FocusableButton style={styles.detailBackTopBtn} onPress={() => { setSelectedFile(null); setVersionGroup([]); }}>
             <Icon name="arrow-back" size={24} color="white" />
           </FocusableButton>
           <FocusableButton style={styles.detailFavTopBtn} onPress={() => toggleWatchlist(selectedFile.name)}>
@@ -1706,7 +1767,6 @@ const App = () => {
             </View>
           </View>
 
-          {/* Live Watch Progress Pill on Detail Screen */}
           {savedSec > 3 && (
             <View style={styles.detailResumeBanner}>
               <View style={styles.detailResumeHeader}>
@@ -1724,11 +1784,50 @@ const App = () => {
 
           {!!meta?.overview && <Text style={styles.detailOverview}>{meta.overview}</Text>}
 
+          {/* Multi-Version Selector (e.g. WEB-DL vs BluRay REMUX) */}
+          {versionGroup.length > 1 && (
+            <View style={styles.versionSelectorBox}>
+              <Text style={styles.versionSelectorLabel}>
+                AVAILABLE VERSIONS ({versionGroup.length}) • TAP TO SWITCH
+              </Text>
+              <View style={styles.versionPillsRow}>
+                {versionGroup.map((vFile, vIdx) => {
+                  const isCurrentVer = vFile.name === selectedFile.name;
+                  const vMi = mediaInfoMap[vFile.name];
+                  return (
+                    <FocusableButton
+                      key={vFile.name || vIdx}
+                      style={[styles.versionPillBtn, isCurrentVer && styles.versionPillBtnActive]}
+                      onPress={() => openFile(vFile)}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <Icon
+                          name={isCurrentVer ? 'radio-button-checked' : 'radio-button-unchecked'}
+                          size={16}
+                          color={isCurrentVer ? '#E50914' : '#8A94A6'}
+                        />
+                        <Text style={[styles.versionPillTitle, isCurrentVer && { color: '#FFF' }]}>
+                          {getVersionTag(vFile.name)}
+                        </Text>
+                      </View>
+                      <Text style={styles.versionPillSub} numberOfLines={1}>
+                        {vMi?.totalBytes ? `${formatBytes(vMi.totalBytes)} • ` : ''}{vFile.name}
+                      </Text>
+                    </FocusableButton>
+                  );
+                })}
+              </View>
+            </View>
+          )}
+
           <View style={styles.detailActionButtons}>
             <FocusableButton hasTVPreferredFocus={true} style={styles.primaryPlayButton} onPress={() => handlePlayInAppPress(selectedFile)}>
               <Icon name="play-arrow" size={26} color="white" />
               <Text style={styles.primaryPlayButtonText}>
-                {savedSec > 3 ? `Resume Watching (${formatRemainingLabel(savedSec, totalDur)})` : 'Play in App'}
+                {savedSec > 3
+                  ? `Resume ${versionGroup.length > 1 ? getVersionTag(selectedFile.name).split(' • ')[0] : 'Watching'} (${formatRemainingLabel(savedSec, totalDur)})`
+                  : versionGroup.length > 1
+                  ? `Play ${getVersionTag(selectedFile.name)} in App`
+                  : 'Play in App'}
               </Text>
             </FocusableButton>
 
@@ -1748,7 +1847,9 @@ const App = () => {
             {!dlTask ? (
               <FocusableButton style={styles.downloadActionBtn} onPress={() => handleStartDownload(selectedFile)}>
                 <Icon name="file-download" size={22} color="#46d369" />
-                <Text style={styles.downloadActionText}>Download</Text>
+                <Text style={styles.downloadActionText}>
+                  {versionGroup.length > 1 ? `Download (${getVersionTag(selectedFile.name)})` : 'Download'}
+                </Text>
               </FocusableButton>
             ) : dlTask.status === 'completed' ? (
               <FocusableButton style={styles.downloadedReadyCard} onPress={handleOpenDownloadFolder}>
@@ -1756,7 +1857,7 @@ const App = () => {
                 <Text style={styles.downloadedReadyText}>Saved in Download/GDStream • Tap to Open Folder</Text>
               </FocusableButton>
             ) : (
-              <FocusableButton style={styles.downloadProgressCard} onPress={() => { setSelectedFile(null); setActiveTab('downloads'); }}>
+              <FocusableButton style={styles.downloadProgressCard} onPress={() => { setSelectedFile(null); setVersionGroup([]); setActiveTab('downloads'); }}>
                 <View style={styles.dlCardHeaderRow}>
                   <Text style={styles.dlCardStatusText}>
                     {dlTask.status === 'downloading' ? `Downloading • ${formatBytes(dlTask.speedBytesPerSec)}/s` : `Download ${dlTask.status.toUpperCase()}`}
@@ -1773,71 +1874,89 @@ const App = () => {
             )}
           </View>
 
-          <View style={styles.mediaInfoCard}>
-            <View style={styles.mediaInfoHeaderRow}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                <Icon name="memory" size={16} color="#E50914" />
-                <Text style={styles.mediaInfoHeaderTitle}>MEDIAINFO TECHNICAL SPECS</Text>
-              </View>
-              {scanningMediaInfo && (
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                  <ActivityIndicator size="small" color="#E50914" />
-                  <Text style={styles.scanningText}>Scanning stream...</Text>
-                </View>
-              )}
-            </View>
-
-            {realMi ? (
-              <View style={{ gap: 10, marginTop: 8 }}>
-                <View style={styles.miSpecRow}>
-                  <Text style={styles.miSpecLabel}>VIDEO</Text>
-                  <Text style={styles.miSpecValue}>
-                    {[
-                      realMi.width > 0 ? `${realMi.width}×${realMi.height} (${realMi.resolution})` : effectiveResolution,
-                      realMi.videoCodec,
-                      realMi.hasDV && realMi.hasHDR ? 'Dolby Vision + HDR10' : realMi.hasDV ? 'Dolby Vision (Single Layer)' : realMi.hasHDR ? 'HDR10' : 'SDR',
-                      realMi.frameRate > 0 ? `${realMi.frameRate.toFixed(2).replace(/\.00$/, '')} fps` : null,
-                    ].filter(Boolean).join(' • ')}
-                  </Text>
-                </View>
-                {(realMi.totalBytes > 0 || realMi.durationSec > 0) && (
-                  <View style={styles.miSpecRow}>
-                    <Text style={styles.miSpecLabel}>FILE & TIME</Text>
-                    <Text style={styles.miSpecValue}>
-                      {[realMi.totalBytes > 0 ? formatBytes(realMi.totalBytes) : null, realMi.durationSec > 0 ? formatRuntime(realMi.durationSec) : null].filter(Boolean).join(' • ')}
+          {/* Dual / Multi-Version MediaInfo Cards on the same Detail Page */}
+          {(versionGroup.length > 1 ? versionGroup : [selectedFile]).map((vItem, vIdx) => {
+            const vMi = mediaInfoMap[vItem.name];
+            const vInfo = parseMediaFilename(vItem.name, false);
+            const vRes = vMi?.resolution || vInfo.resolution;
+            const isSelectedVer = vItem.name === selectedFile.name;
+            return (
+              <TouchableOpacity
+                key={vItem.name || vIdx}
+                activeOpacity={0.9}
+                onPress={() => { if (versionGroup.length > 1 && !isSelectedVer) openFile(vItem); }}
+                style={[
+                  styles.mediaInfoCard,
+                  versionGroup.length > 1 && isSelectedVer && { borderColor: '#E50914', borderWidth: 1.5 },
+                ]}>
+                <View style={styles.mediaInfoHeaderRow}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flex: 1 }}>
+                    <Icon name="memory" size={16} color={isSelectedVer ? '#E50914' : '#8A94A6'} />
+                    <Text style={[styles.mediaInfoHeaderTitle, isSelectedVer && { color: '#FFF' }]}>
+                      {versionGroup.length > 1 ? `MEDIAINFO • ${getVersionTag(vItem.name).toUpperCase()}` : 'MEDIAINFO TECHNICAL SPECS'}
                     </Text>
                   </View>
-                )}
-                {realMi.audioTracks && realMi.audioTracks.length > 0 && (
-                  <View style={styles.miSpecRow}>
-                    <Text style={styles.miSpecLabel}>AUDIO ({realMi.audioTracks.length})</Text>
-                    <View style={styles.miTrackPillWrap}>
-                      {realMi.audioTracks.map((at, idx) => (
-                        <View key={idx} style={styles.miAudioPill}><Text style={styles.miAudioPillText}>{at.summary}</Text></View>
-                      ))}
+                  {scanningMediaInfo && !vMi && (
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <ActivityIndicator size="small" color="#E50914" />
+                      <Text style={styles.scanningText}>Scanning...</Text>
                     </View>
-                  </View>
-                )}
-                {realMi.subtitleTracks && realMi.subtitleTracks.length > 0 && (
-                  <View style={styles.miSpecRow}>
-                    <Text style={styles.miSpecLabel}>SUBTITLES ({realMi.subtitleTracks.length})</Text>
-                    <View style={styles.miTrackPillWrap}>
-                      {realMi.subtitleTracks.map((st, idx) => (
-                        <View key={idx} style={styles.miSubPill}><Text style={styles.miSubPillText}>{st.language} ({st.format})</Text></View>
-                      ))}
-                    </View>
-                  </View>
-                )}
-              </View>
-            ) : !scanningMediaInfo ? (
-              <Text style={styles.rawFileName}>{selectedFile.name}</Text>
-            ) : null}
+                  )}
+                </View>
 
-            <View style={styles.sourceFileDivider}>
-              <Text style={styles.rawFileLabel}>SOURCE FILE</Text>
-              <Text style={styles.rawFileName}>{selectedFile.name}</Text>
-            </View>
-          </View>
+                {vMi ? (
+                  <View style={{ gap: 10, marginTop: 8 }}>
+                    <View style={styles.miSpecRow}>
+                      <Text style={styles.miSpecLabel}>VIDEO</Text>
+                      <Text style={styles.miSpecValue}>
+                        {[
+                          vMi.width > 0 ? `${vMi.width}×${vMi.height} (${vMi.resolution})` : vRes,
+                          vMi.videoCodec,
+                          vMi.hasDV && vMi.hasHDR ? 'Dolby Vision + HDR10' : vMi.hasDV ? 'Dolby Vision (Single Layer)' : vMi.hasHDR ? 'HDR10' : 'SDR',
+                          vMi.frameRate > 0 ? `${vMi.frameRate.toFixed(2).replace(/\.00$/, '')} fps` : null,
+                        ].filter(Boolean).join(' • ')}
+                      </Text>
+                    </View>
+                    {(vMi.totalBytes > 0 || vMi.durationSec > 0) && (
+                      <View style={styles.miSpecRow}>
+                        <Text style={styles.miSpecLabel}>FILE & TIME</Text>
+                        <Text style={styles.miSpecValue}>
+                          {[vMi.totalBytes > 0 ? formatBytes(vMi.totalBytes) : null, vMi.durationSec > 0 ? formatRuntime(vMi.durationSec) : null].filter(Boolean).join(' • ')}
+                        </Text>
+                      </View>
+                    )}
+                    {vMi.audioTracks && vMi.audioTracks.length > 0 && (
+                      <View style={styles.miSpecRow}>
+                        <Text style={styles.miSpecLabel}>AUDIO ({vMi.audioTracks.length})</Text>
+                        <View style={styles.miTrackPillWrap}>
+                          {vMi.audioTracks.map((at, idx) => (
+                            <View key={idx} style={styles.miAudioPill}><Text style={styles.miAudioPillText}>{at.summary}</Text></View>
+                          ))}
+                        </View>
+                      </View>
+                    )}
+                    {vMi.subtitleTracks && vMi.subtitleTracks.length > 0 && (
+                      <View style={styles.miSpecRow}>
+                        <Text style={styles.miSpecLabel}>SUBTITLES ({vMi.subtitleTracks.length})</Text>
+                        <View style={styles.miTrackPillWrap}>
+                          {vMi.subtitleTracks.map((st, idx) => (
+                            <View key={idx} style={styles.miSubPill}><Text style={styles.miSubPillText}>{st.language} ({st.format})</Text></View>
+                          ))}
+                        </View>
+                      </View>
+                    )}
+                  </View>
+                ) : !scanningMediaInfo ? (
+                  <Text style={styles.rawFileName}>{vItem.name}</Text>
+                ) : null}
+
+                <View style={styles.sourceFileDivider}>
+                  <Text style={styles.rawFileLabel}>SOURCE FILE</Text>
+                  <Text style={styles.rawFileName}>{vItem.name}</Text>
+                </View>
+              </TouchableOpacity>
+            );
+          })}
         </View>
         {renderHdrChoiceModal()}
       </ScrollView>
@@ -1906,7 +2025,7 @@ const App = () => {
                   <View style={styles.dlActionsRow}>
                     {isDone ? (
                       <>
-                        <FocusableButton style={styles.dlPrimaryBtn} onPress={() => { const lf = { name: item.fileName, localPath: item.filePath }; openFile(lf); handlePlayInAppPress(lf); }}>
+                        <FocusableButton style={styles.dlPrimaryBtn} onPress={() => { const lf = { name: item.fileName, localPath: item.filePath }; setVersionGroup([lf]); openFile(lf); handlePlayInAppPress(lf); }}>
                           <Icon name="play-arrow" size={20} color="white" />
                           <Text style={styles.dlBtnText}>Play in App</Text>
                         </FocusableButton>
@@ -1954,7 +2073,6 @@ const App = () => {
         </View>
 
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-          {/* Sort Toggle Button: Default Newest, 1-Tap switch to A-Z */}
           <FocusableButton
             style={styles.sortToggleBtn}
             onPress={() => setSortBy(prev => (prev === 'newest' ? 'az' : 'newest'))}>
@@ -2011,7 +2129,6 @@ const App = () => {
         </ScrollView>
       </View>
 
-      {/* Back Bar + Crunchyroll/Netflix Style Season Selector Dropdown */}
       {pathStack.length > 1 && (
         <View style={styles.seriesNavRow}>
           <FocusableButton style={[styles.backFolderBar, { flex: 1, marginHorizontal: 0, marginBottom: 0 }]} onPress={goBack}>
@@ -2055,7 +2172,7 @@ const App = () => {
                       <FocusableButton
                         key={cwItem.id || cwItem.name || idx}
                         style={styles.cwCard}
-                        onPress={() => { openFile(cwItem); handlePlayInAppPress(cwItem); }}>
+                        onPress={() => { setVersionGroup([cwItem]); openFile(cwItem); handlePlayInAppPress(cwItem); }}>
                         <View style={styles.cwImageWrap}>
                           {imgUri ? (
                             <Image source={{ uri: imgUri }} style={styles.cwImage} resizeMode="cover" />
@@ -2095,6 +2212,7 @@ const App = () => {
             const resumePct = totalDur > 0 && savedSec > 0 ? Math.min(98, Math.max(5, (savedSec / totalDur) * 100)) : 45;
             const cardRes = realMi?.resolution || info.resolution;
             const isFav = !!watchlist[item.name];
+            const versionCount = item._versions?.length || 1;
 
             if (viewMode === 'list') {
               return (
@@ -2114,6 +2232,7 @@ const App = () => {
                       {!!(meta?.year || info.year) && <Text style={styles.cardSubText}>{meta?.year || info.year}</Text>}
                       {!!info.seasonEpisode && <Text style={styles.cardSeasonTag}>{info.seasonEpisode}</Text>}
                       {!!cardRes && <Text style={styles.cardQualityTag}>{cardRes}</Text>}
+                      {versionCount > 1 && <Text style={styles.cardSeasonTag}>{versionCount} Versions</Text>}
                       {savedSec > 3 && <Text style={styles.cardResumeTag}>{formatRemainingLabel(savedSec, totalDur)}</Text>}
                     </View>
                   </View>
@@ -2148,6 +2267,12 @@ const App = () => {
                       </View>
                     )}
                   </View>
+
+                  {versionCount > 1 && (
+                    <View style={styles.multiVersionBadge}>
+                      <Text style={styles.multiVersionBadgeText}>{versionCount} VERSIONS</Text>
+                    </View>
+                  )}
 
                   {isFav && (
                     <View style={styles.posterFavBadge}><Icon name="favorite" size={13} color="#E50914" /></View>
@@ -2197,11 +2322,7 @@ const styles = StyleSheet.create({
   logoMark: { width: 30, height: 30, borderRadius: 7, backgroundColor: '#E50914', alignItems: 'center', justifyContent: 'center', marginRight: 9 },
   logoMarkText: { color: 'white', fontSize: 15, fontWeight: '900' },
   headerTitle: { color: '#FFFFFF', fontSize: 21, fontWeight: '800', letterSpacing: 0.4 },
-  sortToggleBtn: {
-    flexDirection: 'row', alignItems: 'center', gap: 4,
-    paddingHorizontal: 10, paddingVertical: 7, borderRadius: 8,
-    backgroundColor: '#1A1D24', borderWidth: 1, borderColor: '#2E3646',
-  },
+  sortToggleBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 8, backgroundColor: '#1A1D24', borderWidth: 1, borderColor: '#2E3646' },
   sortToggleText: { color: '#F2F5F8', fontSize: 12, fontWeight: '800' },
   headerIconBtn: { padding: 8, borderRadius: 8, backgroundColor: '#1A1D24', borderWidth: 2, borderColor: 'transparent', position: 'relative' },
   dlBadgeDot: { position: 'absolute', top: -4, right: -4, backgroundColor: '#E50914', minWidth: 16, height: 16, borderRadius: 8, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 3 },
@@ -2215,17 +2336,9 @@ const styles = StyleSheet.create({
   seriesNavRow: { flexDirection: 'row', alignItems: 'center', marginHorizontal: 14, marginBottom: 10, gap: 8 },
   backFolderBar: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#181C24', paddingVertical: 9, paddingHorizontal: 14, marginHorizontal: 14, borderRadius: 8, marginBottom: 10, gap: 8, borderWidth: 2, borderColor: 'transparent' },
   backFolderText: { color: '#DDD', fontSize: 13, fontWeight: '600', flex: 1 },
-  seasonDropdownBtn: {
-    flexDirection: 'row', alignItems: 'center', gap: 4,
-    backgroundColor: '#E50914', paddingVertical: 8, paddingHorizontal: 14,
-    borderRadius: 8, borderWidth: 1, borderColor: '#FF4B55',
-  },
+  seasonDropdownBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#E50914', paddingVertical: 8, paddingHorizontal: 14, borderRadius: 8, borderWidth: 1, borderColor: '#FF4B55' },
   seasonDropdownBtnText: { color: 'white', fontSize: 13, fontWeight: '900' },
-  seasonOptionItem: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: '#1B1F2C',
-    padding: 12, borderRadius: 10, borderWidth: 1.5, borderColor: '#283042',
-    gap: 12, marginBottom: 8,
-  },
+  seasonOptionItem: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#1B1F2C', padding: 12, borderRadius: 10, borderWidth: 1.5, borderColor: '#283042', gap: 12, marginBottom: 8 },
   seasonOptionItemActive: { borderColor: '#E50914', backgroundColor: 'rgba(229,9,20,0.12)' },
   seasonNumberCircle: { width: 38, height: 38, borderRadius: 19, backgroundColor: '#252B3B', alignItems: 'center', justifyContent: 'center' },
   seasonNumberText: { color: '#F5C518', fontSize: 12, fontWeight: '900' },
@@ -2245,6 +2358,8 @@ const styles = StyleSheet.create({
   posterFallback: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 14, backgroundColor: '#171B24' },
   posterFallbackTitle: { color: '#D5DCE6', fontSize: 14, fontWeight: '700', textAlign: 'center', marginTop: 10 },
   posterTopBadges: { position: 'absolute', top: 8, left: 8, right: 8, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  multiVersionBadge: { position: 'absolute', bottom: 8, left: 8, backgroundColor: 'rgba(229, 9, 20, 0.92)', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 5 },
+  multiVersionBadgeText: { color: '#FFF', fontSize: 9, fontWeight: '900', letterSpacing: 0.4 },
   posterFavBadge: { position: 'absolute', bottom: 8, right: 8, width: 24, height: 24, borderRadius: 12, backgroundColor: 'rgba(11,12,16,0.82)', alignItems: 'center', justifyContent: 'center' },
   folderPill: { backgroundColor: 'rgba(245, 197, 24, 0.92)', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 5 },
   folderPillText: { color: '#000', fontSize: 10, fontWeight: '900' },
@@ -2303,7 +2418,14 @@ const styles = StyleSheet.create({
   detailResumeFill: { height: '100%', backgroundColor: '#E50914' },
   detailResumeSub: { color: '#8A94A6', fontSize: 11, marginTop: 5, fontWeight: '600' },
   detailOverview: { color: '#C4CDD9', fontSize: 14, lineHeight: 21, marginTop: 18 },
-  detailActionButtons: { marginTop: 22, gap: 12 },
+  versionSelectorBox: { marginTop: 18, backgroundColor: '#131722', padding: 12, borderRadius: 12, borderWidth: 1, borderColor: '#262F42' },
+  versionSelectorLabel: { color: '#9BA6B8', fontSize: 11, fontWeight: '900', letterSpacing: 0.8, marginBottom: 8 },
+  versionPillsRow: { gap: 8 },
+  versionPillBtn: { backgroundColor: '#1A1F2E', paddingVertical: 10, paddingHorizontal: 12, borderRadius: 9, borderWidth: 1.5, borderColor: '#2B3346' },
+  versionPillBtnActive: { backgroundColor: 'rgba(229, 9, 20, 0.14)', borderColor: '#E50914' },
+  versionPillTitle: { color: '#D0D8E8', fontSize: 14, fontWeight: '800' },
+  versionPillSub: { color: '#7D899E', fontSize: 11, marginTop: 3, marginLeft: 22 },
+  detailActionButtons: { marginTop: 20, gap: 12 },
   primaryPlayButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: '#E50914', paddingVertical: 14, paddingHorizontal: 20, borderRadius: 10, gap: 8, borderWidth: 2, borderColor: 'transparent' },
   primaryPlayButtonText: { color: '#FFFFFF', fontSize: 16, fontWeight: '800' },
   secondaryPlayButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: '#1E2430', paddingVertical: 13, paddingHorizontal: 20, borderRadius: 10, gap: 8, borderWidth: 2, borderColor: '#2E3748' },
@@ -2319,7 +2441,7 @@ const styles = StyleSheet.create({
   dlProgressBarBg: { height: 6, backgroundColor: '#252C3A', borderRadius: 3, overflow: 'hidden', marginVertical: 6 },
   dlProgressBarFill: { height: '100%', backgroundColor: '#E50914', borderRadius: 3 },
   dlCardSubText: { color: '#99A3B3', fontSize: 11, marginTop: 2 },
-  mediaInfoCard: { marginTop: 24, padding: 14, borderRadius: 12, backgroundColor: '#12151E', borderWidth: 1, borderColor: '#232A38' },
+  mediaInfoCard: { marginTop: 18, padding: 14, borderRadius: 12, backgroundColor: '#12151E', borderWidth: 1, borderColor: '#232A38' },
   mediaInfoHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 },
   mediaInfoHeaderTitle: { color: '#9BA6B8', fontSize: 11, fontWeight: '900', letterSpacing: 0.9 },
   scanningText: { color: '#E50914', fontSize: 11, fontWeight: '700' },
