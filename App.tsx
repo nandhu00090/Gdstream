@@ -29,6 +29,8 @@ interface ParsedMediaInfo {
   badges: string[];
   hasDV: boolean;
   hasHDR: boolean;
+  langCode: string;
+  langName: string;
   isFolder: boolean;
 }
 
@@ -46,6 +48,8 @@ interface RealMediaInfo {
   height: number;
   resolution: string;
   videoCodec: string;
+  videoBitrate?: string;
+  overallBitrate?: string;
   frameRate: number;
   durationSec: number;
   totalBytes: number;
@@ -150,7 +154,12 @@ const getVersionTag = (name: string): string => {
 
 const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => {
   const withoutExt = isFolder ? name : name.replace(/\.(mkv|mp4|avi|mov|webm|m4v|ts)$/i, '');
-  const normalized = withoutExt.replace(/[._]+/g, ' ').replace(/\[.*?\]/g, ' ').replace(/\s+/g, ' ').trim();
+  const normalized = withoutExt
+    .replace(/[._]+/g, ' ')
+    .replace(/\[.*?\]/g, ' ')
+    .replace(/\((?!19\d{2}|20\d{2}).*?\)/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 
   let resolution = '';
   if (/\b(2160p|4k|uhd)\b/i.test(normalized)) resolution = '4K';
@@ -159,7 +168,16 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
   else if (/\b480p\b/i.test(normalized)) resolution = '480p';
 
   const hasDV = /\b(dv|dovi|dolby\s*vision)\b/i.test(normalized);
-  const hasHDR = /\b(hdr|hdr10|hdr10\+)\b/i.test(normalized);
+  const hasHDR = /\b(hdr|hdr10|hdr10[+])\b/i.test(normalized);
+
+  let langCode = '';
+  let langName = '';
+  if (/\b(tam|tamil)\b/i.test(normalized)) { langCode = 'ta'; langName = 'Tamil'; }
+  else if (/\b(mal|malayalam)\b/i.test(normalized)) { langCode = 'ml'; langName = 'Malayalam'; }
+  else if (/\b(tel|telugu)\b/i.test(normalized)) { langCode = 'te'; langName = 'Telugu'; }
+  else if (/\b(hin|hindi)\b/i.test(normalized)) { langCode = 'hi'; langName = 'Hindi'; }
+  else if (/\b(kan|kannada)\b/i.test(normalized)) { langCode = 'kn'; langName = 'Kannada'; }
+  else if (/\b(kor|korean)\b/i.test(normalized)) { langCode = 'ko'; langName = 'Korean'; }
 
   const badges: string[] = [];
   if (/\b(atmos)\b/i.test(normalized)) badges.push('Atmos');
@@ -170,10 +188,7 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
   else if (/\b(web-dl|webdl|web\s*dl|webrip)\b/i.test(normalized)) badges.push('WEB-DL');
   if (/\b(h\s*265|x265|hevc)\b/i.test(normalized)) badges.push('HEVC');
   if (/\b(multi|dual)\b/i.test(normalized)) badges.push('Multi Audio');
-  else if (/\b(tam|tamil)\b/i.test(normalized)) badges.push('Tamil');
-  else if (/\b(mal|malayalam)\b/i.test(normalized)) badges.push('Malayalam');
-  else if (/\b(hin|hindi)\b/i.test(normalized)) badges.push('Hindi');
-  else if (/\b(tel|telugu)\b/i.test(normalized)) badges.push('Telugu');
+  else if (langName) badges.push(langName);
 
   let seasonNum = 0;
   let episodeNum = 0;
@@ -188,7 +203,7 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
   const yearMatch = normalized.match(/(?:^|[\s(])((?:19|20)\d{2})(?:[\s)]|$)/);
   const year = yearMatch ? yearMatch[1] : '';
 
-  const cutPattern = /\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-ray|remux|web-dl|webdl|webrip|web|amzn|nf|snxt|it|hdtv|ddp\d|dd\+|aac|hevc|x264|x265|h\s*264|h\s*265|multi|dual|org|fhd)\b/i;
+  const cutPattern = /\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-ray|remux|web-dl|webdl|webrip|web|amzn|nf|snxt|sonyliv|jiohotstar|zee5|aha|it|hdtv|ddp\d|dd[+]|ddp|aac|eac3|ac3|truehd|dts|dtshd|hevc|avc|x264|x265|h\s*264|h\s*265|multi|dual|org|fhd|jpn|kor|tam|tel|mal|hin|kan|eng|esub|esubs|msub|msubs|subs|sub|uncut|remastered|imax)\b/i;
   let titlePart = normalized;
   if (seMatch && seMatch.index !== undefined && seMatch.index > 1) titlePart = titlePart.slice(0, seMatch.index);
   if (yearMatch && yearMatch.index !== undefined && yearMatch.index > 1) {
@@ -200,8 +215,7 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
 
   titlePart = titlePart
     .replace(/\((?:19|20)\d{2}\)/g, '')
-    .replace(/\bmovie\b$/i, '')
-    .replace(/\s+\b(tamil|malayalam|telugu|hindi|kannada|english|tam|mal|tel|hin|eng)\b$/i, '')
+    .replace(/\b(movie|jpn|kor|tam|mal|tel|hin|eng|tamil|malayalam|telugu|hindi|kannada|english|japanese|korean)\b$/gi, '')
     .replace(/[-–—:([{\s]+$/, '')
     .trim();
 
@@ -211,7 +225,7 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
   return {
     rawName: name, cleanTitle, searchTitle, year, seasonEpisode,
     seasonNum, episodeNum, resolution, badges: badges.slice(0, 4),
-    hasDV, hasHDR, isFolder,
+    hasDV, hasHDR, langCode, langName, isFolder,
   };
 };
 
@@ -453,7 +467,7 @@ const App = () => {
     try {
       const timeKeys = items.map(f => `time_${f.name}`);
       const durKeys = items.map(f => `dur_${f.name}`);
-      const miKeys = items.map(f => `mediainfo_v4_${f.name}`);
+      const miKeys = items.map(f => `mediainfo_v6_${f.name}`);
       const [timePairs, durPairs, miPairs] = await Promise.all([
         AsyncStorage.multiGet(timeKeys),
         AsyncStorage.multiGet(durKeys),
@@ -480,7 +494,7 @@ const App = () => {
       const nextMiMap: Record<string, RealMediaInfo> = {};
       miPairs.forEach(([k, val]) => {
         if (val) {
-          try { nextMiMap[k.replace(/^mediainfo_v4_/, '')] = JSON.parse(val); } catch {}
+          try { nextMiMap[k.replace(/^mediainfo_v6_/, '')] = JSON.parse(val); } catch {}
         }
       });
       if (Object.keys(nextMiMap).length > 0) {
@@ -529,62 +543,129 @@ const App = () => {
   }, [playMode, selectedFile, pathStack, activeMenu, showHdrChoiceModal, showSeasonModal, isLocked, activeTab, closeInternalPlayer]);
 
   const fetchSingleMetadata = useCallback(async (info: ParsedMediaInfo): Promise<MediaMetadata | null> => {
-    const cacheKey = `meta_v4_${info.searchTitle.toLowerCase()}_${info.year}`;
+    const cacheKey = `meta_v6_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
     try {
       const cached = await AsyncStorage.getItem(cacheKey);
       if (cached) return JSON.parse(cached);
     } catch {}
 
+    const targetLower = info.searchTitle.toLowerCase().trim();
     const tmdbKey = vaultRef.current.tmdbKey;
     if (tmdbKey && tmdbKey.trim().length >= 20) {
       try {
         const key = tmdbKey.trim();
-        const endpoint = info.seasonEpisode ? 'tv' : 'multi';
-        const url = `https://api.themoviedb.org/3/search/${endpoint}?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}${info.year && endpoint === 'movie' ? `&year=${info.year}` : ''}`;
-        const res = await axios.get(url, { timeout: 6000 });
-        const results = res.data?.results || [];
-        const match = results.find((r: any) => {
-          const rYear = (r.release_date || r.first_air_date || '').slice(0, 4);
-          return info.year ? rYear === info.year : r.poster_path;
-        }) || results.find((r: any) => r.poster_path) || results[0];
+        const isSeries = !!info.seasonEpisode || info.isFolder;
+        const endpoint = isSeries ? 'tv' : 'movie';
+        const yearParam = info.year
+          ? (isSeries ? `&first_air_date_year=${info.year}` : `&primary_release_year=${info.year}`)
+          : '';
+        let url = `https://api.themoviedb.org/3/search/${endpoint}?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}${yearParam}`;
+        let res = await axios.get(url, { timeout: 6000 });
+        let results: any[] = res.data?.results || [];
 
-        if (match) {
-          const meta: MediaMetadata = {
-            poster: match.poster_path ? `https://image.tmdb.org/t/p/w500${match.poster_path}` : undefined,
-            backdrop: match.backdrop_path ? `https://image.tmdb.org/t/p/w780${match.backdrop_path}` : undefined,
-            rating: match.vote_average && match.vote_average > 0 ? Number(match.vote_average).toFixed(1) : undefined,
-            overview: match.overview || undefined,
-            year: (match.release_date || match.first_air_date || '').slice(0, 4) || info.year,
-          };
-          if (meta.poster || meta.overview) {
-            await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
-            return meta;
+        if (!results.length) {
+          const fallbackUrl = `https://api.themoviedb.org/3/search/multi?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}`;
+          res = await axios.get(fallbackUrl, { timeout: 6000 });
+          results = (res.data?.results || []).filter((r: any) => r.media_type !== 'person');
+        }
+
+        if (results.length > 0) {
+          const scored = results.map((r: any) => {
+            let score = 0;
+            const rTitle = String(r.title || r.name || '').toLowerCase().trim();
+            const rOrig = String(r.original_title || r.original_name || '').toLowerCase().trim();
+            const rYear = String(r.release_date || r.first_air_date || '').slice(0, 4);
+
+            if (rTitle === targetLower || rOrig === targetLower) score += 50;
+            else if (rTitle.startsWith(targetLower) || rOrig.startsWith(targetLower)) score += 20;
+
+            if (info.year) {
+              if (rYear === info.year) score += 60;
+              else if (rYear && Math.abs(parseInt(rYear, 10) - parseInt(info.year, 10)) === 1) score += 25;
+              else score -= 40;
+            }
+            if (info.langCode && r.original_language === info.langCode) {
+              score += 45;
+            }
+            if (r.poster_path) score += 10;
+            return { r, score };
+          });
+
+          scored.sort((a, b) => b.score - a.score);
+          const best = scored[0]?.r;
+
+          if (best && (!info.year || scored[0].score > 0)) {
+            const matchedYear = String(best.release_date || best.first_air_date || '').slice(0, 4);
+            const meta: MediaMetadata = {
+              poster: best.poster_path ? `https://image.tmdb.org/t/p/w500${best.poster_path}` : undefined,
+              backdrop: best.backdrop_path ? `https://image.tmdb.org/t/p/w780${best.backdrop_path}` : undefined,
+              rating: best.vote_average && best.vote_average > 0 ? Number(best.vote_average).toFixed(1) : undefined,
+              overview: best.overview || undefined,
+              year: info.year || matchedYear,
+            };
+            if (meta.poster || meta.overview) {
+              await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
+              return meta;
+            }
           }
         }
       } catch {}
     }
 
     try {
-      const query = `${info.searchTitle} ${info.year}`.trim();
-      const cleanQ = query.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-      const firstChar = cleanQ.charAt(0) || 'a';
-      const imdbUrl = `https://v3.sg.media-imdb.com/suggestion/${firstChar}/${encodeURIComponent(cleanQ.slice(0, 35))}.json`;
-      const res = await axios.get(imdbUrl, { timeout: 6000 });
-      const list: any[] = res.data?.d || [];
-      const validItems = list.filter((item: any) => item?.i?.imageUrl);
-      const match = validItems.find((item: any) => info.year && String(item.y) === String(info.year)) || validItems[0];
+      const queriesToTry = [
+        `${info.searchTitle} ${info.year}`.trim(),
+        info.langName ? `${info.searchTitle} ${info.year} ${info.langName}`.trim() : '',
+        info.searchTitle.trim(),
+      ].filter(Boolean);
 
-      if (match && match.i?.imageUrl) {
-        const rawImg: string = match.i.imageUrl;
-        const meta: MediaMetadata = {
-          poster: rawImg.replace(/\._V1_.*\.jpg$/i, '._V1_QL75_UX500_.jpg'),
-          backdrop: rawImg.replace(/\._V1_.*\.jpg$/i, '._V1_QL75_UX1000_.jpg'),
-          year: match.y ? String(match.y) : info.year,
-          cast: match.s || undefined,
-          overview: match.s ? `${match.q ? `${match.q.toUpperCase()} • ` : ''}Starring: ${match.s}` : undefined,
-        };
-        await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
-        return meta;
+      for (const rawQuery of queriesToTry) {
+        const cleanQ = rawQuery.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+        if (!cleanQ) continue;
+        const firstChar = cleanQ.charAt(0) || 'a';
+        const imdbUrl = `https://v3.sg.media-imdb.com/suggestion/${firstChar}/${encodeURIComponent(cleanQ.slice(0, 35))}.json`;
+        const res = await axios.get(imdbUrl, { timeout: 6000 });
+        const list: any[] = res.data?.d || [];
+
+        const validTitles = list.filter(
+          (item: any) => item?.id && String(item.id).startsWith('tt') && item?.i?.imageUrl
+        );
+        if (!validTitles.length) continue;
+
+        const scoredImdb = validTitles.map((item: any) => {
+          let score = 0;
+          const itemTitle = String(item.l || '').toLowerCase().trim();
+          const itemYear = item.y ? String(item.y) : '';
+          if (itemTitle === targetLower) score += 50;
+          else if (itemTitle.startsWith(targetLower)) score += 20;
+
+          if (info.year) {
+            if (itemYear === info.year) score += 70;
+            else if (itemYear && Math.abs(parseInt(itemYear, 10) - parseInt(info.year, 10)) === 1) score += 30;
+            else score -= 50;
+          }
+          if (!info.seasonEpisode && !info.isFolder && String(item.qid || item.q || '').toLowerCase().includes('feature')) {
+            score += 15;
+          }
+          return { item, score };
+        });
+
+        scoredImdb.sort((a, b) => b.score - a.score);
+        const bestImdb = scoredImdb[0];
+
+        if (bestImdb && (!info.year || bestImdb.score >= 20)) {
+          const match = bestImdb.item;
+          const rawImg: string = match.i.imageUrl;
+          const meta: MediaMetadata = {
+            poster: rawImg.replace(/\._V1_.*\.jpg$/i, '._V1_QL75_UX500_.jpg'),
+            backdrop: rawImg.replace(/\._V1_.*\.jpg$/i, '._V1_QL75_UX1000_.jpg'),
+            year: info.year || (match.y ? String(match.y) : ''),
+            cast: match.s || undefined,
+            overview: match.s ? `${match.q ? `${match.q.toUpperCase()} • ` : ''}Starring: ${match.s}` : undefined,
+          };
+          await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
+          return meta;
+        }
       }
     } catch {}
     return null;
@@ -736,7 +817,7 @@ const App = () => {
           }
           continue;
         }
-        const cacheKey = `mediainfo_v4_${fName}`;
+        const cacheKey = `mediainfo_v6_${fName}`;
         try {
           const cached = await AsyncStorage.getItem(cacheKey);
           if (cached) {
@@ -762,7 +843,7 @@ const App = () => {
               setSavedDurationsMap(prev => ({ ...prev, [fName]: res.durationSec }));
               AsyncStorage.setItem(`dur_${fName}`, res.durationSec.toString()).catch(() => {});
             }
-            await AsyncStorage.setItem(cacheKey, JSON.stringify(res));
+            if (res.totalBytes > 0 && res.audioTracks && res.audioTracks.length > 0) { await AsyncStorage.setItem(cacheKey, JSON.stringify(res)); }
           }
         } catch {} finally {
           if (!cancelled && fName === selectedFile.name) setScanningMediaInfo(false);
@@ -1700,8 +1781,9 @@ const App = () => {
     );
   }
 
-  // 🔥 2. MOVIE / EPISODE DETAIL SCREEN 🔥
-  if (selectedFile && playMode === null) {
+  // 🔥 2. MOVIE / EPISODE DETAIL OVERLAY 🔥
+  const renderDetailOverlay = () => {
+    if (!selectedFile || playMode !== null) return null;
     const info = parseMediaFilename(selectedFile.name, false);
     const meta = metadataMap[selectedFile.name];
     const realMi = mediaInfoMap[selectedFile.name];
@@ -1911,18 +1993,28 @@ const App = () => {
                       <Text style={styles.miSpecValue}>
                         {[
                           vMi.width > 0 ? `${vMi.width}×${vMi.height} (${vMi.resolution})` : vRes,
-                          vMi.videoCodec,
+                          vMi.videoBitrate ? `${vMi.videoCodec} @ ${vMi.videoBitrate}` : vMi.videoCodec,
                           vMi.hasDV && vMi.hasHDR ? 'Dolby Vision + HDR10' : vMi.hasDV ? 'Dolby Vision (Single Layer)' : vMi.hasHDR ? 'HDR10' : 'SDR',
-                          vMi.frameRate > 0 ? `${vMi.frameRate.toFixed(2).replace(/\.00$/, '')} fps` : null,
+                          vMi.frameRate > 0 ? `${vMi.frameRate.toFixed(3).replace(/\.?0+$/, '')} FPS` : null,
                         ].filter(Boolean).join(' • ')}
                       </Text>
                     </View>
                     {(vMi.totalBytes > 0 || vMi.durationSec > 0) && (
                       <View style={styles.miSpecRow}>
-                        <Text style={styles.miSpecLabel}>FILE & TIME</Text>
+                        <Text style={styles.miSpecLabel}>FILE, TIME & BITRATE</Text>
                         <Text style={styles.miSpecValue}>
-                          {[vMi.totalBytes > 0 ? formatBytes(vMi.totalBytes) : null, vMi.durationSec > 0 ? formatRuntime(vMi.durationSec) : null].filter(Boolean).join(' • ')}
+                          {[
+                            vMi.totalBytes > 0 ? formatBytes(vMi.totalBytes) : null,
+                            vMi.durationSec > 0 ? formatRuntime(vMi.durationSec) : null,
+                            vMi.overallBitrate ? `Overall: ${vMi.overallBitrate}` : null,
+                          ].filter(Boolean).join(' • ')}
                         </Text>
+                      </View>
+                    )}
+                    {vMi.languages && vMi.languages.length > 0 && (
+                      <View style={styles.miSpecRow}>
+                        <Text style={styles.miSpecLabel}>LANGUAGE</Text>
+                        <Text style={styles.miSpecValue}>{vMi.languages.join(', ')}</Text>
                       </View>
                     )}
                     {vMi.audioTracks && vMi.audioTracks.length > 0 && (
@@ -1961,7 +2053,7 @@ const App = () => {
         {renderHdrChoiceModal()}
       </ScrollView>
     );
-  }
+  };
 
   // 🔥 3. DOWNLOADS TAB SCREEN 🔥
   if (activeTab === 'downloads') {
@@ -2307,6 +2399,7 @@ const App = () => {
           }}
         />
       )}
+      {renderDetailOverlay()}
       {renderSeasonModal()}
       {renderHdrChoiceModal()}
     </View>
@@ -2387,7 +2480,7 @@ const styles = StyleSheet.create({
   cardQualityTag: { backgroundColor: '#E50914', color: '#FFF', fontSize: 11, fontWeight: '800', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
   cardResumeTag: { backgroundColor: 'rgba(229,9,20,0.18)', color: '#FF6B72', fontSize: 11, fontWeight: '800', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
   tvFocused: { borderColor: '#E50914', borderWidth: 2, backgroundColor: 'rgba(229, 9, 20, 0.22)' },
-  detailScreen: { flex: 1, backgroundColor: '#0B0C10' },
+  detailScreen: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 50, backgroundColor: '#0B0C10' },
   detailHero: { width: '100%', height: 240, backgroundColor: '#141821', position: 'relative' },
   detailBackdrop: { width: '100%', height: '100%' },
   detailBackdropPlaceholder: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#181D29' },
