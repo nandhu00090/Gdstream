@@ -412,9 +412,9 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         val c = track.codecId.uppercase(Locale.ROOT)
         return when {
             c.contains("TRUEHD") ->
-                if (track.bitstreamHasAtmos) "Dolby TrueHD Atmos" else (if (hasAtmos) "Dolby TrueHD with Dolby Atmos" else "Dolby TrueHD")
+                if (track.bitstreamHasAtmos) "Dolby TrueHD Atmos" else "Dolby TrueHD"
             c.contains("EAC3") ->
-                if (track.bitstreamHasAtmos) "Dolby Atmos (DD+)" else (if (hasAtmos) "Dolby Digital Plus with Dolby Atmos" else "Dolby Digital Plus (DD+)")
+                if (track.bitstreamHasAtmos) "Dolby Atmos (DD+)" else "Dolby Digital Plus (DD+)"
             c.contains("AC3") -> "Dolby Digital (AC3)"
             c.contains("DTS") -> when {
                 c.contains("HD") || track.realBitrateBps > 1_550_000L -> "DTS-HD MA"

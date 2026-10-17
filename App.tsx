@@ -467,7 +467,7 @@ const App = () => {
     try {
       const timeKeys = items.map(f => `time_${f.name}`);
       const durKeys = items.map(f => `dur_${f.name}`);
-      const miKeys = items.map(f => `mediainfo_v7_${f.name}`);
+      const miKeys = items.map(f => `mediainfo_v8_${f.name}`);
       const [timePairs, durPairs, miPairs] = await Promise.all([
         AsyncStorage.multiGet(timeKeys),
         AsyncStorage.multiGet(durKeys),
@@ -494,7 +494,7 @@ const App = () => {
       const nextMiMap: Record<string, RealMediaInfo> = {};
       miPairs.forEach(([k, val]) => {
         if (val) {
-          try { nextMiMap[k.replace(/^mediainfo_v7_/, '')] = JSON.parse(val); } catch {}
+          try { nextMiMap[k.replace(/^mediainfo_v8_/, '')] = JSON.parse(val); } catch {}
         }
       });
       if (Object.keys(nextMiMap).length > 0) {
@@ -782,7 +782,7 @@ const App = () => {
           }
           continue;
         }
-        const cacheKey = `mediainfo_v7_${fName}`;
+        const cacheKey = `mediainfo_v8_${fName}`;
         try {
           const cached = await AsyncStorage.getItem(cacheKey);
           if (cached) {
@@ -1980,7 +1980,7 @@ const App = () => {
                         <Text style={styles.miSpecLabel}>AUDIO ({vMi.audioTracks.length})</Text>
                         <View style={styles.miTrackPillWrap}>
                           {vMi.audioTracks.map((at, idx) => (
-                            <View key={idx} style={styles.miAudioPill}><Text style={styles.miAudioPillText}>{at.summary}</Text></View>
+                            <View key={idx} style={styles.miAudioPill}><Text style={styles.miAudioPillText}>{vMi.hasAtmos ? at.summary.replace('Dolby TrueHD', 'Dolby TrueHD with Dolby Atmos').replace('Dolby Digital Plus (DD+)', 'Dolby Digital Plus with Dolby Atmos') : at.summary}</Text></View>
                           ))}
                         </View>
                       </View>
