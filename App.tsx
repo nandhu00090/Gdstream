@@ -467,7 +467,7 @@ const App = () => {
     try {
       const timeKeys = items.map(f => `time_${f.name}`);
       const durKeys = items.map(f => `dur_${f.name}`);
-      const miKeys = items.map(f => `mediainfo_v6_${f.name}`);
+      const miKeys = items.map(f => `mediainfo_v7_${f.name}`);
       const [timePairs, durPairs, miPairs] = await Promise.all([
         AsyncStorage.multiGet(timeKeys),
         AsyncStorage.multiGet(durKeys),
@@ -494,7 +494,7 @@ const App = () => {
       const nextMiMap: Record<string, RealMediaInfo> = {};
       miPairs.forEach(([k, val]) => {
         if (val) {
-          try { nextMiMap[k.replace(/^mediainfo_v6_/, '')] = JSON.parse(val); } catch {}
+          try { nextMiMap[k.replace(/^mediainfo_v7_/, '')] = JSON.parse(val); } catch {}
         }
       });
       if (Object.keys(nextMiMap).length > 0) {
@@ -543,129 +543,94 @@ const App = () => {
   }, [playMode, selectedFile, pathStack, activeMenu, showHdrChoiceModal, showSeasonModal, isLocked, activeTab, closeInternalPlayer]);
 
   const fetchSingleMetadata = useCallback(async (info: ParsedMediaInfo): Promise<MediaMetadata | null> => {
-    const cacheKey = `meta_v6_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
+    const cacheKey = `meta_v7_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
     try {
       const cached = await AsyncStorage.getItem(cacheKey);
       if (cached) return JSON.parse(cached);
     } catch {}
 
     const targetLower = info.searchTitle.toLowerCase().trim();
+    const infoYearNum = info.year ? parseInt(info.year, 10) : 0;
     const tmdbKey = vaultRef.current.tmdbKey;
+
     if (tmdbKey && tmdbKey.trim().length >= 20) {
       try {
         const key = tmdbKey.trim();
-        const isSeries = !!info.seasonEpisode || info.isFolder;
-        const endpoint = isSeries ? 'tv' : 'movie';
-        const yearParam = info.year
-          ? (isSeries ? `&first_air_date_year=${info.year}` : `&primary_release_year=${info.year}`)
-          : '';
-        let url = `https://api.themoviedb.org/3/search/${endpoint}?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}${yearParam}`;
-        let res = await axios.get(url, { timeout: 6000 });
-        let results: any[] = res.data?.results || [];
+        const endpoint = info.seasonEpisode ? 'tv' : 'multi';
+        // Step 1: Search without strict year filter first (so 2025 movies ripped in 2026 like Balti match naturally!)
+        const multiUrl = `https://api.themoviedb.org/3/search/${endpoint}?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}`;
+        const res = await axios.get(multiUrl, { timeout: 6000 });
+        let results: any[] = (res.data?.results || []).filter((r: any) => r.media_type !== 'person' && r.poster_path);
 
-        if (!results.length) {
-          const fallbackUrl = `https://api.themoviedb.org/3/search/multi?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}`;
-          res = await axios.get(fallbackUrl, { timeout: 6000 });
-          results = (res.data?.results || []).filter((r: any) => r.media_type !== 'person');
+        // Check if any result matches the year (within ±1 year tolerance for OTT releases like Balti)
+        let match = results.find((r: any) => {
+          const rYear = parseInt(String(r.release_date || r.first_air_date || '').slice(0, 4), 10);
+          if (!infoYearNum || !rYear) return false;
+          const rTitle = String(r.title || r.name || r.original_title || '').toLowerCase().trim();
+          return Math.abs(rYear - infoYearNum) <= 1 && (rTitle === targetLower || rTitle.includes(targetLower));
+        });
+
+        // Step 2: If movie has a specific older year (like Run 2002) not in top multi results, query with exact year!
+        if (!match && infoYearNum > 0 && !info.seasonEpisode) {
+          const yearUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}&primary_release_year=${info.year}`;
+          const yearRes = await axios.get(yearUrl, { timeout: 6000 });
+          const yearList: any[] = (yearRes.data?.results || []).filter((r: any) => r.poster_path);
+          if (yearList.length > 0) {
+            match =
+              (info.langCode ? yearList.find((r: any) => r.original_language === info.langCode) : null) ||
+              yearList.find((r: any) => String(r.title || r.original_title || '').toLowerCase().trim() === targetLower) ||
+              yearList[0];
+          }
         }
 
-        if (results.length > 0) {
-          const scored = results.map((r: any) => {
-            let score = 0;
-            const rTitle = String(r.title || r.name || '').toLowerCase().trim();
-            const rOrig = String(r.original_title || r.original_name || '').toLowerCase().trim();
-            const rYear = String(r.release_date || r.first_air_date || '').slice(0, 4);
+        // Step 3: Fallback to best title/language match from multi results (e.g. Vikram where year isn't in filename)
+        if (!match && results.length > 0) {
+          match =
+            (info.langCode ? results.find((r: any) => r.original_language === info.langCode && String(r.title || r.name || '').toLowerCase().trim() === targetLower) : null) ||
+            results.find((r: any) => String(r.title || r.name || '').toLowerCase().trim() === targetLower) ||
+            results[0];
+        }
 
-            if (rTitle === targetLower || rOrig === targetLower) score += 50;
-            else if (rTitle.startsWith(targetLower) || rOrig.startsWith(targetLower)) score += 20;
-
-            if (info.year) {
-              if (rYear === info.year) score += 60;
-              else if (rYear && Math.abs(parseInt(rYear, 10) - parseInt(info.year, 10)) === 1) score += 25;
-              else score -= 40;
-            }
-            if (info.langCode && r.original_language === info.langCode) {
-              score += 45;
-            }
-            if (r.poster_path) score += 10;
-            return { r, score };
-          });
-
-          scored.sort((a, b) => b.score - a.score);
-          const best = scored[0]?.r;
-
-          if (best && (!info.year || scored[0].score > 0)) {
-            const matchedYear = String(best.release_date || best.first_air_date || '').slice(0, 4);
-            const meta: MediaMetadata = {
-              poster: best.poster_path ? `https://image.tmdb.org/t/p/w500${best.poster_path}` : undefined,
-              backdrop: best.backdrop_path ? `https://image.tmdb.org/t/p/w780${best.backdrop_path}` : undefined,
-              rating: best.vote_average && best.vote_average > 0 ? Number(best.vote_average).toFixed(1) : undefined,
-              overview: best.overview || undefined,
-              year: info.year || matchedYear,
-            };
-            if (meta.poster || meta.overview) {
-              await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
-              return meta;
-            }
+        if (match) {
+          const meta: MediaMetadata = {
+            poster: match.poster_path ? `https://image.tmdb.org/t/p/w500${match.poster_path}` : undefined,
+            backdrop: match.backdrop_path ? `https://image.tmdb.org/t/p/w780${match.backdrop_path}` : undefined,
+            rating: match.vote_average && match.vote_average > 0 ? Number(match.vote_average).toFixed(1) : undefined,
+            overview: match.overview || undefined,
+            year: (match.release_date || match.first_air_date || '').slice(0, 4) || info.year,
+          };
+          if (meta.poster || meta.overview) {
+            await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
+            return meta;
           }
         }
       } catch {}
     }
 
+    // IMDb Fallback (Strictly 'tt' movie/series IDs only, with ±1 year tolerance)
     try {
-      const queriesToTry = [
-        `${info.searchTitle} ${info.year}`.trim(),
-        info.langName ? `${info.searchTitle} ${info.year} ${info.langName}`.trim() : '',
-        info.searchTitle.trim(),
-      ].filter(Boolean);
+      const query = `${info.searchTitle} ${info.year}`.trim();
+      const cleanQ = query.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+      const firstChar = cleanQ.charAt(0) || 'a';
+      const imdbUrl = `https://v3.sg.media-imdb.com/suggestion/${firstChar}/${encodeURIComponent(cleanQ.slice(0, 35))}.json`;
+      const res = await axios.get(imdbUrl, { timeout: 6000 });
+      const list: any[] = res.data?.d || [];
+      const validItems = list.filter((item: any) => item?.id && String(item.id).startsWith('tt') && item?.i?.imageUrl);
+      const match =
+        validItems.find((item: any) => infoYearNum > 0 && item.y && Math.abs(Number(item.y) - infoYearNum) <= 1) ||
+        validItems[0];
 
-      for (const rawQuery of queriesToTry) {
-        const cleanQ = rawQuery.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
-        if (!cleanQ) continue;
-        const firstChar = cleanQ.charAt(0) || 'a';
-        const imdbUrl = `https://v3.sg.media-imdb.com/suggestion/${firstChar}/${encodeURIComponent(cleanQ.slice(0, 35))}.json`;
-        const res = await axios.get(imdbUrl, { timeout: 6000 });
-        const list: any[] = res.data?.d || [];
-
-        const validTitles = list.filter(
-          (item: any) => item?.id && String(item.id).startsWith('tt') && item?.i?.imageUrl
-        );
-        if (!validTitles.length) continue;
-
-        const scoredImdb = validTitles.map((item: any) => {
-          let score = 0;
-          const itemTitle = String(item.l || '').toLowerCase().trim();
-          const itemYear = item.y ? String(item.y) : '';
-          if (itemTitle === targetLower) score += 50;
-          else if (itemTitle.startsWith(targetLower)) score += 20;
-
-          if (info.year) {
-            if (itemYear === info.year) score += 70;
-            else if (itemYear && Math.abs(parseInt(itemYear, 10) - parseInt(info.year, 10)) === 1) score += 30;
-            else score -= 50;
-          }
-          if (!info.seasonEpisode && !info.isFolder && String(item.qid || item.q || '').toLowerCase().includes('feature')) {
-            score += 15;
-          }
-          return { item, score };
-        });
-
-        scoredImdb.sort((a, b) => b.score - a.score);
-        const bestImdb = scoredImdb[0];
-
-        if (bestImdb && (!info.year || bestImdb.score >= 20)) {
-          const match = bestImdb.item;
-          const rawImg: string = match.i.imageUrl;
-          const meta: MediaMetadata = {
-            poster: rawImg.replace(/\._V1_.*\.jpg$/i, '._V1_QL75_UX500_.jpg'),
-            backdrop: rawImg.replace(/\._V1_.*\.jpg$/i, '._V1_QL75_UX1000_.jpg'),
-            year: info.year || (match.y ? String(match.y) : ''),
-            cast: match.s || undefined,
-            overview: match.s ? `${match.q ? `${match.q.toUpperCase()} • ` : ''}Starring: ${match.s}` : undefined,
-          };
-          await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
-          return meta;
-        }
+      if (match && match.i?.imageUrl) {
+        const rawImg: string = match.i.imageUrl;
+        const meta: MediaMetadata = {
+          poster: rawImg.replace(/\._V1_.*\.jpg$/i, '._V1_QL75_UX500_.jpg'),
+          backdrop: rawImg.replace(/\._V1_.*\.jpg$/i, '._V1_QL75_UX1000_.jpg'),
+          year: match.y ? String(match.y) : info.year,
+          cast: match.s || undefined,
+          overview: match.s ? `${match.q ? `${match.q.toUpperCase()} • ` : ''}Starring: ${match.s}` : undefined,
+        };
+        await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
+        return meta;
       }
     } catch {}
     return null;
@@ -817,7 +782,7 @@ const App = () => {
           }
           continue;
         }
-        const cacheKey = `mediainfo_v6_${fName}`;
+        const cacheKey = `mediainfo_v7_${fName}`;
         try {
           const cached = await AsyncStorage.getItem(cacheKey);
           if (cached) {
@@ -1993,28 +1958,21 @@ const App = () => {
                       <Text style={styles.miSpecValue}>
                         {[
                           vMi.width > 0 ? `${vMi.width}×${vMi.height} (${vMi.resolution})` : vRes,
-                          vMi.videoBitrate ? `${vMi.videoCodec} @ ${vMi.videoBitrate}` : vMi.videoCodec,
+                          vMi.videoCodec,
                           vMi.hasDV && vMi.hasHDR ? 'Dolby Vision + HDR10' : vMi.hasDV ? 'Dolby Vision (Single Layer)' : vMi.hasHDR ? 'HDR10' : 'SDR',
-                          vMi.frameRate > 0 ? `${vMi.frameRate.toFixed(3).replace(/\.?0+$/, '')} FPS` : null,
+                          vMi.frameRate > 0 ? `${vMi.frameRate.toFixed(2).replace(/\.00$/, '')} fps` : null,
                         ].filter(Boolean).join(' • ')}
                       </Text>
                     </View>
                     {(vMi.totalBytes > 0 || vMi.durationSec > 0) && (
                       <View style={styles.miSpecRow}>
-                        <Text style={styles.miSpecLabel}>FILE, TIME & BITRATE</Text>
+                        <Text style={styles.miSpecLabel}>FILE & TIME</Text>
                         <Text style={styles.miSpecValue}>
                           {[
                             vMi.totalBytes > 0 ? formatBytes(vMi.totalBytes) : null,
                             vMi.durationSec > 0 ? formatRuntime(vMi.durationSec) : null,
-                            vMi.overallBitrate ? `Overall: ${vMi.overallBitrate}` : null,
                           ].filter(Boolean).join(' • ')}
                         </Text>
-                      </View>
-                    )}
-                    {vMi.languages && vMi.languages.length > 0 && (
-                      <View style={styles.miSpecRow}>
-                        <Text style={styles.miSpecLabel}>LANGUAGE</Text>
-                        <Text style={styles.miSpecValue}>{vMi.languages.join(', ')}</Text>
                       </View>
                     )}
                     {vMi.audioTracks && vMi.audioTracks.length > 0 && (
