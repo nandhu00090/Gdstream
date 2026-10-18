@@ -147,11 +147,11 @@ for (const file of targets) {
     // Cap ExoPlayer RAM buffer to 24MB so 50GB+ 4K BluRay REMUX files never cause OutOfMemoryError
     content = content.replace(
       /new DefaultLoadControl\.Builder\(\)/g,
-      'new DefaultLoadControl.Builder().setBufferDurationsMs(3000, 8000, 1000, 2000).setTargetBufferBytes(24 * 1024 * 1024).setPrioritizeTimeOverSizeThresholds(false)'
+      'new DefaultLoadControl.Builder().setBufferDurationsMs(15000, 45000, 1500, 3000).setTargetBufferBytes(96 * 1024 * 1024).setPrioritizeTimeOverSizeThresholds(false)'
     );
     content = content.replace(
       /setPrioritizeTimeOverSizeThresholds\(true\)/g,
-      'setPrioritizeTimeOverSizeThresholds(false).setTargetBufferBytes(24 * 1024 * 1024)'
+      'setPrioritizeTimeOverSizeThresholds(false).setTargetBufferBytes(96 * 1024 * 1024)'
     );
 
     

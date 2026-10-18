@@ -46,7 +46,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
         private var currentAudioSessionId: Int = 0
 
         @Volatile
-        private var currentVolumeScale: Double = 0.8 // 0.0 to 2.0 (0% to 200%)
+        private var currentVolumeScale: Double = 0.8
 
         private var loudnessEnhancer: LoudnessEnhancer? = null
         private var enhancerSessionId: Int = -1
@@ -61,7 +61,6 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
         @Synchronized
         private fun applyLoudnessBoostInternal() {
             val boostRatio = (currentVolumeScale - 1.0).coerceIn(0.0, 1.0)
-            // Up to +1500 millibels (+15 dB) hardware pre-amp gain at 200%
             val targetGainMb = (boostRatio * 1500.0).roundToInt()
 
             if (targetGainMb <= 0) {
@@ -82,7 +81,6 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
                 loudnessEnhancer?.setTargetGain(targetGainMb)
                 loudnessEnhancer?.enabled = true
             } catch (_: Exception) {
-                // Fallback to global mix session 0 if specific session rejected effect
                 if (targetSession != 0) {
                     try {
                         loudnessEnhancer?.release()
@@ -111,18 +109,12 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
         }
     }
 
-    override fun getName(): String {
-        return "VideoPlayerManager"
-    }
+    override fun getName(): String = "VideoPlayerManager"
 
     @Synchronized
     private fun readHistoryJson(): JSONObject {
         return try {
-            if (watchHistoryFile.exists()) {
-                JSONObject(watchHistoryFile.readText())
-            } else {
-                JSONObject()
-            }
+            if (watchHistoryFile.exists()) JSONObject(watchHistoryFile.readText()) else JSONObject()
         } catch (_: Exception) {
             JSONObject()
         }
@@ -181,12 +173,8 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
                 val item = root.optJSONObject(k) ?: continue
                 val t = item.optDouble("time", 0.0)
                 val d = item.optDouble("dur", 0.0)
-                if (t > 3.0) {
-                    timesMap.putDouble(k, t)
-                }
-                if (d > 0.0) {
-                    dursMap.putDouble(k, d)
-                }
+                if (t > 3.0) timesMap.putDouble(k, t)
+                if (d > 0.0) dursMap.putDouble(k, d)
             }
             val result = Arguments.createMap().apply {
                 putMap("times", timesMap)
@@ -237,12 +225,8 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
             for (info in codecList.codecInfos) {
                 if (info.isEncoder) continue
                 for (type in info.supportedTypes) {
-                    if (type.equals("video/dolby-vision", ignoreCase = true)) {
-                        hasDvDecoder = true
-                    }
-                    if (type.equals("video/hevc", ignoreCase = true)) {
-                        hasHevcHdrDecoder = true
-                    }
+                    if (type.equals("video/dolby-vision", ignoreCase = true)) hasDvDecoder = true
+                    if (type.equals("video/hevc", ignoreCase = true)) hasHevcHdrDecoder = true
                 }
             }
 
@@ -295,10 +279,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
                 )?.use { cursor ->
                     if (cursor.moveToFirst()) {
                         val id = cursor.getLong(0)
-                        return ContentUris.withAppendedId(
-                            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                            id
-                        )
+                        return ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
                     }
                 }
             } catch (_: Exception) {}
@@ -318,11 +299,9 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
                 setDataAndType(playableUri, "video/*")
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-
             val chooser = Intent.createChooser(intent, "Choose Player 🍿").apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-
             reactApplicationContext.startActivity(chooser)
             promise.resolve(true)
         } catch (e: Exception) {

@@ -3,7 +3,7 @@ import {
   View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator,
   Alert, NativeModules, TextInput, ScrollView, BackHandler, Animated,
   Platform, DeviceEventEmitter, Image, Modal, PanResponder, Dimensions,
-  StatusBar, RefreshControl,
+  StatusBar, RefreshControl, AppState,
 } from 'react-native';
 import Video from 'react-native-video';
 import axios from 'axios';
@@ -16,6 +16,7 @@ const {
 } = NativeModules;
 
 const IS_TV = Platform.isTV;
+const CW_STORAGE_KEY = 'gdstream_cw_history_v2';
 
 interface ParsedMediaInfo {
   rawName: string;
@@ -48,8 +49,6 @@ interface RealMediaInfo {
   height: number;
   resolution: string;
   videoCodec: string;
-  videoBitrate?: string;
-  overallBitrate?: string;
   frameRate: number;
   durationSec: number;
   totalBytes: number;
@@ -203,7 +202,7 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
   const yearMatch = normalized.match(/(?:^|[\s(])((?:19|20)\d{2})(?:[\s)]|$)/);
   const year = yearMatch ? yearMatch[1] : '';
 
-  const cutPattern = /\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-ray|remux|web-dl|webdl|webrip|web|amzn|nf|snxt|sonyliv|jiohotstar|zee5|aha|it|hdtv|ddp\d|dd[+]|ddp|aac|eac3|ac3|truehd|dts|dtshd|hevc|avc|x264|x265|h\s*264|h\s*265|multi|dual|org|fhd|jpn|kor|tam|tel|mal|hin|kan|eng|esub|esubs|msub|msubs|subs|sub|uncut|remastered|imax)\b/i;
+  const cutPattern = /\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-ray|remux|web-dl|webdl|webrip|web|amzn|nf|snxt|sonyliv|jiohotstar|zee5|aha|it|hdtv|ddp\d|dd[+]|\bddp\b|aac|eac3|ac3|truehd|dts|dtshd|hevc|avc|x264|x265|h\s*264|h\s*265|multi|dual|org|fhd|jpn|kor|tam|tel|mal|hin|kan|eng|esub|esubs|msub|msubs|subs|sub|uncut|remastered|imax)\b/i;
   let titlePart = normalized;
   if (seMatch && seMatch.index !== undefined && seMatch.index > 1) titlePart = titlePart.slice(0, seMatch.index);
   if (yearMatch && yearMatch.index !== undefined && yearMatch.index > 1) {
@@ -286,8 +285,11 @@ const App = () => {
   const [vaultReady, setVaultReady] = useState(false);
   const [securityCompromised, setSecurityCompromised] = useState(false);
 
-  const [files, setFiles] = useState<any[]>([]);
+  // Separate Home Catalog vs Series/Subfolder Files so Home FlatList never unmounts or loses scroll position!
+  const [homeFiles, setHomeFiles] = useState<any[]>([]);
+  const [folderFiles, setFolderFiles] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [folderLoading, setFolderLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [pathStack, setPathStack] = useState(['/0:/']);
   const [currentPath, setCurrentPath] = useState('/0:/');
@@ -296,6 +298,9 @@ const App = () => {
   const [sortBy, setSortBy] = useState<'newest' | 'az'>('newest');
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
   const [activeTab, setActiveTab] = useState<'catalog' | 'downloads'>('catalog');
+
+  const isInsideFolder = pathStack.length > 1;
+  const activeRawFiles = isInsideFolder ? folderFiles : homeFiles;
 
   const [seasonFolders, setSeasonFolders] = useState<SeasonFolderItem[]>([]);
   const [activeSeason, setActiveSeason] = useState<SeasonFolderItem | null>(null);
@@ -308,6 +313,8 @@ const App = () => {
   const [scanningMediaInfo, setScanningMediaInfo] = useState(false);
   const [savedTimesMap, setSavedTimesMap] = useState<Record<string, number>>({});
   const [savedDurationsMap, setSavedDurationsMap] = useState<Record<string, number>>({});
+  const savedTimesRef = useRef<Record<string, number>>({});
+  const savedDurationsRef = useRef<Record<string, number>>({});
 
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
   const [activeHdrMode, setActiveHdrMode] = useState<'dv' | 'hdr' | 'sdr'>('dv');
@@ -382,34 +389,88 @@ const App = () => {
   const lastTapTime = useRef(0);
   const lastTapDirection = useRef<boolean | null>(null);
 
+  // Sync Watch Progress to BOTH Native Disk (gdstream_watch_history_v1.json) AND AsyncStorage
   const persistPlaybackProgress = useCallback((fileName: string | undefined, sec: number, dur: number) => {
     if (!fileName || sec <= 3) return;
     if (dur > 0 && dur - sec < 90) {
+      delete savedTimesRef.current[fileName];
+      setSavedTimesMap({ ...savedTimesRef.current });
+      VideoPlayerManager?.removeWatchProgress?.(fileName);
       AsyncStorage.removeItem(`time_${fileName}`).catch(() => {});
-      setSavedTimesMap(prev => {
-        const next = { ...prev };
-        delete next[fileName];
-        return next;
-      });
+      AsyncStorage.setItem(CW_STORAGE_KEY, JSON.stringify({
+        times: savedTimesRef.current,
+        durations: savedDurationsRef.current,
+      })).catch(() => {});
       return;
     }
-    AsyncStorage.setItem(`time_${fileName}`, sec.toString()).catch(() => {});
-    setSavedTimesMap(prev => ({ ...prev, [fileName]: sec }));
+
+    savedTimesRef.current = { ...savedTimesRef.current, [fileName]: sec };
+    setSavedTimesMap(savedTimesRef.current);
     if (dur > 0) {
+      savedDurationsRef.current = { ...savedDurationsRef.current, [fileName]: dur };
+      setSavedDurationsMap(savedDurationsRef.current);
       AsyncStorage.setItem(`dur_${fileName}`, dur.toString()).catch(() => {});
-      setSavedDurationsMap(prev => ({ ...prev, [fileName]: dur }));
     }
+    VideoPlayerManager?.saveWatchProgress?.(fileName, sec, dur);
+    AsyncStorage.setItem(`time_${fileName}`, sec.toString()).catch(() => {});
+    AsyncStorage.setItem(CW_STORAGE_KEY, JSON.stringify({
+      times: savedTimesRef.current,
+      durations: savedDurationsRef.current,
+    })).catch(() => {});
+  }, []);
+
+  const removeContinueWatchingItem = useCallback((fileToRemove: any) => {
+    const namesToClear = fileToRemove?._versions
+      ? fileToRemove._versions.map((v: any) => v.name)
+      : [fileToRemove?.name].filter(Boolean);
+    const nextTimes = { ...savedTimesRef.current };
+    for (const n of namesToClear) {
+      delete nextTimes[n];
+      VideoPlayerManager?.removeWatchProgress?.(n);
+      AsyncStorage.removeItem(`time_${n}`).catch(() => {});
+    }
+    savedTimesRef.current = nextTimes;
+    setSavedTimesMap(nextTimes);
+    AsyncStorage.setItem(CW_STORAGE_KEY, JSON.stringify({
+      times: savedTimesRef.current,
+      durations: savedDurationsRef.current,
+    })).catch(() => {});
+  }, []);
+
+  // Load Watch Progress from Native Disk + AsyncStorage on startup
+  const restoreAllSavedWatchHistory = useCallback(async () => {
+    try {
+      const mergedTimes: Record<string, number> = { ...savedTimesRef.current };
+      const mergedDurs: Record<string, number> = { ...savedDurationsRef.current };
+
+      const cwRaw = await AsyncStorage.getItem(CW_STORAGE_KEY);
+      if (cwRaw) {
+        try {
+          const parsed = JSON.parse(cwRaw);
+          if (parsed?.times) Object.assign(mergedTimes, parsed.times);
+          if (parsed?.durations) Object.assign(mergedDurs, parsed.durations);
+        } catch {}
+      }
+
+      if (VideoPlayerManager?.getAllWatchProgress) {
+        try {
+          const nativeRes = await VideoPlayerManager.getAllWatchProgress();
+          if (nativeRes?.times) Object.assign(mergedTimes, nativeRes.times);
+          if (nativeRes?.durations) Object.assign(mergedDurs, nativeRes.durations);
+        } catch {}
+      }
+
+      savedTimesRef.current = mergedTimes;
+      savedDurationsRef.current = mergedDurs;
+      setSavedTimesMap({ ...mergedTimes });
+      setSavedDurationsMap({ ...mergedDurs });
+    } catch {}
   }, []);
 
   useEffect(() => {
     if (IS_TV) Orientation.lockToLandscape();
+    restoreAllSavedWatchHistory();
     AsyncStorage.getItem('gdstream_watchlist_v1').then(s => { if (s) setWatchlist(JSON.parse(s)); }).catch(() => {});
-    if (VideoPlayerManager?.getAllWatchProgress) {
-      VideoPlayerManager.getAllWatchProgress().then((res: any) => {
-        if (res?.times) setSavedTimesMap(prev => ({ ...prev, ...res.times }));
-        if (res?.durations) setSavedDurationsMap(prev => ({ ...prev, ...res.durations }));
-      }).catch(() => {});
-    }
     if (VideoPlayerManager?.getSystemLevels) {
       VideoPlayerManager.getSystemLevels().then((res: any) => {
         if (typeof res?.brightness === 'number') { setBrightnessLevel(res.brightness); brightnessRef.current = res.brightness; }
@@ -423,8 +484,15 @@ const App = () => {
       if (Array.isArray(list)) setDownloads([...list]);
     });
 
+    const appStateSub = AppState.addEventListener('change', nextState => {
+      if ((nextState === 'background' || nextState === 'inactive') && selectedFile?.name && currentTimeRef.current > 3) {
+        persistPlaybackProgress(selectedFile.name, currentTimeRef.current, durationRef.current);
+      }
+    });
+
     const initVaultAndFetch = async () => {
       try {
+        await restoreAllSavedWatchHistory();
         if (SecurityVault?.getVaultConfig) {
           const cfg = await SecurityVault.getVaultConfig();
           if (cfg?.compromised) { setSecurityCompromised(true); setLoading(false); return; }
@@ -440,8 +508,11 @@ const App = () => {
       }
     };
     initVaultAndFetch();
-    return () => dlSub.remove();
-  }, []);
+    return () => {
+      dlSub.remove();
+      appStateSub.remove();
+    };
+  }, [restoreAllSavedWatchHistory, persistPlaybackProgress, selectedFile]);
 
   const toggleWatchlist = useCallback((fileName: string) => {
     setWatchlist(prev => {
@@ -470,17 +541,9 @@ const App = () => {
   }, [audioDelay, isExternalAudioSelected]);
 
   const loadSavedTimesForFiles = useCallback(async (items: any[]) => {
+    await restoreAllSavedWatchHistory();
+    if (!items.length) return;
     try {
-      if (VideoPlayerManager?.getAllWatchProgress) {
-        const nativeRes = await VideoPlayerManager.getAllWatchProgress();
-        if (nativeRes?.times) {
-          setSavedTimesMap(prev => ({ ...prev, ...nativeRes.times }));
-        }
-        if (nativeRes?.durations) {
-          setSavedDurationsMap(prev => ({ ...prev, ...nativeRes.durations }));
-        }
-      }
-      if (!items.length) return;
       const timeKeys = items.map(f => `time_${f.name}`);
       const durKeys = items.map(f => `dur_${f.name}`);
       const miKeys = items.map(f => `mediainfo_v8_${f.name}`);
@@ -489,26 +552,32 @@ const App = () => {
         AsyncStorage.multiGet(durKeys),
         AsyncStorage.multiGet(miKeys),
       ]);
-      const nextTimes: Record<string, number> = {};
+      let changedTimes = false;
       timePairs.forEach(([k, val]) => {
         if (val) {
           const parsed = parseFloat(val);
-          if (parsed > 3) nextTimes[k.replace(/^time_/, '')] = parsed;
+          const fName = k.replace(/^time_/, '');
+          if (parsed > 3 && !savedTimesRef.current[fName]) {
+            savedTimesRef.current[fName] = parsed;
+            changedTimes = true;
+          }
         }
       });
-      if (Object.keys(nextTimes).length > 0) {
-        setSavedTimesMap(prev => ({ ...nextTimes, ...prev }));
-      }
-      const nextDurs: Record<string, number> = {};
+      if (changedTimes) setSavedTimesMap({ ...savedTimesRef.current });
+
+      let changedDurs = false;
       durPairs.forEach(([k, val]) => {
         if (val) {
           const parsed = parseFloat(val);
-          if (parsed > 0) nextDurs[k.replace(/^dur_/, '')] = parsed;
+          const fName = k.replace(/^dur_/, '');
+          if (parsed > 0 && !savedDurationsRef.current[fName]) {
+            savedDurationsRef.current[fName] = parsed;
+            changedDurs = true;
+          }
         }
       });
-      if (Object.keys(nextDurs).length > 0) {
-        setSavedDurationsMap(prev => ({ ...nextDurs, ...prev }));
-      }
+      if (changedDurs) setSavedDurationsMap({ ...savedDurationsRef.current });
+
       const nextMiMap: Record<string, RealMediaInfo> = {};
       miPairs.forEach(([k, val]) => {
         if (val) {
@@ -519,7 +588,7 @@ const App = () => {
         setMediaInfoMap(prev => ({ ...prev, ...nextMiMap }));
       }
     } catch {}
-  }, []);
+  }, [restoreAllSavedWatchHistory]);
 
   const closeInternalPlayer = useCallback(() => {
     if (selectedFile?.name && currentTimeRef.current > 3) {
@@ -575,12 +644,10 @@ const App = () => {
       try {
         const key = tmdbKey.trim();
         const endpoint = info.seasonEpisode ? 'tv' : 'multi';
-        // Step 1: Search without strict year filter first (so 2025 movies ripped in 2026 like Balti match naturally!)
         const multiUrl = `https://api.themoviedb.org/3/search/${endpoint}?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}`;
         const res = await axios.get(multiUrl, { timeout: 6000 });
-        let results: any[] = (res.data?.results || []).filter((r: any) => r.media_type !== 'person' && r.poster_path);
+        const results: any[] = (res.data?.results || []).filter((r: any) => r.media_type !== 'person' && r.poster_path);
 
-        // Check if any result matches the year (within ±1 year tolerance for OTT releases like Balti)
         let match = results.find((r: any) => {
           const rYear = parseInt(String(r.release_date || r.first_air_date || '').slice(0, 4), 10);
           if (!infoYearNum || !rYear) return false;
@@ -588,7 +655,6 @@ const App = () => {
           return Math.abs(rYear - infoYearNum) <= 1 && (rTitle === targetLower || rTitle.includes(targetLower));
         });
 
-        // Step 2: If movie has a specific older year (like Run 2002) not in top multi results, query with exact year!
         if (!match && infoYearNum > 0 && !info.seasonEpisode) {
           const yearUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}&primary_release_year=${info.year}`;
           const yearRes = await axios.get(yearUrl, { timeout: 6000 });
@@ -601,7 +667,6 @@ const App = () => {
           }
         }
 
-        // Step 3: Fallback to best title/language match from multi results (e.g. Vikram where year isn't in filename)
         if (!match && results.length > 0) {
           match =
             (info.langCode ? results.find((r: any) => r.original_language === info.langCode && String(r.title || r.name || '').toLowerCase().trim() === targetLower) : null) ||
@@ -625,7 +690,6 @@ const App = () => {
       } catch {}
     }
 
-    // IMDb Fallback (Strictly 'tt' movie/series IDs only, with ±1 year tolerance)
     try {
       const query = `${info.searchTitle} ${info.year}`.trim();
       const cleanQ = query.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
@@ -655,11 +719,11 @@ const App = () => {
   }, []);
 
   useEffect(() => {
-    if (!files.length || !vaultReady) return;
+    if (!activeRawFiles.length || !vaultReady) return;
     let cancelled = false;
     const enrichAll = async () => {
-      loadSavedTimesForFiles(files);
-      for (const item of files) {
+      await loadSavedTimesForFiles(activeRawFiles);
+      for (const item of activeRawFiles) {
         if (cancelled) break;
         const itemKey = item.name;
         if (fetchedKeysRef.current.has(itemKey)) continue;
@@ -672,18 +736,16 @@ const App = () => {
     };
     enrichAll();
     return () => { cancelled = true; };
-  }, [files, vaultReady, fetchSingleMetadata, loadSavedTimesForFiles]);
+  }, [activeRawFiles, vaultReady, fetchSingleMetadata, loadSavedTimesForFiles]);
 
-  // Filtered + Sorted + Multi-Version Grouped Catalog
-  const displayedFiles = useMemo(() => {
+  const buildProcessedList = useCallback((rawList: any[], isEpFolder: boolean) => {
     const q = searchQuery.trim().toLowerCase();
-    const filtered = files.filter((file) => {
+    const filtered = rawList.filter((file) => {
       const isFolder = !!file.mimeType?.includes('folder');
       const info = parseMediaFilename(file.name, isFolder);
       const realMi = mediaInfoMap[file.name];
 
       if (q) {
-        // Match ONLY Movie Title, Year, or Episode Tag (Never match raw filename codecs like HEVC)
         const titleLower = info.cleanTitle.toLowerCase();
         const titleWords = titleLower.split(/\s+/);
         const queryWords = q.split(/\s+/).filter(Boolean);
@@ -711,8 +773,7 @@ const App = () => {
       modMs: item.modifiedTime ? Date.parse(item.modifiedTime) || 0 : 0,
     }));
 
-    const isEpisodeFolder = seasonFolders.length > 0 || (indexed.length > 1 && indexed.every(x => x.info.episodeNum > 0));
-    if (isEpisodeFolder && sortBy === 'newest') {
+    if (isEpFolder && sortBy === 'newest') {
       indexed.sort((a, b) => {
         if (a.info.episodeNum !== b.info.episodeNum) return a.info.episodeNum - b.info.episodeNum;
         return a.item.name.localeCompare(b.item.name);
@@ -731,7 +792,6 @@ const App = () => {
       });
     }
 
-    // Group multiple versions of the same movie (e.g. Evil Dead Burn WEB-DL + BluRay) into 1 Card
     const groupedMap = new Map<string, any[]>();
     const mergedOrder: any[] = [];
     for (const entry of indexed) {
@@ -757,11 +817,20 @@ const App = () => {
       const vers = groupedMap.get(key) || [item];
       return vers.length > 1 ? { ...item, _versions: vers } : item;
     });
-  }, [files, searchQuery, activeCategory, sortBy, seasonFolders, mediaInfoMap, watchlist]);
+  }, [searchQuery, activeCategory, sortBy, mediaInfoMap, watchlist]);
+
+  const homeDisplayedFiles = useMemo(() => buildProcessedList(homeFiles, false), [homeFiles, buildProcessedList]);
+  const folderDisplayedFiles = useMemo(() => {
+    const isEp = seasonFolders.length > 0 || (folderFiles.length > 1 && folderFiles.every(f => parseMediaFilename(f.name, false).episodeNum > 0));
+    return buildProcessedList(folderFiles, isEp);
+  }, [folderFiles, seasonFolders, buildProcessedList]);
+
+  const displayedFiles = isInsideFolder ? folderDisplayedFiles : homeDisplayedFiles;
 
   const continueWatchingItems = useMemo(() => {
-    return files.filter(f => !f.mimeType?.includes('folder') && (savedTimesMap[f.name] || 0) > 5);
-  }, [files, savedTimesMap]);
+    const sourcePool = isInsideFolder ? folderFiles : homeFiles;
+    return sourcePool.filter(f => !f.mimeType?.includes('folder') && (savedTimesMap[f.name] || 0) > 3);
+  }, [isInsideFolder, folderFiles, homeFiles, savedTimesMap]);
 
   const playableFolderEpisodes = useMemo(() => {
     if (!selectedFile) return [];
@@ -784,7 +853,6 @@ const App = () => {
     return `${baseUrl}${currentPath}${encodeURIComponent(file.name)}`;
   }, [downloads, currentPath]);
 
-  // Automatically scan MediaInfo for ALL versions in versionGroup when Detail Page opens
   useEffect(() => {
     if (!selectedFile || playMode !== null) return;
     const targets = versionGroup.length > 1 ? versionGroup : [selectedFile];
@@ -796,7 +864,8 @@ const App = () => {
         const fName = fileObj.name;
         if (mediaInfoMap[fName]) {
           if (mediaInfoMap[fName].durationSec > 0) {
-            setSavedDurationsMap(prev => ({ ...prev, [fName]: mediaInfoMap[fName].durationSec }));
+            savedDurationsRef.current[fName] = mediaInfoMap[fName].durationSec;
+            setSavedDurationsMap({ ...savedDurationsRef.current });
           }
           continue;
         }
@@ -808,7 +877,8 @@ const App = () => {
             if (!cancelled) {
               setMediaInfoMap(prev => ({ ...prev, [fName]: parsed }));
               if (parsed.durationSec > 0) {
-                setSavedDurationsMap(prev => ({ ...prev, [fName]: parsed.durationSec }));
+                savedDurationsRef.current[fName] = parsed.durationSec;
+                setSavedDurationsMap({ ...savedDurationsRef.current });
               }
             }
             continue;
@@ -823,10 +893,13 @@ const App = () => {
           if (res && !cancelled) {
             setMediaInfoMap(prev => ({ ...prev, [fName]: res }));
             if (res.durationSec > 0) {
-              setSavedDurationsMap(prev => ({ ...prev, [fName]: res.durationSec }));
+              savedDurationsRef.current[fName] = res.durationSec;
+              setSavedDurationsMap({ ...savedDurationsRef.current });
               AsyncStorage.setItem(`dur_${fName}`, res.durationSec.toString()).catch(() => {});
             }
-            if (res.totalBytes > 0 && res.audioTracks && res.audioTracks.length > 0) { await AsyncStorage.setItem(cacheKey, JSON.stringify(res)); }
+            if (res.totalBytes > 0 && res.audioTracks && res.audioTracks.length > 0) {
+              await AsyncStorage.setItem(cacheKey, JSON.stringify(res));
+            }
           }
         } catch {} finally {
           if (!cancelled && fName === selectedFile.name) setScanningMediaInfo(false);
@@ -916,14 +989,18 @@ const App = () => {
 
   const fetchDirectory = async (path: string, isPullRefresh = false, isSeasonSwitch = false) => {
     const { baseUrl } = vaultRef.current;
-    if (!baseUrl) { setLoading(false); return; }
+    if (!baseUrl) { setLoading(false); setFolderLoading(false); return; }
+    const isRoot = path === '/0:/';
+
     if (isPullRefresh) setRefreshing(true);
-    else setLoading(true);
+    else if (isRoot) setLoading(true);
+    else setFolderLoading(true);
 
     try {
+      await restoreAllSavedWatchHistory();
       const incomingFiles = await requestRawDirectory(path);
 
-      if (!isSeasonSwitch) {
+      if (!isSeasonSwitch && !isRoot) {
         const subFolders = incomingFiles.filter((f: any) => f.mimeType?.includes('folder'));
         const videoFiles = incomingFiles.filter((f: any) => !f.mimeType?.includes('folder'));
         const detectedSeasons: SeasonFolderItem[] = [];
@@ -940,7 +1017,7 @@ const App = () => {
           }
         }
 
-        if (path !== '/0:/' && detectedSeasons.length > 0 && videoFiles.length === 0) {
+        if (detectedSeasons.length > 0 && videoFiles.length === 0) {
           detectedSeasons.sort((a, b) => a.seasonNum - b.seasonNum);
           const targetSeason = (isPullRefresh && activeSeason)
             ? (detectedSeasons.find(s => s.seasonNum === activeSeason.seasonNum) || detectedSeasons[0])
@@ -954,24 +1031,28 @@ const App = () => {
           setActiveSeason(targetSeason);
 
           const seasonEpisodes = await requestRawDirectory(targetSeason.path);
-          setFiles(seasonEpisodes);
+          setFolderFiles(seasonEpisodes);
           setCurrentPath(targetSeason.path);
           if (!isPullRefresh) setSearchQuery('');
           return;
-        } else if (path === '/0:/') {
-          setSeasonFolders([]);
-          setActiveSeason(null);
-          setSeriesParentTitle('');
         }
       }
 
-      setFiles(incomingFiles);
+      if (isRoot) {
+        setSeasonFolders([]);
+        setActiveSeason(null);
+        setSeriesParentTitle('');
+        setHomeFiles(incomingFiles);
+      } else {
+        setFolderFiles(incomingFiles);
+      }
       setCurrentPath(path);
       if (!isPullRefresh) setSearchQuery('');
     } catch (error) {
       Alert.alert('Error', 'Folder load aagala!');
     } finally {
       setLoading(false);
+      setFolderLoading(false);
       setRefreshing(false);
     }
   };
@@ -1087,14 +1168,22 @@ const App = () => {
     }
   };
 
+  // Instant Back from Series to Homepage: Home FlatList stays mounted at exact scroll position!
   const goBack = () => {
     if (pathStack.length > 1) {
       const newStack = pathStack.slice(0, -1);
+      const targetPath = newStack[newStack.length - 1];
       setPathStack(newStack);
       setSeasonFolders([]);
       setActiveSeason(null);
       setSeriesParentTitle('');
-      fetchDirectory(newStack[newStack.length - 1], false, false);
+      if (targetPath === '/0:/' && homeFiles.length > 0) {
+        setCurrentPath('/0:/');
+        setFolderFiles([]);
+        setSearchQuery('');
+      } else {
+        fetchDirectory(targetPath, false, false);
+      }
     }
   };
 
@@ -1188,15 +1277,15 @@ const App = () => {
       }
       if (gestureStartRef.current.isSwiping) {
         const screenH = Dimensions.get('window').height || 400;
-        const nextVal = Math.max(0, Math.min(1, gestureStartRef.current.startVal + (-dy / (screenH * 0.65))));
         clearTimeout(gestureHideTimer.current);
         if (gestureStartRef.current.side === 'left') {
+          const nextVal = Math.max(0, Math.min(1, gestureStartRef.current.startVal + (-dy / (screenH * 0.65))));
           brightnessRef.current = nextVal;
           setBrightnessLevel(nextVal);
           VideoPlayerManager?.setSystemBrightness?.(nextVal);
           setGestureIndicator({ visible: true, type: 'brightness', value: nextVal });
         } else {
-          // Allow volume swipe up to 2.0 (200% Real LoudnessEnhancer Sound Boost)
+          // 0% to 200% Real Hardware LoudnessEnhancer Sound Boost
           const boostVal = Math.max(0, Math.min(2.0, gestureStartRef.current.startVal + (-dy / (screenH * 0.42))));
           volumeRef.current = boostVal;
           setVolumeLevel(boostVal);
@@ -1217,11 +1306,15 @@ const App = () => {
   }), []);
 
   const handleVideoLoad = async (meta: any) => {
-    setDuration(meta.duration);
-    durationRef.current = meta.duration;
-    if (selectedFile?.name && meta.duration > 0) {
-      AsyncStorage.setItem(`dur_${selectedFile.name}`, meta.duration.toString()).catch(() => {});
-      setSavedDurationsMap(prev => ({ ...prev, [selectedFile.name]: meta.duration }));
+    const loadedDur = meta?.duration > 0 ? meta.duration : (savedDurationsRef.current[selectedFile?.name] || 0);
+    if (loadedDur > 0) {
+      setDuration(loadedDur);
+      durationRef.current = loadedDur;
+      if (selectedFile?.name) {
+        savedDurationsRef.current[selectedFile.name] = loadedDur;
+        setSavedDurationsMap({ ...savedDurationsRef.current });
+        AsyncStorage.setItem(`dur_${selectedFile.name}`, loadedDur.toString()).catch(() => {});
+      }
     }
     if (meta.audioTracks) {
       setAudioTracks(meta.audioTracks);
@@ -1232,12 +1325,12 @@ const App = () => {
     }
     if (meta.textTracks) setTextTracks(meta.textTracks);
     try {
-      let savedTime = savedTimesMap[selectedFile.name] || 0;
-      if (savedTime <= 3) {
+      let savedTime = savedTimesRef.current[selectedFile?.name] || 0;
+      if (savedTime <= 3 && selectedFile?.name) {
         const savedTimeStr = await AsyncStorage.getItem(`time_${selectedFile.name}`);
         if (savedTimeStr) savedTime = parseFloat(savedTimeStr);
       }
-      if (savedTime > 3 && (meta.duration <= 0 || meta.duration - savedTime > 90)) {
+      if (savedTime > 3 && (loadedDur <= 0 || loadedDur - savedTime > 90)) {
         videoRef.current?.seek(savedTime);
         setCurrentTime(savedTime);
         currentTimeRef.current = savedTime;
@@ -1245,7 +1338,7 @@ const App = () => {
     } catch {} finally {
       setTimeout(() => {
         hasRestoredResumeRef.current = true;
-      }, 600);
+      }, 650);
     }
   };
 
@@ -1271,12 +1364,7 @@ const App = () => {
     if (switchingEpisode.current) return;
     switchingEpisode.current = true;
     if (selectedFile?.name) {
-      AsyncStorage.removeItem(`time_${selectedFile.name}`).catch(() => {});
-      setSavedTimesMap(prev => {
-        const next = { ...prev };
-        delete next[selectedFile.name];
-        return next;
-      });
+      removeContinueWatchingItem(selectedFile);
     }
     if (nextEpisodeFile) {
       openFile(nextEpisodeFile);
@@ -1438,12 +1526,12 @@ const App = () => {
       <View style={styles.netflixSheetOverlay}>
         <View style={styles.floatingMenu}>
           <View style={styles.floatingMenuHeader}>
-            <Text style={styles.floatingMenuTitle}>{isAudio ? 'Audio & Playback Speed' : 'Subtitles & Captions'}</Text>
+            <Text style={styles.floatingMenuTitle}>{isAudio ? 'Audio & Sound Boost' : 'Subtitles & Captions'}</Text>
             <FocusableButton style={styles.menuCloseBtn} onPress={() => setActiveMenu(null)}>
               <Icon name="close" size={20} color="white" />
             </FocusableButton>
           </View>
-          <ScrollView style={{ maxHeight: 250 }}>
+          <ScrollView style={{ maxHeight: 270 }}>
             {!isAudio && (
               <FocusableButton hasTVPreferredFocus={true} style={styles.menuItem} onPress={() => handleSelectTextTrack({ type: 'disabled' })}>
                 <Icon name="check" size={20} color="#E50914" style={{ opacity: isSubtitleDisabled ? 1 : 0 }} />
@@ -1484,14 +1572,6 @@ const App = () => {
             )}
             {isAudio && (
               <View style={styles.adjustRow}>
-                <Text style={styles.adjustLabel}>Audio Sync</Text>
-                <FocusableButton style={styles.adjustBtn} onPress={() => setAudioDelay(d => Math.round((d - 0.25) * 100) / 100)}><Icon name="remove" size={20} color="white" /></FocusableButton>
-                <Text style={styles.adjustValue}>{audioDelay >= 0 ? `+${audioDelay.toFixed(2)}s` : `${audioDelay.toFixed(2)}s`}</Text>
-                <FocusableButton style={styles.adjustBtn} onPress={() => setAudioDelay(d => Math.round((d + 0.25) * 100) / 100)}><Icon name="add" size={20} color="white" /></FocusableButton>
-              </View>
-            )}
-            {isAudio && (
-              <View style={styles.adjustRow}>
                 <Text style={styles.adjustLabel}>Sound Boost</Text>
                 <FocusableButton
                   style={styles.adjustBtn}
@@ -1516,6 +1596,14 @@ const App = () => {
                   }}>
                   <Icon name="add" size={20} color="white" />
                 </FocusableButton>
+              </View>
+            )}
+            {isAudio && (
+              <View style={styles.adjustRow}>
+                <Text style={styles.adjustLabel}>Audio Sync</Text>
+                <FocusableButton style={styles.adjustBtn} onPress={() => setAudioDelay(d => Math.round((d - 0.25) * 100) / 100)}><Icon name="remove" size={20} color="white" /></FocusableButton>
+                <Text style={styles.adjustValue}>{audioDelay >= 0 ? `+${audioDelay.toFixed(2)}s` : `${audioDelay.toFixed(2)}s`}</Text>
+                <FocusableButton style={styles.adjustBtn} onPress={() => setAudioDelay(d => Math.round((d + 0.25) * 100) / 100)}><Icon name="add" size={20} color="white" /></FocusableButton>
               </View>
             )}
             {isAudio && (
@@ -1578,11 +1666,11 @@ const App = () => {
           rate={playbackRate}
           focusable={false}
           bufferConfig={{
-            minBufferMs: 3000,
-            maxBufferMs: 8000,
-            bufferForPlaybackMs: 1000,
-            bufferForPlaybackAfterRebufferMs: 2000,
-            maxHeapAllocationPercent: 0.12,
+            minBufferMs: 15000,
+            maxBufferMs: 45000,
+            bufferForPlaybackMs: 1500,
+            bufferForPlaybackAfterRebufferMs: 3000,
+            maxHeapAllocationPercent: 0.25,
           }}
           onLoad={handleVideoLoad}
           onBuffer={(b: any) => setIsVideoBuffering(!!b?.isBuffering)}
@@ -1602,7 +1690,7 @@ const App = () => {
               setDuration(p.seekableDuration);
             }
             const sec = Math.floor(p.currentTime);
-            if (hasRestoredResumeRef.current && sec > 3 && sec % 3 === 0 && lastSavedSec.current !== sec) {
+            if (hasRestoredResumeRef.current && sec > 3 && sec % 2 === 0 && lastSavedSec.current !== sec) {
               lastSavedSec.current = sec;
               persistPlaybackProgress(selectedFile?.name, p.currentTime, durationRef.current);
             }
@@ -1636,7 +1724,7 @@ const App = () => {
             source={{ uri: externalAudio.uri }}
             paused={isPaused || isVideoBuffering}
             rate={playbackRate}
-            volume={volumeLevel}
+            volume={Math.min(1.0, volumeLevel)}
             focusable={false}
             disableFocus={true}
             onLoad={() => {
@@ -1748,7 +1836,13 @@ const App = () => {
               <FocusableButton style={styles.netflixSeekCircleBtn} onPress={() => triggerStepSeek(false)}>
                 <Icon name="replay-10" size={40} color="white" />
               </FocusableButton>
-              <FocusableButton hasTVPreferredFocus={true} onPress={() => setIsPaused(!isPaused)} style={styles.netflixMainPlayBtn}>
+              <FocusableButton hasTVPreferredFocus={true} onPress={() => {
+                const nextPaused = !isPaused;
+                setIsPaused(nextPaused);
+                if (nextPaused && selectedFile?.name && currentTimeRef.current > 3) {
+                  persistPlaybackProgress(selectedFile.name, currentTimeRef.current, durationRef.current);
+                }
+              }} style={styles.netflixMainPlayBtn}>
                 {isVideoBuffering ? <ActivityIndicator size="large" color="#FFFFFF" /> : <Icon name={isPaused ? 'play-arrow' : 'pause'} size={54} color="white" />}
               </FocusableButton>
               <FocusableButton style={styles.netflixSeekCircleBtn} onPress={() => triggerStepSeek(true)}>
@@ -1778,8 +1872,10 @@ const App = () => {
 
               <View style={styles.netflixActionRow}>
                 <FocusableButton style={[styles.netflixActionPill, activeMenu === 'audio' && styles.netflixActionPillActive]} onPress={() => setActiveMenu(activeMenu === 'audio' ? null : 'audio')}>
-                  <Icon name="audiotrack" size={20} color={activeMenu === 'audio' ? '#E50914' : 'white'} />
-                  <Text style={styles.netflixActionText}>Audio</Text>
+                  <Icon name="audiotrack" size={20} color={activeMenu === 'audio' ? '#E50914' : volumeLevel > 1.0 ? '#F5C518' : 'white'} />
+                  <Text style={styles.netflixActionText}>
+                    {volumeLevel > 1.0 ? `Audio (${Math.round(volumeLevel * 100)}%)` : 'Audio'}
+                  </Text>
                 </FocusableButton>
                 <FocusableButton style={[styles.netflixActionPill, activeMenu === 'subtitle' && styles.netflixActionPillActive]} onPress={() => setActiveMenu(activeMenu === 'subtitle' ? null : 'subtitle')}>
                   <Icon name="subtitles" size={20} color={activeMenu === 'subtitle' ? '#E50914' : 'white'} />
@@ -1820,7 +1916,7 @@ const App = () => {
     );
   }
 
-  // 🔥 2. MOVIE / EPISODE DETAIL OVERLAY 🔥
+  // 🔥 2. MOVIE / EPISODE DETAIL OVERLAY (Keeps Catalog FlatLists mounted underneath!) 🔥
   const renderDetailOverlay = () => {
     if (!selectedFile || playMode !== null) return null;
     const info = parseMediaFilename(selectedFile.name, false);
@@ -1846,6 +1942,10 @@ const App = () => {
     info.badges.forEach(b => {
       if (b !== 'DV' && b !== 'HDR' && b !== 'Atmos' && b !== 'HEVC' && !topChips.includes(b)) topChips.push(b);
     });
+
+    const vItem = selectedFile;
+    const vMi = realMi;
+    const vRes = effectiveResolution;
 
     return (
       <ScrollView style={styles.detailScreen} contentContainerStyle={{ paddingBottom: 40 }}>
@@ -1905,7 +2005,6 @@ const App = () => {
 
           {!!meta?.overview && <Text style={styles.detailOverview}>{meta.overview}</Text>}
 
-          {/* Multi-Version Selector (e.g. WEB-DL vs BluRay REMUX) */}
           {versionGroup.length > 1 && (
             <View style={styles.versionSelectorBox}>
               <Text style={styles.versionSelectorLabel}>
@@ -1914,7 +2013,7 @@ const App = () => {
               <View style={styles.versionPillsRow}>
                 {versionGroup.map((vFile, vIdx) => {
                   const isCurrentVer = vFile.name === selectedFile.name;
-                  const vMi = mediaInfoMap[vFile.name];
+                  const verMi = mediaInfoMap[vFile.name];
                   return (
                     <FocusableButton
                       key={vFile.name || vIdx}
@@ -1931,7 +2030,7 @@ const App = () => {
                         </Text>
                       </View>
                       <Text style={styles.versionPillSub} numberOfLines={1}>
-                        {vMi?.totalBytes ? `${formatBytes(vMi.totalBytes)} • ` : ''}{vFile.name}
+                        {verMi?.totalBytes ? `${formatBytes(verMi.totalBytes)} • ` : ''}{vFile.name}
                       </Text>
                     </FocusableButton>
                   );
@@ -1995,94 +2094,83 @@ const App = () => {
             )}
           </View>
 
-          {/* Dual / Multi-Version MediaInfo Cards on the same Detail Page */}
-          {[selectedFile].map((vItem, vIdx) => {
-            const vMi = mediaInfoMap[vItem.name];
-            const vInfo = parseMediaFilename(vItem.name, false);
-            const vRes = vMi?.resolution || vInfo.resolution;
-            const isSelectedVer = vItem.name === selectedFile.name;
-            return (
-              <TouchableOpacity
-                key={vItem.name || vIdx}
-                activeOpacity={0.9}
-                onPress={() => { if (versionGroup.length > 1 && !isSelectedVer) openFile(vItem); }}
-                style={[
-                  styles.mediaInfoCard,
-                  versionGroup.length > 1 && isSelectedVer && { borderColor: '#E50914', borderWidth: 1.5 },
-                ]}>
-                <View style={styles.mediaInfoHeaderRow}>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flex: 1 }}>
-                    <Icon name="memory" size={16} color={isSelectedVer ? '#E50914' : '#8A94A6'} />
-                    <Text style={[styles.mediaInfoHeaderTitle, isSelectedVer && { color: '#FFF' }]}>
-                      {versionGroup.length > 1 ? `MEDIAINFO • ${getVersionTag(vItem.name).toUpperCase()}` : 'MEDIAINFO TECHNICAL SPECS'}
+          {/* Single MediaInfo Card for Currently Selected Version Only */}
+          <View style={styles.mediaInfoCard}>
+            <View style={styles.mediaInfoHeaderRow}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flex: 1 }}>
+                <Icon name="memory" size={16} color="#E50914" />
+                <Text style={[styles.mediaInfoHeaderTitle, { color: '#FFF' }]}>
+                  {versionGroup.length > 1 ? `MEDIAINFO • ${getVersionTag(vItem.name).toUpperCase()}` : 'MEDIAINFO TECHNICAL SPECS'}
+                </Text>
+              </View>
+              {scanningMediaInfo && !vMi && (
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  <ActivityIndicator size="small" color="#E50914" />
+                  <Text style={styles.scanningText}>Scanning...</Text>
+                </View>
+              )}
+            </View>
+
+            {vMi ? (
+              <View style={{ gap: 10, marginTop: 8 }}>
+                <View style={styles.miSpecRow}>
+                  <Text style={styles.miSpecLabel}>VIDEO</Text>
+                  <Text style={styles.miSpecValue}>
+                    {[
+                      vMi.width > 0 ? `${vMi.width}×${vMi.height} (${vMi.resolution})` : vRes,
+                      vMi.videoCodec,
+                      vMi.hasDV && vMi.hasHDR ? 'Dolby Vision + HDR10' : vMi.hasDV ? 'Dolby Vision (Single Layer)' : vMi.hasHDR ? 'HDR10' : 'SDR',
+                      vMi.frameRate > 0 ? `${vMi.frameRate.toFixed(2).replace(/\.00$/, '')} fps` : null,
+                    ].filter(Boolean).join(' • ')}
+                  </Text>
+                </View>
+                {(vMi.totalBytes > 0 || vMi.durationSec > 0) && (
+                  <View style={styles.miSpecRow}>
+                    <Text style={styles.miSpecLabel}>FILE & TIME</Text>
+                    <Text style={styles.miSpecValue}>
+                      {[vMi.totalBytes > 0 ? formatBytes(vMi.totalBytes) : null, vMi.durationSec > 0 ? formatRuntime(vMi.durationSec) : null].filter(Boolean).join(' • ')}
                     </Text>
                   </View>
-                  {scanningMediaInfo && !vMi && (
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                      <ActivityIndicator size="small" color="#E50914" />
-                      <Text style={styles.scanningText}>Scanning...</Text>
-                    </View>
-                  )}
-                </View>
-
-                {vMi ? (
-                  <View style={{ gap: 10, marginTop: 8 }}>
-                    <View style={styles.miSpecRow}>
-                      <Text style={styles.miSpecLabel}>VIDEO</Text>
-                      <Text style={styles.miSpecValue}>
-                        {[
-                          vMi.width > 0 ? `${vMi.width}×${vMi.height} (${vMi.resolution})` : vRes,
-                          vMi.videoCodec,
-                          vMi.hasDV && vMi.hasHDR ? 'Dolby Vision + HDR10' : vMi.hasDV ? 'Dolby Vision (Single Layer)' : vMi.hasHDR ? 'HDR10' : 'SDR',
-                          vMi.frameRate > 0 ? `${vMi.frameRate.toFixed(2).replace(/\.00$/, '')} fps` : null,
-                        ].filter(Boolean).join(' • ')}
-                      </Text>
-                    </View>
-                    {(vMi.totalBytes > 0 || vMi.durationSec > 0) && (
-                      <View style={styles.miSpecRow}>
-                        <Text style={styles.miSpecLabel}>FILE & TIME</Text>
-                        <Text style={styles.miSpecValue}>
-                          {[
-                            vMi.totalBytes > 0 ? formatBytes(vMi.totalBytes) : null,
-                            vMi.durationSec > 0 ? formatRuntime(vMi.durationSec) : null,
-                          ].filter(Boolean).join(' • ')}
-                        </Text>
-                      </View>
-                    )}
-                    {vMi.audioTracks && vMi.audioTracks.length > 0 && (
-                      <View style={styles.miSpecRow}>
-                        <Text style={styles.miSpecLabel}>AUDIO ({vMi.audioTracks.length})</Text>
-                        <View style={styles.miTrackPillWrap}>
-                          {vMi.audioTracks.map((at, idx) => (
-                            <View key={idx} style={styles.miAudioPill}><Text style={styles.miAudioPillText}>{vMi.hasAtmos ? at.summary.replace('Dolby TrueHD', 'Dolby TrueHD with Dolby Atmos').replace('Dolby Digital Plus (DD+)', 'Dolby Digital Plus with Dolby Atmos') : at.summary}</Text></View>
-                          ))}
+                )}
+                {vMi.audioTracks && vMi.audioTracks.length > 0 && (
+                  <View style={styles.miSpecRow}>
+                    <Text style={styles.miSpecLabel}>AUDIO ({vMi.audioTracks.length})</Text>
+                    <View style={styles.miTrackPillWrap}>
+                      {vMi.audioTracks.map((at, idx) => (
+                        <View key={idx} style={styles.miAudioPill}>
+                          <Text style={styles.miAudioPillText}>
+                            {vMi.hasAtmos
+                              ? at.summary
+                                  .replace('Dolby TrueHD', 'Dolby TrueHD with Dolby Atmos')
+                                  .replace('Dolby Digital Plus (DD+)', 'Dolby Digital Plus with Dolby Atmos')
+                              : at.summary}
+                          </Text>
                         </View>
-                      </View>
-                    )}
-                    {vMi.subtitleTracks && vMi.subtitleTracks.length > 0 && (
-                      <View style={styles.miSpecRow}>
-                        <Text style={styles.miSpecLabel}>SUBTITLES ({vMi.subtitleTracks.length})</Text>
-                        <View style={styles.miTrackPillWrap}>
-                          {vMi.subtitleTracks.map((st, idx) => (
-                            <View key={idx} style={styles.miSubPill}><Text style={styles.miSubPillText}>{st.language} ({st.format})</Text></View>
-                          ))}
-                        </View>
-                      </View>
-                    )}
+                      ))}
+                    </View>
                   </View>
-                ) : !scanningMediaInfo ? (
-                  <Text style={styles.rawFileName}>{vItem.name}</Text>
-                ) : null}
+                )}
+                {vMi.subtitleTracks && vMi.subtitleTracks.length > 0 && (
+                  <View style={styles.miSpecRow}>
+                    <Text style={styles.miSpecLabel}>SUBTITLES ({vMi.subtitleTracks.length})</Text>
+                    <View style={styles.miTrackPillWrap}>
+                      {vMi.subtitleTracks.map((st, idx) => (
+                        <View key={idx} style={styles.miSubPill}><Text style={styles.miSubPillText}>{st.language} ({st.format})</Text></View>
+                      ))}
+                    </View>
+                  </View>
+                )}
+              </View>
+            ) : !scanningMediaInfo ? (
+              <Text style={styles.rawFileName}>{vItem.name}</Text>
+            ) : null}
 
-                <View style={styles.sourceFileDivider}>
-                  <Text style={styles.rawFileLabel}>SOURCE FILE</Text>
-                  <Text style={styles.rawFileName}>{vItem.name}</Text>
-                </View>
-              </TouchableOpacity>
-            );
-          })}
+            <View style={styles.sourceFileDivider}>
+              <Text style={styles.rawFileLabel}>SOURCE FILE</Text>
+              <Text style={styles.rawFileName}>{vItem.name}</Text>
+            </View>
+          </View>
         </View>
-        {renderHdrChoiceModal()}
       </ScrollView>
     );
   };
@@ -2183,9 +2271,168 @@ const App = () => {
     );
   }
 
-  // 🔥 4. POSTER CATALOG HOME SCREEN 🔥
+  // 🔥 4. POSTER CATALOG HOME + SERIES OVERLAY SCREEN 🔥
   const numColumns = viewMode === 'grid' ? (IS_TV ? 5 : 2) : 1;
   const activeDownloadsCount = downloads.filter(d => d.status === 'downloading').length;
+
+  const renderCatalogCard = ({ item, index }: { item: any; index: number }) => {
+    const isFolder = !!item.mimeType?.includes('folder');
+    const info = parseMediaFilename(item.name, isFolder);
+    const meta = metadataMap[item.name];
+    const realMi = mediaInfoMap[item.name];
+    const activeVerForCard = item._versions?.find((v: any) => (savedTimesMap[v.name] || 0) > 3) || item;
+    const savedSec = savedTimesMap[activeVerForCard.name] || 0;
+    const totalDur = savedDurationsMap[activeVerForCard.name] || mediaInfoMap[activeVerForCard.name]?.durationSec || 0;
+    const resumePct = totalDur > 0 && savedSec > 0 ? Math.min(98, Math.max(5, (savedSec / totalDur) * 100)) : 45;
+    const cardRes = realMi?.resolution || info.resolution;
+    const isFav = !!watchlist[item.name];
+    const versionCount = item._versions?.length || 1;
+
+    if (viewMode === 'list') {
+      return (
+        <FocusableButton hasTVPreferredFocus={index === 0 && !searchQuery} style={styles.listCard} onPress={() => handlePress(item)}>
+          {meta?.poster ? (
+            <Image source={{ uri: meta.poster }} style={styles.listPosterThumb} resizeMode="cover" />
+          ) : (
+            <View style={styles.listPosterFallback}>
+              <Icon name={isFolder ? 'folder' : 'movie'} size={26} color={isFolder ? '#F5C518' : '#E50914'} />
+            </View>
+          )}
+          <View style={styles.listCardBody}>
+            <Text style={styles.listCardTitle} numberOfLines={1}>
+              {info.episodeNum > 0 ? `E${info.episodeNum < 10 ? `0${info.episodeNum}` : info.episodeNum} • ${info.cleanTitle}` : info.cleanTitle}
+            </Text>
+            <View style={styles.listCardMetaRow}>
+              {!!(meta?.year || info.year) && <Text style={styles.cardSubText}>{meta?.year || info.year}</Text>}
+              {!!info.seasonEpisode && <Text style={styles.cardSeasonTag}>{info.seasonEpisode}</Text>}
+              {!!cardRes && <Text style={styles.cardQualityTag}>{cardRes}</Text>}
+              {versionCount > 1 && <Text style={styles.cardSeasonTag}>{versionCount} Versions</Text>}
+              {savedSec > 3 && <Text style={styles.cardResumeTag}>{formatRemainingLabel(savedSec, totalDur)}</Text>}
+            </View>
+          </View>
+        </FocusableButton>
+      );
+    }
+
+    return (
+      <FocusableButton hasTVPreferredFocus={index === 0 && !searchQuery} style={styles.posterCard} onPress={() => handlePress(item)}>
+        <View style={styles.posterImageContainer}>
+          {meta?.poster ? (
+            <Image source={{ uri: meta.poster }} style={styles.posterImage} resizeMode="cover" />
+          ) : (
+            <View style={styles.posterFallback}>
+              <Icon name={isFolder ? 'folder-special' : 'local-movies'} size={38} color={isFolder ? '#F5C518' : '#E50914'} />
+              <Text style={styles.posterFallbackTitle} numberOfLines={3}>{info.cleanTitle}</Text>
+            </View>
+          )}
+
+          <View style={styles.posterTopBadges}>
+            {isFolder ? (
+              <View style={styles.folderPill}><Text style={styles.folderPillText}>{info.seasonEpisode || 'SERIES'}</Text></View>
+            ) : info.seasonEpisode ? (
+              <View style={styles.folderPill}><Text style={styles.folderPillText}>{info.seasonEpisode}</Text></View>
+            ) : meta?.rating ? (
+              <View style={styles.ratingPill}><Text style={styles.ratingPillText}>★ {meta.rating}</Text></View>
+            ) : <View />}
+
+            {!!cardRes && (
+              <View style={[styles.resPill, cardRes === '4K' && styles.resPill4K]}>
+                <Text style={styles.resPillText}>{cardRes}</Text>
+              </View>
+            )}
+          </View>
+
+          {versionCount > 1 && (
+            <View style={styles.multiVersionBadge}>
+              <Text style={styles.multiVersionBadgeText}>{versionCount} VERSIONS</Text>
+            </View>
+          )}
+
+          {isFav && (
+            <View style={styles.posterFavBadge}><Icon name="favorite" size={13} color="#E50914" /></View>
+          )}
+
+          {savedSec > 3 && (
+            <View style={styles.resumeBarBg}>
+              <View style={[styles.resumeBarFill, { width: `${resumePct}%` }]} />
+            </View>
+          )}
+        </View>
+
+        <View style={styles.posterCardFooter}>
+          <Text style={styles.posterTitle} numberOfLines={1}>
+            {info.episodeNum > 0 ? `Episode ${info.episodeNum} • ${info.cleanTitle}` : info.cleanTitle}
+          </Text>
+          <View style={styles.posterSubRow}>
+            {savedSec > 3 ? (
+              <Text style={styles.posterResumeText}>▶ {formatRemainingLabel(savedSec, totalDur)}</Text>
+            ) : (
+              <>
+                <Text style={styles.posterYear}>{meta?.year || info.year || (isFolder ? 'Series' : 'Movie')}</Text>
+                {(realMi?.languages?.length ? realMi.languages.slice(0, 2) : info.badges.slice(0, 2)).map((b, idx) => (
+                  <Text key={idx} style={styles.posterMiniTag}>• {b}</Text>
+                ))}
+              </>
+            )}
+          </View>
+        </View>
+      </FocusableButton>
+    );
+  };
+
+  const renderContinueWatchingHeader = () => {
+    if (searchQuery || activeCategory !== 'all' || continueWatchingItems.length === 0) return null;
+    return (
+      <View style={styles.cwSection}>
+        <Text style={styles.cwSectionTitle}>Continue Watching ⏯️</Text>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 10, paddingHorizontal: 6 }}>
+          {continueWatchingItems.map((cwItem, idx) => {
+            const cwInfo = parseMediaFilename(cwItem.name, false);
+            const cwMeta = metadataMap[cwItem.name];
+            const cwSec = savedTimesMap[cwItem.name] || 0;
+            const cwDur = savedDurationsMap[cwItem.name] || mediaInfoMap[cwItem.name]?.durationSec || 0;
+            const cwPct = cwDur > 0 ? Math.min(98, Math.max(5, (cwSec / cwDur) * 100)) : 45;
+            const imgUri = cwMeta?.backdrop || cwMeta?.poster;
+            return (
+              <View key={cwItem.id || cwItem.name || idx} style={styles.cwCard}>
+                <FocusableButton
+                  onPress={() => {
+                    const parentGroup = displayedFiles.find((df: any) => df._versions?.some((v: any) => v.name === cwItem.name));
+                    setVersionGroup(parentGroup?._versions || [cwItem]);
+                    openFile(cwItem);
+                    handlePlayInAppPress(cwItem);
+                  }}>
+                  <View style={styles.cwImageWrap}>
+                    {imgUri ? (
+                      <Image source={{ uri: imgUri }} style={styles.cwImage} resizeMode="cover" />
+                    ) : (
+                      <View style={styles.cwFallback}><Icon name="play-circle-outline" size={32} color="#E50914" /></View>
+                    )}
+                    <View style={styles.cwPlayBadge}><Icon name="play-arrow" size={18} color="white" /></View>
+                    <View style={styles.resumeBarBg}>
+                      <View style={[styles.resumeBarFill, { width: `${cwPct}%` }]} />
+                    </View>
+                  </View>
+                  <View style={styles.cwFooter}>
+                    <Text style={styles.cwTitle} numberOfLines={1}>
+                      {cwInfo.seasonEpisode ? `${cwInfo.seasonEpisode} • ${cwInfo.cleanTitle}` : cwInfo.cleanTitle}
+                    </Text>
+                    <Text style={styles.cwTimeText}>Resume • {formatRemainingLabel(cwSec, cwDur)}</Text>
+                  </View>
+                </FocusableButton>
+                <TouchableOpacity
+                  style={styles.cwRemoveBtn}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  onPress={() => removeContinueWatchingItem(cwItem)}>
+                  <Icon name="close" size={15} color="#FFFFFF" />
+                </TouchableOpacity>
+              </View>
+            );
+          })}
+        </ScrollView>
+      </View>
+    );
+  };
 
   return (
     <View style={styles.container}>
@@ -2253,196 +2500,68 @@ const App = () => {
         </ScrollView>
       </View>
 
-      {pathStack.length > 1 && (
-        <View style={styles.seriesNavRow}>
-          <FocusableButton style={[styles.backFolderBar, { flex: 1, marginHorizontal: 0, marginBottom: 0 }]} onPress={goBack}>
-            <Icon name="arrow-back" size={18} color="white" />
-            <Text style={styles.backFolderText} numberOfLines={1}>
-              {seriesParentTitle ? `Back • ${seriesParentTitle}` : `Back • ${decodeURIComponent(currentPath)}`}
-            </Text>
-          </FocusableButton>
-
-          {seasonFolders.length > 0 && activeSeason && (
-            <FocusableButton style={styles.seasonDropdownBtn} onPress={() => setShowSeasonModal(true)}>
-              <Text style={styles.seasonDropdownBtnText}>{activeSeason.label}</Text>
-              <Icon name="arrow-drop-down" size={22} color="white" />
-            </FocusableButton>
-          )}
-        </View>
-      )}
-
-      {loading ? (
-        <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 60 }} />
-      ) : (
-        <FlatList
-          key={`catalog-${viewMode}-${numColumns}`}
-          data={displayedFiles}
-          numColumns={numColumns}
-          keyboardShouldPersistTaps="handled"
-          removeClippedSubviews={false}
-          ListHeaderComponent={
-            !searchQuery && activeCategory === 'all' && continueWatchingItems.length > 0 ? (
-              <View style={styles.cwSection}>
-                <Text style={styles.cwSectionTitle}>Continue Watching ⏯️</Text>
-                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 10, paddingHorizontal: 6 }}>
-                  {continueWatchingItems.map((cwItem, idx) => {
-                    const cwInfo = parseMediaFilename(cwItem.name, false);
-                    const cwMeta = metadataMap[cwItem.name];
-                    const cwSec = savedTimesMap[cwItem.name] || 0;
-                    const cwDur = savedDurationsMap[cwItem.name] || mediaInfoMap[cwItem.name]?.durationSec || 0;
-                    const cwPct = cwDur > 0 ? Math.min(98, Math.max(5, (cwSec / cwDur) * 100)) : 45;
-                    const imgUri = cwMeta?.backdrop || cwMeta?.poster;
-                    return (
-                      <View key={cwItem.id || cwItem.name || idx} style={styles.cwCard}>
-                        <FocusableButton
-                          onPress={() => {
-                            const parentGroup = displayedFiles.find((df: any) => df._versions?.some((v: any) => v.name === cwItem.name));
-                            setVersionGroup(parentGroup?._versions || [cwItem]);
-                            openFile(cwItem);
-                            handlePlayInAppPress(cwItem);
-                          }}>
-                          <View style={styles.cwImageWrap}>
-                            {imgUri ? (
-                              <Image source={{ uri: imgUri }} style={styles.cwImage} resizeMode="cover" />
-                            ) : (
-                              <View style={styles.cwFallback}><Icon name="play-circle-outline" size={32} color="#E50914" /></View>
-                            )}
-                            <View style={styles.cwPlayBadge}><Icon name="play-arrow" size={18} color="white" /></View>
-                            <View style={styles.resumeBarBg}>
-                              <View style={[styles.resumeBarFill, { width: `${cwPct}%` }]} />
-                            </View>
-                          </View>
-                          <View style={styles.cwFooter}>
-                            <Text style={styles.cwTitle} numberOfLines={1}>
-                              {cwInfo.seasonEpisode ? `${cwInfo.seasonEpisode} • ${cwInfo.cleanTitle}` : cwInfo.cleanTitle}
-                            </Text>
-                            <Text style={styles.cwTimeText}>Resume • {formatRemainingLabel(cwSec, cwDur)}</Text>
-                          </View>
-                        </FocusableButton>
-                        <TouchableOpacity
-                          style={styles.cwRemoveBtn}
-                          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                          onPress={() => removeContinueWatchingItem(cwItem)}>
-                          <Icon name="close" size={15} color="#FFFFFF" />
-                        </TouchableOpacity>
-                      </View>
-                    );
-                  })}
-                </ScrollView>
-              </View>
-            ) : null
-          }
-          refreshControl={
-            <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" />
-          }
-          contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
-          keyExtractor={(item, idx) => item.id || item.name || String(idx)}
-          renderItem={({ item, index }) => {
-            const isFolder = !!item.mimeType?.includes('folder');
-            const info = parseMediaFilename(item.name, isFolder);
-            const meta = metadataMap[item.name];
-            const realMi = mediaInfoMap[item.name];
-            const activeVerForCard = item._versions?.find((v: any) => (savedTimesMap[v.name] || 0) > 3) || item;
-            const savedSec = savedTimesMap[activeVerForCard.name] || 0;
-            const totalDur = savedDurationsMap[activeVerForCard.name] || mediaInfoMap[activeVerForCard.name]?.durationSec || 0;
-            const resumePct = totalDur > 0 && savedSec > 0 ? Math.min(98, Math.max(5, (savedSec / totalDur) * 100)) : 45;
-            const cardRes = realMi?.resolution || info.resolution;
-            const isFav = !!watchlist[item.name];
-            const versionCount = item._versions?.length || 1;
-
-            if (viewMode === 'list') {
-              return (
-                <FocusableButton hasTVPreferredFocus={index === 0 && !searchQuery} style={styles.listCard} onPress={() => handlePress(item)}>
-                  {meta?.poster ? (
-                    <Image source={{ uri: meta.poster }} style={styles.listPosterThumb} resizeMode="cover" />
-                  ) : (
-                    <View style={styles.listPosterFallback}>
-                      <Icon name={isFolder ? 'folder' : 'movie'} size={26} color={isFolder ? '#F5C518' : '#E50914'} />
-                    </View>
-                  )}
-                  <View style={styles.listCardBody}>
-                    <Text style={styles.listCardTitle} numberOfLines={1}>
-                      {info.episodeNum > 0 ? `E${info.episodeNum < 10 ? `0${info.episodeNum}` : info.episodeNum} • ${info.cleanTitle}` : info.cleanTitle}
-                    </Text>
-                    <View style={styles.listCardMetaRow}>
-                      {!!(meta?.year || info.year) && <Text style={styles.cardSubText}>{meta?.year || info.year}</Text>}
-                      {!!info.seasonEpisode && <Text style={styles.cardSeasonTag}>{info.seasonEpisode}</Text>}
-                      {!!cardRes && <Text style={styles.cardQualityTag}>{cardRes}</Text>}
-                      {versionCount > 1 && <Text style={styles.cardSeasonTag}>{versionCount} Versions</Text>}
-                      {savedSec > 3 && <Text style={styles.cardResumeTag}>{formatRemainingLabel(savedSec, totalDur)}</Text>}
-                    </View>
-                  </View>
-                </FocusableButton>
-              );
+      <View style={{ flex: 1, position: 'relative' }}>
+        {/* Home Catalog FlatList stays permanently mounted so scroll position NEVER resets when entering a Series or Movie! */}
+        {loading ? (
+          <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 60 }} />
+        ) : (
+          <FlatList
+            key={`home-catalog-${viewMode}-${numColumns}`}
+            data={homeDisplayedFiles}
+            numColumns={numColumns}
+            keyboardShouldPersistTaps="handled"
+            removeClippedSubviews={false}
+            ListHeaderComponent={!isInsideFolder ? renderContinueWatchingHeader() : null}
+            refreshControl={
+              <RefreshControl refreshing={refreshing && !isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" />
             }
+            contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
+            keyExtractor={(item, idx) => item.id || item.name || String(idx)}
+            renderItem={renderCatalogCard}
+          />
+        )}
 
-            return (
-              <FocusableButton hasTVPreferredFocus={index === 0 && !searchQuery} style={styles.posterCard} onPress={() => handlePress(item)}>
-                <View style={styles.posterImageContainer}>
-                  {meta?.poster ? (
-                    <Image source={{ uri: meta.poster }} style={styles.posterImage} resizeMode="cover" />
-                  ) : (
-                    <View style={styles.posterFallback}>
-                      <Icon name={isFolder ? 'folder-special' : 'local-movies'} size={38} color={isFolder ? '#F5C518' : '#E50914'} />
-                      <Text style={styles.posterFallbackTitle} numberOfLines={3}>{info.cleanTitle}</Text>
-                    </View>
-                  )}
-
-                  <View style={styles.posterTopBadges}>
-                    {isFolder ? (
-                      <View style={styles.folderPill}><Text style={styles.folderPillText}>{info.seasonEpisode || 'SERIES'}</Text></View>
-                    ) : info.seasonEpisode ? (
-                      <View style={styles.folderPill}><Text style={styles.folderPillText}>{info.seasonEpisode}</Text></View>
-                    ) : meta?.rating ? (
-                      <View style={styles.ratingPill}><Text style={styles.ratingPillText}>★ {meta.rating}</Text></View>
-                    ) : <View />}
-
-                    {!!cardRes && (
-                      <View style={[styles.resPill, cardRes === '4K' && styles.resPill4K]}>
-                        <Text style={styles.resPillText}>{cardRes}</Text>
-                      </View>
-                    )}
-                  </View>
-
-                  {versionCount > 1 && (
-                    <View style={styles.multiVersionBadge}>
-                      <Text style={styles.multiVersionBadgeText}>{versionCount} VERSIONS</Text>
-                    </View>
-                  )}
-
-                  {isFav && (
-                    <View style={styles.posterFavBadge}><Icon name="favorite" size={13} color="#E50914" /></View>
-                  )}
-
-                  {savedSec > 3 && (
-                    <View style={styles.resumeBarBg}>
-                      <View style={[styles.resumeBarFill, { width: `${resumePct}%` }]} />
-                    </View>
-                  )}
-                </View>
-
-                <View style={styles.posterCardFooter}>
-                  <Text style={styles.posterTitle} numberOfLines={1}>
-                    {info.episodeNum > 0 ? `Episode ${info.episodeNum} • ${info.cleanTitle}` : info.cleanTitle}
-                  </Text>
-                  <View style={styles.posterSubRow}>
-                    {savedSec > 3 ? (
-                      <Text style={styles.posterResumeText}>▶ {formatRemainingLabel(savedSec, totalDur)}</Text>
-                    ) : (
-                      <>
-                        <Text style={styles.posterYear}>{meta?.year || info.year || (isFolder ? 'Series' : 'Movie')}</Text>
-                        {(realMi?.languages?.length ? realMi.languages.slice(0, 2) : info.badges.slice(0, 2)).map((b, idx) => (
-                          <Text key={idx} style={styles.posterMiniTag}>• {b}</Text>
-                        ))}
-                      </>
-                    )}
-                  </View>
-                </View>
+        {/* Series / Folder Overlay Layer (Renders over Home FlatList so going Back to Home is instant & preserves scroll offset!) */}
+        {isInsideFolder && (
+          <View style={styles.seriesFolderOverlay}>
+            <View style={styles.seriesNavRow}>
+              <FocusableButton style={[styles.backFolderBar, { flex: 1, marginHorizontal: 0, marginBottom: 0 }]} onPress={goBack}>
+                <Icon name="arrow-back" size={18} color="white" />
+                <Text style={styles.backFolderText} numberOfLines={1}>
+                  {seriesParentTitle ? `Back • ${seriesParentTitle}` : `Back • ${decodeURIComponent(currentPath)}`}
+                </Text>
               </FocusableButton>
-            );
-          }}
-        />
-      )}
+
+              {seasonFolders.length > 0 && activeSeason && (
+                <FocusableButton style={styles.seasonDropdownBtn} onPress={() => setShowSeasonModal(true)}>
+                  <Text style={styles.seasonDropdownBtnText}>{activeSeason.label}</Text>
+                  <Icon name="arrow-drop-down" size={22} color="white" />
+                </FocusableButton>
+              )}
+            </View>
+
+            {folderLoading ? (
+              <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 60 }} />
+            ) : (
+              <FlatList
+                key={`folder-catalog-${currentPath}-${viewMode}-${numColumns}`}
+                data={folderDisplayedFiles}
+                numColumns={numColumns}
+                keyboardShouldPersistTaps="handled"
+                removeClippedSubviews={false}
+                ListHeaderComponent={renderContinueWatchingHeader()}
+                refreshControl={
+                  <RefreshControl refreshing={refreshing && isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" />
+                }
+                contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
+                keyExtractor={(item, idx) => item.id || item.name || String(idx)}
+                renderItem={renderCatalogCard}
+              />
+            )}
+          </View>
+        )}
+      </View>
+
       {renderDetailOverlay()}
       {renderSeasonModal()}
       {renderHdrChoiceModal()}
@@ -2452,6 +2571,7 @@ const App = () => {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0B0C10', paddingTop: 38 },
+  seriesFolderOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: '#0B0C10', zIndex: 20 },
   securityAlertScreen: { flex: 1, backgroundColor: '#0B0C10', alignItems: 'center', justifyContent: 'center', padding: 32 },
   securityAlertTitle: { color: 'white', fontSize: 20, fontWeight: '800', marginTop: 14 },
   securityAlertSub: { color: '#99A3B3', fontSize: 13, textAlign: 'center', lineHeight: 20, marginTop: 8 },
@@ -2481,7 +2601,7 @@ const styles = StyleSheet.create({
   seasonNumberText: { color: '#F5C518', fontSize: 12, fontWeight: '900' },
   cwSection: { marginBottom: 14 },
   cwSectionTitle: { color: '#F2F5F8', fontSize: 15, fontWeight: '800', marginLeft: 6, marginBottom: 8 },
-  cwCard: { width: 190, backgroundColor: '#14171F', borderRadius: 10, overflow: 'hidden', borderWidth: 1.5, borderColor: '#222836' },
+  cwCard: { width: 190, backgroundColor: '#14171F', borderRadius: 10, overflow: 'hidden', borderWidth: 1.5, borderColor: '#222836', position: 'relative' },
   cwImageWrap: { width: '100%', height: 106, backgroundColor: '#191D26', position: 'relative' },
   cwImage: { width: '100%', height: '100%' },
   cwFallback: { flex: 1, alignItems: 'center', justifyContent: 'center' },
@@ -2579,7 +2699,7 @@ const styles = StyleSheet.create({
   dlProgressBarBg: { height: 6, backgroundColor: '#252C3A', borderRadius: 3, overflow: 'hidden', marginVertical: 6 },
   dlProgressBarFill: { height: '100%', backgroundColor: '#E50914', borderRadius: 3 },
   dlCardSubText: { color: '#99A3B3', fontSize: 11, marginTop: 2 },
-  mediaInfoCard: { marginTop: 18, padding: 14, borderRadius: 12, backgroundColor: '#12151E', borderWidth: 1, borderColor: '#232A38' },
+  mediaInfoCard: { marginTop: 18, padding: 14, borderRadius: 12, backgroundColor: '#12151E', borderWidth: 1.5, borderColor: '#E50914' },
   mediaInfoHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 },
   mediaInfoHeaderTitle: { color: '#9BA6B8', fontSize: 11, fontWeight: '900', letterSpacing: 0.9 },
   scanningText: { color: '#E50914', fontSize: 11, fontWeight: '700' },
