@@ -322,6 +322,8 @@ const App = () => {
   const [playerInstanceKey, setPlayerInstanceKey] = useState(0);
 
   const [selectedFile, setSelectedFile] = useState<any>(null);
+  const selectedFileRef = useRef<any>(null);
+  useEffect(() => { selectedFileRef.current = selectedFile; }, [selectedFile]);
   const [versionGroup, setVersionGroup] = useState<any[]>([]);
   const [playMode, setPlayMode] = useState<string | null>(null);
   const [resizeMode, setResizeMode] = useState<'contain' | 'cover'>('contain');
@@ -485,8 +487,9 @@ const App = () => {
     });
 
     const appStateSub = AppState.addEventListener('change', nextState => {
-      if ((nextState === 'background' || nextState === 'inactive') && selectedFile?.name && currentTimeRef.current > 3) {
-        persistPlaybackProgress(selectedFile.name, currentTimeRef.current, durationRef.current);
+      const activeFile = selectedFileRef.current;
+      if ((nextState === 'background' || nextState === 'inactive') && activeFile?.name && currentTimeRef.current > 3) {
+        persistPlaybackProgress(activeFile.name, currentTimeRef.current, durationRef.current);
       }
     });
 
@@ -512,7 +515,8 @@ const App = () => {
       dlSub.remove();
       appStateSub.remove();
     };
-  }, [restoreAllSavedWatchHistory, persistPlaybackProgress, selectedFile]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const toggleWatchlist = useCallback((fileName: string) => {
     setWatchlist(prev => {
@@ -1640,8 +1644,9 @@ const App = () => {
     );
   };
 
-  // 🔥 1. INTERNAL VIDEO PLAYER SCREEN 🔥
-  if (selectedFile && playMode === 'internal') {
+  // 🔥 1. INTERNAL VIDEO PLAYER OVERLAY (Keeps Home & Series FlatLists mounted underneath!) 🔥
+  const renderPlayerOverlay = () => {
+    if (!selectedFile || playMode !== 'internal') return null;
     const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
     const remainingTime = Math.max(0, duration - currentTime);
     const playerInfo = parseMediaFilename(selectedFile.name, false);
@@ -1914,7 +1919,7 @@ const App = () => {
         {renderFloatingMenu()}
       </View>
     );
-  }
+  };
 
   // 🔥 2. MOVIE / EPISODE DETAIL OVERLAY (Keeps Catalog FlatLists mounted underneath!) 🔥
   const renderDetailOverlay = () => {
@@ -2175,10 +2180,11 @@ const App = () => {
     );
   };
 
-  // 🔥 3. DOWNLOADS TAB SCREEN 🔥
-  if (activeTab === 'downloads') {
+  // 🔥 3. DOWNLOADS TAB OVERLAY 🔥
+  const renderDownloadsOverlay = () => {
+    if (activeTab !== 'downloads') return null;
     return (
-      <View style={styles.container}>
+      <View style={styles.downloadsOverlayScreen}>
         <StatusBar hidden={false} barStyle="light-content" />
         <View style={styles.topHeaderBar}>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
@@ -2266,10 +2272,9 @@ const App = () => {
             }}
           />
         )}
-        {renderHdrChoiceModal()}
       </View>
     );
-  }
+  };
 
   // 🔥 4. POSTER CATALOG HOME + SERIES OVERLAY SCREEN 🔥
   const numColumns = viewMode === 'grid' ? (IS_TV ? 5 : 2) : 1;
@@ -2562,7 +2567,9 @@ const App = () => {
         )}
       </View>
 
+      {renderDownloadsOverlay()}
       {renderDetailOverlay()}
+      {renderPlayerOverlay()}
       {renderSeasonModal()}
       {renderHdrChoiceModal()}
     </View>
@@ -2746,7 +2753,8 @@ const styles = StyleSheet.create({
   dlDeleteBtn: { padding: 9, borderRadius: 8, backgroundColor: 'rgba(255, 107, 107, 0.12)' },
   dlBtnText: { color: 'white', fontSize: 13, fontWeight: '700' },
   modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.78)', alignItems: 'center', justifyContent: 'center', padding: 20 },
-  playerWrapper: { flex: 1, backgroundColor: 'black' },
+  downloadsOverlayScreen: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 40, backgroundColor: '#0B0C10', paddingTop: 38 },
+  playerWrapper: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 120, backgroundColor: 'black' },
   videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
   externalSubtitleContainer: { position: 'absolute', left: 24, right: 24, bottom: 52, alignItems: 'center', justifyContent: 'center' },
   externalSubtitleText: { color: '#FFFFFF', backgroundColor: 'transparent', fontWeight: '700', textAlign: 'center', textShadowColor: 'rgba(0, 0, 0, 0.95)', textShadowOffset: { width: 1.5, height: 1.5 }, textShadowRadius: 4 },
