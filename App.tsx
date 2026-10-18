@@ -346,6 +346,7 @@ const App = () => {
   const switchingEpisode = useRef(false);
   const isLoggedIn = useRef(false);
   const lastSavedSec = useRef(-1);
+  const hasRestoredResumeRef = useRef(false);
   const fetchedKeysRef = useRef<Set<string>>(new Set());
 
   const [audioTracks, setAudioTracks] = useState<any[]>([]);
@@ -403,6 +404,12 @@ const App = () => {
   useEffect(() => {
     if (IS_TV) Orientation.lockToLandscape();
     AsyncStorage.getItem('gdstream_watchlist_v1').then(s => { if (s) setWatchlist(JSON.parse(s)); }).catch(() => {});
+    if (VideoPlayerManager?.getAllWatchProgress) {
+      VideoPlayerManager.getAllWatchProgress().then((res: any) => {
+        if (res?.times) setSavedTimesMap(prev => ({ ...prev, ...res.times }));
+        if (res?.durations) setSavedDurationsMap(prev => ({ ...prev, ...res.durations }));
+      }).catch(() => {});
+    }
     if (VideoPlayerManager?.getSystemLevels) {
       VideoPlayerManager.getSystemLevels().then((res: any) => {
         if (typeof res?.brightness === 'number') { setBrightnessLevel(res.brightness); brightnessRef.current = res.brightness; }
@@ -463,8 +470,17 @@ const App = () => {
   }, [audioDelay, isExternalAudioSelected]);
 
   const loadSavedTimesForFiles = useCallback(async (items: any[]) => {
-    if (!items.length) return;
     try {
+      if (VideoPlayerManager?.getAllWatchProgress) {
+        const nativeRes = await VideoPlayerManager.getAllWatchProgress();
+        if (nativeRes?.times) {
+          setSavedTimesMap(prev => ({ ...prev, ...nativeRes.times }));
+        }
+        if (nativeRes?.durations) {
+          setSavedDurationsMap(prev => ({ ...prev, ...nativeRes.durations }));
+        }
+      }
+      if (!items.length) return;
       const timeKeys = items.map(f => `time_${f.name}`);
       const durKeys = items.map(f => `dur_${f.name}`);
       const miKeys = items.map(f => `mediainfo_v8_${f.name}`);
@@ -480,8 +496,9 @@ const App = () => {
           if (parsed > 3) nextTimes[k.replace(/^time_/, '')] = parsed;
         }
       });
-      setSavedTimesMap(prev => ({ ...prev, ...nextTimes }));
-
+      if (Object.keys(nextTimes).length > 0) {
+        setSavedTimesMap(prev => ({ ...nextTimes, ...prev }));
+      }
       const nextDurs: Record<string, number> = {};
       durPairs.forEach(([k, val]) => {
         if (val) {
@@ -489,8 +506,9 @@ const App = () => {
           if (parsed > 0) nextDurs[k.replace(/^dur_/, '')] = parsed;
         }
       });
-      setSavedDurationsMap(prev => ({ ...prev, ...nextDurs }));
-
+      if (Object.keys(nextDurs).length > 0) {
+        setSavedDurationsMap(prev => ({ ...nextDurs, ...prev }));
+      }
       const nextMiMap: Record<string, RealMediaInfo> = {};
       miPairs.forEach(([k, val]) => {
         if (val) {
@@ -982,6 +1000,7 @@ const App = () => {
   const openFile = (file: any) => {
     switchingEpisode.current = false;
     lastSavedSec.current = -1;
+    hasRestoredResumeRef.current = false;
     setSelectedAudio(undefined);
     setSelectedText({ type: 'disabled' });
     setCurrentTime(0);
@@ -1063,7 +1082,8 @@ const App = () => {
     } else {
       const vers = item._versions && item._versions.length > 1 ? item._versions : [item];
       setVersionGroup(vers);
-      openFile(vers[0]);
+      const resumedVer = vers.find((v: any) => (savedTimesMap[v.name] || 0) > 3) || vers[0];
+      openFile(resumedVer);
     }
   };
 
@@ -1176,10 +1196,12 @@ const App = () => {
           VideoPlayerManager?.setSystemBrightness?.(nextVal);
           setGestureIndicator({ visible: true, type: 'brightness', value: nextVal });
         } else {
-          volumeRef.current = nextVal;
-          setVolumeLevel(nextVal);
-          VideoPlayerManager?.setSystemVolume?.(nextVal);
-          setGestureIndicator({ visible: true, type: 'volume', value: nextVal });
+          // Allow volume swipe up to 2.0 (200% Real LoudnessEnhancer Sound Boost)
+          const boostVal = Math.max(0, Math.min(2.0, gestureStartRef.current.startVal + (-dy / (screenH * 0.42))));
+          volumeRef.current = boostVal;
+          setVolumeLevel(boostVal);
+          VideoPlayerManager?.setSystemVolume?.(boostVal);
+          setGestureIndicator({ visible: true, type: 'volume', value: boostVal });
         }
       }
     },
@@ -1210,14 +1232,21 @@ const App = () => {
     }
     if (meta.textTracks) setTextTracks(meta.textTracks);
     try {
-      const savedTimeStr = await AsyncStorage.getItem(`time_${selectedFile.name}`);
-      if (savedTimeStr) {
-        const savedTime = parseFloat(savedTimeStr);
-        if (savedTime > 3 && meta.duration - savedTime > 90) {
-          seekBothPlayers(savedTime);
-        }
+      let savedTime = savedTimesMap[selectedFile.name] || 0;
+      if (savedTime <= 3) {
+        const savedTimeStr = await AsyncStorage.getItem(`time_${selectedFile.name}`);
+        if (savedTimeStr) savedTime = parseFloat(savedTimeStr);
       }
-    } catch {}
+      if (savedTime > 3 && (meta.duration <= 0 || meta.duration - savedTime > 90)) {
+        videoRef.current?.seek(savedTime);
+        setCurrentTime(savedTime);
+        currentTimeRef.current = savedTime;
+      }
+    } catch {} finally {
+      setTimeout(() => {
+        hasRestoredResumeRef.current = true;
+      }, 600);
+    }
   };
 
   const nextEpisodeFile = useMemo(() => {
@@ -1463,6 +1492,34 @@ const App = () => {
             )}
             {isAudio && (
               <View style={styles.adjustRow}>
+                <Text style={styles.adjustLabel}>Sound Boost</Text>
+                <FocusableButton
+                  style={styles.adjustBtn}
+                  onPress={() => {
+                    const next = Math.max(0, Math.round((volumeLevel - 0.2) * 10) / 10);
+                    volumeRef.current = next;
+                    setVolumeLevel(next);
+                    VideoPlayerManager?.setSystemVolume?.(next);
+                  }}>
+                  <Icon name="remove" size={20} color="white" />
+                </FocusableButton>
+                <Text style={[styles.adjustValue, volumeLevel > 1.0 && { color: '#F5C518' }]}>
+                  {Math.round(volumeLevel * 100)}%
+                </Text>
+                <FocusableButton
+                  style={styles.adjustBtn}
+                  onPress={() => {
+                    const next = Math.min(2.0, Math.round((volumeLevel + 0.2) * 10) / 10);
+                    volumeRef.current = next;
+                    setVolumeLevel(next);
+                    VideoPlayerManager?.setSystemVolume?.(next);
+                  }}>
+                  <Icon name="add" size={20} color="white" />
+                </FocusableButton>
+              </View>
+            )}
+            {isAudio && (
+              <View style={styles.adjustRow}>
                 <Text style={styles.adjustLabel}>Speed</Text>
                 <FocusableButton style={styles.adjustBtn} onPress={() => setPlaybackRate(r => Math.max(0.5, Math.round((r - 0.25) * 100) / 100))}><Icon name="remove" size={20} color="white" /></FocusableButton>
                 <Text style={styles.adjustValue}>{playbackRate.toFixed(2)}x</Text>
@@ -1515,7 +1572,7 @@ const App = () => {
           style={styles.videoPlayer}
           resizeMode={resizeMode}
           paused={isPaused}
-          volume={volumeLevel}
+          volume={Math.min(1.0, volumeLevel)}
           muted={isExternalAudioSelected}
           disableFocus={isExternalAudioSelected}
           rate={playbackRate}
@@ -1545,7 +1602,7 @@ const App = () => {
               setDuration(p.seekableDuration);
             }
             const sec = Math.floor(p.currentTime);
-            if (sec > 3 && sec % 3 === 0 && lastSavedSec.current !== sec) {
+            if (hasRestoredResumeRef.current && sec > 3 && sec % 3 === 0 && lastSavedSec.current !== sec) {
               lastSavedSec.current = sec;
               persistPlaybackProgress(selectedFile?.name, p.currentTime, durationRef.current);
             }
@@ -1604,11 +1661,28 @@ const App = () => {
         {gestureIndicator.visible && (
           <View style={[styles.gestureHudContainer, gestureIndicator.type === 'brightness' ? styles.gestureHudLeft : styles.gestureHudRight]} pointerEvents="none">
             <View style={styles.gestureHudPill}>
-              <Icon name={gestureIndicator.type === 'brightness' ? 'wb-sunny' : gestureIndicator.value === 0 ? 'volume-off' : 'volume-up'} size={22} color="#E50914" />
+              <Icon
+                name={gestureIndicator.type === 'brightness' ? 'wb-sunny' : gestureIndicator.value === 0 ? 'volume-off' : 'volume-up'}
+                size={22}
+                color={gestureIndicator.type === 'volume' && gestureIndicator.value > 1.0 ? '#F5C518' : '#E50914'}
+              />
               <View style={styles.gestureBarTrack}>
-                <View style={[styles.gestureBarFill, { height: `${Math.round(gestureIndicator.value * 100)}%` }]} />
+                <View
+                  style={[
+                    styles.gestureBarFill,
+                    {
+                      height: `${Math.min(100, Math.round((gestureIndicator.type === 'volume' ? gestureIndicator.value / 2.0 : gestureIndicator.value) * 100))}%`,
+                      backgroundColor: gestureIndicator.type === 'volume' && gestureIndicator.value > 1.0 ? '#F5C518' : '#E50914',
+                    },
+                  ]}
+                />
               </View>
-              <Text style={styles.gestureHudText}>{Math.round(gestureIndicator.value * 100)}%</Text>
+              <Text style={[styles.gestureHudText, gestureIndicator.type === 'volume' && gestureIndicator.value > 1.0 && { color: '#F5C518' }]}>
+                {Math.round(gestureIndicator.value * 100)}%
+              </Text>
+              {gestureIndicator.type === 'volume' && gestureIndicator.value > 1.0 && (
+                <Text style={{ color: '#F5C518', fontSize: 9, fontWeight: '900' }}>BOOST</Text>
+              )}
             </View>
           </View>
         )}
@@ -1922,7 +1996,7 @@ const App = () => {
           </View>
 
           {/* Dual / Multi-Version MediaInfo Cards on the same Detail Page */}
-          {(versionGroup.length > 1 ? versionGroup : [selectedFile]).map((vItem, vIdx) => {
+          {[selectedFile].map((vItem, vIdx) => {
             const vMi = mediaInfoMap[vItem.name];
             const vInfo = parseMediaFilename(vItem.name, false);
             const vRes = vMi?.resolution || vInfo.resolution;
@@ -2219,28 +2293,39 @@ const App = () => {
                     const cwPct = cwDur > 0 ? Math.min(98, Math.max(5, (cwSec / cwDur) * 100)) : 45;
                     const imgUri = cwMeta?.backdrop || cwMeta?.poster;
                     return (
-                      <FocusableButton
-                        key={cwItem.id || cwItem.name || idx}
-                        style={styles.cwCard}
-                        onPress={() => { setVersionGroup([cwItem]); openFile(cwItem); handlePlayInAppPress(cwItem); }}>
-                        <View style={styles.cwImageWrap}>
-                          {imgUri ? (
-                            <Image source={{ uri: imgUri }} style={styles.cwImage} resizeMode="cover" />
-                          ) : (
-                            <View style={styles.cwFallback}><Icon name="play-circle-outline" size={32} color="#E50914" /></View>
-                          )}
-                          <View style={styles.cwPlayBadge}><Icon name="play-arrow" size={18} color="white" /></View>
-                          <View style={styles.resumeBarBg}>
-                            <View style={[styles.resumeBarFill, { width: `${cwPct}%` }]} />
+                      <View key={cwItem.id || cwItem.name || idx} style={styles.cwCard}>
+                        <FocusableButton
+                          onPress={() => {
+                            const parentGroup = displayedFiles.find((df: any) => df._versions?.some((v: any) => v.name === cwItem.name));
+                            setVersionGroup(parentGroup?._versions || [cwItem]);
+                            openFile(cwItem);
+                            handlePlayInAppPress(cwItem);
+                          }}>
+                          <View style={styles.cwImageWrap}>
+                            {imgUri ? (
+                              <Image source={{ uri: imgUri }} style={styles.cwImage} resizeMode="cover" />
+                            ) : (
+                              <View style={styles.cwFallback}><Icon name="play-circle-outline" size={32} color="#E50914" /></View>
+                            )}
+                            <View style={styles.cwPlayBadge}><Icon name="play-arrow" size={18} color="white" /></View>
+                            <View style={styles.resumeBarBg}>
+                              <View style={[styles.resumeBarFill, { width: `${cwPct}%` }]} />
+                            </View>
                           </View>
-                        </View>
-                        <View style={styles.cwFooter}>
-                          <Text style={styles.cwTitle} numberOfLines={1}>
-                            {cwInfo.seasonEpisode ? `${cwInfo.seasonEpisode} • ${cwInfo.cleanTitle}` : cwInfo.cleanTitle}
-                          </Text>
-                          <Text style={styles.cwTimeText}>Resume • {formatRemainingLabel(cwSec, cwDur)}</Text>
-                        </View>
-                      </FocusableButton>
+                          <View style={styles.cwFooter}>
+                            <Text style={styles.cwTitle} numberOfLines={1}>
+                              {cwInfo.seasonEpisode ? `${cwInfo.seasonEpisode} • ${cwInfo.cleanTitle}` : cwInfo.cleanTitle}
+                            </Text>
+                            <Text style={styles.cwTimeText}>Resume • {formatRemainingLabel(cwSec, cwDur)}</Text>
+                          </View>
+                        </FocusableButton>
+                        <TouchableOpacity
+                          style={styles.cwRemoveBtn}
+                          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                          onPress={() => removeContinueWatchingItem(cwItem)}>
+                          <Icon name="close" size={15} color="#FFFFFF" />
+                        </TouchableOpacity>
+                      </View>
                     );
                   })}
                 </ScrollView>
@@ -2257,8 +2342,9 @@ const App = () => {
             const info = parseMediaFilename(item.name, isFolder);
             const meta = metadataMap[item.name];
             const realMi = mediaInfoMap[item.name];
-            const savedSec = savedTimesMap[item.name] || 0;
-            const totalDur = savedDurationsMap[item.name] || realMi?.durationSec || 0;
+            const activeVerForCard = item._versions?.find((v: any) => (savedTimesMap[v.name] || 0) > 3) || item;
+            const savedSec = savedTimesMap[activeVerForCard.name] || 0;
+            const totalDur = savedDurationsMap[activeVerForCard.name] || mediaInfoMap[activeVerForCard.name]?.durationSec || 0;
             const resumePct = totalDur > 0 && savedSec > 0 ? Math.min(98, Math.max(5, (savedSec / totalDur) * 100)) : 45;
             const cardRes = realMi?.resolution || info.resolution;
             const isFav = !!watchlist[item.name];
@@ -2399,6 +2485,7 @@ const styles = StyleSheet.create({
   cwImageWrap: { width: '100%', height: 106, backgroundColor: '#191D26', position: 'relative' },
   cwImage: { width: '100%', height: '100%' },
   cwFallback: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  cwRemoveBtn: { position: 'absolute', top: 6, right: 6, width: 24, height: 24, borderRadius: 12, backgroundColor: 'rgba(0,0,0,0.78)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.28)', alignItems: 'center', justifyContent: 'center', zIndex: 10 },
   cwPlayBadge: { position: 'absolute', right: 8, bottom: 10, width: 28, height: 28, borderRadius: 14, backgroundColor: 'rgba(229,9,20,0.92)', alignItems: 'center', justifyContent: 'center' },
   cwFooter: { paddingHorizontal: 9, paddingVertical: 7 },
   cwTitle: { color: 'white', fontSize: 13, fontWeight: '700' },

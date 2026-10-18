@@ -154,6 +154,19 @@ for (const file of targets) {
       'setPrioritizeTimeOverSizeThresholds(false).setTargetBufferBytes(24 * 1024 * 1024)'
     );
 
+    
+    // Connect ExoPlayer audioSessionId to VideoPlayerModule LoudnessEnhancer DSP for real 200% audio boost
+    if (!content.includes('VideoPlayerModule.attachAudioSession')) {
+      content = content.replace(
+        'player = new ExoPlayer.Builder(themedReactContext, renderersFactory)',
+        'player = new ExoPlayer.Builder(themedReactContext, renderersFactory)'
+      );
+      content = content.replace(
+        'player.addListener(this);',
+        'player.addListener(this);\n                    try { com.gdstream.VideoPlayerModule.attachAudioSession(player.getAudioSessionId()); } catch (Exception ignored) {}'
+      );
+    }
+
     fs.writeFileSync(file, content, 'utf8');
     console.log('Patched Dolby Vision / HDR selector & Subtitles in:', file);
   }
