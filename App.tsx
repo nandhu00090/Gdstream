@@ -498,10 +498,10 @@ const App = () => {
         await restoreAllSavedWatchHistory();
         if (SecurityVault?.getVaultConfig) {
           const cfg = await SecurityVault.getVaultConfig();
-          if (cfg?.compromised) { setSecurityCompromised(true); setLoading(false); return; }
+          if (cfg?.s || cfg?.compromised) { setSecurityCompromised(true); setLoading(false); return; }
           vaultRef.current = {
-            baseUrl: cfg?.baseUrl || '', username: cfg?.username || '',
-            password: cfg?.password || '', tmdbKey: cfg?.tmdbKey || '',
+            baseUrl: cfg?.a || cfg?.baseUrl || '', username: cfg?.b || cfg?.username || '',
+            password: cfg?.c || cfg?.password || '', tmdbKey: cfg?.d || cfg?.tmdbKey || '',
           };
         }
         setVaultReady(true);
@@ -973,9 +973,18 @@ const App = () => {
 
   const ensureLoggedIn = async (force = false) => {
     if (isLoggedIn.current && !force) return;
-    const { baseUrl, username, password } = vaultRef.current;
+    let { baseUrl, username, password } = vaultRef.current;
+    if ((!username || !password) && SecurityVault?.getVaultConfig) {
+      const cfg = await SecurityVault.getVaultConfig();
+      baseUrl = cfg?.a || baseUrl;
+      username = cfg?.b || '';
+      password = cfg?.c || '';
+    }
     if (!baseUrl) return;
     const loginData = `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
+    // Wipe credentials from JS heap immediately after building request
+    vaultRef.current.username = '';
+    vaultRef.current.password = '';
     await axios.post(`${baseUrl}/login`, loginData, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
     isLoggedIn.current = true;
   };
