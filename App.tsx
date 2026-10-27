@@ -971,33 +971,16 @@ const App = () => {
     return () => sub.remove();
   }, [playMode, showControls, activeMenu, triggerStepSeek]);
 
-  const ensureLoggedIn = async (force = false) => {
-    if (isLoggedIn.current && !force) return;
-    let { baseUrl, username, password } = vaultRef.current;
-    if ((!username || !password) && SecurityVault?.getVaultConfig) {
-      const cfg = await SecurityVault.getVaultConfig();
-      baseUrl = cfg?.a || baseUrl;
-      username = cfg?.b || '';
-      password = cfg?.c || '';
-    }
-    if (!baseUrl) return;
-    const loginData = `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
-    // Wipe credentials from JS heap immediately after building request
-    vaultRef.current.username = '';
-    vaultRef.current.password = '';
-    await axios.post(`${baseUrl}/login`, loginData, { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-    isLoggedIn.current = true;
-  };
-
   const requestRawDirectory = async (path: string) => {
-    const { baseUrl } = vaultRef.current;
-    await ensureLoggedIn(false);
-    let response = await axios.post(`${baseUrl}${path}`, { page_index: 0 });
-    if (!response.data?.data?.files) {
-      await ensureLoggedIn(true);
-      response = await axios.post(`${baseUrl}${path}`, { page_index: 0 });
+    if (SecurityVault?.securePostDirectory) {
+      const rawJson = await SecurityVault.securePostDirectory(path, 0);
+      if (rawJson) {
+        const parsed = JSON.parse(rawJson);
+        return parsed?.data?.files || [];
+      }
+      return [];
     }
-    return response.data?.data?.files || [];
+    return [];
   };
 
   const fetchDirectory = async (path: string, isPullRefresh = false, isSeasonSwitch = false) => {
