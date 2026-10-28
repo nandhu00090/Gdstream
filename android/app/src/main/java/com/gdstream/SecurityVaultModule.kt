@@ -603,7 +603,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             }
 
             UiThreadUtil.runOnUiThread {
-                val activity = currentActivity
+                val activity: android.app.Activity? = reactContext.currentActivity
                 if (activity == null || activity.isFinishing) {
                     promise.reject("E_ACT", "Activity unavailable")
                     return@runOnUiThread
