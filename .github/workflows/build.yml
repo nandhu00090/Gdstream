@@ -6,6 +6,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -50,3 +53,21 @@ jobs:
         with:
           name: GDStream-App
           path: android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Publish APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: "GDStream v1.0.${{ github.run_number }} (Latest Build)"
+          body: |
+            ### 🛡️ GDStream Official Release (Build #${{ github.run_number }})
+            - **Commit:** ${{ github.event.head_commit.message }}
+            - **Security:** 12-Layer Native C++ NDK Shield + Cloudflare Hardware Lock
+            - Direct APK download below 👇
+          files: |
+            android/app/build/outputs/apk/release/*.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
