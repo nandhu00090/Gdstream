@@ -278,6 +278,35 @@ const parseSubtitleFile = (raw: string) => {
   return cues;
 };
 
+const normalizeAudioTrackSpec = (rawSpec: string, index: number, allSpecs: string[], fileName: string): string => {
+  if (!rawSpec) return '';
+  let spec = rawSpec;
+  const brMatch = spec.match(/(\d+)\s*kbps/i);
+  const kbps = brMatch ? parseInt(brMatch[1], 10) : 0;
+
+  if (kbps > 0 && kbps < 384) {
+    spec = spec
+      .replace(/Dolby Atmos \(DD\+\)/gi, 'Dolby Digital Plus (DD+)')
+      .replace(/Dolby Digital Plus with Dolby Atmos/gi, 'Dolby Digital Plus (DD+)')
+      .replace(/\bAtmos\b/gi, 'DD+');
+    return spec;
+  }
+
+  if (allSpecs.length > 1 && /Atmos/i.test(spec)) {
+    const allKbps = allSpecs.map(s => {
+      const m = s.match(/(\d+)\s*kbps/i);
+      return m ? parseInt(m[1], 10) : 0;
+    });
+    const maxKbps = Math.max(...allKbps);
+    if (maxKbps >= 448 && kbps > 0 && kbps < maxKbps) {
+      spec = spec
+        .replace(/Dolby Atmos \(DD\+\)/gi, 'Dolby Digital Plus (DD+)')
+        .replace(/Dolby Digital Plus with Dolby Atmos/gi, 'Dolby Digital Plus (DD+)');
+    }
+  }
+  return spec;
+};
+
 const App = () => {
   const vaultRef = useRef<{ baseUrl: string; username: string; password: string; tmdbKey: string }>({
     baseUrl: '', username: '', password: '', tmdbKey: '',
@@ -2139,7 +2168,7 @@ const App = () => {
                             {vMi.hasAtmos
                               ? at.summary
                                   .replace('Dolby TrueHD', 'Dolby TrueHD with Dolby Atmos')
-                                  .replace('Dolby Digital Plus (DD+)', 'Dolby Digital Plus with Dolby Atmos')
+                                  .replace('Dolby Digital Plus (DD+)', 'Dolby Digital Plus (DD+)')
                               : at.summary}
                           </Text>
                         </View>
