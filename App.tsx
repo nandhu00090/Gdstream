@@ -351,6 +351,130 @@ const App = () => {
   const [playerInstanceKey, setPlayerInstanceKey] = useState(0);
 
   const [selectedFile, setSelectedFile] = useState<any>(null);
+
+  const [episodeTmdbMeta, setEpisodeTmdbMeta] = React.useState<{
+    rating: string | null;
+    overview: string | null;
+    epTitle: string | null;
+    code: string | null;
+  } | null>(null);
+
+  const [trailerState, setTrailerState] = React.useState<{
+    loading: boolean;
+    videoId: string | null;
+    title: string;
+  }>({ loading: false, videoId: null, title: '' });
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const rawName = (typeof selectedFile !== 'undefined' && selectedFile?.name) ? String(selectedFile.name) : '';
+    if (!rawName) {
+      setEpisodeTmdbMeta(null);
+      setTrailerState({ loading: false, videoId: null, title: '' });
+      return;
+    }
+
+    const fetchEpisodeAndTrailer = async () => {
+      const tmdbKey = vaultRef.current?.tmdbKey || '';
+      // Detect Series Episode pattern (e.g. S01E02, 1x02)
+      const epMatch = rawName.match(/(?:[.\s_-]|\b)S(\d{1,2})[\s._-]*E(\d{1,3})\b/i)
+        || rawName.match(/\b(\d{1,2})x(\d{1,3})\b/i);
+
+      const yearMatch = rawName.match(/\b(19\d{2}|20\d{2})\b/);
+      const year = yearMatch ? yearMatch[1] : '';
+
+      const cutIdx = epMatch?.index
+        ?? rawName.search(/\b(19\d{2}|20\d{2}|2160p|1080p|720p|480p|4K|WEB-DL|WEBRip|BluRay|HDRip|HEVC|x264|x265)\b/i);
+      const rawTitlePart = cutIdx > 0 ? rawName.slice(0, cutIdx) : rawName.replace(/\.[^.]+$/, '');
+      const cleanTitle = rawTitlePart.replace(/[._-]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+      setTrailerState({ loading: true, videoId: null, title: cleanTitle || 'Movie' });
+      if (!epMatch) {
+        setEpisodeTmdbMeta(null);
+      }
+
+      let foundTrailerKey: string | null = null;
+
+      try {
+        if (tmdbKey && cleanTitle) {
+          if (epMatch) {
+            const sNum = parseInt(epMatch[1], 10);
+            const eNum = parseInt(epMatch[2], 10);
+            const codeStr = `S${String(sNum).padStart(2, '0')}E${String(eNum).padStart(2, '0')}`;
+
+            const tvSearchUrl = `https://api.themoviedb.org/3/search/tv?api_key=${tmdbKey}&query=${encodeURIComponent(cleanTitle)}`;
+            const tvRes = await fetch(tvSearchUrl).then(r => r.json());
+            const tvId = tvRes?.results?.[0]?.id;
+
+            if (tvId && !cancelled) {
+              // Fetch Individual Episode Rating & Overview from TMDb
+              try {
+                const epUrl = `https://api.themoviedb.org/3/tv/${tvId}/season/${sNum}/episode/${eNum}?api_key=${tmdbKey}`;
+                const epData = await fetch(epUrl).then(r => r.json());
+                if (!cancelled && epData && (epData.vote_average || epData.overview || epData.name)) {
+                  setEpisodeTmdbMeta({
+                    rating: epData.vote_average > 0 ? Number(epData.vote_average).toFixed(1) : null,
+                    overview: epData.overview || null,
+                    epTitle: epData.name || null,
+                    code: codeStr,
+                  });
+                }
+              } catch (_e) {}
+
+              // Fetch Series / Season Trailer from TMDb
+              try {
+                const vidUrl = `https://api.themoviedb.org/3/tv/${tvId}/videos?api_key=${tmdbKey}`;
+                const vidData = await fetch(vidUrl).then(r => r.json());
+                const ytList = (vidData?.results || []).filter((v: any) => v.site === 'YouTube' && v.key);
+                const best = ytList.find((v: any) => v.type === 'Trailer' && v.official)
+                  || ytList.find((v: any) => v.type === 'Trailer')
+                  || ytList.find((v: any) => v.type === 'Teaser')
+                  || ytList[0];
+                if (best?.key) foundTrailerKey = best.key;
+              } catch (_e) {}
+            }
+          } else {
+            // Movie Trailer Lookup from TMDb
+            const mvSearchUrl = `https://api.themoviedb.org/3/search/movie?api_key=${tmdbKey}&query=${encodeURIComponent(cleanTitle)}${year ? '&year=' + year : ''}`;
+            const mvRes = await fetch(mvSearchUrl).then(r => r.json());
+            const movieId = mvRes?.results?.[0]?.id;
+            if (movieId && !cancelled) {
+              try {
+                const vidUrl = `https://api.themoviedb.org/3/movie/${movieId}/videos?api_key=${tmdbKey}`;
+                const vidData = await fetch(vidUrl).then(r => r.json());
+                const ytList = (vidData?.results || []).filter((v: any) => v.site === 'YouTube' && v.key);
+                const best = ytList.find((v: any) => v.type === 'Trailer' && v.official)
+                  || ytList.find((v: any) => v.type === 'Trailer')
+                  || ytList.find((v: any) => v.type === 'Teaser')
+                  || ytList[0];
+                if (best?.key) foundTrailerKey = best.key;
+              } catch (_e) {}
+            }
+          }
+        }
+
+        // Fallback to Native YouTube InnerTube Trailer Finder if TMDb /videos had no link
+        if (!foundTrailerKey && !cancelled && SecurityVault?.findYoutubeTrailerId && cleanTitle) {
+          const fallbackId = await SecurityVault.findYoutubeTrailerId(`${cleanTitle} ${year}`.trim());
+          if (fallbackId && fallbackId.length === 11) {
+            foundTrailerKey = fallbackId;
+          }
+        }
+      } catch (_err) {}
+
+      if (!cancelled) {
+        setTrailerState({
+          loading: false,
+          videoId: foundTrailerKey,
+          title: cleanTitle || 'Trailer',
+        });
+      }
+    };
+
+    fetchEpisodeAndTrailer();
+    return () => { cancelled = true; };
+  }, [selectedFile?.id, selectedFile?.name]);
+
   const selectedFileRef = useRef<any>(null);
   useEffect(() => { selectedFileRef.current = selectedFile; }, [selectedFile]);
   const [versionGroup, setVersionGroup] = useState<any[]>([]);
@@ -2029,7 +2153,7 @@ const App = () => {
             </View>
           )}
 
-          {!!meta?.overview && <Text style={styles.detailOverview}>{meta.overview}</Text>}
+          {!!meta?.overview && <Text style={styles.detailOverview}>{episodeTmdbMeta?.overview || meta.overview}</Text>}
 
           {versionGroup.length > 1 && (
             <View style={styles.versionSelectorBox}>
@@ -2122,7 +2246,71 @@ const App = () => {
 
           {/* Single MediaInfo Card for Currently Selected Version Only */}
           <View style={styles.mediaInfoCard}>
-            <View style={styles.mediaInfoHeaderRow}>
+            
+              {episodeTmdbMeta && (episodeTmdbMeta.rating || episodeTmdbMeta.epTitle || episodeTmdbMeta.overview) && (
+                <View style={{
+                  backgroundColor: '#12131A',
+                  borderColor: '#F59E0B',
+                  borderWidth: 1,
+                  borderRadius: 10,
+                  padding: 12,
+                  marginBottom: 12,
+                }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: episodeTmdbMeta.overview ? 6 : 0 }}>
+                    <Text style={{ color: '#FBBF24', fontWeight: 'bold', fontSize: 13 }}>
+                      {episodeTmdbMeta.code}{episodeTmdbMeta.epTitle ? ` • ${episodeTmdbMeta.epTitle}` : ''}
+                    </Text>
+                    {episodeTmdbMeta.rating && (
+                      <View style={{ backgroundColor: '#292524', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, borderWidth: 1, borderColor: '#F59E0B' }}>
+                        <Text style={{ color: '#FBBF24', fontWeight: 'bold', fontSize: 12 }}>
+                          ★ {episodeTmdbMeta.rating} / 10 (Episode Rating)
+                        </Text>
+                      </View>
+                    )}
+                  </View>
+                  {episodeTmdbMeta.overview ? (
+                    <Text style={{ color: '#D1D5DB', fontSize: 12, lineHeight: 18 }}>
+                      {episodeTmdbMeta.overview}
+                    </Text>
+                  ) : null}
+                </View>
+              )}
+
+              <TouchableOpacity
+                disabled={trailerState.loading || !trailerState.videoId}
+                onPress={() => {
+                  if (trailerState.videoId && SecurityVault?.playYoutubeTrailer) {
+                    SecurityVault.playYoutubeTrailer(trailerState.videoId, trailerState.title);
+                  }
+                }}
+                style={{
+                  backgroundColor: trailerState.videoId ? '#1E1B2E' : '#141418',
+                  borderColor: trailerState.videoId ? '#A855F7' : '#27272A',
+                  borderWidth: 1,
+                  borderRadius: 10,
+                  paddingVertical: 13,
+                  paddingHorizontal: 16,
+                  marginBottom: 14,
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  opacity: (trailerState.loading || !trailerState.videoId) ? 0.42 : 1,
+                }}
+              >
+                <Text style={{
+                  color: trailerState.videoId ? '#E9D5FF' : '#71717A',
+                  fontWeight: 'bold',
+                  fontSize: 14,
+                }}>
+                  {trailerState.loading
+                    ? '⏳ Checking Official Trailer...'
+                    : trailerState.videoId
+                    ? '🎬 Watch Official Trailer (Ad-Free • 4K / 1080p)'
+                    : '🎬 Trailer Unavailable'}
+                </Text>
+              </TouchableOpacity>
+
+              <View style={styles.mediaInfoHeaderRow}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flex: 1 }}>
                 <Icon name="memory" size={16} color="#E50914" />
                 <Text style={[styles.mediaInfoHeaderTitle, { color: '#FFF' }]}>
