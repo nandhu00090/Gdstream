@@ -433,33 +433,90 @@ const App = () => {
   }, [typeof files !== 'undefined' ? files?.length : 0]);
 
   
-  const formatHomeSeriesBadge = (rawSeasonTag: string | null | undefined, cleanTitle: string | null | undefined, overallRating: string | number | null | undefined): string => {
-    const tagStr = String(rawSeasonTag || '').trim();
-    const isEpDetailCode = /S\d{1,2}E\d{1,3}/i.test(tagStr);
-    if (isEpDetailCode) return tagStr.toUpperCase();
+  const seriesMetaCacheRef = React.useRef<Record<string, { maxSeasons: number; rating: string }>>({});
+  const seriesPendingRef = React.useRef<Set<string>>(new Set());
+  const [, forceSeriesBadgeUpdate] = React.useState(0);
 
-    const meta = ensureSeriesMetaLoaded(String(cleanTitle || ''));
-    const cleanKey = String(cleanTitle || '')
-      .replace(/\b(19\d{2}|20\d{2}|S\d{1,2}.*)\b/gi, '')
-      .replace(/[._-]+/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toUpperCase();
+  const ensureSeriesMetaLoaded = (itemObj: any, infoObj: any) => {
+    const searchName = String(infoObj?.searchTitle || infoObj?.cleanTitle || itemObj?.name || '').trim();
+    const cleanKey = searchName.toUpperCase();
+    if (!cleanKey || cleanKey.length < 2) return null;
+    if (seriesMetaCacheRef.current[cleanKey]) {
+      return seriesMetaCacheRef.current[cleanKey];
+    }
+    if (seriesPendingRef.current.has(cleanKey)) return null;
 
-    const sMatch = tagStr.match(/S(\d{1,2})/i);
-    const curS = sMatch ? parseInt(sMatch[1], 10) : 1;
+    seriesPendingRef.current.add(cleanKey);
+    setTimeout(async () => {
+      let maxS = 1;
+      let tmdbRating = '';
+
+      // A. If this Homepage item is a Series Folder on Google Drive, inspect its actual season subfolders!
+      try {
+        if (itemObj?.mimeType?.includes('folder') && itemObj?.name) {
+          const subPath = `/${encodeURIComponent(itemObj.name)}/`;
+          const subFiles = await requestRawDirectory(subPath);
+          if (Array.isArray(subFiles) && subFiles.length > 0) {
+            let folderSeasonCount = 0;
+            for (const sf of subFiles) {
+              const sNum = extractSeasonNumberFromFolder(String(sf?.name || ''));
+              if (sNum !== null && sNum > 0) {
+                folderSeasonCount = Math.max(folderSeasonCount, sNum);
+              }
+            }
+            if (folderSeasonCount > maxS) maxS = folderSeasonCount;
+          }
+        }
+      } catch (_e) {}
+
+      // B. Also check TMDb /search/tv -> /tv/{id} for total seasons & overall series rating
+      try {
+        const tmdbKey = vaultRef.current?.tmdbKey || '';
+        if (tmdbKey) {
+          const sUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(searchName)}`;
+          const sData = await fetch(sUrl).then(r => r.json());
+          const first = sData?.results?.[0];
+          if (first?.id) {
+            const dUrl = `https://api.themoviedb.org/3/tv/${first.id}?api_key=${encodeURIComponent(tmdbKey)}`;
+            const dData = await fetch(dUrl).then(r => r.json());
+            const numSeasons = Number(dData?.number_of_seasons || 0);
+            if (numSeasons > maxS) maxS = numSeasons;
+            const voteAvg = Number(dData?.vote_average || first?.vote_average || 0);
+            if (voteAvg > 0) tmdbRating = voteAvg.toFixed(1);
+          }
+        }
+      } catch (_e) {}
+
+      seriesMetaCacheRef.current[cleanKey] = {
+        maxSeasons: maxS,
+        rating: tmdbRating,
+      };
+      setSeriesMaxSeasonMap(prev => ({ ...prev, [cleanKey]: maxS }));
+      forceSeriesBadgeUpdate(v => v + 1);
+    }, 20);
+
+    return null;
+  };
+
+  const getHomeSeriesBadgeText = (itemObj: any, infoObj: any, metaObj: any): { text: string; isRating: boolean } => {
+    const cached = ensureSeriesMetaLoaded(itemObj, infoObj);
+    const cleanKey = String(infoObj?.searchTitle || infoObj?.cleanTitle || '').trim().toUpperCase();
     const mappedS = (cleanKey && seriesMaxSeasonMap[cleanKey]) ? seriesMaxSeasonMap[cleanKey] : 0;
-    const totalS = Math.max(meta?.maxSeasons || 0, mappedS, curS);
+
+    const rawTag = String(infoObj?.seasonEpisode || 'S01');
+    const sMatch = rawTag.match(/S(\d{1,2})/i);
+    const curS = sMatch ? parseInt(sMatch[1], 10) : 1;
+    const totalS = Math.max(cached?.maxSeasons || 0, mappedS, curS);
 
     const seasonRangeText = totalS > 1
       ? `S01-S${String(totalS).padStart(2, '0')}`
       : `S${String(curS).padStart(2, '0')}`;
 
-    const effectiveRating = overallRating || meta?.rating || '';
-    if (effectiveRating && showSeriesRatingTick) {
-      return `★ ${effectiveRating}`;
+    const ratingVal = metaObj?.rating || cached?.rating || '';
+    if (ratingVal && showSeriesRatingTick) {
+      return { text: `★ ${ratingVal}`, isRating: true };
     }
-    return seasonRangeText;
+    return { text: seasonRangeText, isRating: false };
   };
 
   const [episodeTmdbMeta, setEpisodeTmdbMeta] = React.useState<{
@@ -477,48 +534,6 @@ const App = () => {
     title: string;
   }>({ loading: false, available: false, cacheKey: '', bestQuality: '', title: '' });
 
-  const seriesMetaCacheRef = React.useRef<Record<string, { maxSeasons: number; rating: string }>>({});
-  const seriesPendingRef = React.useRef<Set<string>>(new Set());
-  const [, forceSeriesBadgeUpdate] = React.useState(0);
-
-  const ensureSeriesMetaLoaded = (rawTitle: string) => {
-    const cleanKey = String(rawTitle || '')
-      .replace(/\b(19\d{2}|20\d{2}|S\d{1,2}.*)\b/gi, '')
-      .replace(/[._-]+/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toUpperCase();
-    if (!cleanKey || cleanKey.length < 2) return null;
-    if (seriesMetaCacheRef.current[cleanKey]) {
-      return seriesMetaCacheRef.current[cleanKey];
-    }
-    if (seriesPendingRef.current.has(cleanKey)) return null;
-    const tmdbKey = vaultRef.current?.tmdbKey || '';
-    if (!tmdbKey) return null;
-
-    seriesPendingRef.current.add(cleanKey);
-    setTimeout(async () => {
-      try {
-        const sUrl = `https://api.themoviedb.org/3/search/tv?api_key=${tmdbKey}&query=${encodeURIComponent(cleanKey)}`;
-        const sData = await fetch(sUrl).then(r => r.json());
-        const first = sData?.results?.[0];
-        if (first?.id) {
-          const dUrl = `https://api.themoviedb.org/3/tv/${first.id}?api_key=${tmdbKey}`;
-          const dData = await fetch(dUrl).then(r => r.json());
-          const numSeasons = Math.max(1, Number(dData?.number_of_seasons || 1));
-          const voteAvg = Number(dData?.vote_average || first?.vote_average || 0);
-          seriesMetaCacheRef.current[cleanKey] = {
-            maxSeasons: numSeasons,
-            rating: voteAvg > 0 ? voteAvg.toFixed(1) : '',
-          };
-          setSeriesMaxSeasonMap(prev => ({ ...prev, [cleanKey]: numSeasons }));
-          forceSeriesBadgeUpdate(v => v + 1);
-        }
-      } catch (_e) {}
-    }, 10);
-    return null;
-  };
-
   React.useEffect(() => {
     let cancelled = false;
     const rawName = (typeof selectedFile !== 'undefined' && selectedFile?.name) ? String(selectedFile.name) : '';
@@ -530,20 +545,19 @@ const App = () => {
 
     const fetchEpisodeAndVerifiedTrailer = async () => {
       const tmdbKey = vaultRef.current?.tmdbKey || '';
+      const parsed = parseMediaFilename(rawName, false);
       const epMatch = rawName.match(/(?:[.\s_-]|\b)S(\d{1,2})[\s._-]*E(\d{1,3})\b/i)
-        || rawName.match(/\b(\d{1,2})x(\d{1,3})\b/i);
+        || (parsed.seasonEpisode ? parsed.seasonEpisode.match(/S(\d{1,2})E(\d{1,3})/i) : null);
 
-      const yearMatch = rawName.match(/\b(19\d{2}|20\d{2})\b/);
-      const year = yearMatch ? yearMatch[1] : '';
+      const isSeriesEp = Boolean(epMatch || parsed.episodeNum > 0 || seasonFolders.length > 0);
+      const searchTitle = (isSeriesEp && seriesParentTitle)
+        ? seriesParentTitle
+        : (parsed.searchTitle || parsed.cleanTitle || rawName.replace(/\.[^.]+$/, ''));
+      const year = parsed.year || '';
+      const cacheKey = `${searchTitle}_${year}_${isSeriesEp ? 'tv' : 'mv'}`.toLowerCase();
 
-      const cutIdx = epMatch?.index
-        ?? rawName.search(/\b(19\d{2}|20\d{2}|2160p|1080p|720p|480p|4K|WEB-DL|WEBRip|BluRay|HDRip|HEVC|x264|x265)\b/i);
-      const rawTitlePart = cutIdx > 0 ? rawName.slice(0, cutIdx) : rawName.replace(/\.[^.]+$/, '');
-      const cleanTitle = rawTitlePart.replace(/[._-]+/g, ' ').replace(/\s+/g, ' ').trim();
-      const cacheKey = `${cleanTitle}_${year}_${epMatch ? 'tv' : 'mv'}`.toLowerCase();
-
-      setTrailerState({ loading: true, available: false, cacheKey, bestQuality: '', title: cleanTitle || 'Official Trailer' });
-      if (!epMatch) {
+      setTrailerState({ loading: true, available: false, cacheKey, bestQuality: '', title: searchTitle || 'Official Trailer' });
+      if (!isSeriesEp) {
         setEpisodeTmdbMeta(null);
       }
 
@@ -551,19 +565,20 @@ const App = () => {
       let imdbId = '';
 
       try {
-        if (tmdbKey && cleanTitle) {
-          if (epMatch) {
-            const sNum = parseInt(epMatch[1], 10);
-            const eNum = parseInt(epMatch[2], 10);
+        if (tmdbKey && searchTitle) {
+          if (isSeriesEp) {
+            const sNum = epMatch ? parseInt(epMatch[1], 10) : (activeSeason?.seasonNum || 1);
+            const eNum = epMatch ? parseInt(epMatch[2], 10) : (parsed.episodeNum || 1);
             const codeStr = `S${String(sNum).padStart(2, '0')}E${String(eNum).padStart(2, '0')}`;
 
-            const tvSearchUrl = `https://api.themoviedb.org/3/search/tv?api_key=${tmdbKey}&query=${encodeURIComponent(cleanTitle)}`;
+            const tvSearchUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(searchTitle)}`;
             const tvRes = await fetch(tvSearchUrl).then(r => r.json());
             const tvId = tvRes?.results?.[0]?.id;
 
             if (tvId && !cancelled) {
+              // 1. Fetch Individual Episode Rating & Overview from TMDb
               try {
-                const epUrl = `https://api.themoviedb.org/3/tv/${tvId}/season/${sNum}/episode/${eNum}?api_key=${tmdbKey}`;
+                const epUrl = `https://api.themoviedb.org/3/tv/${tvId}/season/${sNum}/episode/${eNum}?api_key=${encodeURIComponent(tmdbKey)}`;
                 const epData = await fetch(epUrl).then(r => r.json());
                 if (!cancelled && epData && (epData.vote_average || epData.overview || epData.name)) {
                   setEpisodeTmdbMeta({
@@ -575,50 +590,54 @@ const App = () => {
                 }
               } catch (_e) {}
 
+              // 2. Fetch Series IMDb ID & Official Trailer Videos from TMDb
               try {
-                const extUrl = `https://api.themoviedb.org/3/tv/${tvId}/external_ids?api_key=${tmdbKey}`;
-                const extData = await fetch(extUrl).then(r => r.json());
-                if (extData?.imdb_id) imdbId = String(extData.imdb_id);
-              } catch (_e) {}
-
-              try {
-                const vidUrl = `https://api.themoviedb.org/3/tv/${tvId}/videos?api_key=${tmdbKey}`;
-                const vidData = await fetch(vidUrl).then(r => r.json());
-                // Strictly accept ONLY Official Trailers (Never Teasers, Featurettes, or Clips!)
-                const ytTrailers = (vidData?.results || []).filter(
-                  (v: any) => v.site === 'YouTube' && v.key && v.type === 'Trailer'
+                const tvDetailUrl = `https://api.themoviedb.org/3/tv/${tvId}?api_key=${encodeURIComponent(tmdbKey)}&append_to_response=videos,external_ids`;
+                const tvDetail = await fetch(tvDetailUrl).then(r => r.json());
+                imdbId = tvDetail?.external_ids?.imdb_id || '';
+                const vids = (tvDetail?.videos?.results || []).filter(
+                  (v: any) => v.site === 'YouTube' && v.key && (v.type === 'Trailer' || v.type === 'Teaser')
                 );
-                ytTrailers.sort((a: any, b: any) => (b.official ? 1 : 0) - (a.official ? 1 : 0));
-                for (const t of ytTrailers) {
-                  if (t.key && !tmdbYtKeys.includes(t.key)) tmdbYtKeys.push(t.key);
+                vids.sort((a: any, b: any) => {
+                  const aScore = (a.type === 'Trailer' ? 10 : 0) + (a.official ? 5 : 0);
+                  const bScore = (b.type === 'Trailer' ? 10 : 0) + (b.official ? 5 : 0);
+                  return bScore - aScore;
+                });
+                for (const v of vids) {
+                  if (v.key && !tmdbYtKeys.includes(v.key)) tmdbYtKeys.push(v.key);
                 }
               } catch (_e) {}
             }
           } else {
-            const mvSearchUrl = `https://api.themoviedb.org/3/search/movie?api_key=${tmdbKey}&query=${encodeURIComponent(cleanTitle)}${year ? '&year=' + year : ''}`;
+            // Movie TMDb Lookup
+            const mvSearchUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(searchTitle)}${year ? '&year=' + year : ''}`;
             const mvRes = await fetch(mvSearchUrl).then(r => r.json());
             const movieId = mvRes?.results?.[0]?.id;
             if (movieId && !cancelled) {
               try {
-                const mvDetailUrl = `https://api.themoviedb.org/3/movie/${movieId}?api_key=${tmdbKey}&append_to_response=videos,external_ids`;
+                const mvDetailUrl = `https://api.themoviedb.org/3/movie/${movieId}?api_key=${encodeURIComponent(tmdbKey)}&append_to_response=videos,external_ids`;
                 const mvDetail = await fetch(mvDetailUrl).then(r => r.json());
                 imdbId = mvDetail?.imdb_id || mvDetail?.external_ids?.imdb_id || '';
-                const ytTrailers = (mvDetail?.videos?.results || []).filter(
-                  (v: any) => v.site === 'YouTube' && v.key && v.type === 'Trailer'
+                const vids = (mvDetail?.videos?.results || []).filter(
+                  (v: any) => v.site === 'YouTube' && v.key && (v.type === 'Trailer' || v.type === 'Teaser')
                 );
-                ytTrailers.sort((a: any, b: any) => (b.official ? 1 : 0) - (a.official ? 1 : 0));
-                for (const t of ytTrailers) {
-                  if (t.key && !tmdbYtKeys.includes(t.key)) tmdbYtKeys.push(t.key);
+                vids.sort((a: any, b: any) => {
+                  const aScore = (a.type === 'Trailer' ? 10 : 0) + (a.official ? 5 : 0);
+                  const bScore = (b.type === 'Trailer' ? 10 : 0) + (b.official ? 5 : 0);
+                  return bScore - aScore;
+                });
+                for (const v of vids) {
+                  if (v.key && !tmdbYtKeys.includes(v.key)) tmdbYtKeys.push(v.key);
                 }
               } catch (_e) {}
             }
           }
         }
 
-        if (!cancelled && SecurityVault?.resolveVerifiedTrailer && cleanTitle) {
+        if (!cancelled && SecurityVault?.resolveVerifiedTrailer && searchTitle) {
           const verified = await SecurityVault.resolveVerifiedTrailer(
             cacheKey,
-            cleanTitle,
+            searchTitle,
             year,
             imdbId,
             JSON.stringify(tmdbYtKeys)
@@ -629,7 +648,7 @@ const App = () => {
               available: Boolean(verified?.available),
               cacheKey: verified?.cacheKey || cacheKey,
               bestQuality: verified?.bestQuality || '1080p FHD',
-              title: cleanTitle || 'Official Trailer',
+              title: searchTitle || 'Official Trailer',
             });
             return;
           }
@@ -642,7 +661,7 @@ const App = () => {
           available: false,
           cacheKey,
           bestQuality: '',
-          title: cleanTitle || 'Official Trailer',
+          title: searchTitle || 'Official Trailer',
         });
       }
     };
@@ -1730,12 +1749,12 @@ const App = () => {
                 const isSelected = activeSeason?.seasonNum === sItem.seasonNum;
                 return (
                   <FocusableButton
-                    key={formatHomeSeriesBadge(sItem.seasonNum, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}
+                    key={sItem.seasonNum}
                     hasTVPreferredFocus={isSelected}
                     style={[styles.seasonOptionItem, isSelected && styles.seasonOptionItemActive]}
                     onPress={() => handleSelectSeason(sItem)}>
-                    <View style={formatHomeSeriesBadge(styles.seasonNumberCircle, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}>
-                      <Text style={formatHomeSeriesBadge(styles.seasonNumberText, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}>S{sItem.seasonNum < 10 ? `0${formatHomeSeriesBadge(sItem.seasonNum, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}` : sItem.seasonNum}</Text>
+                    <View style={styles.seasonNumberCircle}>
+                      <Text style={styles.seasonNumberText}>S{sItem.seasonNum < 10 ? `0${sItem.seasonNum}` : sItem.seasonNum}</Text>
                     </View>
                     <View style={{ flex: 1 }}>
                       <Text style={[styles.hdrOptionTitle, isSelected && { color: '#E50914' }]}>{sItem.label}</Text>
@@ -1830,7 +1849,7 @@ const App = () => {
                     <Icon name={isCurrent ? 'play-circle-fill' : 'play-circle-outline'} size={22} color={isCurrent ? '#E50914' : '#AAA'} />
                     <View style={{ flex: 1, marginLeft: 10 }}>
                       <Text style={[styles.menuItemText, { marginLeft: 0 }, isCurrent && { color: '#E50914', fontWeight: '800' }]} numberOfLines={1}>
-                        {epInfo.seasonEpisode ? `${formatHomeSeriesBadge(epInfo.seasonEpisode, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)} • ${epInfo.cleanTitle}` : ep.name}
+                        {epInfo.seasonEpisode ? `${epInfo.seasonEpisode} • ${epInfo.cleanTitle}` : ep.name}
                       </Text>
                       <Text style={{ color: '#7D8799', fontSize: 11 }} numberOfLines={1}>{ep.name}</Text>
                     </View>
@@ -2126,7 +2145,7 @@ const App = () => {
               <View style={styles.netflixTitleCenter}>
                 <Text style={styles.netflixMainTitle} numberOfLines={1}>{playerInfo.cleanTitle}</Text>
                 <View style={styles.netflixSubMetaRow}>
-                  {!!playerInfo.seasonEpisode && <Text style={styles.netflixEpisodeTag}>{formatHomeSeriesBadge(playerInfo.seasonEpisode, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}</Text>}
+                  {!!playerInfo.seasonEpisode && <Text style={styles.netflixEpisodeTag}>{playerInfo.seasonEpisode}</Text>}
                   {!!(realMi?.resolution || playerInfo.resolution) && (
                     <View style={styles.netflixMiniBadge}>
                       <Text style={styles.netflixMiniBadgeText}>{realMi?.resolution || playerInfo.resolution}</Text>
@@ -2300,7 +2319,7 @@ const App = () => {
               <Text style={styles.detailTitle}>{info.cleanTitle}</Text>
               <View style={styles.detailMetaRow}>
                 {!!(meta?.year || info.year) && <Text style={styles.detailYearText}>{meta?.year || info.year}</Text>}
-                {!!info.seasonEpisode && <View style={formatHomeSeriesBadge(styles.seasonBadge, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}><Text style={formatHomeSeriesBadge(styles.seasonBadgeText, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}>{formatHomeSeriesBadge(info.seasonEpisode, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}</Text></View>}
+                {!!info.seasonEpisode && <View style={styles.seasonBadge}><Text style={styles.seasonBadgeText}>{info.seasonEpisode}</Text></View>}
                 {!!(episodeTmdbMeta?.rating || meta?.rating) && <View style={styles.ratingBadge}><Text style={styles.ratingBadgeText}>★ {(episodeTmdbMeta?.rating || meta.rating)}</Text></View>}
                 {!!effectiveResolution && <View style={styles.qualityBadge}><Text style={styles.qualityBadgeText}>{effectiveResolution}</Text></View>}
               </View>
@@ -2688,9 +2707,16 @@ const App = () => {
           )}
 
           <View style={styles.posterTopBadges}>
-            {isFolder ? (
-              <View style={styles.folderPill}><Text style={styles.folderPillText}>{info.seasonEpisode || 'SERIES'}</Text></View>
-            ) : info.seasonEpisode ? (
+            {(isFolder || (!isInsideFolder && !!info.seasonEpisode)) ? (() => {
+              const badgeInfo = getHomeSeriesBadgeText(item, info, meta);
+              return (
+                <View style={badgeInfo.isRating ? styles.ratingPill : styles.folderPill}>
+                  <Text style={badgeInfo.isRating ? styles.ratingPillText : styles.folderPillText}>
+                    {badgeInfo.text}
+                  </Text>
+                </View>
+              );
+            })() : info.seasonEpisode ? (
               <View style={styles.folderPill}><Text style={styles.folderPillText}>{info.seasonEpisode}</Text></View>
             ) : meta?.rating ? (
               <View style={styles.ratingPill}><Text style={styles.ratingPillText}>★ {meta.rating}</Text></View>

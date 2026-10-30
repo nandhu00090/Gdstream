@@ -1,7 +1,9 @@
 package com.gdstream
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Dialog
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
@@ -20,6 +22,13 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowManager
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
@@ -72,15 +81,20 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     @Volatile
     private var sessionCookieHeader: String = ""
 
-    data class TrailerStreamOption(
+    data class DirectTrailerStream(
         val label: String,
         val height: Int,
-        val videoUrl: String,
-        val audioUrl: String,
-        val isMuxed: Boolean
+        val videoUrl: String
     )
 
-    private val verifiedTrailerCache = ConcurrentHashMap<String, List<TrailerStreamOption>>()
+    data class VerifiedTrailerInfo(
+        val engine: String, // "IMDB_DIRECT" or "YT_VERIFIED"
+        val videoId: String,
+        val directStreams: List<DirectTrailerStream>,
+        val maxQualityLabel: String
+    )
+
+    private val verifiedTrailerCache = ConcurrentHashMap<String, VerifiedTrailerInfo>()
 
     companion object {
         init {
@@ -363,20 +377,124 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // --- STAGE 1: IMDb Official Trailer CDN Extractor (Direct Amazon CloudFront MP4 / HLS, Zero Country Blocks, Zero Reviews!) ---
-    private fun fetchImdbOfficialTrailerStreams(imdbIdArg: String, title: String, year: String): List<TrailerStreamOption> {
+    // Strict filter to reject Movie Reviews, Public Talk, Reactions, Shorts, Songs, etc.
+    private fun isReviewOrJunkTitle(rawTitle: String): Boolean {
+        val t = rawTitle.lowercase(Locale.ROOT)
+        val junkWords = listOf(
+            "review", "reaction", "public talk", "public review", "public opinion",
+            "fdfs", "explained", "breakdown", "roast", "troll", "spoof", "parody",
+            "interview", "press meet", "audio launch", "success meet", "making",
+            "behind the scenes", "full movie", "jukebox", "lyrical", "video song",
+            "whatsapp status", "shorts", "#shorts", "top cinemas"
+        )
+        return junkWords.any { t.contains(it) }
+    }
+
+    // Verifies that a YouTube videoId is:
+    // 1. Not a review/reaction
+    // 2. Embeddable & public (via oEmbed HTTP 200 check)
+    // 3. Playable in India (gl: "IN") with status == "OK" and playableInEmbed == true
+    private fun verifyYoutubePlayableInIndia(videoId: String): String? {
+        try {
+            if (videoId.length != 11) return null
+
+            // Check 1: Fast oEmbed check (Rejects deleted, private, or embed-disabled videos immediately)
+            val oembedUrl = "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=$videoId&format=json"
+            val oConn = (URL(oembedUrl).openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
+                connectTimeout = 5000
+                readTimeout = 5000
+                requestMethod = "GET"
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            }
+            val oCode = oConn.responseCode
+            if (oCode !in 200..299) {
+                oConn.disconnect()
+                return null
+            }
+            val oJson = BufferedReader(InputStreamReader(oConn.inputStream, Charsets.UTF_8)).use { it.readText() }
+            oConn.disconnect()
+
+            val oObj = JSONObject(oJson)
+            val oTitle = oObj.optString("title", "")
+            val oAuthor = oObj.optString("author_name", "")
+            if (isReviewOrJunkTitle(oTitle) || isReviewOrJunkTitle(oAuthor)) {
+                return null
+            }
+
+            // Check 2: InnerTube WEB Player check with gl: "IN" (India) to catch country-blocked / age-restricted videos
+            val payload = JSONObject().apply {
+                put("context", JSONObject().apply {
+                    put("client", JSONObject().apply {
+                        put("clientName", "WEB")
+                        put("clientVersion", "2.20250101.00.00")
+                        put("hl", "en")
+                        put("gl", "IN")
+                    })
+                })
+                put("videoId", videoId)
+            }.toString()
+
+            val pConn = (URL("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+                .openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
+                connectTimeout = 6000
+                readTimeout = 6000
+                requestMethod = "POST"
+                doInput = true
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            }
+            pConn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+            val pText = BufferedReader(InputStreamReader(pConn.inputStream, Charsets.UTF_8)).use { it.readText() }
+            pConn.disconnect()
+
+            val pRoot = JSONObject(pText)
+            val playability = pRoot.optJSONObject("playabilityStatus") ?: return null
+            val status = playability.optString("status", "")
+            val playableInEmbed = playability.optBoolean("playableInEmbed", true)
+            if (status != "OK" || !playableInEmbed) {
+                return null
+            }
+
+            // Also check duration (reject 15-second shorts or 30-minute interviews)
+            val videoDetails = pRoot.optJSONObject("videoDetails")
+            val lenSec = videoDetails?.optString("lengthSeconds", "0")?.toIntOrNull() ?: 0
+            if (lenSec in 1..30 || lenSec > 360) {
+                return null
+            }
+
+            // Detect highest resolution label available on this YouTube video
+            var maxHeight = 1080
+            val adaptive = pRoot.optJSONObject("streamingData")?.optJSONArray("adaptiveFormats")
+            if (adaptive != null) {
+                for (i in 0 until adaptive.length()) {
+                    val h = adaptive.optJSONObject(i)?.optInt("height", 0) ?: 0
+                    if (h > maxHeight) maxHeight = h
+                }
+            }
+            return when {
+                maxHeight >= 2160 -> "4K / 1080p"
+                maxHeight >= 1440 -> "2K / 1080p"
+                else -> "1080p FHD"
+            }
+        } catch (_: Throwable) {
+            return null
+        }
+    }
+
+    // IMDb Official Trailer CDN Extractor (Direct Amazon CloudFront MP4s — 1080p / 720p / 480p)
+    private fun fetchImdbOfficialTrailerStreams(imdbIdArg: String, title: String, year: String): List<DirectTrailerStream> {
         try {
             var imdbId = imdbIdArg.trim()
             val cleanTitle = title.trim()
 
-            // If TMDb didn't have imdb_id, look up IMDb's official suggestion API by title + year
             if (!imdbId.startsWith("tt") && cleanTitle.isNotEmpty()) {
                 val firstChar = cleanTitle.lowercase(Locale.ROOT).firstOrNull { it.isLetterOrDigit() } ?: 'a'
                 val encodedQ = URLEncoder.encode(cleanTitle, "UTF-8").replace("+", "%20")
                 val sugUrl = "https://v3.sg.media-imdb.com/suggestion/$firstChar/$encodedQ.json"
                 val sugConn = (URL(sugUrl).openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
-                    connectTimeout = 6000
-                    readTimeout = 6000
+                    connectTimeout = 5000
+                    readTimeout = 5000
                     requestMethod = "GET"
                     setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14)")
                 }
@@ -389,7 +507,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         val idCand = item.optString("id", "")
                         val lCand = item.optString("l", "").lowercase(Locale.ROOT).replace(Regex("[^a-z0-9]"), "")
                         val yCand = item.optInt("y", 0).toString()
-                        if (idCand.startsWith("tt") && (lCand == normTarget || lCand.contains(normTarget))) {
+                        if (idCand.startsWith("tt") && lCand == normTarget) {
                             if (year.isEmpty() || yCand == year || kotlin.math.abs((yCand.toIntOrNull() ?: 0) - (year.toIntOrNull() ?: 0)) <= 1) {
                                 imdbId = idCand
                                 break
@@ -402,13 +520,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
             if (!imdbId.startsWith("tt")) return emptyList()
 
-            // Fetch IMDb Title page to find the primary official trailer videoId (vi...)
             val titleConn = (URL("https://www.imdb.com/title/$imdbId/").openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
-                connectTimeout = 8000
-                readTimeout = 8000
+                connectTimeout = 7000
+                readTimeout = 7000
                 requestMethod = "GET"
                 setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-                setRequestProperty("Accept-Language", "en-US,en;q=0.9")
             }
             val titleHtml = BufferedReader(InputStreamReader(titleConn.inputStream, Charsets.UTF_8)).use { it.readText() }
             titleConn.disconnect()
@@ -417,10 +533,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             if (!viMatcher.find()) return emptyList()
             val videoId = viMatcher.group(1) ?: return emptyList()
 
-            // Fetch IMDb Video page and parse __NEXT_DATA__ playbackURLs (1080p, 720p, 480p, SD, AUTO)
             val vidConn = (URL("https://www.imdb.com/video/$videoId/").openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
-                connectTimeout = 8000
-                readTimeout = 8000
+                connectTimeout = 7000
+                readTimeout = 7000
                 requestMethod = "GET"
                 setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
             }
@@ -435,8 +550,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             if (!playbackMatcher.find()) return emptyList()
             val pbArray = JSONArray(playbackMatcher.group(1))
 
-            val byHeight = LinkedHashMap<Int, TrailerStreamOption>()
-            var hlsOption: TrailerStreamOption? = null
+            val byHeight = LinkedHashMap<Int, DirectTrailerStream>()
+            var hlsOption: DirectTrailerStream? = null
 
             for (i in 0 until pbArray.length()) {
                 val obj = pbArray.optJSONObject(i) ?: continue
@@ -447,9 +562,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 if (url.isEmpty()) continue
 
                 if (mime.contains("M3U8") || valStr.contains("AUTO")) {
-                    if (hlsOption == null) {
-                        hlsOption = TrailerStreamOption("Auto (HLS)", 1, url, "", true)
-                    }
+                    if (hlsOption == null) hlsOption = DirectTrailerStream("Auto (HLS)", 1, url)
                     continue
                 }
 
@@ -457,8 +570,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     valStr.contains("1080") -> 1080
                     valStr.contains("720") -> 720
                     valStr.contains("480") -> 480
-                    valStr.contains("360") || valStr.contains("SD") -> 360
-                    else -> 480
+                    else -> 360
                 }
                 val label = when (height) {
                     1080 -> "1080p FHD"
@@ -467,7 +579,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     else -> "360p"
                 }
                 if (!byHeight.containsKey(height)) {
-                    byHeight[height] = TrailerStreamOption(label, height, url, "", true)
+                    byHeight[height] = DirectTrailerStream(label, height, url)
                 }
             }
 
@@ -479,8 +591,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // --- STAGE 2: Strict YouTube Official Trailer Search (Blocks Reviews, Teasers, Reactions, Clips, Shorts) ---
-    private fun findStrictYoutubeOfficialTrailerCandidates(titleQuery: String, year: String): List<String> {
+    // Strict YouTube Official Trailer Search (Proper JSON node parsing — never mixes up adjacent videoRenderers, blocks all Reviews!)
+    private fun searchStrictOfficialTrailerIds(titleQuery: String, year: String): List<String> {
         val candidates = ArrayList<String>()
         try {
             val clean = titleQuery.trim()
@@ -501,8 +613,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
             val conn = (URL("https://www.youtube.com/youtubei/v1/search?prettyPrint=false")
                 .openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
-                connectTimeout = 8000
-                readTimeout = 8000
+                connectTimeout = 7000
+                readTimeout = 7000
                 requestMethod = "POST"
                 doInput = true
                 doOutput = true
@@ -514,41 +626,38 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val resp = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText() }
             conn.disconnect()
 
-            // Significant words from the movie title
             val titleWords = clean.lowercase(Locale.ROOT)
                 .replace(Regex("[^a-z0-9\\s]"), " ")
                 .split(Regex("\\s+"))
                 .filter { it.length >= 3 && it != "the" && it != "and" }
 
-            // Strictly forbidden words (Never allow reviews, teasers, reactions, interviews, etc.)
-            val forbiddenWords = listOf(
-                "review", "reaction", "teaser", "glimpse", "promo", "explained",
-                "breakdown", "public", "talk", "opinion", "fdfs", "interview",
-                "making", "behind", "scene", "clip", "sneak", "spoof", "troll",
-                "roast", "parody", "fan", "concept", "short", "status", "whatsapp",
-                "full movie", "jukebox", "lyrical", "video song", "audio launch", "press"
-            )
+            // Split by "videoRenderer":{"videoId":" so each chunk ONLY belongs to a single video!
+            val chunks = resp.split("\"videoRenderer\":{\"videoId\":\"")
+            for (i in 1 until chunks.size) {
+                val chunk = chunks[i]
+                if (chunk.length < 11) continue
+                val vid = chunk.substring(0, 11)
+                if (!vid.matches(Regex("[a-zA-Z0-9_-]{11}"))) continue
 
-            val pattern = Pattern.compile("\"videoRenderer\":\\{\"videoId\":\"([a-zA-Z0-9_-]{11})\".*?\"title\":\\{\"runs\":\\[\\{\"text\":\"([^\"]+)\"")
-            val matcher = pattern.matcher(resp)
-            while (matcher.find()) {
-                val vid = matcher.group(1) ?: continue
-                val vTitle = (matcher.group(2) ?: "").lowercase(Locale.ROOT)
+                // Extract title from this specific videoRenderer chunk only (bounded before next videoRenderer)
+                val titleMatch = Pattern.compile("\"title\":\\{\"runs\":\\[\\{\"text\":\"([^\"]+)\"").matcher(chunk)
+                if (!titleMatch.find()) continue
+                val vTitle = (titleMatch.group(1) ?: "").lowercase(Locale.ROOT)
 
-                // 1. Must explicitly contain "trailer"
+                // Must explicitly say "trailer"
                 if (!vTitle.contains("trailer")) continue
 
-                // 2. Must NOT contain any forbidden word (review, teaser, reaction, etc.)
-                if (forbiddenWords.any { vTitle.contains(it) }) continue
+                // Must NOT be a review, reaction, public talk, teaser, etc.
+                if (isReviewOrJunkTitle(vTitle)) continue
 
-                // 3. Must match the movie title words
-                val matchesTitle = if (titleWords.isNotEmpty()) {
+                // Must match all significant words of the movie/series title
+                val matchesMovie = if (titleWords.isNotEmpty()) {
                     titleWords.all { w -> vTitle.contains(w) }
                 } else {
                     vTitle.contains(clean.lowercase(Locale.ROOT))
                 }
 
-                if (matchesTitle && !candidates.contains(vid)) {
+                if (matchesMovie && !candidates.contains(vid)) {
                     candidates.add(vid)
                     if (candidates.size >= 3) break
                 }
@@ -557,172 +666,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return candidates
     }
 
-    // --- STAGE 3: Extract & Verify Playable Direct Streams in India (gl: "IN") ---
-    private fun extractVerifiedYoutubeStreamsInIndia(videoId: String): List<TrailerStreamOption> {
-        val clients = listOf(
-            Triple("IOS", "19.45.4", "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)"),
-            Triple("ANDROID_VR", "1.60.19", "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 14; en_US; Quest 3; Build/UP1A.231005.007.A1; Cronet/132.0.6808.3)"),
-            Triple("ANDROID_TESTSUITE", "1.9", "com.google.android.youtube/1.9 (Linux; U; Android 14; en_US)")
-        )
-
-        for ((clientName, clientVer, ua) in clients) {
-            try {
-                val clientObj = JSONObject().apply {
-                    put("clientName", clientName)
-                    put("clientVersion", clientVer)
-                    put("hl", "en")
-                    put("gl", "IN") // Strict India region check so country-blocked trailers are caught!
-                    if (clientName == "IOS") {
-                        put("deviceMake", "Apple")
-                        put("deviceModel", "iPhone16,2")
-                        put("osName", "iPhone")
-                        put("osVersion", "18.1.0.22B83")
-                    } else {
-                        put("androidSdkVersion", 34)
-                        put("osName", "Android")
-                        put("osVersion", "14")
-                    }
-                }
-                val body = JSONObject().apply {
-                    put("context", JSONObject().put("client", clientObj))
-                    put("videoId", videoId)
-                    put("contentCheckOk", true)
-                    put("racyCheckOk", true)
-                }.toString()
-
-                val conn = (URL("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
-                    .openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
-                    connectTimeout = 7000
-                    readTimeout = 7000
-                    requestMethod = "POST"
-                    doInput = true
-                    doOutput = true
-                    setRequestProperty("Content-Type", "application/json")
-                    setRequestProperty("User-Agent", ua)
-                }
-
-                conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-                val text = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText() }
-                conn.disconnect()
-
-                val root = JSONObject(text)
-
-                // Check Playability Status in India (Reject country-blocked, private, or age-gated videos!)
-                val playability = root.optJSONObject("playabilityStatus")
-                val status = playability?.optString("status", "") ?: ""
-                if (status != "OK") {
-                    continue
-                }
-
-                // Check videoDetails to reject Reviews/Teasers/Shorts even if TMDb linked them
-                val videoDetails = root.optJSONObject("videoDetails")
-                val lengthSec = videoDetails?.optString("lengthSeconds", "0")?.toIntOrNull() ?: 0
-                val ytTitle = (videoDetails?.optString("title", "") ?: "").lowercase(Locale.ROOT)
-                if (lengthSec in 1..40 || lengthSec > 320) {
-                    // Trailer must be between 40s and 5m20s
-                    continue
-                }
-                if (ytTitle.contains("review") || ytTitle.contains("reaction") || ytTitle.contains("public talk")) {
-                    continue
-                }
-
-                val streamingData = root.optJSONObject("streamingData") ?: continue
-                val formats = streamingData.optJSONArray("formats") ?: JSONArray()
-                val adaptive = streamingData.optJSONArray("adaptiveFormats") ?: JSONArray()
-
-                var bestAudioUrl = ""
-                var bestAudioScore = -1
-                for (i in 0 until adaptive.length()) {
-                    val item = adaptive.optJSONObject(i) ?: continue
-                    val mime = item.optString("mimeType", "")
-                    val url = item.optString("url", "")
-                    if (url.isEmpty() || !mime.startsWith("audio/")) continue
-                    val br = item.optInt("bitrate", 0)
-                    val score = (if (mime.contains("mp4")) 1000000 else 0) + br
-                    if (score > bestAudioScore) {
-                        bestAudioScore = score
-                        bestAudioUrl = url
-                    }
-                }
-
-                val byHeight = LinkedHashMap<Int, TrailerStreamOption>()
-                val byHeightScore = HashMap<Int, Int>()
-
-                if (bestAudioUrl.isNotEmpty()) {
-                    for (i in 0 until adaptive.length()) {
-                        val item = adaptive.optJSONObject(i) ?: continue
-                        val mime = item.optString("mimeType", "")
-                        val url = item.optString("url", "")
-                        val height = item.optInt("height", 0)
-                        if (url.isEmpty() || !mime.startsWith("video/") || height < 240) continue
-                        // Avoid AV1 (av01) on devices without hardware AV1 decoder; prefer AVC1 (H.264) & VP9
-                        if (mime.contains("av01")) continue
-                        val codecScore = when {
-                            mime.contains("avc1") -> 30000000
-                            mime.contains("mp4") -> 20000000
-                            mime.contains("vp9") -> 15000000
-                            else -> 5000000
-                        } + item.optInt("bitrate", 0)
-
-                        val prevScore = byHeightScore[height] ?: -1
-                        if (codecScore > prevScore) {
-                            byHeightScore[height] = codecScore
-                            val label = when {
-                                height >= 2160 -> "2160p 4K"
-                                height >= 1440 -> "1440p QHD"
-                                height >= 1080 -> "1080p FHD"
-                                height >= 720 -> "720p HD"
-                                height >= 480 -> "480p"
-                                else -> "${height}p"
-                            }
-                            byHeight[height] = TrailerStreamOption(
-                                label = label,
-                                height = height,
-                                videoUrl = url,
-                                audioUrl = bestAudioUrl,
-                                isMuxed = false
-                            )
-                        }
-                    }
-                }
-
-                for (i in 0 until formats.length()) {
-                    val item = formats.optJSONObject(i) ?: continue
-                    val url = item.optString("url", "")
-                    val height = item.optInt("height", 0)
-                    if (url.isEmpty() || height < 240) continue
-                    if (!byHeight.containsKey(height)) {
-                        val label = when {
-                            height >= 1080 -> "1080p FHD"
-                            height >= 720 -> "720p HD"
-                            height >= 480 -> "480p"
-                            else -> "${height}p"
-                        }
-                        byHeight[height] = TrailerStreamOption(
-                            label = label,
-                            height = height,
-                            videoUrl = url,
-                            audioUrl = "",
-                            isMuxed = true
-                        )
-                    }
-                }
-
-                val sorted = byHeight.values.sortedByDescending { it.height }.toMutableList()
-                val hlsUrl = streamingData.optString("hlsManifestUrl", "")
-                if (hlsUrl.isNotEmpty()) {
-                    sorted.add(TrailerStreamOption("Auto (HLS)", 1, hlsUrl, "", true))
-                }
-
-                if (sorted.isNotEmpty()) {
-                    return sorted
-                }
-            } catch (_: Throwable) {}
-        }
-        return emptyList()
-    }
-
-    // Pre-validates and caches playable direct streams BEFORE enabling the Trailer button in UI!
     @ReactMethod
     fun resolveVerifiedTrailer(
         cacheKey: String,
@@ -735,63 +678,71 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         ioExecutor.submit {
             try {
                 val cached = verifiedTrailerCache[cacheKey]
-                if (!cached.isNullOrEmpty()) {
+                if (cached != null) {
                     val res = Arguments.createMap()
                     res.putBoolean("available", true)
                     res.putString("cacheKey", cacheKey)
-                    res.putString("bestQuality", cached.first().label)
+                    res.putString("bestQuality", cached.maxQualityLabel)
                     promise.resolve(res)
                     return@submit
                 }
 
-                var verifiedStreams: List<TrailerStreamOption> = emptyList()
-
-                // 1. Try TMDb Official Trailer YouTube Keys first (with strict India gl:IN + Direct Stream verification)
+                // 1. Check TMDb Official Trailer keys first (verified playable in India & embeddable)
                 try {
                     val arr = JSONArray(tmdbYtKeysJson)
                     for (i in 0 until arr.length()) {
                         val key = arr.optString(i, "").trim()
                         if (key.length == 11) {
-                            val s = extractVerifiedYoutubeStreamsInIndia(key)
-                            if (s.isNotEmpty()) {
-                                verifiedStreams = s
-                                break
+                            val qualityLabel = verifyYoutubePlayableInIndia(key)
+                            if (qualityLabel != null) {
+                                val info = VerifiedTrailerInfo("YT_VERIFIED", key, emptyList(), qualityLabel)
+                                verifiedTrailerCache[cacheKey] = info
+                                val res = Arguments.createMap()
+                                res.putBoolean("available", true)
+                                res.putString("cacheKey", cacheKey)
+                                res.putString("bestQuality", qualityLabel)
+                                promise.resolve(res)
+                                return@submit
                             }
                         }
                     }
                 } catch (_: Throwable) {}
 
-                // 2. Try IMDb Official Trailer CDN (Direct Amazon CloudFront 1080p/720p/480p MP4 — Zero Country Blocks!)
-                if (verifiedStreams.isEmpty()) {
-                    val imdbStreams = fetchImdbOfficialTrailerStreams(imdbId, title, year)
-                    if (imdbStreams.isNotEmpty()) {
-                        verifiedStreams = imdbStreams
-                    }
-                }
-
-                // 3. Try Strict YouTube Official Trailer Search (Blocks all Reviews, Teasers, Reactions, Clips)
-                if (verifiedStreams.isEmpty()) {
-                    val strictCandidates = findStrictYoutubeOfficialTrailerCandidates(title, year)
-                    for (candId in strictCandidates) {
-                        val s = extractVerifiedYoutubeStreamsInIndia(candId)
-                        if (s.isNotEmpty()) {
-                            verifiedStreams = s
-                            break
-                        }
-                    }
-                }
-
-                val res = Arguments.createMap()
-                if (verifiedStreams.isNotEmpty()) {
-                    verifiedTrailerCache[cacheKey] = verifiedStreams
+                // 2. Check IMDb Official Trailer CDN (Direct Amazon CloudFront MP4s, Zero Country Blocks, Zero Reviews!)
+                val imdbStreams = fetchImdbOfficialTrailerStreams(imdbId, title, year)
+                if (imdbStreams.isNotEmpty()) {
+                    val bestQ = imdbStreams.first().label
+                    val info = VerifiedTrailerInfo("IMDB_DIRECT", "", imdbStreams, bestQ)
+                    verifiedTrailerCache[cacheKey] = info
+                    val res = Arguments.createMap()
                     res.putBoolean("available", true)
                     res.putString("cacheKey", cacheKey)
-                    res.putString("bestQuality", verifiedStreams.first().label)
-                } else {
-                    res.putBoolean("available", false)
-                    res.putString("cacheKey", cacheKey)
-                    res.putString("bestQuality", "")
+                    res.putString("bestQuality", bestQ)
+                    promise.resolve(res)
+                    return@submit
                 }
+
+                // 3. Check Strict YouTube Official Trailer Search (Strictly blocks Reviews/Reactions/Talks & verifies India playability)
+                val ytCandidates = searchStrictOfficialTrailerIds(title, year)
+                for (candId in ytCandidates) {
+                    val qualityLabel = verifyYoutubePlayableInIndia(candId)
+                    if (qualityLabel != null) {
+                        val info = VerifiedTrailerInfo("YT_VERIFIED", candId, emptyList(), qualityLabel)
+                        verifiedTrailerCache[cacheKey] = info
+                        val res = Arguments.createMap()
+                        res.putBoolean("available", true)
+                        res.putString("cacheKey", cacheKey)
+                        res.putString("bestQuality", qualityLabel)
+                        promise.resolve(res)
+                        return@submit
+                    }
+                }
+
+                // If no genuine playable official trailer exists anywhere, disable the button!
+                val res = Arguments.createMap()
+                res.putBoolean("available", false)
+                res.putString("cacheKey", cacheKey)
+                res.putString("bestQuality", "")
                 promise.resolve(res)
             } catch (_: Throwable) {
                 val res = Arguments.createMap()
@@ -811,19 +762,19 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         ).toInt()
     }
 
-    private fun formatTimeMs(ms: Int): String {
-        val totalSec = (ms / 1000).coerceAtLeast(0)
-        val mins = totalSec / 60
-        val secs = totalSec % 60
+    private fun formatTimeSec(totalSec: Int): String {
+        val s = totalSec.coerceAtLeast(0)
+        val mins = s / 60
+        val secs = s % 60
         return String.format(Locale.US, "%02d:%02d", mins, secs)
     }
 
-    // Plays ONLY in our 100% Native In-App Video Player (Play in App engine) — NO YouTube WebView!
+    @SuppressLint("SetJavaScriptEnabled")
     @ReactMethod
     fun playYoutubeTrailer(cacheKey: String, title: String, promise: Promise) {
-        val streams = verifiedTrailerCache[cacheKey]
-        if (streams.isNullOrEmpty()) {
-            promise.reject("E_UNAVAIL", "No verified trailer streams available")
+        val info = verifiedTrailerCache[cacheKey]
+        if (info == null) {
+            promise.reject("E_UNAVAIL", "No verified trailer available")
             return
         }
 
@@ -834,12 +785,29 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 return@runOnUiThread
             }
 
+            // Force Landscape Cinema Mode just like "Play in App"!
+            val prevOrientation = activity.requestedOrientation
+            try {
+                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            } catch (_: Throwable) {}
+
             val dialog = Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
             dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
-            dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            dialog.window?.apply {
+                addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+                decorView.systemUiVisibility = (
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                )
+            }
 
             val root = FrameLayout(activity).apply {
-                setBackgroundColor(Color.parseColor("#050508"))
+                setBackgroundColor(Color.BLACK)
             }
 
             val playerStage = FrameLayout(activity).apply {
@@ -850,26 +818,17 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 )
             }
 
-            val surfaceView = SurfaceView(activity).apply {
-                layoutParams = FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    Gravity.CENTER
-                )
-            }
-            playerStage.addView(surfaceView)
-
             val spinner = ProgressBar(activity).apply {
                 layoutParams = FrameLayout.LayoutParams(dp(48), dp(48), Gravity.CENTER)
             }
-            playerStage.addView(spinner)
             root.addView(playerStage)
+            root.addView(spinner)
 
-            // Top Overlay Bar (Title + Real Available Quality Chips + Close Button)
+            // Top Cinema Overlay Bar (Back Button + Title + Dynamic Real Quality Chips)
             val topOverlay = LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.parseColor("#D90D0D14"))
-                setPadding(dp(16), dp(14), dp(16), dp(12))
+                setBackgroundColor(Color.parseColor("#CC0A0A0F"))
+                setPadding(dp(18), dp(12), dp(18), dp(10))
                 layoutParams = FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -882,21 +841,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 gravity = Gravity.CENTER_VERTICAL
             }
 
-            val titleView = TextView(activity).apply {
-                text = "🎬 $title • Official Trailer"
-                setTextColor(Color.WHITE)
-                textSize = 15f
-                typeface = Typeface.DEFAULT_BOLD
-                maxLines = 1
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            }
-
             val closeBtn = TextView(activity).apply {
-                text = "✕ Close"
+                text = "← Back"
                 setTextColor(Color.WHITE)
                 textSize = 13f
                 typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(14), dp(7), dp(14), dp(7))
+                setPadding(dp(14), dp(6), dp(14), dp(6))
                 background = GradientDrawable().apply {
                     setColor(Color.parseColor("#E50914"))
                     cornerRadius = dp(8).toFloat()
@@ -904,13 +854,22 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 setOnClickListener { dialog.dismiss() }
             }
 
-            headerRow.addView(titleView)
+            val titleView = TextView(activity).apply {
+                text = "  🎬 $title • Official Trailer"
+                setTextColor(Color.WHITE)
+                textSize = 15f
+                typeface = Typeface.DEFAULT_BOLD
+                maxLines = 1
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+
             headerRow.addView(closeBtn)
+            headerRow.addView(titleView)
             topOverlay.addView(headerRow)
 
             val qualityScroll = HorizontalScrollView(activity).apply {
                 isHorizontalScrollBarEnabled = false
-                setPadding(0, dp(10), 0, 0)
+                setPadding(0, dp(8), 0, 0)
             }
             val qualityRow = LinearLayout(activity).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -929,11 +888,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             topOverlay.addView(qualityScroll)
             root.addView(topOverlay)
 
-            // Bottom Native Controls Bar
+            // Bottom Native Cinema Controls Bar (Play/Pause, -10s, +10s, SeekBar, Time)
             val bottomOverlay = LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.parseColor("#D90D0D14"))
-                setPadding(dp(16), dp(10), dp(16), dp(18))
+                setBackgroundColor(Color.parseColor("#CC0A0A0F"))
+                setPadding(dp(18), dp(8), dp(18), dp(14))
                 layoutParams = FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -947,7 +906,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val controlsRow = LinearLayout(activity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(6), 0, 0)
+                setPadding(0, dp(4), 0, 0)
             }
 
             val playPauseBtn = TextView(activity).apply {
@@ -955,7 +914,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 setTextColor(Color.WHITE)
                 textSize = 13f
                 typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(14), dp(7), dp(14), dp(7))
+                setPadding(dp(14), dp(6), dp(14), dp(6))
                 background = GradientDrawable().apply {
                     setColor(Color.parseColor("#E50914"))
                     cornerRadius = dp(8).toFloat()
@@ -966,20 +925,23 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 text = "⏪ -10s"
                 setTextColor(Color.WHITE)
                 textSize = 12f
-                setPadding(dp(12), dp(7), dp(12), dp(7))
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(14), dp(6), dp(14), dp(6))
             }
 
             val ffBtn = TextView(activity).apply {
                 text = "+10s ⏩"
                 setTextColor(Color.WHITE)
                 textSize = 12f
-                setPadding(dp(12), dp(7), dp(12), dp(7))
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(14), dp(6), dp(14), dp(6))
             }
 
             val timeLabel = TextView(activity).apply {
                 text = "00:00 / 00:00"
-                setTextColor(Color.parseColor("#D1D5DB"))
+                setTextColor(Color.parseColor("#E5E7EB"))
                 textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
                 gravity = Gravity.END
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
@@ -991,258 +953,460 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             bottomOverlay.addView(controlsRow)
             root.addView(bottomOverlay)
 
-            // Toggle controls visibility when tapping video stage
-            playerStage.setOnClickListener {
-                val nextVis = if (topOverlay.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-                topOverlay.visibility = nextVis
-                bottomOverlay.visibility = nextVis
+            // Touching anywhere on the video stage toggles our custom cinema controls
+            val touchInterceptor = View(activity).apply {
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                setOnClickListener {
+                    val vis = if (topOverlay.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                    topOverlay.visibility = vis
+                    bottomOverlay.visibility = vis
+                }
             }
+            root.addView(touchInterceptor, 1) // Right above playerStage, below topOverlay & bottomOverlay
 
             dialog.setContentView(root)
 
-            var videoPlayer: MediaPlayer? = null
-            var audioPlayer: MediaPlayer? = null
-            var videoPrepared = false
-            var audioPrepared = false
-            var isSeeking = false
-            var resumePosMs = 0
             val uiHandler = Handler(Looper.getMainLooper())
+            var mediaPlayer: MediaPlayer? = null
+            var activeWebView: WebView? = null
 
-            var activeIndex = streams.indexOfFirst { it.height == 1080 }.takeIf { it >= 0 } ?: 0
-            val qualityButtons = ArrayList<TextView>()
-
-            fun updateQualityStyles() {
-                for (i in qualityButtons.indices) {
-                    val btn = qualityButtons[i]
-                    val isSel = (i == activeIndex)
-                    btn.background = GradientDrawable().apply {
-                        setColor(if (isSel) Color.parseColor("#E50914") else Color.parseColor("#1F2029"))
-                        cornerRadius = dp(16).toFloat()
-                        setStroke(dp(1), if (isSel) Color.parseColor("#FF4D4D") else Color.parseColor("#374151"))
-                    }
-                    btn.setTextColor(if (isSel) Color.WHITE else Color.parseColor("#D1D5DB"))
+            if (info.engine == "IMDB_DIRECT" && info.directStreams.isNotEmpty()) {
+                // Native SurfaceView Player for IMDb Direct MP4/HLS streams
+                val streams = info.directStreams
+                val surfaceView = SurfaceView(activity).apply {
+                    layoutParams = FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        Gravity.CENTER
+                    )
                 }
-            }
+                playerStage.addView(surfaceView)
 
-            fun releasePlayers() {
-                videoPrepared = false
-                audioPrepared = false
-                try { videoPlayer?.stop() } catch (_: Throwable) {}
-                try { videoPlayer?.release() } catch (_: Throwable) {}
-                videoPlayer = null
-                try { audioPlayer?.stop() } catch (_: Throwable) {}
-                try { audioPlayer?.release() } catch (_: Throwable) {}
-                audioPlayer = null
-            }
+                var activeIdx = 0
+                var prepared = false
+                var isSeeking = false
+                var resumeMs = 0
+                val qButtons = ArrayList<TextView>()
 
-            fun tryStartPlayback() {
-                val opt = streams[activeIndex]
-                if (!videoPrepared) return
-                if (!opt.isMuxed && opt.audioUrl.isNotEmpty() && !audioPrepared) return
-                spinner.visibility = View.GONE
-                try {
-                    if (resumePosMs > 0) {
-                        videoPlayer?.seekTo(resumePosMs)
-                        audioPlayer?.seekTo(resumePosMs)
-                    }
-                    videoPlayer?.start()
-                    audioPlayer?.start()
-                    playPauseBtn.text = "⏸ Pause"
-                } catch (_: Throwable) {}
-            }
-
-            fun loadStreamOption(index: Int, seekMs: Int) {
-                activeIndex = index
-                resumePosMs = seekMs
-                updateQualityStyles()
-                spinner.visibility = View.VISIBLE
-                releasePlayers()
-
-                val opt = streams[index]
-                val vp = MediaPlayer()
-                videoPlayer = vp
-                vp.setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .build()
-                )
-                vp.setDisplay(surfaceView.holder)
-                vp.setOnVideoSizeChangedListener { _, w, h ->
-                    if (w > 0 && h > 0) {
-                        val rootW = playerStage.width.takeIf { it > 0 } ?: reactContext.resources.displayMetrics.widthPixels
-                        val rootH = playerStage.height.takeIf { it > 0 } ?: reactContext.resources.displayMetrics.heightPixels
-                        val videoAspect = w.toFloat() / h.toFloat()
-                        val screenAspect = rootW.toFloat() / rootH.toFloat()
-                        val lp = surfaceView.layoutParams as FrameLayout.LayoutParams
-                        if (videoAspect > screenAspect) {
-                            lp.width = rootW
-                            lp.height = (rootW / videoAspect).toInt()
-                        } else {
-                            lp.height = rootH
-                            lp.width = (rootH * videoAspect).toInt()
+                fun styleButtons() {
+                    for (i in qButtons.indices) {
+                        val b = qButtons[i]
+                        val sel = (i == activeIdx)
+                        b.background = GradientDrawable().apply {
+                            setColor(if (sel) Color.parseColor("#E50914") else Color.parseColor("#1F2029"))
+                            cornerRadius = dp(16).toFloat()
+                            setStroke(dp(1), if (sel) Color.parseColor("#FF4D4D") else Color.parseColor("#374151"))
                         }
-                        lp.gravity = Gravity.CENTER
-                        surfaceView.layoutParams = lp
+                        b.setTextColor(if (sel) Color.WHITE else Color.parseColor("#D1D5DB"))
                     }
-                }
-                vp.setOnPreparedListener {
-                    videoPrepared = true
-                    tryStartPlayback()
-                }
-                vp.setOnErrorListener { _, _, _ ->
-                    // Automatically fallback to next available stream quality if one fails
-                    if (activeIndex + 1 < streams.size) {
-                        loadStreamOption(activeIndex + 1, resumePosMs)
-                    } else {
-                        spinner.visibility = View.GONE
-                    }
-                    true
-                }
-                vp.setOnCompletionListener {
-                    playPauseBtn.text = "▶ Replay"
-                    try { audioPlayer?.pause() } catch (_: Throwable) {}
                 }
 
-                if (!opt.isMuxed && opt.audioUrl.isNotEmpty()) {
-                    val ap = MediaPlayer()
-                    audioPlayer = ap
-                    ap.setAudioAttributes(
+                fun loadDirectStream(idx: Int, seekToMs: Int) {
+                    activeIdx = idx
+                    resumeMs = seekToMs
+                    styleButtons()
+                    spinner.visibility = View.VISIBLE
+                    prepared = false
+                    try { mediaPlayer?.stop() } catch (_: Throwable) {}
+                    try { mediaPlayer?.release() } catch (_: Throwable) {}
+
+                    val mp = MediaPlayer()
+                    mediaPlayer = mp
+                    mp.setAudioAttributes(
                         AudioAttributes.Builder()
                             .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
                             .setUsage(AudioAttributes.USAGE_MEDIA)
                             .build()
                     )
-                    ap.setOnPreparedListener {
-                        audioPrepared = true
-                        tryStartPlayback()
+                    mp.setDisplay(surfaceView.holder)
+                    mp.setOnPreparedListener {
+                        prepared = true
+                        spinner.visibility = View.GONE
+                        if (resumeMs > 0) mp.seekTo(resumeMs)
+                        mp.start()
+                        playPauseBtn.text = "⏸ Pause"
+                    }
+                    mp.setOnCompletionListener {
+                        playPauseBtn.text = "▶ Replay"
                     }
                     try {
-                        ap.setDataSource(opt.audioUrl)
-                        ap.prepareAsync()
+                        mp.setDataSource(streams[idx].videoUrl)
+                        mp.prepareAsync()
                     } catch (_: Throwable) {
-                        audioPrepared = true
+                        spinner.visibility = View.GONE
                     }
                 }
 
-                try {
-                    vp.setDataSource(opt.videoUrl)
-                    vp.prepareAsync()
-                } catch (_: Throwable) {
-                    spinner.visibility = View.GONE
-                }
-            }
-
-            // Show ONLY the actual available qualities for this verified trailer!
-            for (i in streams.indices) {
-                val opt = streams[i]
-                val chip = TextView(activity).apply {
-                    text = opt.label
-                    textSize = 12f
-                    typeface = Typeface.DEFAULT_BOLD
-                    setPadding(dp(12), dp(5), dp(12), dp(5))
-                    layoutParams = LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT
-                    ).apply { setMargins(0, 0, dp(8), 0) }
-                    setOnClickListener {
-                        if (activeIndex != i) {
-                            val pos = try { if (videoPrepared) videoPlayer?.currentPosition ?: 0 else 0 } catch (_: Throwable) { 0 }
-                            loadStreamOption(i, pos)
+                for (i in streams.indices) {
+                    val chip = TextView(activity).apply {
+                        text = streams[i].label
+                        textSize = 12f
+                        typeface = Typeface.DEFAULT_BOLD
+                        setPadding(dp(12), dp(5), dp(12), dp(5))
+                        layoutParams = LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT
+                        ).apply { setMargins(0, 0, dp(8), 0) }
+                        setOnClickListener {
+                            if (activeIdx != i) {
+                                val pos = try { if (prepared) mediaPlayer?.currentPosition ?: 0 else 0 } catch (_: Throwable) { 0 }
+                                loadDirectStream(i, pos)
+                            }
                         }
                     }
+                    qButtons.add(chip)
+                    qualityRow.addView(chip)
                 }
-                qualityButtons.add(chip)
-                qualityRow.addView(chip)
-            }
-            updateQualityStyles()
+                styleButtons()
 
-            playPauseBtn.setOnClickListener {
-                val vp = videoPlayer ?: return@setOnClickListener
-                if (!videoPrepared) return@setOnClickListener
-                if (vp.isPlaying) {
-                    vp.pause()
-                    try { audioPlayer?.pause() } catch (_: Throwable) {}
-                    playPauseBtn.text = "▶ Play"
-                } else {
-                    try {
-                        audioPlayer?.seekTo(vp.currentPosition)
-                        vp.start()
-                        audioPlayer?.start()
+                playPauseBtn.setOnClickListener {
+                    val mp = mediaPlayer ?: return@setOnClickListener
+                    if (!prepared) return@setOnClickListener
+                    if (mp.isPlaying) {
+                        mp.pause()
+                        playPauseBtn.text = "▶ Play"
+                    } else {
+                        mp.start()
                         playPauseBtn.text = "⏸ Pause"
-                    } catch (_: Throwable) {}
-                }
-            }
-
-            rewBtn.setOnClickListener {
-                val vp = videoPlayer ?: return@setOnClickListener
-                if (!videoPrepared) return@setOnClickListener
-                val t = (vp.currentPosition - 10000).coerceAtLeast(0)
-                vp.seekTo(t)
-                try { audioPlayer?.seekTo(t) } catch (_: Throwable) {}
-            }
-
-            ffBtn.setOnClickListener {
-                val vp = videoPlayer ?: return@setOnClickListener
-                if (!videoPrepared) return@setOnClickListener
-                val t = (vp.currentPosition + 10000).coerceAtMost(vp.duration.coerceAtLeast(0))
-                vp.seekTo(t)
-                try { audioPlayer?.seekTo(t) } catch (_: Throwable) {}
-            }
-
-            seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {}
-                override fun onStartTrackingTouch(sb: SeekBar?) { isSeeking = true }
-                override fun onStopTrackingTouch(sb: SeekBar?) {
-                    isSeeking = false
-                    val vp = videoPlayer ?: return
-                    if (!videoPrepared || sb == null) return
-                    val dur = vp.duration
-                    if (dur > 0) {
-                        val target = ((sb.progress.toLong() * dur) / 1000L).toInt()
-                        vp.seekTo(target)
-                        try { audioPlayer?.seekTo(target) } catch (_: Throwable) {}
                     }
                 }
-            })
+                rewBtn.setOnClickListener {
+                    val mp = mediaPlayer ?: return@setOnClickListener
+                    if (prepared) mp.seekTo((mp.currentPosition - 10000).coerceAtLeast(0))
+                }
+                ffBtn.setOnClickListener {
+                    val mp = mediaPlayer ?: return@setOnClickListener
+                    if (prepared) mp.seekTo((mp.currentPosition + 10000).coerceAtMost(mp.duration.coerceAtLeast(0)))
+                }
+                seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(sb: SeekBar?, p: Int, f: Boolean) {}
+                    override fun onStartTrackingTouch(sb: SeekBar?) { isSeeking = true }
+                    override fun onStopTrackingTouch(sb: SeekBar?) {
+                        isSeeking = false
+                        val mp = mediaPlayer ?: return
+                        if (prepared && sb != null && mp.duration > 0) {
+                            mp.seekTo(((sb.progress.toLong() * mp.duration) / 1000L).toInt())
+                        }
+                    }
+                })
 
-            val syncTask = object : Runnable {
-                override fun run() {
-                    val vp = videoPlayer
-                    if (vp != null && videoPrepared) {
+                val progressRunner = object : Runnable {
+                    override fun run() {
+                        val mp = mediaPlayer
+                        if (mp != null && prepared && !isSeeking) {
+                            try {
+                                val pos = mp.currentPosition
+                                val dur = mp.duration
+                                if (dur > 0) {
+                                    seekBar.progress = ((pos.toLong() * 1000L) / dur).toInt()
+                                    timeLabel.text = "${formatTimeSec(pos / 1000)} / ${formatTimeSec(dur / 1000)}"
+                                }
+                            } catch (_: Throwable) {}
+                        }
+                        uiHandler.postDelayed(this, 400)
+                    }
+                }
+
+                surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+                    override fun surfaceCreated(holder: SurfaceHolder) {
+                        loadDirectStream(activeIdx, resumeMs)
+                        uiHandler.post(progressRunner)
+                    }
+                    override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
+                    override fun surfaceDestroyed(h: SurfaceHolder) {
+                        try { if (prepared) resumeMs = mediaPlayer?.currentPosition ?: 0 } catch (_: Throwable) {}
+                    }
+                })
+            } else {
+                // Chromeless Locked Cinema Engine for Verified YouTube Trailers:
+                // - ZERO YouTube controls/logos/channel headers (controls: 0 + pointer-events: none + cropped overscan)
+                // - Controlled 100% by our Native Android Play/Pause, SeekBar, -10s/+10s, and Dynamic Quality Selector!
+                val webView = WebView(activity).apply {
+                    setBackgroundColor(Color.BLACK)
+                    isClickable = false
+                    isFocusable = false
+                    layoutParams = FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        Gravity.CENTER
+                    )
+                    settings.javaScriptEnabled = true
+                    settings.mediaPlaybackRequiresUserGesture = false
+                    settings.domStorageEnabled = true
+                    settings.cacheMode = WebSettings.LOAD_DEFAULT
+                    settings.userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                }
+                activeWebView = webView
+                playerStage.addView(webView)
+
+                var isPlayingState = true
+                var isSeeking = false
+                var totalDurationSec = 0
+                val qualityMap = linkedMapOf(
+                    "hd2160" to "2160p 4K",
+                    "hd1440" to "1440p QHD",
+                    "hd1080" to "1080p FHD",
+                    "hd720" to "720p HD",
+                    "large" to "480p",
+                    "medium" to "360p"
+                )
+                var activeVq = "hd1080"
+                val qChips = LinkedHashMap<String, TextView>()
+
+                fun styleYtQualityChips() {
+                    for ((code, btn) in qChips) {
+                        val sel = (code == activeVq)
+                        btn.background = GradientDrawable().apply {
+                            setColor(if (sel) Color.parseColor("#E50914") else Color.parseColor("#1F2029"))
+                            cornerRadius = dp(16).toFloat()
+                            setStroke(dp(1), if (sel) Color.parseColor("#FF4D4D") else Color.parseColor("#374151"))
+                        }
+                        btn.setTextColor(if (sel) Color.WHITE else Color.parseColor("#D1D5DB"))
+                    }
+                }
+
+                fun populateQualityChips(codes: List<String>) {
+                    qualityRow.removeAllViews()
+                    qualityRow.addView(qualityTagLabel)
+                    qChips.clear()
+
+                    val validCodes = codes.filter { qualityMap.containsKey(it) }
+                        .ifEmpty { listOf("hd1080", "hd720", "large") }
+
+                    if (!validCodes.contains(activeVq)) {
+                        activeVq = validCodes.first()
+                    }
+
+                    for (code in validCodes) {
+                        val label = qualityMap[code] ?: code
+                        val chip = TextView(activity).apply {
+                            text = label
+                            textSize = 12f
+                            typeface = Typeface.DEFAULT_BOLD
+                            setPadding(dp(12), dp(5), dp(12), dp(5))
+                            layoutParams = LinearLayout.LayoutParams(
+                                ViewGroup.LayoutParams.WRAP_CONTENT,
+                                ViewGroup.LayoutParams.WRAP_CONTENT
+                            ).apply { setMargins(0, 0, dp(8), 0) }
+                            setOnClickListener {
+                                activeVq = code
+                                styleYtQualityChips()
+                                spinner.visibility = View.VISIBLE
+                                webView.evaluateJavascript("window.setTrailerQuality('$code');", null)
+                            }
+                        }
+                        qChips[code] = chip
+                        qualityRow.addView(chip)
+                    }
+                    styleYtQualityChips()
+                }
+
+                // Start with default chips; JS Bridge immediately updates to exact available qualities onReady!
+                populateQualityChips(listOf("hd1080", "hd720", "large"))
+
+                webView.addJavascriptInterface(object {
+                    @JavascriptInterface
+                    fun onPlayerReady(durSec: Double, qualitiesCsv: String) {
+                        uiHandler.post {
+                            spinner.visibility = View.GONE
+                            totalDurationSec = durSec.toInt().coerceAtLeast(0)
+                            if (qualitiesCsv.isNotEmpty()) {
+                                val list = qualitiesCsv.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                                if (list.isNotEmpty()) populateQualityChips(list)
+                            }
+                        }
+                    }
+
+                    @JavascriptInterface
+                    fun onTimeUpdate(curSec: Double, durSec: Double, playing: Boolean) {
+                        uiHandler.post {
+                            val c = curSec.toInt().coerceAtLeast(0)
+                            val d = durSec.toInt().coerceAtLeast(0)
+                            totalDurationSec = d
+                            isPlayingState = playing
+                            if (playing) spinner.visibility = View.GONE
+                            playPauseBtn.text = if (playing) "⏸ Pause" else "▶ Play"
+                            if (d > 0 && !isSeeking) {
+                                seekBar.progress = ((c.toLong() * 1000L) / d).toInt()
+                                timeLabel.text = "${formatTimeSec(c)} / ${formatTimeSec(d)}"
+                            }
+                        }
+                    }
+                }, "GDNativeBridge")
+
+                val blockedAdHosts = listOf(
+                    "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+                    "/pagead/", "/api/stats/ads", "adservice.google"
+                )
+
+                webView.webChromeClient = WebChromeClient()
+                webView.webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                        val u = request?.url?.toString()?.lowercase(Locale.ROOT) ?: ""
+                        if (blockedAdHosts.any { u.contains(it) }) {
+                            return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+                }
+
+                val vid = info.videoId
+                val html = """
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+                    <style>
+                      * { margin: 0; padding: 0; box-sizing: border-box; background: #000; user-select: none; }
+                      html, body { width: 100%; height: 100%; overflow: hidden; background: #000; pointer-events: none; }
+                      .stage {
+                        position: fixed;
+                        top: -18%;
+                        left: 0;
+                        width: 100%;
+                        height: 136%;
+                        pointer-events: none;
+                        overflow: hidden;
+                      }
+                      #player { width: 100%; height: 100%; border: 0; pointer-events: none; }
+                    </style>
+                    </head>
+                    <body>
+                    <div class="stage"><div id="player"></div></div>
+                    <script src="https://www.youtube.com/iframe_api"></script>
+                    <script>
+                      var player;
+                      var targetVq = 'hd1080';
+                      function onYouTubeIframeAPIReady() {
+                        player = new YT.Player('player', {
+                          videoId: '$vid',
+                          host: 'https://www.youtube-nocookie.com',
+                          playerVars: {
+                            'autoplay': 1,
+                            'controls': 0,
+                            'disablekb': 1,
+                            'fs': 0,
+                            'iv_load_policy': 3,
+                            'modestbranding': 1,
+                            'rel': 0,
+                            'showinfo': 0,
+                            'playsinline': 1
+                          },
+                          events: {
+                            'onReady': function(e) {
+                              try {
+                                e.target.playVideo();
+                                var qList = e.target.getAvailableQualityLevels ? e.target.getAvailableQualityLevels() : [];
+                                var dur = e.target.getDuration ? e.target.getDuration() : 0;
+                                if (window.GDNativeBridge) {
+                                  window.GDNativeBridge.onPlayerReady(dur || 0, (qList || []).join(','));
+                                }
+                              } catch(err) {}
+                            },
+                            'onStateChange': function(e) {
+                              try {
+                                if (e.data === YT.PlayerState.PLAYING) {
+                                  var qList = e.target.getAvailableQualityLevels ? e.target.getAvailableQualityLevels() : [];
+                                  var dur = e.target.getDuration ? e.target.getDuration() : 0;
+                                  if (window.GDNativeBridge && qList && qList.length > 0) {
+                                    window.GDNativeBridge.onPlayerReady(dur || 0, qList.join(','));
+                                  }
+                                  if (targetVq && e.target.setPlaybackQualityRange) {
+                                    e.target.setPlaybackQualityRange(targetVq, targetVq);
+                                  }
+                                }
+                              } catch(err) {}
+                            }
+                          }
+                        });
+                      }
+                      setInterval(function() {
                         try {
-                            val pos = vp.currentPosition
-                            val dur = vp.duration
-                            if (dur > 0 && !isSeeking) {
-                                seekBar.progress = ((pos.toLong() * 1000L) / dur).toInt()
-                                timeLabel.text = "${formatTimeMs(pos)} / ${formatTimeMs(dur)}"
+                          if (player && player.getCurrentTime) {
+                            var c = player.getCurrentTime() || 0;
+                            var d = player.getDuration ? (player.getDuration() || 0) : 0;
+                            var st = player.getPlayerState ? player.getPlayerState() : 1;
+                            if (window.GDNativeBridge) {
+                              window.GDNativeBridge.onTimeUpdate(c, d, st === 1);
                             }
-                            val ap = audioPlayer
-                            if (ap != null && audioPrepared && vp.isPlaying) {
-                                if (!ap.isPlaying) ap.start()
-                                if (kotlin.math.abs(pos - ap.currentPosition) > 90) ap.seekTo(pos)
-                            }
-                        } catch (_: Throwable) {}
-                    }
-                    uiHandler.postDelayed(this, 400)
-                }
-            }
+                          }
+                        } catch(e) {}
+                      }, 400);
+                      window.togglePlay = function() {
+                        if (!player) return;
+                        var st = player.getPlayerState ? player.getPlayerState() : 1;
+                        if (st === 1) player.pauseVideo(); else player.playVideo();
+                      };
+                      window.seekToSec = function(sec) {
+                        if (player && player.seekTo) player.seekTo(sec, true);
+                      };
+                      window.seekBySec = function(delta) {
+                        if (player && player.getCurrentTime) {
+                          var t = Math.max(0, (player.getCurrentTime() || 0) + delta);
+                          player.seekTo(t, true);
+                        }
+                      };
+                      window.setTrailerQuality = function(vq) {
+                        targetVq = vq;
+                        if (player && player.getCurrentTime) {
+                          var t = player.getCurrentTime() || 0;
+                          if (player.setPlaybackQualityRange) {
+                            player.setPlaybackQualityRange(vq, vq);
+                          }
+                          player.loadVideoById({'videoId': '$vid', 'startSeconds': t, 'suggestedQuality': vq});
+                        }
+                      };
+                    </script>
+                    </body>
+                    </html>
+                """.trimIndent()
 
-            surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
-                override fun surfaceCreated(holder: SurfaceHolder) {
-                    loadStreamOption(activeIndex, resumePosMs)
-                    uiHandler.post(syncTask)
+                webView.loadDataWithBaseURL(
+                    "https://www.youtube-nocookie.com",
+                    html,
+                    "text/html",
+                    "UTF-8",
+                    null
+                )
+
+                playPauseBtn.setOnClickListener {
+                    webView.evaluateJavascript("window.togglePlay();", null)
                 }
-                override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
-                override fun surfaceDestroyed(h: SurfaceHolder) {
-                    try { if (videoPrepared) resumePosMs = videoPlayer?.currentPosition ?: 0 } catch (_: Throwable) {}
-                    releasePlayers()
+                rewBtn.setOnClickListener {
+                    webView.evaluateJavascript("window.seekBySec(-10);", null)
                 }
-            })
+                ffBtn.setOnClickListener {
+                    webView.evaluateJavascript("window.seekBySec(10);", null)
+                }
+                seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(sb: SeekBar?, p: Int, f: Boolean) {}
+                    override fun onStartTrackingTouch(sb: SeekBar?) { isSeeking = true }
+                    override fun onStopTrackingTouch(sb: SeekBar?) {
+                        isSeeking = false
+                        if (sb != null && totalDurationSec > 0) {
+                            val targetSec = (sb.progress.toLong() * totalDurationSec) / 1000L
+                            webView.evaluateJavascript("window.seekToSec($targetSec);", null)
+                        }
+                    }
+                })
+            }
 
             dialog.setOnDismissListener {
                 uiHandler.removeCallbacksAndMessages(null)
-                releasePlayers()
+                try { mediaPlayer?.stop() } catch (_: Throwable) {}
+                try { mediaPlayer?.release() } catch (_: Throwable) {}
+                mediaPlayer = null
+                try {
+                    activeWebView?.loadUrl("about:blank")
+                    activeWebView?.destroy()
+                } catch (_: Throwable) {}
+                activeWebView = null
+                try {
+                    activity.requestedOrientation = prevOrientation
+                } catch (_: Throwable) {}
             }
 
             dialog.show()
