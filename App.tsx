@@ -592,9 +592,9 @@ const App = () => {
 
               // 2. Fetch Series IMDb ID & Official Trailer Videos from TMDb
               try {
-                const tvDetailUrl = `https://api.themoviedb.org/3/tv/${tvId}?api_key=${encodeURIComponent(tmdbKey)}&append_to_response=videos,external_ids`;
+                const tvDetailUrl = `https://api.themoviedb.org/3/tv/${tvId}?api_key=${encodeURIComponent(tmdbKey)}&append_to_response=videos,external_ids&include_video_language=en,ta,ml,hi,te,kn,ja,ko,null`;
                 const tvDetail = await fetch(tvDetailUrl).then(r => r.json());
-                imdbId = tvDetail?.external_ids?.imdb_id || '';
+                imdbId = `${tvId}|tv`;
                 const vids = (tvDetail?.videos?.results || []).filter(
                   (v: any) => v.site === 'YouTube' && v.key && (v.type === 'Trailer' || v.type === 'Teaser')
                 );
@@ -615,9 +615,9 @@ const App = () => {
             const movieId = mvRes?.results?.[0]?.id;
             if (movieId && !cancelled) {
               try {
-                const mvDetailUrl = `https://api.themoviedb.org/3/movie/${movieId}?api_key=${encodeURIComponent(tmdbKey)}&append_to_response=videos,external_ids`;
+                const mvDetailUrl = `https://api.themoviedb.org/3/movie/${movieId}?api_key=${encodeURIComponent(tmdbKey)}&append_to_response=videos,external_ids&include_video_language=en,ta,ml,hi,te,kn,ja,ko,null`;
                 const mvDetail = await fetch(mvDetailUrl).then(r => r.json());
-                imdbId = mvDetail?.imdb_id || mvDetail?.external_ids?.imdb_id || '';
+                imdbId = `${movieId}|movie`;
                 const vids = (mvDetail?.videos?.results || []).filter(
                   (v: any) => v.site === 'YouTube' && v.key && (v.type === 'Trailer' || v.type === 'Teaser')
                 );
