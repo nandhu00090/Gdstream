@@ -91,6 +91,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     @Volatile
     private var sessionCookieHeader: String = ""
 
+    @Volatile
+    private var cachedShieldToken: String = ""
+
     data class DirectTrailerStream(
         val label: String,
         val height: Int,
@@ -104,11 +107,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val maxQualityLabel: String
     )
 
-    data class ZipEntryTarget(
+    data class ArchiveEntryTarget(
         val id: String,
-        val zipUrl: String,
+        val archiveUrl: String,
         val fileName: String,
-        val compressionMethod: Int,
+        val archiveFormat: String, // "ZIP" or "RAR"
+        val compressionMethod: Int, // 0 = STORE (Uncompressed), 8 = DEFLATE (ZIP), >0 = RAR Compressed
         val compressedSize: Long,
         val uncompressedSize: Long,
         val localHeaderOffset: Long,
@@ -116,13 +120,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     )
 
     private val verifiedTrailerCache = ConcurrentHashMap<String, VerifiedTrailerInfo>()
-    private val zipEntryRegistry = ConcurrentHashMap<String, ZipEntryTarget>()
-    private val zipEntryCounter = AtomicInteger(1)
+    private val archiveEntryRegistry = ConcurrentHashMap<String, ArchiveEntryTarget>()
+    private val archiveEntryCounter = AtomicInteger(1)
 
     @Volatile
-    private var zipProxyPort: Int = 0
+    private var archiveProxyPort: Int = 0
 
-    private val zipProxyLock = Any()
+    private val archiveProxyLock = Any()
 
     companion object {
         init {
@@ -322,6 +326,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val user = nSync(2, seed)
         val pass = nSync(3, seed)
         if (user.isEmpty() || pass.isEmpty()) throw SecurityException("Sync check failed")
+        cachedShieldToken = shieldToken
         val formBody = "username=${URLEncoder.encode(user, "UTF-8")}&password=${URLEncoder.encode(pass, "UTF-8")}"
         executePinnedPost(
             "$baseUrl/login",
@@ -348,6 +353,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     promise.reject("E_SEC", "Security shield active")
                     return@submit
                 }
+                cachedShieldToken = shieldToken
 
                 if (!nativeSessionLoggedIn) {
                     performNativeLogin(baseUrl, seed, shieldToken)
@@ -394,6 +400,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 return
             }
 
+            cachedShieldToken = nSync(5, seed)
             map.putBoolean("s", false)
             map.putString("a", baseUrl)
             map.putString("b", "")
@@ -406,7 +413,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     }
 
     // =========================================================================
-    // 📦 NATIVE ZIP / ZIP64 RANGE UNPACKER & LOCAL 127.0.0.1 BYTE-SLICE STREAMER
+    // 📦 NATIVE ZIP / ZIP64 + RAR4 / RAR5 INSPECTOR & 127.0.0.1 STREAMING PROXY
     // =========================================================================
 
     private fun readUInt16LE(b: ByteArray, off: Int): Int {
@@ -431,6 +438,23 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             ((b[off + 7].toLong() and 0xFFL) shl 56)
     }
 
+    // Reads a RAR 5.0 variable-length integer (vint), returning Pair(value, bytesConsumed)
+    private fun readRar5Vint(b: ByteArray, startOff: Int): Pair<Long, Int> {
+        var result = 0L
+        var shift = 0
+        var count = 0
+        var idx = startOff
+        while (idx < b.size && count < 10) {
+            val byteVal = b[idx].toInt() and 0xFF
+            result = result or ((byteVal and 0x7F).toLong() shl shift)
+            count++
+            idx++
+            if ((byteVal and 0x80) == 0) break
+            shift += 7
+        }
+        return Pair(result, count)
+    }
+
     private fun openRangeConnection(urlStr: String, rangeHeader: String?): HttpURLConnection {
         var currentUrl = urlStr
         var redirects = 0
@@ -442,6 +466,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 instanceFollowRedirects = false
                 useCaches = false
                 setRequestProperty("User-Agent", "GDStream-Native-Engine/3.0")
+                if (cachedShieldToken.isNotEmpty()) {
+                    setRequestProperty("X-GD-Shield", cachedShieldToken)
+                }
                 if (sessionCookieHeader.isNotEmpty()) {
                     setRequestProperty("Cookie", sessionCookieHeader)
                 }
@@ -464,7 +491,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 return conn
             }
         }
-        throw IllegalStateException("Too many redirects for ZIP stream")
+        throw IllegalStateException("Too many redirects for archive stream")
     }
 
     private fun readExactBytes(stream: InputStream, maxLen: Int): ByteArray {
@@ -481,9 +508,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return out.toByteArray()
     }
 
-    private fun fetchRemoteByteRange(zipUrl: String, start: Long, endInclusive: Long): ByteArray {
+    private fun fetchRemoteByteRange(archiveUrl: String, start: Long, endInclusive: Long): ByteArray {
         val len = (endInclusive - start + 1L).toInt()
-        val conn = openRangeConnection(zipUrl, "bytes=$start-$endInclusive")
+        val conn = openRangeConnection(archiveUrl, "bytes=$start-$endInclusive")
         try {
             return conn.inputStream.use { readExactBytes(it, len) }
         } finally {
@@ -491,8 +518,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun detectRemoteFileSize(zipUrl: String): Long {
-        val conn = openRangeConnection(zipUrl, "bytes=0-1")
+    private fun detectRemoteFileSize(archiveUrl: String): Long {
+        val conn = openRangeConnection(archiveUrl, "bytes=0-1")
         try {
             val contentRange = conn.getHeaderField("Content-Range") ?: conn.getHeaderField("content-range") ?: ""
             if (contentRange.contains("/")) {
@@ -500,17 +527,16 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val parsed = slashVal.toLongOrNull()
                 if (parsed != null && parsed > 0L) return parsed
             }
-            val lenHeader = conn.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
-            return lenHeader
+            return conn.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
         } finally {
             conn.disconnect()
         }
     }
 
-    private fun resolveEntryDataStartOffset(entry: ZipEntryTarget): Long {
+    private fun resolveEntryDataStartOffset(entry: ArchiveEntryTarget): Long {
         if (entry.dataStartOffset >= 0L) return entry.dataStartOffset
         val headerBytes = fetchRemoteByteRange(
-            entry.zipUrl,
+            entry.archiveUrl,
             entry.localHeaderOffset,
             entry.localHeaderOffset + 63L
         )
@@ -529,25 +555,25 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         throw IllegalStateException("Invalid ZIP Local File Header at offset ${entry.localHeaderOffset}")
     }
 
-    private fun ensureZipProxyRunning(): Int {
-        if (zipProxyPort > 0) return zipProxyPort
-        synchronized(zipProxyLock) {
-            if (zipProxyPort > 0) return zipProxyPort
+    private fun ensureArchiveProxyRunning(): Int {
+        if (archiveProxyPort > 0) return archiveProxyPort
+        synchronized(archiveProxyLock) {
+            if (archiveProxyPort > 0) return archiveProxyPort
             val server = ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"))
-            zipProxyPort = server.localPort
+            archiveProxyPort = server.localPort
             ioExecutor.submit {
                 while (!server.isClosed) {
                     try {
                         val client = server.accept()
-                        ioExecutor.submit { handleZipProxyClient(client) }
+                        ioExecutor.submit { handleArchiveProxyClient(client) }
                     } catch (_: Throwable) {}
                 }
             }
-            return zipProxyPort
+            return archiveProxyPort
         }
     }
 
-    private fun handleZipProxyClient(socket: Socket) {
+    private fun handleArchiveProxyClient(socket: Socket) {
         socket.use { sock ->
             sock.soTimeout = 30000
             val reader = BufferedReader(InputStreamReader(sock.getInputStream(), StandardCharsets.US_ASCII))
@@ -566,7 +592,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
             }
 
-            // Expected path: /zip/<entryId>/<encodedFileName>
             val segments = path.split("/").filter { it.isNotEmpty() }
             if (segments.size < 2 || segments[0] != "zip") {
                 val out = sock.getOutputStream()
@@ -576,7 +601,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             }
 
             val entryId = segments[1]
-            val entry = zipEntryRegistry[entryId]
+            val entry = archiveEntryRegistry[entryId]
             if (entry == null) {
                 val out = sock.getOutputStream()
                 out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
@@ -640,10 +665,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val dataStart = resolveEntryDataStartOffset(entry)
 
             if (entry.compressionMethod == 0) {
-                // STORE Mode (Uncompressed): True 1:1 Byte-Slice Range Streaming with Instant Seeking!
+                // STORE Mode (Uncompressed ZIP or Uncompressed RAR): Direct 1:1 Byte-Slice Range Streaming!
                 val remoteStart = dataStart + reqStart
                 val remoteEnd = dataStart + reqEnd
-                val remoteConn = openRangeConnection(entry.zipUrl, "bytes=$remoteStart-$remoteEnd")
+                val remoteConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
                 try {
                     val headers = buildString {
                         append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
@@ -673,11 +698,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 } finally {
                     remoteConn.disconnect()
                 }
-            } else if (entry.compressionMethod == 8) {
-                // DEFLATE Mode (Compressed): On-the-fly Inflater stream from start of compressed entry
+            } else if (entry.archiveFormat == "ZIP" && entry.compressionMethod == 8) {
+                // DEFLATE Mode (Compressed ZIP): On-the-fly Inflater stream
                 val remoteStart = dataStart
                 val remoteEnd = dataStart + entry.compressedSize - 1L
-                val remoteConn = openRangeConnection(entry.zipUrl, "bytes=$remoteStart-$remoteEnd")
+                val remoteConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
                 val inflater = Inflater(true)
                 try {
                     val headers = buildString {
@@ -695,7 +720,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
                     InflaterInputStream(remoteConn.inputStream, inflater, 65536).use { infStream ->
                         val buf = ByteArray(65536)
-                        // Skip to reqStart if small range offset (e.g. MediaInfo probe or header read)
                         var toSkip = reqStart
                         while (toSkip > 0L) {
                             val step = minOf(buf.size.toLong(), toSkip).toInt()
@@ -718,8 +742,192 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     inflater.end()
                     remoteConn.disconnect()
                 }
+            } else {
+                val outStream = sock.getOutputStream()
+                outStream.write("HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\n\r\n".toByteArray())
+                outStream.flush()
             }
         }
+    }
+
+    // Hop across RAR 5.0 block headers via tiny Range reads (Works even if .rar was renamed to .zip!)
+    private fun parseRar5ArchiveEntries(archiveUrl: String, totalSize: Long, port: Int): List<JSONObject> {
+        val mediaExtensions = listOf(".mkv", ".mp4", ".avi", ".mov", ".m4v", ".webm", ".ts", ".m2ts")
+        val items = ArrayList<JSONObject>()
+        var offset = 8L // Skip 8-byte RAR5 signature
+        var hops = 0
+
+        while (offset + 10L < totalSize && hops < 250) {
+            hops++
+            val readEnd = minOf(totalSize - 1L, offset + 511L)
+            val buf = fetchRemoteByteRange(archiveUrl, offset, readEnd)
+            if (buf.size < 8) break
+
+            val (headerSize, hsLen) = readRar5Vint(buf, 4)
+            val hdrStart = 4 + hsLen
+            if (headerSize <= 0L || headerSize > 65536L) break
+
+            val fullHdrBytes = if (hdrStart + headerSize.toInt() <= buf.size) {
+                buf
+            } else {
+                fetchRemoteByteRange(archiveUrl, offset, minOf(totalSize - 1L, offset + hdrStart + headerSize - 1L))
+            }
+
+            var p = hdrStart
+            val (headerType, htLen) = readRar5Vint(fullHdrBytes, p); p += htLen
+            val (headerFlags, hfLen) = readRar5Vint(fullHdrBytes, p); p += hfLen
+
+            if ((headerFlags and 0x0001L) != 0L) {
+                val (_, esLen) = readRar5Vint(fullHdrBytes, p); p += esLen
+            }
+            var dataSize = 0L
+            if ((headerFlags and 0x0002L) != 0L) {
+                val (ds, dsLen) = readRar5Vint(fullHdrBytes, p); dataSize = ds; p += dsLen
+            }
+
+            if (headerType == 5L) break // End of archive header
+
+            val dataStartOffset = offset + hdrStart.toLong() + headerSize
+
+            if (headerType == 2L) { // File header
+                val (fileFlags, ffLen) = readRar5Vint(fullHdrBytes, p); p += ffLen
+                val (unpackedSize, usLen) = readRar5Vint(fullHdrBytes, p); p += usLen
+                val (_, atLen) = readRar5Vint(fullHdrBytes, p); p += atLen
+                if ((fileFlags and 0x0002L) != 0L) p += 4 // mtime
+                if ((fileFlags and 0x0004L) != 0L) p += 4 // crc32
+                val (compInfo, ciLen) = readRar5Vint(fullHdrBytes, p); p += ciLen
+                val (_, hoLen) = readRar5Vint(fullHdrBytes, p); p += hoLen
+                val (nameLen, nlLen) = readRar5Vint(fullHdrBytes, p); p += nlLen
+
+                val nLen = nameLen.toInt()
+                if (nLen > 0 && p + nLen <= fullHdrBytes.size) {
+                    val fullEntryName = String(fullHdrBytes, p, nLen, StandardCharsets.UTF_8).replace('\\', '/')
+                    val baseName = fullEntryName.substringAfterLast('/')
+                    val lowerName = baseName.lowercase(Locale.ROOT)
+                    val isDir = (fileFlags and 0x0001L) != 0L
+                    val method = ((compInfo ushr 7) and 0x07L).toInt() // 0 = STORE
+
+                    if (!isDir && unpackedSize > 0L && mediaExtensions.any { lowerName.endsWith(it) }) {
+                        val entryId = "ze_${archiveEntryCounter.getAndIncrement()}"
+                        val target = ArchiveEntryTarget(
+                            id = entryId,
+                            archiveUrl = archiveUrl,
+                            fileName = baseName,
+                            archiveFormat = "RAR",
+                            compressionMethod = method,
+                            compressedSize = dataSize,
+                            uncompressedSize = unpackedSize,
+                            localHeaderOffset = offset,
+                            dataStartOffset = dataStartOffset
+                        )
+                        archiveEntryRegistry[entryId] = target
+                        val safeName = URLEncoder.encode(baseName, "UTF-8").replace("+", "%20")
+                        val streamUrl = "http://127.0.0.1:$port/zip/$entryId/$safeName"
+
+                        items.add(JSONObject().apply {
+                            put("id", entryId)
+                            put("name", baseName)
+                            put("size", unpackedSize.toString())
+                            put("mimeType", if (lowerName.endsWith(".mp4") || lowerName.endsWith(".m4v")) "video/mp4" else "video/x-matroska")
+                            put("link", streamUrl)
+                            put("isZipEntry", true)
+                            put("zipCompression", if (method == 0) "STORE" else "RAR_COMPRESSED")
+                        })
+                    }
+                }
+            }
+
+            val nextOffset = dataStartOffset + dataSize
+            if (nextOffset <= offset) break
+            offset = nextOffset
+        }
+        return items
+    }
+
+    // Hop across RAR 4.x block headers via tiny Range reads (Works even if .rar was renamed to .zip!)
+    private fun parseRar4ArchiveEntries(archiveUrl: String, totalSize: Long, port: Int): List<JSONObject> {
+        val mediaExtensions = listOf(".mkv", ".mp4", ".avi", ".mov", ".m4v", ".webm", ".ts", ".m2ts")
+        val items = ArrayList<JSONObject>()
+        var offset = 7L // Skip 7-byte RAR4 signature
+        var hops = 0
+
+        while (offset + 7L < totalSize && hops < 250) {
+            hops++
+            val readEnd = minOf(totalSize - 1L, offset + 511L)
+            val buf = fetchRemoteByteRange(archiveUrl, offset, readEnd)
+            if (buf.size < 7) break
+
+            val headType = buf[2].toInt() and 0xFF
+            val headFlags = readUInt16LE(buf, 3)
+            val headSize = readUInt16LE(buf, 5)
+            if (headSize < 7 || headType == 0x7B) break
+
+            var addSize = 0L
+            if ((headFlags and 0x8000) != 0 && buf.size >= 11) {
+                addSize = readUInt32LE(buf, 7)
+            }
+
+            if (headType == 0x74 && buf.size >= 32) { // File Header
+                var packSize = readUInt32LE(buf, 7)
+                var unpSize = readUInt32LE(buf, 11)
+                val method = buf[25].toInt() and 0xFF // 0x30 = STORE
+                val nameSize = readUInt16LE(buf, 26)
+                var nameOffset = 32
+
+                if ((headFlags and 0x0100) != 0 && buf.size >= 40) {
+                    val highPack = readUInt32LE(buf, 32)
+                    val highUnp = readUInt32LE(buf, 36)
+                    packSize = packSize or (highPack shl 32)
+                    unpSize = unpSize or (highUnp shl 32)
+                    nameOffset = 40
+                }
+                addSize = packSize
+
+                if (nameSize > 0 && nameOffset + nameSize <= buf.size) {
+                    val rawNameStr = String(buf, nameOffset, nameSize, StandardCharsets.UTF_8)
+                        .substringBefore('\u0000')
+                        .replace('\\', '/')
+                    val baseName = rawNameStr.substringAfterLast('/')
+                    val lowerName = baseName.lowercase(Locale.ROOT)
+                    val isDir = (headFlags and 0x00E0) == 0x00E0
+                    val normMethod = if (method == 0x30) 0 else method
+                    val dataStartOffset = offset + headSize.toLong()
+
+                    if (!isDir && unpSize > 0L && mediaExtensions.any { lowerName.endsWith(it) }) {
+                        val entryId = "ze_${archiveEntryCounter.getAndIncrement()}"
+                        val target = ArchiveEntryTarget(
+                            id = entryId,
+                            archiveUrl = archiveUrl,
+                            fileName = baseName,
+                            archiveFormat = "RAR",
+                            compressionMethod = normMethod,
+                            compressedSize = packSize,
+                            uncompressedSize = unpSize,
+                            localHeaderOffset = offset,
+                            dataStartOffset = dataStartOffset
+                        )
+                        archiveEntryRegistry[entryId] = target
+                        val safeName = URLEncoder.encode(baseName, "UTF-8").replace("+", "%20")
+                        val streamUrl = "http://127.0.0.1:$port/zip/$entryId/$safeName"
+
+                        items.add(JSONObject().apply {
+                            put("id", entryId)
+                            put("name", baseName)
+                            put("size", unpSize.toString())
+                            put("mimeType", if (lowerName.endsWith(".mp4") || lowerName.endsWith(".m4v")) "video/mp4" else "video/x-matroska")
+                            put("link", streamUrl)
+                            put("isZipEntry", true)
+                            put("zipCompression", if (normMethod == 0) "STORE" else "RAR_COMPRESSED")
+                        })
+                    }
+                }
+            }
+
+            val nextOffset = offset + headSize.toLong() + addSize
+            if (nextOffset <= offset) break
+            offset = nextOffset
+        }
+        return items
     }
 
     @ReactMethod
@@ -732,28 +940,53 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     return@submit
                 }
 
-                // Ensure session cookie is initialized if needed
-                if (!nativeSessionLoggedIn) {
-                    val baseUrl = nSync(1, seed)
-                    val shieldToken = nSync(5, seed)
-                    if (baseUrl.isNotEmpty() && shieldToken.isNotEmpty()) {
-                        try { performNativeLogin(baseUrl, seed, shieldToken) } catch (_: Throwable) {}
-                    }
+                val baseUrl = nSync(1, seed)
+                val shieldToken = nSync(5, seed)
+                if (shieldToken.isNotEmpty()) cachedShieldToken = shieldToken
+
+                if (!nativeSessionLoggedIn && baseUrl.isNotEmpty() && shieldToken.isNotEmpty()) {
+                    try { performNativeLogin(baseUrl, seed, shieldToken) } catch (_: Throwable) {}
                 }
 
-                var totalZipSize = fileSizeHint.toLong()
-                if (totalZipSize <= 0L) {
-                    totalZipSize = detectRemoteFileSize(zipUrl)
+                var totalArchiveSize = fileSizeHint.toLong()
+                if (totalArchiveSize <= 0L) {
+                    totalArchiveSize = detectRemoteFileSize(zipUrl)
                 }
-                if (totalZipSize <= 22L) {
-                    promise.reject("E_ZIP", "Unable to determine ZIP file size")
+                if (totalArchiveSize <= 22L) {
+                    promise.reject("E_ZIP", "Unable to determine archive file size")
                     return@submit
                 }
 
-                // 1. Fetch the last 128 KB of the .zip to locate EOCD / ZIP64 EOCD
-                val tailLen = minOf(totalZipSize, 131072L).toInt()
-                val tailStart = totalZipSize - tailLen.toLong()
-                val tailBuf = fetchRemoteByteRange(zipUrl, tailStart, totalZipSize - 1L)
+                val port = ensureArchiveProxyRunning()
+
+                // 1. Check first 16 bytes at offset 0 to auto-detect RAR4 / RAR5 (even if .rar was renamed to .zip!)
+                val headProbe = fetchRemoteByteRange(zipUrl, 0L, 15L)
+                if (headProbe.size >= 7 &&
+                    headProbe[0] == 0x52.toByte() && // 'R'
+                    headProbe[1] == 0x61.toByte() && // 'a'
+                    headProbe[2] == 0x72.toByte() && // 'r'
+                    headProbe[3] == 0x21.toByte() && // '!'
+                    headProbe[4] == 0x1A.toByte() &&
+                    headProbe[5] == 0x07.toByte()
+                ) {
+                    val rarItems = if (headProbe.size >= 8 && headProbe[6] == 0x01.toByte() && headProbe[7] == 0x00.toByte()) {
+                        parseRar5ArchiveEntries(zipUrl, totalArchiveSize, port)
+                    } else {
+                        parseRar4ArchiveEntries(zipUrl, totalArchiveSize, port)
+                    }
+                    val sortedRar = rarItems.sortedWith(Comparator { a, b ->
+                        a.optString("name", "").compareTo(b.optString("name", ""), ignoreCase = true)
+                    })
+                    val outRar = JSONArray()
+                    for (item in sortedRar) outRar.put(item)
+                    promise.resolve(outRar.toString())
+                    return@submit
+                }
+
+                // 2. Standard ZIP / ZIP64 Central Directory Tail Reader
+                val tailLen = minOf(totalArchiveSize, 131072L).toInt()
+                val tailStart = totalArchiveSize - tailLen.toLong()
+                val tailBuf = fetchRemoteByteRange(zipUrl, tailStart, totalArchiveSize - 1L)
 
                 var eocdPos = -1
                 for (i in (tailBuf.size - 22) downTo 0) {
@@ -768,14 +1001,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
 
                 if (eocdPos < 0) {
-                    promise.reject("E_ZIP", "Valid ZIP Central Directory not found")
+                    promise.reject("E_ZIP", "Archive header not recognized (Not a valid ZIP or RAR file)")
                     return@submit
                 }
 
                 var cdSize = readUInt32LE(tailBuf, eocdPos + 12)
                 var cdOffset = readUInt32LE(tailBuf, eocdPos + 16)
 
-                // Check for ZIP64 End of Central Directory Locator (20 bytes right before EOCD)
                 if (eocdPos >= 20) {
                     val locPos = eocdPos - 20
                     if (tailBuf[locPos] == 0x50.toByte() &&
@@ -784,7 +1016,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         tailBuf[locPos + 3] == 0x07.toByte()
                     ) {
                         val zip64EocdOffset = readInt64LE(tailBuf, locPos + 8)
-                        val z64Buf = if (zip64EocdOffset >= tailStart && (zip64EocdOffset + 56L) <= totalZipSize) {
+                        val z64Buf = if (zip64EocdOffset >= tailStart && (zip64EocdOffset + 56L) <= totalArchiveSize) {
                             val rel = (zip64EocdOffset - tailStart).toInt()
                             tailBuf.copyOfRange(rel, rel + 56)
                         } else {
@@ -807,8 +1039,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     return@submit
                 }
 
-                // 2. Obtain Central Directory bytes (from tailBuf if already inside, otherwise 1 HTTP Range call)
-                val cdBytes = if (cdOffset >= tailStart && (cdOffset + cdSize) <= totalZipSize) {
+                val cdBytes = if (cdOffset >= tailStart && (cdOffset + cdSize) <= totalArchiveSize) {
                     val relStart = (cdOffset - tailStart).toInt()
                     val relEnd = (relStart + cdSize.toInt()).coerceAtMost(tailBuf.size)
                     tailBuf.copyOfRange(relStart, relEnd)
@@ -816,7 +1047,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     fetchRemoteByteRange(zipUrl, cdOffset, cdOffset + cdSize - 1L)
                 }
 
-                val port = ensureZipProxyRunning()
                 val mediaExtensions = listOf(".mkv", ".mp4", ".avi", ".mov", ".m4v", ".webm", ".ts", ".m2ts")
                 val parsedItems = ArrayList<JSONObject>()
 
@@ -842,7 +1072,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     if (nameStart + nameLen > cdBytes.size) break
                     val fullEntryName = String(cdBytes, nameStart, nameLen, StandardCharsets.UTF_8)
 
-                    // Parse ZIP64 Extra Field (0x0001) if any 32-bit field overflowed (0xFFFFFFFF)
                     val extraStart = nameStart + nameLen
                     val extraEnd = (extraStart + extraLen).coerceAtMost(cdBytes.size)
                     if (uncompSize == 0xFFFFFFFFL || compSize == 0xFFFFFFFFL || localHdrOff == 0xFFFFFFFFL) {
@@ -880,17 +1109,18 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         baseName.isEmpty()
 
                     if (!isJunk && uncompSize > 0L && mediaExtensions.any { lowerName.endsWith(it) }) {
-                        val entryId = "ze_${zipEntryCounter.getAndIncrement()}"
-                        val target = ZipEntryTarget(
+                        val entryId = "ze_${archiveEntryCounter.getAndIncrement()}"
+                        val target = ArchiveEntryTarget(
                             id = entryId,
-                            zipUrl = zipUrl,
+                            archiveUrl = zipUrl,
                             fileName = baseName,
+                            archiveFormat = "ZIP",
                             compressionMethod = compMethod,
                             compressedSize = compSize,
                             uncompressedSize = uncompSize,
                             localHeaderOffset = localHdrOff
                         )
-                        zipEntryRegistry[entryId] = target
+                        archiveEntryRegistry[entryId] = target
 
                         val safeName = URLEncoder.encode(baseName, "UTF-8").replace("+", "%20")
                         val streamUrl = "http://127.0.0.1:$port/zip/$entryId/$safeName"
@@ -908,7 +1138,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 }
 
-                // Sort episodes naturally by filename (S01E01, S01E02, ...)
                 parsedItems.sortWith(Comparator { a, b ->
                     a.optString("name", "").compareTo(b.optString("name", ""), ignoreCase = true)
                 })
@@ -919,7 +1148,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
                 promise.resolve(outArray.toString())
             } catch (e: Exception) {
-                promise.reject("E_ZIP", e.message ?: "Failed to inspect ZIP archive")
+                promise.reject("E_ZIP", e.message ?: "Failed to inspect archive")
             }
         }
     }
