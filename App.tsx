@@ -152,7 +152,7 @@ const getVersionTag = (name: string): string => {
 };
 
 const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => {
-  const withoutExt = isFolder ? name : name.replace(/\.(mkv|mp4|avi|mov|webm|m4v|ts)$/i, '');
+  const withoutExt = isFolder ? name : name.replace(/\.(mkv|mp4|avi|mov|webm|m4v|ts|zip)$/i, '');
   const normalized = withoutExt
     .replace(/[._]+/g, ' ')
     .replace(/\[.*?\]/g, ' ')
@@ -1080,7 +1080,7 @@ const App = () => {
         const itemKey = item.name;
         if (fetchedKeysRef.current.has(itemKey)) continue;
         fetchedKeysRef.current.add(itemKey);
-        const isFolder = !!item.mimeType?.includes('folder');
+        const isFolder = !!item.mimeType?.includes('folder') || (/\.zip$/i.test(String(item.name || '')) && !item.isZipEntry);
         const info = parseMediaFilename(item.name, isFolder);
         const meta = await fetchSingleMetadata(info);
         if (meta && !cancelled) setMetadataMap(prev => ({ ...prev, [itemKey]: meta }));
@@ -1093,7 +1093,7 @@ const App = () => {
   const buildProcessedList = useCallback((rawList: any[], isEpFolder: boolean) => {
     const q = searchQuery.trim().toLowerCase();
     const filtered = rawList.filter((file) => {
-      const isFolder = !!file.mimeType?.includes('folder');
+      const isFolder = !!file.mimeType?.includes('folder') || (/\.zip$/i.test(String(file.name || '')) && !file.isZipEntry);
       const info = parseMediaFilename(file.name, isFolder);
       const realMi = mediaInfoMap[file.name];
 
@@ -1162,7 +1162,7 @@ const App = () => {
     }
 
     return mergedOrder.map(item => {
-      const isFolder = !!item.mimeType?.includes('folder');
+      const isFolder = !!item.mimeType?.includes('folder') || (/\.zip$/i.test(String(item.name || '')) && !item.isZipEntry);
       const info = parseMediaFilename(item.name, isFolder);
       if (info.isFolder || info.seasonEpisode || info.episodeNum > 0) return item;
       const key = `${info.cleanTitle.toLowerCase()}|${info.year}`;
@@ -1204,6 +1204,50 @@ const App = () => {
     if (file.link) return file.link.startsWith('http') ? file.link : `${baseUrl}${file.link.startsWith('/') ? '' : '/'}${file.link}`;
     return `${baseUrl}${currentPath}${encodeURIComponent(file.name)}`;
   }, [downloads, currentPath]);
+
+  const zipParentBackupRef = React.useRef<{
+    wasInsideFolder: boolean;
+    folderFiles: any[];
+    currentPath: string;
+    seriesParentTitle: string;
+    seasonFolders: any[];
+    activeSeason: any;
+  } | null>(null);
+
+  const openZipArchiveFile = async (zipItem: any) => {
+    try {
+      const info = parseMediaFilename(zipItem.name, false);
+      zipParentBackupRef.current = {
+        wasInsideFolder: isInsideFolder,
+        folderFiles: [...folderFiles],
+        currentPath,
+        seriesParentTitle,
+        seasonFolders: [...seasonFolders],
+        activeSeason,
+      };
+
+      setIsInsideFolder(true);
+      setFolderLoading(true);
+      setSeriesParentTitle(info.cleanTitle || zipItem.name.replace(/\.zip$/i, ''));
+
+      const zipUrl = getStreamUrl(zipItem);
+      const sizeHint = Number(zipItem.size || 0);
+      if (SecurityVault?.listZipMediaEntries) {
+        const rawJson = await SecurityVault.listZipMediaEntries(zipUrl, sizeHint);
+        const entries = rawJson ? JSON.parse(rawJson) : [];
+        if (Array.isArray(entries) && entries.length > 0) {
+          setFolderFiles(entries);
+          setFolderLoading(false);
+          return;
+        }
+      }
+      setFolderFiles([]);
+      setFolderLoading(false);
+    } catch (_e) {
+      setFolderLoading(false);
+    }
+  };
+
 
   useEffect(() => {
     if (!selectedFile || playMode !== null) return;
@@ -1500,6 +1544,10 @@ const App = () => {
   };
 
   const handlePress = (item: any) => {
+    if (item?.name && /\.zip$/i.test(String(item.name)) && !item?.isZipEntry) {
+      openZipArchiveFile(item);
+      return;
+    }
     if (item.mimeType?.includes('folder')) {
       const newPath = `${currentPath}${encodeURIComponent(item.name)}/`;
       setPathStack([...pathStack, newPath]);
@@ -1514,6 +1562,24 @@ const App = () => {
 
   // Instant Back from Series to Homepage: Home FlatList stays mounted at exact scroll position!
   const goBack = () => {
+    if (zipParentBackupRef.current) {
+      const prev = zipParentBackupRef.current;
+      zipParentBackupRef.current = null;
+      if (prev.wasInsideFolder) {
+        setFolderFiles(prev.folderFiles);
+        setCurrentPath(prev.currentPath);
+        setSeriesParentTitle(prev.seriesParentTitle);
+        setSeasonFolders(prev.seasonFolders);
+        setActiveSeason(prev.activeSeason);
+      } else {
+        setIsInsideFolder(false);
+        setFolderFiles([]);
+        setSeasonFolders([]);
+        setActiveSeason(null);
+        setSeriesParentTitle('');
+      }
+      return;
+    }
     if (pathStack.length > 1) {
       const newStack = pathStack.slice(0, -1);
       const targetPath = newStack[newStack.length - 1];
@@ -2656,7 +2722,7 @@ const App = () => {
   const activeDownloadsCount = downloads.filter(d => d.status === 'downloading').length;
 
   const renderCatalogCard = ({ item, index }: { item: any; index: number }) => {
-    const isFolder = !!item.mimeType?.includes('folder');
+    const isFolder = !!item.mimeType?.includes('folder') || (/\.zip$/i.test(String(item.name || '')) && !item.isZipEntry);
     const info = parseMediaFilename(item.name, isFolder);
     const meta = metadataMap[item.name];
     const realMi = mediaInfoMap[item.name];

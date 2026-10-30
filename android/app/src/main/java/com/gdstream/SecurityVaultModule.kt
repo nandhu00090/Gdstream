@@ -43,17 +43,24 @@ import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.UiThreadUtil
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedOutputStream
 import java.io.BufferedReader
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.FileReader
+import java.io.InputStream
 import java.io.InputStreamReader
 import java.net.CookieHandler
 import java.net.CookieManager
 import java.net.CookiePolicy
 import java.net.HttpURLConnection
+import java.net.InetAddress
 import java.net.Proxy
+import java.net.ServerSocket
+import java.net.Socket
 import java.net.URL
 import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import java.security.KeyStore
 import java.security.SecureRandom
 import java.security.cert.CertificateException
@@ -62,7 +69,10 @@ import java.security.cert.X509Certificate
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.regex.Pattern
+import java.util.zip.Inflater
+import java.util.zip.InflaterInputStream
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocketFactory
@@ -88,13 +98,31 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     )
 
     data class VerifiedTrailerInfo(
-        val engine: String, // "IMDB_DIRECT" or "YT_VERIFIED"
+        val engine: String,
         val videoId: String,
         val directStreams: List<DirectTrailerStream>,
         val maxQualityLabel: String
     )
 
+    data class ZipEntryTarget(
+        val id: String,
+        val zipUrl: String,
+        val fileName: String,
+        val compressionMethod: Int,
+        val compressedSize: Long,
+        val uncompressedSize: Long,
+        val localHeaderOffset: Long,
+        @Volatile var dataStartOffset: Long = -1L
+    )
+
     private val verifiedTrailerCache = ConcurrentHashMap<String, VerifiedTrailerInfo>()
+    private val zipEntryRegistry = ConcurrentHashMap<String, ZipEntryTarget>()
+    private val zipEntryCounter = AtomicInteger(1)
+
+    @Volatile
+    private var zipProxyPort: Int = 0
+
+    private val zipProxyLock = Any()
 
     companion object {
         init {
@@ -377,7 +405,529 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // Strict filter to reject Movie Reviews, Public Talk, Reactions, Shorts, Songs, etc.
+    // =========================================================================
+    // 📦 NATIVE ZIP / ZIP64 RANGE UNPACKER & LOCAL 127.0.0.1 BYTE-SLICE STREAMER
+    // =========================================================================
+
+    private fun readUInt16LE(b: ByteArray, off: Int): Int {
+        return (b[off].toInt() and 0xFF) or ((b[off + 1].toInt() and 0xFF) shl 8)
+    }
+
+    private fun readUInt32LE(b: ByteArray, off: Int): Long {
+        return (b[off].toLong() and 0xFFL) or
+            ((b[off + 1].toLong() and 0xFFL) shl 8) or
+            ((b[off + 2].toLong() and 0xFFL) shl 16) or
+            ((b[off + 3].toLong() and 0xFFL) shl 24)
+    }
+
+    private fun readInt64LE(b: ByteArray, off: Int): Long {
+        return (b[off].toLong() and 0xFFL) or
+            ((b[off + 1].toLong() and 0xFFL) shl 8) or
+            ((b[off + 2].toLong() and 0xFFL) shl 16) or
+            ((b[off + 3].toLong() and 0xFFL) shl 24) or
+            ((b[off + 4].toLong() and 0xFFL) shl 32) or
+            ((b[off + 5].toLong() and 0xFFL) shl 40) or
+            ((b[off + 6].toLong() and 0xFFL) shl 48) or
+            ((b[off + 7].toLong() and 0xFFL) shl 56)
+    }
+
+    private fun openRangeConnection(urlStr: String, rangeHeader: String?): HttpURLConnection {
+        var currentUrl = urlStr
+        var redirects = 0
+        while (redirects < 5) {
+            val conn = (URL(currentUrl).openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
+                connectTimeout = 12000
+                readTimeout = 20000
+                requestMethod = "GET"
+                instanceFollowRedirects = false
+                useCaches = false
+                setRequestProperty("User-Agent", "GDStream-Native-Engine/3.0")
+                if (sessionCookieHeader.isNotEmpty()) {
+                    setRequestProperty("Cookie", sessionCookieHeader)
+                }
+                if (!rangeHeader.isNullOrEmpty()) {
+                    setRequestProperty("Range", rangeHeader)
+                }
+                if (this is HttpsURLConnection) {
+                    sslSocketFactory = buildPinnedSystemSslFactory()
+                    hostnameVerifier = HttpsURLConnection.getDefaultHostnameVerifier()
+                }
+            }
+            val code = conn.responseCode
+            if (code in 300..399) {
+                val loc = conn.getHeaderField("Location")
+                conn.disconnect()
+                if (loc.isNullOrEmpty()) break
+                currentUrl = URL(URL(currentUrl), loc).toString()
+                redirects++
+            } else {
+                return conn
+            }
+        }
+        throw IllegalStateException("Too many redirects for ZIP stream")
+    }
+
+    private fun readExactBytes(stream: InputStream, maxLen: Int): ByteArray {
+        val out = ByteArrayOutputStream()
+        val buf = ByteArray(16384)
+        var total = 0
+        while (total < maxLen) {
+            val toRead = minOf(buf.size, maxLen - total)
+            val r = stream.read(buf, 0, toRead)
+            if (r <= 0) break
+            out.write(buf, 0, r)
+            total += r
+        }
+        return out.toByteArray()
+    }
+
+    private fun fetchRemoteByteRange(zipUrl: String, start: Long, endInclusive: Long): ByteArray {
+        val len = (endInclusive - start + 1L).toInt()
+        val conn = openRangeConnection(zipUrl, "bytes=$start-$endInclusive")
+        try {
+            return conn.inputStream.use { readExactBytes(it, len) }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun detectRemoteFileSize(zipUrl: String): Long {
+        val conn = openRangeConnection(zipUrl, "bytes=0-1")
+        try {
+            val contentRange = conn.getHeaderField("Content-Range") ?: conn.getHeaderField("content-range") ?: ""
+            if (contentRange.contains("/")) {
+                val slashVal = contentRange.substringAfterLast("/").trim()
+                val parsed = slashVal.toLongOrNull()
+                if (parsed != null && parsed > 0L) return parsed
+            }
+            val lenHeader = conn.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
+            return lenHeader
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun resolveEntryDataStartOffset(entry: ZipEntryTarget): Long {
+        if (entry.dataStartOffset >= 0L) return entry.dataStartOffset
+        val headerBytes = fetchRemoteByteRange(
+            entry.zipUrl,
+            entry.localHeaderOffset,
+            entry.localHeaderOffset + 63L
+        )
+        if (headerBytes.size >= 30 &&
+            headerBytes[0] == 0x50.toByte() &&
+            headerBytes[1] == 0x4b.toByte() &&
+            headerBytes[2] == 0x03.toByte() &&
+            headerBytes[3] == 0x04.toByte()
+        ) {
+            val nameLen = readUInt16LE(headerBytes, 26)
+            val extraLen = readUInt16LE(headerBytes, 28)
+            val computed = entry.localHeaderOffset + 30L + nameLen.toLong() + extraLen.toLong()
+            entry.dataStartOffset = computed
+            return computed
+        }
+        throw IllegalStateException("Invalid ZIP Local File Header at offset ${entry.localHeaderOffset}")
+    }
+
+    private fun ensureZipProxyRunning(): Int {
+        if (zipProxyPort > 0) return zipProxyPort
+        synchronized(zipProxyLock) {
+            if (zipProxyPort > 0) return zipProxyPort
+            val server = ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"))
+            zipProxyPort = server.localPort
+            ioExecutor.submit {
+                while (!server.isClosed) {
+                    try {
+                        val client = server.accept()
+                        ioExecutor.submit { handleZipProxyClient(client) }
+                    } catch (_: Throwable) {}
+                }
+            }
+            return zipProxyPort
+        }
+    }
+
+    private fun handleZipProxyClient(socket: Socket) {
+        socket.use { sock ->
+            sock.soTimeout = 30000
+            val reader = BufferedReader(InputStreamReader(sock.getInputStream(), StandardCharsets.US_ASCII))
+            val requestLine = reader.readLine() ?: return
+            val parts = requestLine.split(" ")
+            if (parts.size < 2) return
+            val method = parts[0].uppercase(Locale.ROOT)
+            val path = parts[1]
+
+            var rangeHeader: String? = null
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.isEmpty()) break
+                if (line.startsWith("Range:", ignoreCase = true)) {
+                    rangeHeader = line.substringAfter(":").trim()
+                }
+            }
+
+            // Expected path: /zip/<entryId>/<encodedFileName>
+            val segments = path.split("/").filter { it.isNotEmpty() }
+            if (segments.size < 2 || segments[0] != "zip") {
+                val out = sock.getOutputStream()
+                out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
+                out.flush()
+                return
+            }
+
+            val entryId = segments[1]
+            val entry = zipEntryRegistry[entryId]
+            if (entry == null) {
+                val out = sock.getOutputStream()
+                out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
+                out.flush()
+                return
+            }
+
+            val totalSize = entry.uncompressedSize
+            val mimeType = when {
+                entry.fileName.endsWith(".mp4", ignoreCase = true) ||
+                entry.fileName.endsWith(".m4v", ignoreCase = true) -> "video/mp4"
+                entry.fileName.endsWith(".webm", ignoreCase = true) -> "video/webm"
+                else -> "video/x-matroska"
+            }
+
+            var reqStart = 0L
+            var reqEnd = totalSize - 1L
+            var isPartial = false
+
+            if (!rangeHeader.isNullOrEmpty() && rangeHeader.startsWith("bytes=")) {
+                isPartial = true
+                val spec = rangeHeader.removePrefix("bytes=").substringBefore(",").trim()
+                val dashIdx = spec.indexOf('-')
+                if (dashIdx >= 0) {
+                    val sPart = spec.substring(0, dashIdx).trim()
+                    val ePart = spec.substring(dashIdx + 1).trim()
+                    if (sPart.isNotEmpty()) {
+                        reqStart = sPart.toLongOrNull() ?: 0L
+                        if (ePart.isNotEmpty()) {
+                            reqEnd = ePart.toLongOrNull() ?: (totalSize - 1L)
+                        }
+                    } else if (ePart.isNotEmpty()) {
+                        val suffixLen = ePart.toLongOrNull() ?: 0L
+                        reqStart = (totalSize - suffixLen).coerceAtLeast(0L)
+                    }
+                }
+            }
+
+            reqStart = reqStart.coerceIn(0L, (totalSize - 1L).coerceAtLeast(0L))
+            reqEnd = reqEnd.coerceIn(reqStart, (totalSize - 1L).coerceAtLeast(0L))
+            val contentLength = reqEnd - reqStart + 1L
+
+            val out = BufferedOutputStream(sock.getOutputStream(), 65536)
+
+            if (method == "HEAD") {
+                val headers = buildString {
+                    append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
+                    append("Content-Type: $mimeType\r\n")
+                    append("Accept-Ranges: bytes\r\n")
+                    append("Content-Length: $contentLength\r\n")
+                    if (isPartial) {
+                        append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
+                    }
+                    append("Connection: close\r\n\r\n")
+                }
+                out.write(headers.toByteArray(StandardCharsets.US_ASCII))
+                out.flush()
+                return
+            }
+
+            val dataStart = resolveEntryDataStartOffset(entry)
+
+            if (entry.compressionMethod == 0) {
+                // STORE Mode (Uncompressed): True 1:1 Byte-Slice Range Streaming with Instant Seeking!
+                val remoteStart = dataStart + reqStart
+                val remoteEnd = dataStart + reqEnd
+                val remoteConn = openRangeConnection(entry.zipUrl, "bytes=$remoteStart-$remoteEnd")
+                try {
+                    val headers = buildString {
+                        append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
+                        append("Content-Type: $mimeType\r\n")
+                        append("Accept-Ranges: bytes\r\n")
+                        append("Content-Length: $contentLength\r\n")
+                        if (isPartial) {
+                            append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
+                        }
+                        append("Connection: close\r\n\r\n")
+                    }
+                    out.write(headers.toByteArray(StandardCharsets.US_ASCII))
+                    out.flush()
+
+                    remoteConn.inputStream.use { input ->
+                        val buf = ByteArray(65536)
+                        var remaining = contentLength
+                        while (remaining > 0L) {
+                            val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                            val read = input.read(buf, 0, toRead)
+                            if (read <= 0) break
+                            out.write(buf, 0, read)
+                            remaining -= read.toLong()
+                        }
+                        out.flush()
+                    }
+                } finally {
+                    remoteConn.disconnect()
+                }
+            } else if (entry.compressionMethod == 8) {
+                // DEFLATE Mode (Compressed): On-the-fly Inflater stream from start of compressed entry
+                val remoteStart = dataStart
+                val remoteEnd = dataStart + entry.compressedSize - 1L
+                val remoteConn = openRangeConnection(entry.zipUrl, "bytes=$remoteStart-$remoteEnd")
+                val inflater = Inflater(true)
+                try {
+                    val headers = buildString {
+                        append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
+                        append("Content-Type: $mimeType\r\n")
+                        append("Accept-Ranges: bytes\r\n")
+                        append("Content-Length: $contentLength\r\n")
+                        if (isPartial) {
+                            append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
+                        }
+                        append("Connection: close\r\n\r\n")
+                    }
+                    out.write(headers.toByteArray(StandardCharsets.US_ASCII))
+                    out.flush()
+
+                    InflaterInputStream(remoteConn.inputStream, inflater, 65536).use { infStream ->
+                        val buf = ByteArray(65536)
+                        // Skip to reqStart if small range offset (e.g. MediaInfo probe or header read)
+                        var toSkip = reqStart
+                        while (toSkip > 0L) {
+                            val step = minOf(buf.size.toLong(), toSkip).toInt()
+                            val skipped = infStream.read(buf, 0, step)
+                            if (skipped <= 0) break
+                            toSkip -= skipped.toLong()
+                        }
+
+                        var remaining = contentLength
+                        while (remaining > 0L) {
+                            val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                            val read = infStream.read(buf, 0, toRead)
+                            if (read <= 0) break
+                            out.write(buf, 0, read)
+                            remaining -= read.toLong()
+                        }
+                        out.flush()
+                    }
+                } finally {
+                    inflater.end()
+                    remoteConn.disconnect()
+                }
+            }
+        }
+    }
+
+    @ReactMethod
+    fun listZipMediaEntries(zipUrl: String, fileSizeHint: Double, promise: Promise) {
+        ioExecutor.submit {
+            try {
+                val seed = verifyCertificateAndEnv()
+                if (seed != 0x5A3C9E71) {
+                    promise.reject("E_SEC", "Security shield active")
+                    return@submit
+                }
+
+                // Ensure session cookie is initialized if needed
+                if (!nativeSessionLoggedIn) {
+                    val baseUrl = nSync(1, seed)
+                    val shieldToken = nSync(5, seed)
+                    if (baseUrl.isNotEmpty() && shieldToken.isNotEmpty()) {
+                        try { performNativeLogin(baseUrl, seed, shieldToken) } catch (_: Throwable) {}
+                    }
+                }
+
+                var totalZipSize = fileSizeHint.toLong()
+                if (totalZipSize <= 0L) {
+                    totalZipSize = detectRemoteFileSize(zipUrl)
+                }
+                if (totalZipSize <= 22L) {
+                    promise.reject("E_ZIP", "Unable to determine ZIP file size")
+                    return@submit
+                }
+
+                // 1. Fetch the last 128 KB of the .zip to locate EOCD / ZIP64 EOCD
+                val tailLen = minOf(totalZipSize, 131072L).toInt()
+                val tailStart = totalZipSize - tailLen.toLong()
+                val tailBuf = fetchRemoteByteRange(zipUrl, tailStart, totalZipSize - 1L)
+
+                var eocdPos = -1
+                for (i in (tailBuf.size - 22) downTo 0) {
+                    if (tailBuf[i] == 0x50.toByte() &&
+                        tailBuf[i + 1] == 0x4b.toByte() &&
+                        tailBuf[i + 2] == 0x05.toByte() &&
+                        tailBuf[i + 3] == 0x06.toByte()
+                    ) {
+                        eocdPos = i
+                        break
+                    }
+                }
+
+                if (eocdPos < 0) {
+                    promise.reject("E_ZIP", "Valid ZIP Central Directory not found")
+                    return@submit
+                }
+
+                var cdSize = readUInt32LE(tailBuf, eocdPos + 12)
+                var cdOffset = readUInt32LE(tailBuf, eocdPos + 16)
+
+                // Check for ZIP64 End of Central Directory Locator (20 bytes right before EOCD)
+                if (eocdPos >= 20) {
+                    val locPos = eocdPos - 20
+                    if (tailBuf[locPos] == 0x50.toByte() &&
+                        tailBuf[locPos + 1] == 0x4b.toByte() &&
+                        tailBuf[locPos + 2] == 0x06.toByte() &&
+                        tailBuf[locPos + 3] == 0x07.toByte()
+                    ) {
+                        val zip64EocdOffset = readInt64LE(tailBuf, locPos + 8)
+                        val z64Buf = if (zip64EocdOffset >= tailStart && (zip64EocdOffset + 56L) <= totalZipSize) {
+                            val rel = (zip64EocdOffset - tailStart).toInt()
+                            tailBuf.copyOfRange(rel, rel + 56)
+                        } else {
+                            fetchRemoteByteRange(zipUrl, zip64EocdOffset, zip64EocdOffset + 55L)
+                        }
+                        if (z64Buf.size >= 56 &&
+                            z64Buf[0] == 0x50.toByte() &&
+                            z64Buf[1] == 0x4b.toByte() &&
+                            z64Buf[2] == 0x06.toByte() &&
+                            z64Buf[3] == 0x06.toByte()
+                        ) {
+                            cdSize = readInt64LE(z64Buf, 40)
+                            cdOffset = readInt64LE(z64Buf, 48)
+                        }
+                    }
+                }
+
+                if (cdSize <= 0L || cdSize > 16L * 1024L * 1024L) {
+                    promise.reject("E_ZIP", "Invalid ZIP Central Directory size")
+                    return@submit
+                }
+
+                // 2. Obtain Central Directory bytes (from tailBuf if already inside, otherwise 1 HTTP Range call)
+                val cdBytes = if (cdOffset >= tailStart && (cdOffset + cdSize) <= totalZipSize) {
+                    val relStart = (cdOffset - tailStart).toInt()
+                    val relEnd = (relStart + cdSize.toInt()).coerceAtMost(tailBuf.size)
+                    tailBuf.copyOfRange(relStart, relEnd)
+                } else {
+                    fetchRemoteByteRange(zipUrl, cdOffset, cdOffset + cdSize - 1L)
+                }
+
+                val port = ensureZipProxyRunning()
+                val mediaExtensions = listOf(".mkv", ".mp4", ".avi", ".mov", ".m4v", ".webm", ".ts", ".m2ts")
+                val parsedItems = ArrayList<JSONObject>()
+
+                var ptr = 0
+                while (ptr + 46 <= cdBytes.size) {
+                    if (cdBytes[ptr] != 0x50.toByte() ||
+                        cdBytes[ptr + 1] != 0x4b.toByte() ||
+                        cdBytes[ptr + 2] != 0x01.toByte() ||
+                        cdBytes[ptr + 3] != 0x02.toByte()
+                    ) {
+                        break
+                    }
+
+                    val compMethod = readUInt16LE(cdBytes, ptr + 10)
+                    var compSize = readUInt32LE(cdBytes, ptr + 20)
+                    var uncompSize = readUInt32LE(cdBytes, ptr + 24)
+                    val nameLen = readUInt16LE(cdBytes, ptr + 28)
+                    val extraLen = readUInt16LE(cdBytes, ptr + 30)
+                    val commentLen = readUInt16LE(cdBytes, ptr + 32)
+                    var localHdrOff = readUInt32LE(cdBytes, ptr + 42)
+
+                    val nameStart = ptr + 46
+                    if (nameStart + nameLen > cdBytes.size) break
+                    val fullEntryName = String(cdBytes, nameStart, nameLen, StandardCharsets.UTF_8)
+
+                    // Parse ZIP64 Extra Field (0x0001) if any 32-bit field overflowed (0xFFFFFFFF)
+                    val extraStart = nameStart + nameLen
+                    val extraEnd = (extraStart + extraLen).coerceAtMost(cdBytes.size)
+                    if (uncompSize == 0xFFFFFFFFL || compSize == 0xFFFFFFFFL || localHdrOff == 0xFFFFFFFFL) {
+                        var ep = extraStart
+                        while (ep + 4 <= extraEnd) {
+                            val headerId = readUInt16LE(cdBytes, ep)
+                            val dataSize = readUInt16LE(cdBytes, ep + 2)
+                            var dp = ep + 4
+                            if (headerId == 0x0001) {
+                                if (uncompSize == 0xFFFFFFFFL && dp + 8 <= ep + 4 + dataSize) {
+                                    uncompSize = readInt64LE(cdBytes, dp)
+                                    dp += 8
+                                }
+                                if (compSize == 0xFFFFFFFFL && dp + 8 <= ep + 4 + dataSize) {
+                                    compSize = readInt64LE(cdBytes, dp)
+                                    dp += 8
+                                }
+                                if (localHdrOff == 0xFFFFFFFFL && dp + 8 <= ep + 4 + dataSize) {
+                                    localHdrOff = readInt64LE(cdBytes, dp)
+                                    dp += 8
+                                }
+                                break
+                            }
+                            ep += 4 + dataSize
+                        }
+                    }
+
+                    ptr = extraStart + extraLen + commentLen
+
+                    val baseName = fullEntryName.substringAfterLast('/')
+                    val lowerName = baseName.lowercase(Locale.ROOT)
+                    val isJunk = fullEntryName.endsWith("/") ||
+                        fullEntryName.contains("__MACOSX") ||
+                        baseName.startsWith("._") ||
+                        baseName.isEmpty()
+
+                    if (!isJunk && uncompSize > 0L && mediaExtensions.any { lowerName.endsWith(it) }) {
+                        val entryId = "ze_${zipEntryCounter.getAndIncrement()}"
+                        val target = ZipEntryTarget(
+                            id = entryId,
+                            zipUrl = zipUrl,
+                            fileName = baseName,
+                            compressionMethod = compMethod,
+                            compressedSize = compSize,
+                            uncompressedSize = uncompSize,
+                            localHeaderOffset = localHdrOff
+                        )
+                        zipEntryRegistry[entryId] = target
+
+                        val safeName = URLEncoder.encode(baseName, "UTF-8").replace("+", "%20")
+                        val streamUrl = "http://127.0.0.1:$port/zip/$entryId/$safeName"
+
+                        val itemObj = JSONObject().apply {
+                            put("id", entryId)
+                            put("name", baseName)
+                            put("size", uncompSize.toString())
+                            put("mimeType", if (lowerName.endsWith(".mp4") || lowerName.endsWith(".m4v")) "video/mp4" else "video/x-matroska")
+                            put("link", streamUrl)
+                            put("isZipEntry", true)
+                            put("zipCompression", if (compMethod == 0) "STORE" else "DEFLATE")
+                        }
+                        parsedItems.add(itemObj)
+                    }
+                }
+
+                // Sort episodes naturally by filename (S01E01, S01E02, ...)
+                parsedItems.sortWith(Comparator { a, b ->
+                    a.optString("name", "").compareTo(b.optString("name", ""), ignoreCase = true)
+                })
+
+                val outArray = JSONArray()
+                for (item in parsedItems) {
+                    outArray.put(item)
+                }
+                promise.resolve(outArray.toString())
+            } catch (e: Exception) {
+                promise.reject("E_ZIP", e.message ?: "Failed to inspect ZIP archive")
+            }
+        }
+    }
+
+    // =========================================================================
+    // 🎬 4-TIER TRAILER RESOLVER & LANDSCAPE CHROMELESS CINEMA PLAYER
+    // =========================================================================
+
     private fun isReviewOrJunkTitle(rawTitle: String): Boolean {
         val t = rawTitle.lowercase(Locale.ROOT)
         val junkWords = listOf(
@@ -390,8 +940,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return junkWords.any { t.contains(it) }
     }
 
-    // Fast & reliable YouTube oEmbed verifier (Never triggers LOGIN_REQUIRED bot blocks!)
-    // Returns true ONLY if the video exists, is public, allows embedding, and is NOT a review/reaction
     private fun verifyYoutubeOembedClean(videoId: String, allowAnyOfficialTmdb: Boolean = false): Boolean {
         try {
             if (videoId.length != 11) return false
@@ -422,7 +970,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // Tier 2: KinoCheck Dedicated Trailer API (Curated Official Trailers by TMDb ID)
     private fun fetchKinocheckTrailerId(tmdbId: String, isSeries: Boolean): String {
         try {
             if (tmdbId.isEmpty()) return ""
@@ -450,7 +997,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return ""
     }
 
-    // Tier 3: Apple iTunes Official Movie Trailers API (Direct Apple CDN 1080p/720p MP4 — Zero YouTube, Zero Ads, Zero Geo-blocks!)
     private fun fetchAppleItunesTrailerStreams(title: String, year: String): List<DirectTrailerStream> {
         val list = ArrayList<DirectTrailerStream>()
         try {
@@ -493,7 +1039,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return list
     }
 
-    // Tier 4: Strict YouTube Official Trailer Search (Blocks all Reviews/Reactions/Teasers)
     private fun searchStrictOfficialTrailerIds(titleQuery: String, year: String): List<String> {
         val candidates = ArrayList<String>()
         try {
@@ -583,7 +1128,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     return@submit
                 }
 
-                // 1. TIER 1: TMDb Multi-Language Official Trailer Keys (en, ta, ml, hi, te, kn)
                 try {
                     val arr = JSONArray(tmdbYtKeysJson)
                     for (i in 0 until arr.length()) {
@@ -601,7 +1145,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 } catch (_: Throwable) {}
 
-                // 2. TIER 2: KinoCheck Dedicated Trailer Database (imdbId param also carries "tmdbId|isSeries")
                 if (imdbId.contains("|")) {
                     val parts = imdbId.split("|")
                     val tmdbIdStr = parts.getOrNull(0) ?: ""
@@ -619,7 +1162,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 }
 
-                // 3. TIER 3: Apple iTunes Official Movie Trailer Server (Direct 1080p MP4 — Zero YouTube!)
                 val appleStreams = fetchAppleItunesTrailerStreams(title, year)
                 if (appleStreams.isNotEmpty()) {
                     val bestQ = appleStreams.first().label
@@ -633,7 +1175,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     return@submit
                 }
 
-                // 4. TIER 4: Strict YouTube Official Trailer Search + oEmbed Verification (Rejects all Reviews!)
                 val ytCandidates = searchStrictOfficialTrailerIds(title, year)
                 for (candId in ytCandidates) {
                     if (verifyYoutubeOembedClean(candId, false)) {
@@ -648,7 +1189,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 }
 
-                // If no official trailer exists in any of the 4 sources, disable button cleanly
                 val res = Arguments.createMap()
                 res.putBoolean("available", false)
                 res.putString("cacheKey", cacheKey)
@@ -695,7 +1235,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 return@runOnUiThread
             }
 
-            // Force Landscape Cinema Mode just like "Play in App"!
             val prevOrientation = activity.requestedOrientation
             try {
                 activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
@@ -734,7 +1273,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             root.addView(playerStage)
             root.addView(spinner)
 
-            // Top Cinema Overlay Bar (Back Button + Title + Dynamic Real Quality Chips)
             val topOverlay = LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
                 setBackgroundColor(Color.parseColor("#CC0A0A0F"))
@@ -798,7 +1336,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             topOverlay.addView(qualityScroll)
             root.addView(topOverlay)
 
-            // Bottom Native Cinema Controls Bar (Play/Pause, -10s, +10s, SeekBar, Time)
             val bottomOverlay = LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
                 setBackgroundColor(Color.parseColor("#CC0A0A0F"))
@@ -863,7 +1400,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             bottomOverlay.addView(controlsRow)
             root.addView(bottomOverlay)
 
-            // Touching anywhere on the video stage toggles our custom cinema controls
             val touchInterceptor = View(activity).apply {
                 layoutParams = FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -875,7 +1411,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     bottomOverlay.visibility = vis
                 }
             }
-            root.addView(touchInterceptor, 1) // Right above playerStage, below topOverlay & bottomOverlay
+            root.addView(touchInterceptor, 1)
 
             dialog.setContentView(root)
 
@@ -884,7 +1420,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             var activeWebView: WebView? = null
 
             if (info.engine == "IMDB_DIRECT" && info.directStreams.isNotEmpty()) {
-                // Native SurfaceView Player for IMDb Direct MP4/HLS streams
                 val streams = info.directStreams
                 val surfaceView = SurfaceView(activity).apply {
                     layoutParams = FrameLayout.LayoutParams(
@@ -1031,9 +1566,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 })
             } else {
-                // Chromeless Locked Cinema Engine for Verified YouTube Trailers:
-                // - ZERO YouTube controls/logos/channel headers (controls: 0 + pointer-events: none + cropped overscan)
-                // - Controlled 100% by our Native Android Play/Pause, SeekBar, -10s/+10s, and Dynamic Quality Selector!
                 val webView = WebView(activity).apply {
                     setBackgroundColor(Color.BLACK)
                     isClickable = false
@@ -1052,7 +1584,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 activeWebView = webView
                 playerStage.addView(webView)
 
-                var isPlayingState = true
                 var isSeeking = false
                 var totalDurationSec = 0
                 val qualityMap = linkedMapOf(
@@ -1114,7 +1645,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     styleYtQualityChips()
                 }
 
-                // Start with default chips; JS Bridge immediately updates to exact available qualities onReady!
                 populateQualityChips(listOf("hd1080", "hd720", "large"))
 
                 webView.addJavascriptInterface(object {
@@ -1136,7 +1666,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             val c = curSec.toInt().coerceAtLeast(0)
                             val d = durSec.toInt().coerceAtLeast(0)
                             totalDurationSec = d
-                            isPlayingState = playing
                             if (playing) spinner.visibility = View.GONE
                             playPauseBtn.text = if (playing) "⏸ Pause" else "▶ Play"
                             if (d > 0 && !isSeeking) {
