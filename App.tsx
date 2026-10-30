@@ -434,22 +434,30 @@ const App = () => {
 
   
   const formatHomeSeriesBadge = (rawSeasonTag: string | null | undefined, cleanTitle: string | null | undefined, overallRating: string | number | null | undefined): string => {
-    if (!rawSeasonTag) return overallRating ? `★ ${overallRating}` : '';
-    const isEpDetailCode = /S\d{1,2}E\d{1,3}/i.test(rawSeasonTag);
-    if (isEpDetailCode) return rawSeasonTag.toUpperCase();
+    const tagStr = String(rawSeasonTag || '').trim();
+    const isEpDetailCode = /S\d{1,2}E\d{1,3}/i.test(tagStr);
+    if (isEpDetailCode) return tagStr.toUpperCase();
 
-    const key = String(cleanTitle || '').replace(/\b(19\d{2}|20\d{2})\b.*$/, '').replace(/[._-]+/g, ' ').replace(/\s+/g, ' ').trim().toUpperCase();
-    const maxS = (key && seriesMaxSeasonMap[key]) ? seriesMaxSeasonMap[key] : 0;
-    const sMatch = rawSeasonTag.match(/S(\d{1,2})/i);
+    const meta = ensureSeriesMetaLoaded(String(cleanTitle || ''));
+    const cleanKey = String(cleanTitle || '')
+      .replace(/\b(19\d{2}|20\d{2}|S\d{1,2}.*)\b/gi, '')
+      .replace(/[._-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toUpperCase();
+
+    const sMatch = tagStr.match(/S(\d{1,2})/i);
     const curS = sMatch ? parseInt(sMatch[1], 10) : 1;
-    const totalS = Math.max(maxS, curS);
+    const mappedS = (cleanKey && seriesMaxSeasonMap[cleanKey]) ? seriesMaxSeasonMap[cleanKey] : 0;
+    const totalS = Math.max(meta?.maxSeasons || 0, mappedS, curS);
 
     const seasonRangeText = totalS > 1
       ? `S01-S${String(totalS).padStart(2, '0')}`
-      : formatHomeSeriesBadge(`S${String(curS).padStart(2, "0")}`, (typeof item !== "undefined" ? (item?.cleanTitle || item?.title || item?.name) : (typeof cleanTitle !== "undefined" ? cleanTitle : "")), (typeof tmdb !== "undefined" ? tmdb?.rating : (typeof meta !== "undefined" ? meta?.rating : null)));
+      : `S${String(curS).padStart(2, '0')}`;
 
-    if (overallRating && showSeriesRatingTick) {
-      return `★ ${overallRating}`;
+    const effectiveRating = overallRating || meta?.rating || '';
+    if (effectiveRating && showSeriesRatingTick) {
+      return `★ ${effectiveRating}`;
     }
     return seasonRangeText;
   };
@@ -463,22 +471,65 @@ const App = () => {
 
   const [trailerState, setTrailerState] = React.useState<{
     loading: boolean;
-    videoId: string | null;
+    available: boolean;
+    cacheKey: string;
+    bestQuality: string;
     title: string;
-  }>({ loading: false, videoId: null, title: '' });
+  }>({ loading: false, available: false, cacheKey: '', bestQuality: '', title: '' });
+
+  const seriesMetaCacheRef = React.useRef<Record<string, { maxSeasons: number; rating: string }>>({});
+  const seriesPendingRef = React.useRef<Set<string>>(new Set());
+  const [, forceSeriesBadgeUpdate] = React.useState(0);
+
+  const ensureSeriesMetaLoaded = (rawTitle: string) => {
+    const cleanKey = String(rawTitle || '')
+      .replace(/\b(19\d{2}|20\d{2}|S\d{1,2}.*)\b/gi, '')
+      .replace(/[._-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toUpperCase();
+    if (!cleanKey || cleanKey.length < 2) return null;
+    if (seriesMetaCacheRef.current[cleanKey]) {
+      return seriesMetaCacheRef.current[cleanKey];
+    }
+    if (seriesPendingRef.current.has(cleanKey)) return null;
+    const tmdbKey = vaultRef.current?.tmdbKey || '';
+    if (!tmdbKey) return null;
+
+    seriesPendingRef.current.add(cleanKey);
+    setTimeout(async () => {
+      try {
+        const sUrl = `https://api.themoviedb.org/3/search/tv?api_key=${tmdbKey}&query=${encodeURIComponent(cleanKey)}`;
+        const sData = await fetch(sUrl).then(r => r.json());
+        const first = sData?.results?.[0];
+        if (first?.id) {
+          const dUrl = `https://api.themoviedb.org/3/tv/${first.id}?api_key=${tmdbKey}`;
+          const dData = await fetch(dUrl).then(r => r.json());
+          const numSeasons = Math.max(1, Number(dData?.number_of_seasons || 1));
+          const voteAvg = Number(dData?.vote_average || first?.vote_average || 0);
+          seriesMetaCacheRef.current[cleanKey] = {
+            maxSeasons: numSeasons,
+            rating: voteAvg > 0 ? voteAvg.toFixed(1) : '',
+          };
+          setSeriesMaxSeasonMap(prev => ({ ...prev, [cleanKey]: numSeasons }));
+          forceSeriesBadgeUpdate(v => v + 1);
+        }
+      } catch (_e) {}
+    }, 10);
+    return null;
+  };
 
   React.useEffect(() => {
     let cancelled = false;
     const rawName = (typeof selectedFile !== 'undefined' && selectedFile?.name) ? String(selectedFile.name) : '';
     if (!rawName) {
       setEpisodeTmdbMeta(null);
-      setTrailerState({ loading: false, videoId: null, title: '' });
+      setTrailerState({ loading: false, available: false, cacheKey: '', bestQuality: '', title: '' });
       return;
     }
 
-    const fetchEpisodeAndTrailer = async () => {
+    const fetchEpisodeAndVerifiedTrailer = async () => {
       const tmdbKey = vaultRef.current?.tmdbKey || '';
-      // Detect Series Episode pattern (e.g. S01E02, 1x02)
       const epMatch = rawName.match(/(?:[.\s_-]|\b)S(\d{1,2})[\s._-]*E(\d{1,3})\b/i)
         || rawName.match(/\b(\d{1,2})x(\d{1,3})\b/i);
 
@@ -489,13 +540,15 @@ const App = () => {
         ?? rawName.search(/\b(19\d{2}|20\d{2}|2160p|1080p|720p|480p|4K|WEB-DL|WEBRip|BluRay|HDRip|HEVC|x264|x265)\b/i);
       const rawTitlePart = cutIdx > 0 ? rawName.slice(0, cutIdx) : rawName.replace(/\.[^.]+$/, '');
       const cleanTitle = rawTitlePart.replace(/[._-]+/g, ' ').replace(/\s+/g, ' ').trim();
+      const cacheKey = `${cleanTitle}_${year}_${epMatch ? 'tv' : 'mv'}`.toLowerCase();
 
-      setTrailerState({ loading: true, videoId: null, title: cleanTitle || 'Movie' });
+      setTrailerState({ loading: true, available: false, cacheKey, bestQuality: '', title: cleanTitle || 'Official Trailer' });
       if (!epMatch) {
         setEpisodeTmdbMeta(null);
       }
 
-      let foundTrailerKey: string | null = null;
+      const tmdbYtKeys: string[] = [];
+      let imdbId = '';
 
       try {
         if (tmdbKey && cleanTitle) {
@@ -509,7 +562,6 @@ const App = () => {
             const tvId = tvRes?.results?.[0]?.id;
 
             if (tvId && !cancelled) {
-              // Fetch Individual Episode Rating & Overview from TMDb
               try {
                 const epUrl = `https://api.themoviedb.org/3/tv/${tvId}/season/${sNum}/episode/${eNum}?api_key=${tmdbKey}`;
                 const epData = await fetch(epUrl).then(r => r.json());
@@ -523,43 +575,63 @@ const App = () => {
                 }
               } catch (_e) {}
 
-              // Fetch Series / Season Trailer from TMDb
+              try {
+                const extUrl = `https://api.themoviedb.org/3/tv/${tvId}/external_ids?api_key=${tmdbKey}`;
+                const extData = await fetch(extUrl).then(r => r.json());
+                if (extData?.imdb_id) imdbId = String(extData.imdb_id);
+              } catch (_e) {}
+
               try {
                 const vidUrl = `https://api.themoviedb.org/3/tv/${tvId}/videos?api_key=${tmdbKey}`;
                 const vidData = await fetch(vidUrl).then(r => r.json());
-                const ytList = (vidData?.results || []).filter((v: any) => v.site === 'YouTube' && v.key);
-                const best = ytList.find((v: any) => v.type === 'Trailer' && v.official)
-                  || ytList.find((v: any) => v.type === 'Trailer')
-                  || ytList.find((v: any) => v.type === 'Teaser')
-                  || ytList[0];
-                if (best?.key) foundTrailerKey = best.key;
+                // Strictly accept ONLY Official Trailers (Never Teasers, Featurettes, or Clips!)
+                const ytTrailers = (vidData?.results || []).filter(
+                  (v: any) => v.site === 'YouTube' && v.key && v.type === 'Trailer'
+                );
+                ytTrailers.sort((a: any, b: any) => (b.official ? 1 : 0) - (a.official ? 1 : 0));
+                for (const t of ytTrailers) {
+                  if (t.key && !tmdbYtKeys.includes(t.key)) tmdbYtKeys.push(t.key);
+                }
               } catch (_e) {}
             }
           } else {
-            // Movie Trailer Lookup from TMDb
             const mvSearchUrl = `https://api.themoviedb.org/3/search/movie?api_key=${tmdbKey}&query=${encodeURIComponent(cleanTitle)}${year ? '&year=' + year : ''}`;
             const mvRes = await fetch(mvSearchUrl).then(r => r.json());
             const movieId = mvRes?.results?.[0]?.id;
             if (movieId && !cancelled) {
               try {
-                const vidUrl = `https://api.themoviedb.org/3/movie/${movieId}/videos?api_key=${tmdbKey}`;
-                const vidData = await fetch(vidUrl).then(r => r.json());
-                const ytList = (vidData?.results || []).filter((v: any) => v.site === 'YouTube' && v.key);
-                const best = ytList.find((v: any) => v.type === 'Trailer' && v.official)
-                  || ytList.find((v: any) => v.type === 'Trailer')
-                  || ytList.find((v: any) => v.type === 'Teaser')
-                  || ytList[0];
-                if (best?.key) foundTrailerKey = best.key;
+                const mvDetailUrl = `https://api.themoviedb.org/3/movie/${movieId}?api_key=${tmdbKey}&append_to_response=videos,external_ids`;
+                const mvDetail = await fetch(mvDetailUrl).then(r => r.json());
+                imdbId = mvDetail?.imdb_id || mvDetail?.external_ids?.imdb_id || '';
+                const ytTrailers = (mvDetail?.videos?.results || []).filter(
+                  (v: any) => v.site === 'YouTube' && v.key && v.type === 'Trailer'
+                );
+                ytTrailers.sort((a: any, b: any) => (b.official ? 1 : 0) - (a.official ? 1 : 0));
+                for (const t of ytTrailers) {
+                  if (t.key && !tmdbYtKeys.includes(t.key)) tmdbYtKeys.push(t.key);
+                }
               } catch (_e) {}
             }
           }
         }
 
-        // Fallback to Native YouTube InnerTube Trailer Finder if TMDb /videos had no link
-        if (!foundTrailerKey && !cancelled && SecurityVault?.findYoutubeTrailerId && cleanTitle) {
-          const fallbackId = await SecurityVault.findYoutubeTrailerId(`${cleanTitle} ${year}`.trim());
-          if (fallbackId && fallbackId.length === 11) {
-            foundTrailerKey = fallbackId;
+        if (!cancelled && SecurityVault?.resolveVerifiedTrailer && cleanTitle) {
+          const verified = await SecurityVault.resolveVerifiedTrailer(
+            cacheKey,
+            cleanTitle,
+            year,
+            imdbId,
+            JSON.stringify(tmdbYtKeys)
+          );
+          if (!cancelled) {
+            setTrailerState({
+              loading: false,
+              available: Boolean(verified?.available),
+              cacheKey: verified?.cacheKey || cacheKey,
+              bestQuality: verified?.bestQuality || '1080p FHD',
+              title: cleanTitle || 'Official Trailer',
+            });
+            return;
           }
         }
       } catch (_err) {}
@@ -567,13 +639,15 @@ const App = () => {
       if (!cancelled) {
         setTrailerState({
           loading: false,
-          videoId: foundTrailerKey,
-          title: cleanTitle || 'Trailer',
+          available: false,
+          cacheKey,
+          bestQuality: '',
+          title: cleanTitle || 'Official Trailer',
         });
       }
     };
 
-    fetchEpisodeAndTrailer();
+    fetchEpisodeAndVerifiedTrailer();
     return () => { cancelled = true; };
   }, [selectedFile?.id, selectedFile?.name]);
 
@@ -1656,12 +1730,12 @@ const App = () => {
                 const isSelected = activeSeason?.seasonNum === sItem.seasonNum;
                 return (
                   <FocusableButton
-                    key={sItem.seasonNum}
+                    key={formatHomeSeriesBadge(sItem.seasonNum, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}
                     hasTVPreferredFocus={isSelected}
                     style={[styles.seasonOptionItem, isSelected && styles.seasonOptionItemActive]}
                     onPress={() => handleSelectSeason(sItem)}>
-                    <View style={styles.seasonNumberCircle}>
-                      <Text style={styles.seasonNumberText}>S{sItem.seasonNum < 10 ? `0${sItem.seasonNum}` : sItem.seasonNum}</Text>
+                    <View style={formatHomeSeriesBadge(styles.seasonNumberCircle, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}>
+                      <Text style={formatHomeSeriesBadge(styles.seasonNumberText, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}>S{sItem.seasonNum < 10 ? `0${formatHomeSeriesBadge(sItem.seasonNum, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}` : sItem.seasonNum}</Text>
                     </View>
                     <View style={{ flex: 1 }}>
                       <Text style={[styles.hdrOptionTitle, isSelected && { color: '#E50914' }]}>{sItem.label}</Text>
@@ -1756,7 +1830,7 @@ const App = () => {
                     <Icon name={isCurrent ? 'play-circle-fill' : 'play-circle-outline'} size={22} color={isCurrent ? '#E50914' : '#AAA'} />
                     <View style={{ flex: 1, marginLeft: 10 }}>
                       <Text style={[styles.menuItemText, { marginLeft: 0 }, isCurrent && { color: '#E50914', fontWeight: '800' }]} numberOfLines={1}>
-                        {epInfo.seasonEpisode ? `${epInfo.seasonEpisode} • ${epInfo.cleanTitle}` : ep.name}
+                        {epInfo.seasonEpisode ? `${formatHomeSeriesBadge(epInfo.seasonEpisode, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)} • ${epInfo.cleanTitle}` : ep.name}
                       </Text>
                       <Text style={{ color: '#7D8799', fontSize: 11 }} numberOfLines={1}>{ep.name}</Text>
                     </View>
@@ -2052,7 +2126,7 @@ const App = () => {
               <View style={styles.netflixTitleCenter}>
                 <Text style={styles.netflixMainTitle} numberOfLines={1}>{playerInfo.cleanTitle}</Text>
                 <View style={styles.netflixSubMetaRow}>
-                  {!!playerInfo.seasonEpisode && <Text style={styles.netflixEpisodeTag}>{playerInfo.seasonEpisode}</Text>}
+                  {!!playerInfo.seasonEpisode && <Text style={styles.netflixEpisodeTag}>{formatHomeSeriesBadge(playerInfo.seasonEpisode, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}</Text>}
                   {!!(realMi?.resolution || playerInfo.resolution) && (
                     <View style={styles.netflixMiniBadge}>
                       <Text style={styles.netflixMiniBadgeText}>{realMi?.resolution || playerInfo.resolution}</Text>
@@ -2226,7 +2300,7 @@ const App = () => {
               <Text style={styles.detailTitle}>{info.cleanTitle}</Text>
               <View style={styles.detailMetaRow}>
                 {!!(meta?.year || info.year) && <Text style={styles.detailYearText}>{meta?.year || info.year}</Text>}
-                {!!info.seasonEpisode && <View style={styles.seasonBadge}><Text style={styles.seasonBadgeText}>{info.seasonEpisode}</Text></View>}
+                {!!info.seasonEpisode && <View style={formatHomeSeriesBadge(styles.seasonBadge, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}><Text style={formatHomeSeriesBadge(styles.seasonBadgeText, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}>{formatHomeSeriesBadge(info.seasonEpisode, item?.cleanTitle || item?.title || item?.name, item?.rating || item?.tmdb?.rating)}</Text></View>}
                 {!!(episodeTmdbMeta?.rating || meta?.rating) && <View style={styles.ratingBadge}><Text style={styles.ratingBadgeText}>★ {(episodeTmdbMeta?.rating || meta.rating)}</Text></View>}
                 {!!effectiveResolution && <View style={styles.qualityBadge}><Text style={styles.qualityBadgeText}>{effectiveResolution}</Text></View>}
               </View>
@@ -2350,15 +2424,15 @@ const App = () => {
           <View style={styles.mediaInfoCard}>
             
                             <TouchableOpacity
-                disabled={trailerState.loading || !trailerState.videoId}
+                disabled={trailerState.loading || !trailerState.available}
                 onPress={() => {
-                  if (trailerState.videoId && SecurityVault?.playYoutubeTrailer) {
-                    SecurityVault.playYoutubeTrailer(trailerState.videoId, trailerState.title);
+                  if (trailerState.available && trailerState.cacheKey && SecurityVault?.playYoutubeTrailer) {
+                    SecurityVault.playYoutubeTrailer(trailerState.cacheKey, trailerState.title);
                   }
                 }}
                 style={{
-                  backgroundColor: trailerState.videoId ? '#1E1B2E' : '#141418',
-                  borderColor: trailerState.videoId ? '#A855F7' : '#27272A',
+                  backgroundColor: trailerState.available ? '#1E1B2E' : '#141418',
+                  borderColor: trailerState.available ? '#A855F7' : '#27272A',
                   borderWidth: 1,
                   borderRadius: 10,
                   paddingVertical: 13,
@@ -2367,18 +2441,18 @@ const App = () => {
                   flexDirection: 'row',
                   alignItems: 'center',
                   justifyContent: 'center',
-                  opacity: (trailerState.loading || !trailerState.videoId) ? 0.42 : 1,
+                  opacity: (trailerState.loading || !trailerState.available) ? 0.40 : 1,
                 }}
               >
                 <Text style={{
-                  color: trailerState.videoId ? '#E9D5FF' : '#71717A',
+                  color: trailerState.available ? '#E9D5FF' : '#71717A',
                   fontWeight: 'bold',
                   fontSize: 14,
                 }}>
                   {trailerState.loading
-                    ? '⏳ Checking Official Trailer...'
-                    : trailerState.videoId
-                    ? '🎬 Watch Official Trailer (Ad-Free • 4K / 1080p)'
+                    ? '⏳ Verifying Official Trailer...'
+                    : trailerState.available
+                    ? `🎬 Watch Official Trailer (In-App • ${trailerState.bestQuality})`
                     : '🎬 Trailer Unavailable'}
                 </Text>
               </TouchableOpacity>
