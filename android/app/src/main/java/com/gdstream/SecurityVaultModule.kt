@@ -540,7 +540,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val vid = chunk.substring(0, 11)
                 if (!vid.matches(Regex("[a-zA-Z0-9_-]{11}"))) continue
 
-                val titleMatch = Pattern.compile("\"title\":\{\"runs\":\[\{\"text\":\"([^\"]+)\"").matcher(chunk)
+                val titleMatch = Pattern.compile("\"title\":\\{\"runs\":\\[\\{\"text\":\"([^\"]+)\"").matcher(chunk)
                 if (!titleMatch.find()) continue
                 val vTitle = (titleMatch.group(1) ?: "").lowercase(Locale.ROOT)
 
