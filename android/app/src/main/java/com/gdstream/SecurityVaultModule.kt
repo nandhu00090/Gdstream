@@ -1,5 +1,7 @@
 package com.gdstream
 
+import android.annotation.SuppressLint
+import android.app.Activity
 import android.app.Dialog
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -19,6 +21,12 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowManager
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
@@ -72,6 +80,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     data class TrailerStreamOption(
         val label: String,
+        val vqCode: String,
         val height: Int,
         val videoUrl: String,
         val audioUrl: String,
@@ -359,7 +368,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // Fallback Native YouTube InnerTube Trailer Finder when TMDb /videos is empty
     @ReactMethod
     fun findYoutubeTrailerId(titleQuery: String, promise: Promise) {
         ioExecutor.submit {
@@ -397,7 +405,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val resp = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText() }
                 conn.disconnect()
 
-                // Match videoRenderer blocks with videoId and verify title relevance
                 val primaryWord = clean.split(Regex("\\s+")).firstOrNull { it.length >= 3 }?.lowercase(Locale.ROOT)
                     ?: clean.lowercase(Locale.ROOT)
                 val pattern = Pattern.compile("\"videoRenderer\":\\{\"videoId\":\"([a-zA-Z0-9_-]{11})\".*?\"title\":\\{\"runs\":\\[\\{\"text\":\"([^\"]+)\"")
@@ -420,7 +427,88 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun fetchInnerTubeStreams(videoId: String): List<TrailerStreamOption> {
+    private fun fetchPipedOrInnerTubeStreams(videoId: String): List<TrailerStreamOption> {
+        // 1. Try Piped API Mirrors first (Provides clean, unthrottled 4K/1080p/720p direct streams + HLS)
+        val pipedHosts = listOf(
+            "https://pipedapi.kavin.rocks",
+            "https://api.piped.private.coffee",
+            "https://pipedapi.drgns.space"
+        )
+        for (host in pipedHosts) {
+            try {
+                val conn = (URL("$host/streams/$videoId").openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
+                    connectTimeout = 5000
+                    readTimeout = 6000
+                    requestMethod = "GET"
+                    setRequestProperty("User-Agent", "GDStream/3.0")
+                }
+                if (conn.responseCode in 200..299) {
+                    val text = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText() }
+                    conn.disconnect()
+                    val root = JSONObject(text)
+                    val audioStreams = root.optJSONArray("audioStreams") ?: JSONArray()
+                    var bestAudio = ""
+                    var bestAudioBitrate = -1
+                    for (i in 0 until audioStreams.length()) {
+                        val a = audioStreams.optJSONObject(i) ?: continue
+                        val url = a.optString("url", "")
+                        val mime = a.optString("mimeType", "")
+                        val br = a.optInt("bitrate", 0)
+                        if (url.isNotEmpty() && (mime.contains("mp4") || bestAudio.isEmpty()) && br > bestAudioBitrate) {
+                            bestAudioBitrate = br
+                            bestAudio = url
+                        }
+                    }
+
+                    val videoStreams = root.optJSONArray("videoStreams") ?: JSONArray()
+                    val byHeight = LinkedHashMap<Int, TrailerStreamOption>()
+                    for (i in 0 until videoStreams.length()) {
+                        val v = videoStreams.optJSONObject(i) ?: continue
+                        val url = v.optString("url", "")
+                        val height = v.optInt("height", 0)
+                        val videoOnly = v.optBoolean("videoOnly", true)
+                        val format = v.optString("format", "")
+                        if (url.isEmpty() || height < 240) continue
+                        if (videoOnly && bestAudio.isEmpty()) continue
+                        if (!byHeight.containsKey(height) || format.contains("MPEG_4")) {
+                            val label = when {
+                                height >= 2160 -> "2160p 4K"
+                                height >= 1440 -> "1440p QHD"
+                                height >= 1080 -> "1080p FHD"
+                                height >= 720 -> "720p HD"
+                                height >= 480 -> "480p"
+                                else -> "${height}p"
+                            }
+                            val vq = when {
+                                height >= 2160 -> "hd2160"
+                                height >= 1440 -> "hd1440"
+                                height >= 1080 -> "hd1080"
+                                height >= 720 -> "hd720"
+                                height >= 480 -> "large"
+                                else -> "medium"
+                            }
+                            byHeight[height] = TrailerStreamOption(
+                                label = label,
+                                vqCode = vq,
+                                height = height,
+                                videoUrl = url,
+                                audioUrl = if (videoOnly) bestAudio else "",
+                                isMuxed = !videoOnly
+                            )
+                        }
+                    }
+                    val sorted = byHeight.values.sortedByDescending { it.height }.toMutableList()
+                    val hls = root.optString("hls", "")
+                    if (hls.isNotEmpty()) {
+                        sorted.add(TrailerStreamOption("Auto (HLS)", "default", 1, hls, "", true))
+                    }
+                    if (sorted.isNotEmpty()) return sorted
+                }
+                conn.disconnect()
+            } catch (_: Throwable) {}
+        }
+
+        // 2. Try YouTube InnerTube Clients (ANDROID_VR, IOS, ANDROID_TESTSUITE)
         val clients = listOf(
             Triple("ANDROID_VR", "1.60.19", "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 14; en_US; Quest 3; Build/UP1A.231005.007.A1; Cronet/132.0.6808.3)"),
             Triple("IOS", "19.45.4", "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)"),
@@ -454,8 +542,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
                 val conn = (URL("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
                     .openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
-                    connectTimeout = 10000
-                    readTimeout = 12000
+                    connectTimeout = 8000
+                    readTimeout = 8000
                     requestMethod = "POST"
                     doInput = true
                     doOutput = true
@@ -473,7 +561,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val formats = streamingData.optJSONArray("formats") ?: JSONArray()
                 val adaptive = streamingData.optJSONArray("adaptiveFormats") ?: JSONArray()
 
-                // 1. Find best audio-only stream (prefer audio/mp4 m4a for universal hardware playback)
                 var bestAudioUrl = ""
                 var bestAudioScore = -1
                 for (i in 0 until adaptive.length()) {
@@ -489,11 +576,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 }
 
-                // 2. Collect video resolutions (2160p 4K, 1440p, 1080p, 720p, 480p, 360p)
                 val byHeight = LinkedHashMap<Int, TrailerStreamOption>()
                 val byHeightScore = HashMap<Int, Int>()
 
-                // Check adaptiveFormats first for high-res 4K / 1440p / 1080p / 720p / 480p / 360p
                 if (bestAudioUrl.isNotEmpty()) {
                     for (i in 0 until adaptive.length()) {
                         val item = adaptive.optJSONObject(i) ?: continue
@@ -501,7 +586,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         val url = item.optString("url", "")
                         val height = item.optInt("height", 0)
                         if (url.isEmpty() || !mime.startsWith("video/") || height < 240) continue
-                        // Prefer avc1 / mp4 or vp9 for hardware compatibility, skip av01 if alternatives exist
                         val codecScore = when {
                             mime.contains("avc1") -> 30000000
                             mime.contains("mp4") && !mime.contains("av01") -> 20000000
@@ -520,8 +604,17 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                                 height >= 480 -> "480p"
                                 else -> "${height}p"
                             }
+                            val vq = when {
+                                height >= 2160 -> "hd2160"
+                                height >= 1440 -> "hd1440"
+                                height >= 1080 -> "hd1080"
+                                height >= 720 -> "hd720"
+                                height >= 480 -> "large"
+                                else -> "medium"
+                            }
                             byHeight[height] = TrailerStreamOption(
                                 label = label,
+                                vqCode = vq,
                                 height = height,
                                 videoUrl = url,
                                 audioUrl = bestAudioUrl,
@@ -531,7 +624,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 }
 
-                // Also check muxed formats (with integrated audio)
                 for (i in 0 until formats.length()) {
                     val item = formats.optJSONObject(i) ?: continue
                     val url = item.optString("url", "")
@@ -544,8 +636,15 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             height >= 480 -> "480p"
                             else -> "${height}p"
                         }
+                        val vq = when {
+                            height >= 1080 -> "hd1080"
+                            height >= 720 -> "hd720"
+                            height >= 480 -> "large"
+                            else -> "medium"
+                        }
                         byHeight[height] = TrailerStreamOption(
                             label = label,
+                            vqCode = vq,
                             height = height,
                             videoUrl = url,
                             audioUrl = "",
@@ -555,24 +654,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
 
                 val sorted = byHeight.values.sortedByDescending { it.height }.toMutableList()
-
-                // Also append HLS Auto option if IOS client provided hlsManifestUrl
                 val hlsUrl = streamingData.optString("hlsManifestUrl", "")
                 if (hlsUrl.isNotEmpty()) {
-                    sorted.add(
-                        TrailerStreamOption(
-                            label = "Auto (HLS)",
-                            height = 1,
-                            videoUrl = hlsUrl,
-                            audioUrl = "",
-                            isMuxed = true
-                        )
-                    )
+                    sorted.add(TrailerStreamOption("Auto (HLS)", "default", 1, hlsUrl, "", true))
                 }
-
-                if (sorted.isNotEmpty()) {
-                    return sorted
-                }
+                if (sorted.isNotEmpty()) return sorted
             } catch (_: Throwable) {}
         }
         return emptyList()
@@ -593,457 +679,595 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return String.format(Locale.US, "%02d:%02d", mins, secs)
     }
 
+    @SuppressLint("SetJavaScriptEnabled")
     @ReactMethod
     fun playYoutubeTrailer(videoId: String, title: String, promise: Promise) {
-        ioExecutor.submit {
-            val streams = fetchInnerTubeStreams(videoId)
-            if (streams.isEmpty()) {
-                promise.reject("E_TRAILER", "Trailer streams unavailable")
-                return@submit
+        // Open Fullscreen In-App Trailer Dialog IMMEDIATELY on UI Thread (0ms delay!)
+        UiThreadUtil.runOnUiThread {
+            val activity: Activity? = reactContext.currentActivity
+            if (activity == null || activity.isFinishing) {
+                promise.reject("E_ACT", "Activity unavailable")
+                return@runOnUiThread
             }
 
-            UiThreadUtil.runOnUiThread {
-                val activity: android.app.Activity? = reactContext.currentActivity
-                if (activity == null || activity.isFinishing) {
-                    promise.reject("E_ACT", "Activity unavailable")
-                    return@runOnUiThread
+            val dialog = Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+            dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+            dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+            val root = FrameLayout(activity).apply {
+                setBackgroundColor(Color.parseColor("#08080C"))
+            }
+
+            val playerStage = FrameLayout(activity).apply {
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    Gravity.CENTER
+                )
+            }
+
+            val spinner = ProgressBar(activity).apply {
+                layoutParams = FrameLayout.LayoutParams(dp(48), dp(48), Gravity.CENTER)
+            }
+            playerStage.addView(spinner)
+            root.addView(playerStage)
+
+            // Top Overlay Bar (Title + Quality Selector Chips + Close Button)
+            val topOverlay = LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(Color.parseColor("#D90D0D14"))
+                setPadding(dp(16), dp(14), dp(16), dp(12))
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP
+                )
+            }
+
+            val headerRow = LinearLayout(activity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+
+            val titleView = TextView(activity).apply {
+                text = "🎬 $title • Official Trailer (Ad-Free)"
+                setTextColor(Color.WHITE)
+                textSize = 15f
+                typeface = Typeface.DEFAULT_BOLD
+                maxLines = 1
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+
+            val closeBtn = TextView(activity).apply {
+                text = "✕ Close"
+                setTextColor(Color.WHITE)
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(14), dp(7), dp(14), dp(7))
+                background = GradientDrawable().apply {
+                    setColor(Color.parseColor("#E50914"))
+                    cornerRadius = dp(8).toFloat()
                 }
+                setOnClickListener { dialog.dismiss() }
+            }
 
-                val dialog = Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
-                dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
-                dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            headerRow.addView(titleView)
+            headerRow.addView(closeBtn)
+            topOverlay.addView(headerRow)
 
-                val root = FrameLayout(activity).apply {
-                    setBackgroundColor(Color.parseColor("#08080C"))
+            val qualityScroll = HorizontalScrollView(activity).apply {
+                isHorizontalScrollBarEnabled = false
+                setPadding(0, dp(10), 0, 0)
+            }
+            val qualityRow = LinearLayout(activity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+
+            val qualityTagLabel = TextView(activity).apply {
+                text = "QUALITY: "
+                setTextColor(Color.parseColor("#9CA3AF"))
+                textSize = 11f
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(0, 0, dp(8), 0)
+            }
+            qualityRow.addView(qualityTagLabel)
+            qualityScroll.addView(qualityRow)
+            topOverlay.addView(qualityScroll)
+            root.addView(topOverlay)
+
+            // Bottom Controls Overlay (for Native Stream Engine)
+            val bottomOverlay = LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(Color.parseColor("#CC0D0D14"))
+                setPadding(dp(16), dp(10), dp(16), dp(16))
+                visibility = View.GONE
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.BOTTOM
+                )
+            }
+
+            val seekBar = SeekBar(activity).apply { max = 1000 }
+            bottomOverlay.addView(seekBar)
+
+            val controlsRow = LinearLayout(activity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(6), 0, 0)
+            }
+
+            val playPauseBtn = TextView(activity).apply {
+                text = "⏸ Pause"
+                setTextColor(Color.WHITE)
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(14), dp(7), dp(14), dp(7))
+                background = GradientDrawable().apply {
+                    setColor(Color.parseColor("#E50914"))
+                    cornerRadius = dp(8).toFloat()
                 }
+            }
 
-                // Video Surface container centered
-                val surfaceContainer = FrameLayout(activity).apply {
-                    layoutParams = FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        Gravity.CENTER
-                    )
-                }
+            val rewBtn = TextView(activity).apply {
+                text = "⏪ -10s"
+                setTextColor(Color.WHITE)
+                textSize = 12f
+                setPadding(dp(12), dp(7), dp(12), dp(7))
+            }
 
-                val surfaceView = SurfaceView(activity).apply {
-                    layoutParams = FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        Gravity.CENTER
-                    )
-                }
-                surfaceContainer.addView(surfaceView)
+            val ffBtn = TextView(activity).apply {
+                text = "+10s ⏩"
+                setTextColor(Color.WHITE)
+                textSize = 12f
+                setPadding(dp(12), dp(7), dp(12), dp(7))
+            }
 
-                val spinner = ProgressBar(activity).apply {
-                    layoutParams = FrameLayout.LayoutParams(dp(48), dp(48), Gravity.CENTER)
-                }
-                surfaceContainer.addView(spinner)
-                root.addView(surfaceContainer)
+            val timeLabel = TextView(activity).apply {
+                text = "00:00 / 00:00"
+                setTextColor(Color.parseColor("#D1D5DB"))
+                textSize = 12f
+                gravity = Gravity.END
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
 
-                // Top Overlay Bar (Title + Quality Selector Chips + Close Button)
-                val topOverlay = LinearLayout(activity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setBackgroundColor(Color.parseColor("#CC0D0D14"))
-                    setPadding(dp(16), dp(14), dp(16), dp(12))
-                    layoutParams = FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        Gravity.TOP
-                    )
-                }
+            controlsRow.addView(playPauseBtn)
+            controlsRow.addView(rewBtn)
+            controlsRow.addView(ffBtn)
+            controlsRow.addView(timeLabel)
+            bottomOverlay.addView(controlsRow)
+            root.addView(bottomOverlay)
 
-                val headerRow = LinearLayout(activity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                }
+            dialog.setContentView(root)
+            dialog.show()
+            promise.resolve(true)
 
-                val titleView = TextView(activity).apply {
-                    text = "🎬 $title • Official Trailer (Ad-Free)"
-                    setTextColor(Color.WHITE)
-                    textSize = 15f
-                    typeface = Typeface.DEFAULT_BOLD
-                    maxLines = 1
-                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                }
+            var videoPlayer: MediaPlayer? = null
+            var audioPlayer: MediaPlayer? = null
+            var activeWebView: WebView? = null
+            val uiHandler = Handler(Looper.getMainLooper())
 
-                val closeBtn = TextView(activity).apply {
-                    text = "✕ Close"
-                    setTextColor(Color.WHITE)
-                    textSize = 13f
-                    typeface = Typeface.DEFAULT_BOLD
-                    setPadding(dp(14), dp(7), dp(14), dp(7))
-                    background = GradientDrawable().apply {
-                        setColor(Color.parseColor("#262632"))
-                        cornerRadius = dp(8).toFloat()
-                        setStroke(dp(1), Color.parseColor("#444455"))
-                    }
-                    setOnClickListener { dialog.dismiss() }
-                }
+            fun releaseAll() {
+                uiHandler.removeCallbacksAndMessages(null)
+                try { videoPlayer?.stop() } catch (_: Throwable) {}
+                try { videoPlayer?.release() } catch (_: Throwable) {}
+                videoPlayer = null
+                try { audioPlayer?.stop() } catch (_: Throwable) {}
+                try { audioPlayer?.release() } catch (_: Throwable) {}
+                audioPlayer = null
+                try {
+                    activeWebView?.loadUrl("about:blank")
+                    activeWebView?.destroy()
+                } catch (_: Throwable) {}
+                activeWebView = null
+            }
 
-                headerRow.addView(titleView)
-                headerRow.addView(closeBtn)
-                topOverlay.addView(headerRow)
+            dialog.setOnDismissListener { releaseAll() }
 
-                // Quality Selector Row
-                val qualityScroll = HorizontalScrollView(activity).apply {
-                    isHorizontalScrollBarEnabled = false
-                    setPadding(0, dp(10), 0, 0)
-                }
-                val qualityRow = LinearLayout(activity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                }
+            // Fetch streams in background and bind to either Native MediaPlayer or Ad-Blocked Hardware WebEngine
+            ioExecutor.submit {
+                val streams = fetchPipedOrInnerTubeStreams(videoId)
 
-                val qualityTagLabel = TextView(activity).apply {
-                    text = "QUALITY: "
-                    setTextColor(Color.parseColor("#9CA3AF"))
-                    textSize = 11f
-                    typeface = Typeface.DEFAULT_BOLD
-                    setPadding(0, 0, dp(8), 0)
-                }
-                qualityRow.addView(qualityTagLabel)
-                qualityScroll.addView(qualityRow)
-                topOverlay.addView(qualityScroll)
-                root.addView(topOverlay)
+                UiThreadUtil.runOnUiThread {
+                    if (!dialog.isShowing) return@runOnUiThread
 
-                // Bottom Controls Overlay
-                val bottomOverlay = LinearLayout(activity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setBackgroundColor(Color.parseColor("#CC0D0D14"))
-                    setPadding(dp(16), dp(10), dp(16), dp(16))
-                    layoutParams = FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        Gravity.BOTTOM
-                    )
-                }
-
-                val seekBar = SeekBar(activity).apply {
-                    max = 1000
-                }
-                bottomOverlay.addView(seekBar)
-
-                val controlsRow = LinearLayout(activity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    setPadding(0, dp(6), 0, 0)
-                }
-
-                val playPauseBtn = TextView(activity).apply {
-                    text = "⏸ Pause"
-                    setTextColor(Color.WHITE)
-                    textSize = 13f
-                    typeface = Typeface.DEFAULT_BOLD
-                    setPadding(dp(14), dp(7), dp(14), dp(7))
-                    background = GradientDrawable().apply {
-                        setColor(Color.parseColor("#E50914"))
-                        cornerRadius = dp(8).toFloat()
-                    }
-                }
-
-                val rewBtn = TextView(activity).apply {
-                    text = "⏪ -10s"
-                    setTextColor(Color.WHITE)
-                    textSize = 12f
-                    setPadding(dp(12), dp(7), dp(12), dp(7))
-                }
-
-                val ffBtn = TextView(activity).apply {
-                    text = "+10s ⏩"
-                    setTextColor(Color.WHITE)
-                    textSize = 12f
-                    setPadding(dp(12), dp(7), dp(12), dp(7))
-                }
-
-                val timeLabel = TextView(activity).apply {
-                    text = "00:00 / 00:00"
-                    setTextColor(Color.parseColor("#D1D5DB"))
-                    textSize = 12f
-                    gravity = Gravity.END
-                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                }
-
-                controlsRow.addView(playPauseBtn)
-                controlsRow.addView(rewBtn)
-                controlsRow.addView(ffBtn)
-                controlsRow.addView(timeLabel)
-                bottomOverlay.addView(controlsRow)
-                root.addView(bottomOverlay)
-
-                dialog.setContentView(root)
-
-                // MediaPlayers (Video + Synced Audio for 4K / 1440p / 1080p DASH streams)
-                var videoPlayer: MediaPlayer? = null
-                var audioPlayer: MediaPlayer? = null
-                var videoPrepared = false
-                var audioPrepared = false
-                var isSeeking = false
-                var resumePosMs = 0
-                val uiHandler = Handler(Looper.getMainLooper())
-
-                // Default to 1080p FHD if available, otherwise highest quality
-                var activeIndex = streams.indexOfFirst { it.height == 1080 }
-                    .takeIf { it >= 0 } ?: 0
-
-                val qualityButtons = ArrayList<TextView>()
-
-                fun updateQualityButtonStyles() {
-                    for (i in qualityButtons.indices) {
-                        val btn = qualityButtons[i]
-                        val isSelected = (i == activeIndex)
-                        btn.background = GradientDrawable().apply {
-                            setColor(if (isSelected) Color.parseColor("#E50914") else Color.parseColor("#1F2029"))
-                            cornerRadius = dp(16).toFloat()
-                            setStroke(dp(1), if (isSelected) Color.parseColor("#FF4D4D") else Color.parseColor("#374151"))
+                    if (streams.isNotEmpty()) {
+                        // Engine A: Native Direct Stream Player (4K / 1440p / 1080p / 720p / 480p)
+                        bottomOverlay.visibility = View.VISIBLE
+                        val surfaceView = SurfaceView(activity).apply {
+                            layoutParams = FrameLayout.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                Gravity.CENTER
+                            )
                         }
-                        btn.setTextColor(if (isSelected) Color.WHITE else Color.parseColor("#D1D5DB"))
-                    }
-                }
+                        playerStage.addView(surfaceView, 0)
 
-                fun releasePlayers() {
-                    videoPrepared = false
-                    audioPrepared = false
-                    try { videoPlayer?.stop() } catch (_: Throwable) {}
-                    try { videoPlayer?.release() } catch (_: Throwable) {}
-                    videoPlayer = null
-                    try { audioPlayer?.stop() } catch (_: Throwable) {}
-                    try { audioPlayer?.release() } catch (_: Throwable) {}
-                    audioPlayer = null
-                }
+                        var videoPrepared = false
+                        var audioPrepared = false
+                        var isSeeking = false
+                        var resumePosMs = 0
+                        var activeIndex = streams.indexOfFirst { it.height == 1080 }.takeIf { it >= 0 } ?: 0
+                        val qualityButtons = ArrayList<TextView>()
 
-                fun tryStartPlayback() {
-                    val opt = streams[activeIndex]
-                    if (!videoPrepared) return
-                    if (!opt.isMuxed && opt.audioUrl.isNotEmpty() && !audioPrepared) return
-
-                    spinner.visibility = View.GONE
-                    try {
-                        if (resumePosMs > 0) {
-                            videoPlayer?.seekTo(resumePosMs)
-                            audioPlayer?.seekTo(resumePosMs)
-                        }
-                        videoPlayer?.start()
-                        audioPlayer?.start()
-                        playPauseBtn.text = "⏸ Pause"
-                    } catch (_: Throwable) {}
-                }
-
-                fun loadStreamOption(index: Int, seekMs: Int) {
-                    activeIndex = index
-                    resumePosMs = seekMs
-                    updateQualityButtonStyles()
-                    spinner.visibility = View.VISIBLE
-                    releasePlayers()
-
-                    val opt = streams[index]
-                    val holder = surfaceView.holder
-
-                    val vp = MediaPlayer()
-                    videoPlayer = vp
-                    vp.setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .build()
-                    )
-                    vp.setDisplay(holder)
-                    vp.setOnVideoSizeChangedListener { _, w, h ->
-                        if (w > 0 && h > 0) {
-                            val rootW = surfaceContainer.width.takeIf { it > 0 } ?: reactContext.resources.displayMetrics.widthPixels
-                            val rootH = surfaceContainer.height.takeIf { it > 0 } ?: reactContext.resources.displayMetrics.heightPixels
-                            val videoAspect = w.toFloat() / h.toFloat()
-                            val screenAspect = rootW.toFloat() / rootH.toFloat()
-                            val lp = surfaceView.layoutParams as FrameLayout.LayoutParams
-                            if (videoAspect > screenAspect) {
-                                lp.width = rootW
-                                lp.height = (rootW / videoAspect).toInt()
-                            } else {
-                                lp.height = rootH
-                                lp.width = (rootH * videoAspect).toInt()
+                        fun updateQualityStyles() {
+                            for (i in qualityButtons.indices) {
+                                val btn = qualityButtons[i]
+                                val isSel = (i == activeIndex)
+                                btn.background = GradientDrawable().apply {
+                                    setColor(if (isSel) Color.parseColor("#E50914") else Color.parseColor("#1F2029"))
+                                    cornerRadius = dp(16).toFloat()
+                                    setStroke(dp(1), if (isSel) Color.parseColor("#FF4D4D") else Color.parseColor("#374151"))
+                                }
+                                btn.setTextColor(if (isSel) Color.WHITE else Color.parseColor("#D1D5DB"))
                             }
-                            lp.gravity = Gravity.CENTER
-                            surfaceView.layoutParams = lp
                         }
-                    }
-                    vp.setOnPreparedListener {
-                        videoPrepared = true
-                        tryStartPlayback()
-                    }
-                    vp.setOnInfoListener { _, what, _ ->
-                        if (what == MediaPlayer.MEDIA_INFO_BUFFERING_START) {
-                            spinner.visibility = View.VISIBLE
-                            try { audioPlayer?.pause() } catch (_: Throwable) {}
-                        } else if (what == MediaPlayer.MEDIA_INFO_BUFFERING_END) {
+
+                        fun tryStart() {
+                            val opt = streams[activeIndex]
+                            if (!videoPrepared) return
+                            if (!opt.isMuxed && opt.audioUrl.isNotEmpty() && !audioPrepared) return
                             spinner.visibility = View.GONE
+                            try {
+                                if (resumePosMs > 0) {
+                                    videoPlayer?.seekTo(resumePosMs)
+                                    audioPlayer?.seekTo(resumePosMs)
+                                }
+                                videoPlayer?.start()
+                                audioPlayer?.start()
+                                playPauseBtn.text = "⏸ Pause"
+                            } catch (_: Throwable) {}
+                        }
+
+                        fun loadOption(index: Int, seekMs: Int) {
+                            activeIndex = index
+                            resumePosMs = seekMs
+                            updateQualityStyles()
+                            spinner.visibility = View.VISIBLE
+                            videoPrepared = false
+                            audioPrepared = false
+                            try { videoPlayer?.stop() } catch (_: Throwable) {}
+                            try { videoPlayer?.release() } catch (_: Throwable) {}
+                            videoPlayer = null
+                            try { audioPlayer?.stop() } catch (_: Throwable) {}
+                            try { audioPlayer?.release() } catch (_: Throwable) {}
+                            audioPlayer = null
+
+                            val opt = streams[index]
+                            val vp = MediaPlayer()
+                            videoPlayer = vp
+                            vp.setAudioAttributes(
+                                AudioAttributes.Builder()
+                                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                                    .build()
+                            )
+                            vp.setDisplay(surfaceView.holder)
+                            vp.setOnVideoSizeChangedListener { _, w, h ->
+                                if (w > 0 && h > 0) {
+                                    val rootW = playerStage.width.takeIf { it > 0 } ?: reactContext.resources.displayMetrics.widthPixels
+                                    val rootH = playerStage.height.takeIf { it > 0 } ?: reactContext.resources.displayMetrics.heightPixels
+                                    val videoAspect = w.toFloat() / h.toFloat()
+                                    val screenAspect = rootW.toFloat() / rootH.toFloat()
+                                    val lp = surfaceView.layoutParams as FrameLayout.LayoutParams
+                                    if (videoAspect > screenAspect) {
+                                        lp.width = rootW
+                                        lp.height = (rootW / videoAspect).toInt()
+                                    } else {
+                                        lp.height = rootH
+                                        lp.width = (rootH * videoAspect).toInt()
+                                    }
+                                    lp.gravity = Gravity.CENTER
+                                    surfaceView.layoutParams = lp
+                                }
+                            }
+                            vp.setOnPreparedListener {
+                                videoPrepared = true
+                                tryStart()
+                            }
+                            vp.setOnCompletionListener {
+                                playPauseBtn.text = "▶ Replay"
+                                try { audioPlayer?.pause() } catch (_: Throwable) {}
+                            }
+
+                            if (!opt.isMuxed && opt.audioUrl.isNotEmpty()) {
+                                val ap = MediaPlayer()
+                                audioPlayer = ap
+                                ap.setAudioAttributes(
+                                    AudioAttributes.Builder()
+                                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                                        .build()
+                                )
+                                ap.setOnPreparedListener {
+                                    audioPrepared = true
+                                    tryStart()
+                                }
+                                try {
+                                    ap.setDataSource(opt.audioUrl)
+                                    ap.prepareAsync()
+                                } catch (_: Throwable) { audioPrepared = true }
+                            }
+
+                            try {
+                                vp.setDataSource(opt.videoUrl)
+                                vp.prepareAsync()
+                            } catch (_: Throwable) {
+                                spinner.visibility = View.GONE
+                            }
+                        }
+
+                        for (i in streams.indices) {
+                            val opt = streams[i]
+                            val chip = TextView(activity).apply {
+                                text = opt.label
+                                textSize = 12f
+                                typeface = Typeface.DEFAULT_BOLD
+                                setPadding(dp(12), dp(5), dp(12), dp(5))
+                                layoutParams = LinearLayout.LayoutParams(
+                                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                                    ViewGroup.LayoutParams.WRAP_CONTENT
+                                ).apply { setMargins(0, 0, dp(8), 0) }
+                                setOnClickListener {
+                                    if (activeIndex != i) {
+                                        val pos = try { if (videoPrepared) videoPlayer?.currentPosition ?: 0 else 0 } catch (_: Throwable) { 0 }
+                                        loadOption(i, pos)
+                                    }
+                                }
+                            }
+                            qualityButtons.add(chip)
+                            qualityRow.addView(chip)
+                        }
+                        updateQualityStyles()
+
+                        playPauseBtn.setOnClickListener {
+                            val vp = videoPlayer ?: return@setOnClickListener
+                            if (!videoPrepared) return@setOnClickListener
                             if (vp.isPlaying) {
+                                vp.pause()
+                                try { audioPlayer?.pause() } catch (_: Throwable) {}
+                                playPauseBtn.text = "▶ Play"
+                            } else {
                                 try {
                                     audioPlayer?.seekTo(vp.currentPosition)
+                                    vp.start()
                                     audioPlayer?.start()
+                                    playPauseBtn.text = "⏸ Pause"
                                 } catch (_: Throwable) {}
                             }
                         }
-                        false
-                    }
-                    vp.setOnCompletionListener {
-                        playPauseBtn.text = "▶ Replay"
-                        try { audioPlayer?.pause() } catch (_: Throwable) {}
-                    }
 
-                    if (!opt.isMuxed && opt.audioUrl.isNotEmpty()) {
-                        val ap = MediaPlayer()
-                        audioPlayer = ap
-                        ap.setAudioAttributes(
-                            AudioAttributes.Builder()
-                                .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
-                                .build()
-                        )
-                        ap.setOnPreparedListener {
-                            audioPrepared = true
-                            tryStartPlayback()
+                        rewBtn.setOnClickListener {
+                            val vp = videoPlayer ?: return@setOnClickListener
+                            if (!videoPrepared) return@setOnClickListener
+                            val t = (vp.currentPosition - 10000).coerceAtLeast(0)
+                            vp.seekTo(t)
+                            try { audioPlayer?.seekTo(t) } catch (_: Throwable) {}
                         }
-                        try {
-                            ap.setDataSource(opt.audioUrl)
-                            ap.prepareAsync()
-                        } catch (_: Throwable) {
-                            audioPrepared = true
+
+                        ffBtn.setOnClickListener {
+                            val vp = videoPlayer ?: return@setOnClickListener
+                            if (!videoPrepared) return@setOnClickListener
+                            val t = (vp.currentPosition + 10000).coerceAtMost(vp.duration.coerceAtLeast(0))
+                            vp.seekTo(t)
+                            try { audioPlayer?.seekTo(t) } catch (_: Throwable) {}
                         }
-                    }
 
-                    try {
-                        vp.setDataSource(opt.videoUrl)
-                        vp.prepareAsync()
-                    } catch (_: Throwable) {
-                        spinner.visibility = View.GONE
-                    }
-                }
+                        seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {}
+                            override fun onStartTrackingTouch(sb: SeekBar?) { isSeeking = true }
+                            override fun onStopTrackingTouch(sb: SeekBar?) {
+                                isSeeking = false
+                                val vp = videoPlayer ?: return
+                                if (!videoPrepared || sb == null) return
+                                val dur = vp.duration
+                                if (dur > 0) {
+                                    val target = ((sb.progress.toLong() * dur) / 1000L).toInt()
+                                    vp.seekTo(target)
+                                    try { audioPlayer?.seekTo(target) } catch (_: Throwable) {}
+                                }
+                            }
+                        })
 
-                // Populate Quality Chips (e.g., 2160p 4K, 1440p QHD, 1080p FHD, 720p HD, 480p, 360p)
-                for (i in streams.indices) {
-                    val opt = streams[i]
-                    val chip = TextView(activity).apply {
-                        text = opt.label
-                        textSize = 12f
-                        typeface = Typeface.DEFAULT_BOLD
-                        setPadding(dp(12), dp(5), dp(12), dp(5))
-                        val lp = LinearLayout.LayoutParams(
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                            ViewGroup.LayoutParams.WRAP_CONTENT
-                        )
-                        lp.setMargins(0, 0, dp(8), 0)
-                        layoutParams = lp
-                        setOnClickListener {
-                            if (activeIndex != i) {
-                                val currentPos = try {
-                                    if (videoPrepared) videoPlayer?.currentPosition ?: 0 else 0
-                                } catch (_: Throwable) { 0 }
-                                loadStreamOption(i, currentPos)
+                        val syncTask = object : Runnable {
+                            override fun run() {
+                                val vp = videoPlayer
+                                if (vp != null && videoPrepared) {
+                                    try {
+                                        val pos = vp.currentPosition
+                                        val dur = vp.duration
+                                        if (dur > 0 && !isSeeking) {
+                                            seekBar.progress = ((pos.toLong() * 1000L) / dur).toInt()
+                                            timeLabel.text = "${formatTimeMs(pos)} / ${formatTimeMs(dur)}"
+                                        }
+                                        val ap = audioPlayer
+                                        if (ap != null && audioPrepared && vp.isPlaying) {
+                                            if (!ap.isPlaying) ap.start()
+                                            if (kotlin.math.abs(pos - ap.currentPosition) > 90) ap.seekTo(pos)
+                                        }
+                                    } catch (_: Throwable) {}
+                                }
+                                uiHandler.postDelayed(this, 400)
                             }
                         }
-                    }
-                    qualityButtons.add(chip)
-                    qualityRow.addView(chip)
-                }
-                updateQualityButtonStyles()
 
-                playPauseBtn.setOnClickListener {
-                    val vp = videoPlayer ?: return@setOnClickListener
-                    if (!videoPrepared) return@setOnClickListener
-                    if (vp.isPlaying) {
-                        vp.pause()
-                        try { audioPlayer?.pause() } catch (_: Throwable) {}
-                        playPauseBtn.text = "▶ Play"
+                        surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+                            override fun surfaceCreated(holder: SurfaceHolder) {
+                                loadOption(activeIndex, resumePosMs)
+                                uiHandler.post(syncTask)
+                            }
+                            override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
+                            override fun surfaceDestroyed(h: SurfaceHolder) {
+                                try { if (videoPrepared) resumePosMs = videoPlayer?.currentPosition ?: 0 } catch (_: Throwable) {}
+                            }
+                        })
                     } else {
-                        try {
-                            audioPlayer?.seekTo(vp.currentPosition)
-                            vp.start()
-                            audioPlayer?.start()
-                            playPauseBtn.text = "⏸ Pause"
-                        } catch (_: Throwable) {}
-                    }
-                }
+                        // Engine B: Built-in Ad-Blocked Hardware IFrame Player inside the same Dialog (100% Guaranteed Playback + Quality Chips!)
+                        val presetQualities = listOf(
+                            "2160p 4K" to "hd2160",
+                            "1440p QHD" to "hd1440",
+                            "1080p FHD" to "hd1080",
+                            "720p HD" to "hd720",
+                            "480p" to "large",
+                            "Auto" to "default"
+                        )
+                        var selectedQIndex = 2 // Default 1080p FHD
+                        val qualityButtons = ArrayList<TextView>()
 
-                rewBtn.setOnClickListener {
-                    val vp = videoPlayer ?: return@setOnClickListener
-                    if (!videoPrepared) return@setOnClickListener
-                    val target = (vp.currentPosition - 10000).coerceAtLeast(0)
-                    vp.seekTo(target)
-                    try { audioPlayer?.seekTo(target) } catch (_: Throwable) {}
-                }
-
-                ffBtn.setOnClickListener {
-                    val vp = videoPlayer ?: return@setOnClickListener
-                    if (!videoPrepared) return@setOnClickListener
-                    val dur = vp.duration.coerceAtLeast(0)
-                    val target = (vp.currentPosition + 10000).coerceAtMost(dur)
-                    vp.seekTo(target)
-                    try { audioPlayer?.seekTo(target) } catch (_: Throwable) {}
-                }
-
-                seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {}
-                    override fun onStartTrackingTouch(sb: SeekBar?) { isSeeking = true }
-                    override fun onStopTrackingTouch(sb: SeekBar?) {
-                        isSeeking = false
-                        val vp = videoPlayer ?: return
-                        if (!videoPrepared || sb == null) return
-                        val dur = vp.duration
-                        if (dur > 0) {
-                            val target = ((sb.progress.toLong() * dur) / 1000L).toInt()
-                            vp.seekTo(target)
-                            try { audioPlayer?.seekTo(target) } catch (_: Throwable) {}
+                        val webView = WebView(activity).apply {
+                            setBackgroundColor(Color.BLACK)
+                            layoutParams = FrameLayout.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                Gravity.CENTER
+                            ).apply {
+                                topMargin = dp(78)
+                            }
+                            settings.javaScriptEnabled = true
+                            settings.mediaPlaybackRequiresUserGesture = false
+                            settings.domStorageEnabled = true
+                            settings.cacheMode = WebSettings.LOAD_DEFAULT
+                            settings.userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
                         }
-                    }
-                })
+                        activeWebView = webView
 
-                val syncRunnable = object : Runnable {
-                    override fun run() {
-                        val vp = videoPlayer
-                        if (vp != null && videoPrepared) {
-                            try {
-                                val pos = vp.currentPosition
-                                val dur = vp.duration
-                                if (dur > 0 && !isSeeking) {
-                                    seekBar.progress = ((pos.toLong() * 1000L) / dur).toInt()
-                                    timeLabel.text = "${formatTimeMs(pos)} / ${formatTimeMs(dur)}"
+                        val blockedAdKeywords = listOf(
+                            "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+                            "/pagead/", "/api/stats/ads", "adservice.google", "youtube.com/api/stats/ads",
+                            "youtube.com/pagead", "youtube.com/ptracking"
+                        )
+
+                        webView.webChromeClient = WebChromeClient()
+                        webView.webViewClient = object : WebViewClient() {
+                            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                                val u = request?.url?.toString()?.lowercase(Locale.ROOT) ?: ""
+                                if (blockedAdKeywords.any { u.contains(it) }) {
+                                    return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
                                 }
-                                // Keep DASH audio in tight sync (<90ms drift)
-                                val ap = audioPlayer
-                                if (ap != null && audioPrepared && vp.isPlaying) {
-                                    if (!ap.isPlaying) ap.start()
-                                    val drift = kotlin.math.abs(pos - ap.currentPosition)
-                                    if (drift > 90) {
-                                        ap.seekTo(pos)
+                                return super.shouldInterceptRequest(view, request)
+                            }
+
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                spinner.visibility = View.GONE
+                            }
+                        }
+
+                        fun loadEmbedWithQuality(vq: String) {
+                            spinner.visibility = View.VISIBLE
+                            val html = """
+                                <!DOCTYPE html>
+                                <html>
+                                <head>
+                                <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+                                <style>
+                                  * { margin: 0; padding: 0; box-sizing: border-box; background: #000; }
+                                  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+                                  #player { width: 100%; height: 100%; border: 0; }
+                                  .ytp-pause-overlay, .ytp-watermark, .ytp-chrome-top-buttons, .ytp-show-cards-title { display: none !important; }
+                                </style>
+                                </head>
+                                <body>
+                                <div id="player"></div>
+                                <script src="https://www.youtube.com/iframe_api"></script>
+                                <script>
+                                  var player;
+                                  var targetVq = '$vq';
+                                  function onYouTubeIframeAPIReady() {
+                                    player = new YT.Player('player', {
+                                      videoId: '$videoId',
+                                      host: 'https://www.youtube-nocookie.com',
+                                      playerVars: {
+                                        'autoplay': 1,
+                                        'playsinline': 1,
+                                        'rel': 0,
+                                        'modestbranding': 1,
+                                        'iv_load_policy': 3,
+                                        'fs': 1,
+                                        'vq': targetVq
+                                      },
+                                      events: {
+                                        'onReady': function(e) {
+                                          try {
+                                            if (targetVq !== 'default' && e.target.setPlaybackQualityRange) {
+                                              e.target.setPlaybackQualityRange(targetVq, targetVq);
+                                            }
+                                            e.target.playVideo();
+                                          } catch(err) {}
+                                        },
+                                        'onStateChange': function(e) {
+                                          try {
+                                            if (e.data === YT.PlayerState.PLAYING && targetVq !== 'default' && e.target.setPlaybackQualityRange) {
+                                              e.target.setPlaybackQualityRange(targetVq, targetVq);
+                                            }
+                                          } catch(err) {}
+                                        }
+                                      }
+                                    });
+                                  }
+                                  function changeQuality(newVq) {
+                                    targetVq = newVq;
+                                    if (player && player.getCurrentTime) {
+                                      var t = player.getCurrentTime() || 0;
+                                      if (player.setPlaybackQualityRange && newVq !== 'default') {
+                                        player.setPlaybackQualityRange(newVq, newVq);
+                                      }
+                                      player.loadVideoById({'videoId': '$videoId', 'startSeconds': t, 'suggestedQuality': newVq});
+                                    }
+                                  }
+                                </script>
+                                </body>
+                                </html>
+                            """.trimIndent()
+                            webView.loadDataWithBaseURL(
+                                "https://www.youtube-nocookie.com",
+                                html,
+                                "text/html",
+                                "UTF-8",
+                                null
+                            )
+                        }
+
+                        fun updateWebQualityStyles() {
+                            for (i in qualityButtons.indices) {
+                                val btn = qualityButtons[i]
+                                val isSel = (i == selectedQIndex)
+                                btn.background = GradientDrawable().apply {
+                                    setColor(if (isSel) Color.parseColor("#E50914") else Color.parseColor("#1F2029"))
+                                    cornerRadius = dp(16).toFloat()
+                                    setStroke(dp(1), if (isSel) Color.parseColor("#FF4D4D") else Color.parseColor("#374151"))
+                                }
+                                btn.setTextColor(if (isSel) Color.WHITE else Color.parseColor("#D1D5DB"))
+                            }
+                        }
+
+                        for (i in presetQualities.indices) {
+                            val (label, vq) = presetQualities[i]
+                            val chip = TextView(activity).apply {
+                                text = label
+                                textSize = 12f
+                                typeface = Typeface.DEFAULT_BOLD
+                                setPadding(dp(12), dp(5), dp(12), dp(5))
+                                layoutParams = LinearLayout.LayoutParams(
+                                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                                    ViewGroup.LayoutParams.WRAP_CONTENT
+                                ).apply { setMargins(0, 0, dp(8), 0) }
+                                setOnClickListener {
+                                    if (selectedQIndex != i) {
+                                        selectedQIndex = i
+                                        updateWebQualityStyles()
+                                        webView.evaluateJavascript("changeQuality('$vq');", null)
                                     }
                                 }
-                            } catch (_: Throwable) {}
+                            }
+                            qualityButtons.add(chip)
+                            qualityRow.addView(chip)
                         }
-                        uiHandler.postDelayed(this, 400)
+                        updateWebQualityStyles()
+                        playerStage.addView(webView, 0)
+                        loadEmbedWithQuality(presetQualities[selectedQIndex].second)
                     }
                 }
-
-                surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
-                    override fun surfaceCreated(holder: SurfaceHolder) {
-                        loadStreamOption(activeIndex, resumePosMs)
-                        uiHandler.post(syncRunnable)
-                    }
-                    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
-                    override fun surfaceDestroyed(holder: SurfaceHolder) {
-                        try {
-                            if (videoPrepared) resumePosMs = videoPlayer?.currentPosition ?: 0
-                        } catch (_: Throwable) {}
-                        releasePlayers()
-                    }
-                })
-
-                dialog.setOnDismissListener {
-                    uiHandler.removeCallbacksAndMessages(null)
-                    releasePlayers()
-                }
-
-                dialog.show()
-                promise.resolve(true)
             }
         }
     }

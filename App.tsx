@@ -352,6 +352,108 @@ const App = () => {
 
   const [selectedFile, setSelectedFile] = useState<any>(null);
 
+  
+  const [showSeriesRatingTick, setShowSeriesRatingTick] = React.useState(false);
+  const [seriesMaxSeasonMap, setSeriesMaxSeasonMap] = React.useState<Record<string, number>>({});
+
+  React.useEffect(() => {
+    const timer = setInterval(() => {
+      setShowSeriesRatingTick(prev => !prev);
+    }, 2600);
+    return () => clearInterval(timer);
+  }, []);
+
+  
+  // Automatically discover total seasons (e.g. S01-S04) for series from both loaded files and TMDb /tv/{id}
+  React.useEffect(() => {
+    let cancelled = false;
+    const tmdbKey = vaultRef.current?.tmdbKey || '';
+    if (!tmdbKey) return;
+
+    const scanSeriesSeasons = async () => {
+      try {
+        // Find all unique series titles from current files/items in memory
+        const rawList: any[] = (typeof files !== 'undefined' && Array.isArray(files)) ? files : [];
+        const localMaxMap: Record<string, number> = {};
+        const seriesTitles = new Set<string>();
+
+        for (const f of rawList) {
+          const name = String(f?.name || f?.title || '');
+          const sMatch = name.match(/(?:[.\s_-]|\b)S(\d{1,2})(?:[\s._-]*E\d{1,3}|\b)/i)
+            || name.match(/\bSeason[\s._-]*(\d{1,2})\b/i);
+          if (sMatch) {
+            const sNum = parseInt(sMatch[1], 10);
+            const cut = sMatch.index || 0;
+            const clean = (cut > 0 ? name.slice(0, cut) : name)
+              .replace(/\b(19\d{2}|20\d{2})\b.*$/, '')
+              .replace(/[._-]+/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .toUpperCase();
+            if (clean) {
+              seriesTitles.add(clean);
+              if (sNum > (localMaxMap[clean] || 0)) {
+                localMaxMap[clean] = sNum;
+              }
+            }
+          }
+        }
+
+        if (Object.keys(localMaxMap).length > 0 && !cancelled) {
+          setSeriesMaxSeasonMap(prev => ({ ...prev, ...localMaxMap }));
+        }
+
+        for (const titleKey of Array.from(seriesTitles)) {
+          if (cancelled) break;
+          try {
+            const sUrl = `https://api.themoviedb.org/3/search/tv?api_key=${tmdbKey}&query=${encodeURIComponent(titleKey)}`;
+            const sData = await fetch(sUrl).then(r => r.json());
+            const tvId = sData?.results?.[0]?.id;
+            if (tvId) {
+              const dUrl = `https://api.themoviedb.org/3/tv/${tvId}?api_key=${tmdbKey}`;
+              const dData = await fetch(dUrl).then(r => r.json());
+              const numSeasons = Number(dData?.number_of_seasons || 0);
+              if (numSeasons > 0 && !cancelled) {
+                setSeriesMaxSeasonMap(prev => ({
+                  ...prev,
+                  [titleKey]: Math.max(prev[titleKey] || 1, numSeasons),
+                }));
+              }
+            }
+          } catch (_e) {}
+        }
+      } catch (_err) {}
+    };
+
+    const t = setTimeout(scanSeriesSeasons, 900);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [typeof files !== 'undefined' ? files?.length : 0]);
+
+  
+  const formatHomeSeriesBadge = (rawSeasonTag: string | null | undefined, cleanTitle: string | null | undefined, overallRating: string | number | null | undefined): string => {
+    if (!rawSeasonTag) return overallRating ? `★ ${overallRating}` : '';
+    const isEpDetailCode = /S\d{1,2}E\d{1,3}/i.test(rawSeasonTag);
+    if (isEpDetailCode) return rawSeasonTag.toUpperCase();
+
+    const key = String(cleanTitle || '').replace(/\b(19\d{2}|20\d{2})\b.*$/, '').replace(/[._-]+/g, ' ').replace(/\s+/g, ' ').trim().toUpperCase();
+    const maxS = (key && seriesMaxSeasonMap[key]) ? seriesMaxSeasonMap[key] : 0;
+    const sMatch = rawSeasonTag.match(/S(\d{1,2})/i);
+    const curS = sMatch ? parseInt(sMatch[1], 10) : 1;
+    const totalS = Math.max(maxS, curS);
+
+    const seasonRangeText = totalS > 1
+      ? `S01-S${String(totalS).padStart(2, '0')}`
+      : formatHomeSeriesBadge(`S${String(curS).padStart(2, "0")}`, (typeof item !== "undefined" ? (item?.cleanTitle || item?.title || item?.name) : (typeof cleanTitle !== "undefined" ? cleanTitle : "")), (typeof tmdb !== "undefined" ? tmdb?.rating : (typeof meta !== "undefined" ? meta?.rating : null)));
+
+    if (overallRating && showSeriesRatingTick) {
+      return `★ ${overallRating}`;
+    }
+    return seasonRangeText;
+  };
+
   const [episodeTmdbMeta, setEpisodeTmdbMeta] = React.useState<{
     rating: string | null;
     overview: string | null;
@@ -2125,7 +2227,7 @@ const App = () => {
               <View style={styles.detailMetaRow}>
                 {!!(meta?.year || info.year) && <Text style={styles.detailYearText}>{meta?.year || info.year}</Text>}
                 {!!info.seasonEpisode && <View style={styles.seasonBadge}><Text style={styles.seasonBadgeText}>{info.seasonEpisode}</Text></View>}
-                {!!meta?.rating && <View style={styles.ratingBadge}><Text style={styles.ratingBadgeText}>★ {meta.rating}</Text></View>}
+                {!!(episodeTmdbMeta?.rating || meta?.rating) && <View style={styles.ratingBadge}><Text style={styles.ratingBadgeText}>★ {(episodeTmdbMeta?.rating || meta.rating)}</Text></View>}
                 {!!effectiveResolution && <View style={styles.qualityBadge}><Text style={styles.qualityBadgeText}>{effectiveResolution}</Text></View>}
               </View>
               {topChips.length > 0 && (
@@ -2247,36 +2349,7 @@ const App = () => {
           {/* Single MediaInfo Card for Currently Selected Version Only */}
           <View style={styles.mediaInfoCard}>
             
-              {episodeTmdbMeta && (episodeTmdbMeta.rating || episodeTmdbMeta.epTitle || episodeTmdbMeta.overview) && (
-                <View style={{
-                  backgroundColor: '#12131A',
-                  borderColor: '#F59E0B',
-                  borderWidth: 1,
-                  borderRadius: 10,
-                  padding: 12,
-                  marginBottom: 12,
-                }}>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: episodeTmdbMeta.overview ? 6 : 0 }}>
-                    <Text style={{ color: '#FBBF24', fontWeight: 'bold', fontSize: 13 }}>
-                      {episodeTmdbMeta.code}{episodeTmdbMeta.epTitle ? ` • ${episodeTmdbMeta.epTitle}` : ''}
-                    </Text>
-                    {episodeTmdbMeta.rating && (
-                      <View style={{ backgroundColor: '#292524', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, borderWidth: 1, borderColor: '#F59E0B' }}>
-                        <Text style={{ color: '#FBBF24', fontWeight: 'bold', fontSize: 12 }}>
-                          ★ {episodeTmdbMeta.rating} / 10 (Episode Rating)
-                        </Text>
-                      </View>
-                    )}
-                  </View>
-                  {episodeTmdbMeta.overview ? (
-                    <Text style={{ color: '#D1D5DB', fontSize: 12, lineHeight: 18 }}>
-                      {episodeTmdbMeta.overview}
-                    </Text>
-                  ) : null}
-                </View>
-              )}
-
-              <TouchableOpacity
+                            <TouchableOpacity
                 disabled={trailerState.loading || !trailerState.videoId}
                 onPress={() => {
                   if (trailerState.videoId && SecurityVault?.playYoutubeTrailer) {
