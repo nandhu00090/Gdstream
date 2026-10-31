@@ -699,18 +699,25 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     remoteConn.disconnect()
                 }
             } else if (entry.archiveFormat == "ZIP" && entry.compressionMethod == 8) {
-                // DEFLATE Mode (Compressed ZIP): On-the-fly Inflater stream
+                // DEFLATE Mode (Compressed ZIP): Prevent ExoPlayer & MediaInfo from hanging on end-of-file Cues/Tags seeks!
+                if (reqStart > 8L * 1024L * 1024L) {
+                    val rejectHdr = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$totalSize\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    out.write(rejectHdr.toByteArray(StandardCharsets.US_ASCII))
+                    out.flush()
+                    return
+                }
                 val remoteStart = dataStart
                 val remoteEnd = dataStart + entry.compressedSize - 1L
                 val remoteConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
                 val inflater = Inflater(true)
                 try {
+                    val send200 = (reqStart == 0L && reqEnd >= totalSize - 1L)
                     val headers = buildString {
-                        append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
+                        append(if (send200) "HTTP/1.1 200 OK\r\n" else "HTTP/1.1 206 Partial Content\r\n")
                         append("Content-Type: $mimeType\r\n")
-                        append("Accept-Ranges: bytes\r\n")
+                        append("Accept-Ranges: none\r\n")
                         append("Content-Length: $contentLength\r\n")
-                        if (isPartial) {
+                        if (!send200) {
                             append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
                         }
                         append("Connection: close\r\n\r\n")

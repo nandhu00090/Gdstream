@@ -1206,7 +1206,7 @@ const App = () => {
   }, [downloads, currentPath]);
 
   const zipParentBackupRef = React.useRef<{
-    wasInsideFolder: boolean;
+    pathStack: string[];
     folderFiles: any[];
     currentPath: string;
     seriesParentTitle: string;
@@ -1214,26 +1214,35 @@ const App = () => {
     activeSeason: any;
   } | null>(null);
 
-  const openZipArchiveFile = async (zipItem: any) => {
+  const openZipArchiveFile = async (zipItem: any, basePathOverride?: string) => {
+    const effectiveBasePath = basePathOverride || (currentPath.startsWith('/0:/') ? currentPath : '/0:/');
     const prevBackup = {
-      wasInsideFolder: isInsideFolder,
+      pathStack: [...pathStack],
       folderFiles: [...folderFiles],
-      currentPath,
+      currentPath: effectiveBasePath,
       seriesParentTitle,
       seasonFolders: [...seasonFolders],
       activeSeason,
     };
+
     try {
       const info = parseMediaFilename(zipItem.name, false);
-      const zipUrl = getStreamUrl(zipItem);
+      const baseUrl = vaultRef.current.baseUrl;
+      const zipUrl = zipItem.link
+        ? (zipItem.link.startsWith('http') ? zipItem.link : `${baseUrl}${zipItem.link.startsWith('/') ? '' : '/'}${zipItem.link}`)
+        : `${baseUrl}${effectiveBasePath}${encodeURIComponent(zipItem.name)}`;
       const sizeHint = Number(zipItem.size || 0);
+      const virtualZipPath = `${effectiveBasePath}${encodeURIComponent(zipItem.name)}/`;
 
       zipParentBackupRef.current = prevBackup;
       setFolderLoading(true);
-      setSeriesParentTitle(info.cleanTitle || zipItem.name.replace(/\.(zip|rar)$/i, ''));
+      setFolderFiles([]);
       setSeasonFolders([]);
       setActiveSeason(null);
-      setCurrentPath(`${currentPath}${encodeURIComponent(zipItem.name)}/`);
+      setSeriesParentTitle(info.cleanTitle || zipItem.name.replace(/\.(zip|rar)$/i, ''));
+      setCurrentPath(virtualZipPath);
+      // CRITICAL FIX: Push onto pathStack so isInsideFolder (pathStack.length > 1) becomes true IMMEDIATELY!
+      setPathStack(prev => [...prev, virtualZipPath]);
 
       if (SecurityVault?.listZipMediaEntries) {
         const rawJson = await SecurityVault.listZipMediaEntries(zipUrl, sizeHint);
@@ -1245,24 +1254,26 @@ const App = () => {
         }
       }
 
-      // Restore previous view if archive was empty or unreadable
+      // Restore previous view cleanly if archive had no playable video files
       zipParentBackupRef.current = null;
       setFolderLoading(false);
-      setCurrentPath(prevBackup.wasInsideFolder ? prevBackup.currentPath : '/');
+      setPathStack(prevBackup.pathStack);
+      setCurrentPath(prevBackup.currentPath);
       setFolderFiles(prevBackup.folderFiles);
       setSeriesParentTitle(prevBackup.seriesParentTitle);
       setSeasonFolders(prevBackup.seasonFolders);
       setActiveSeason(prevBackup.activeSeason);
-      Alert.alert('Archive Info', 'No playable video episodes (.mkv / .mp4) were found inside this archive.');
+      Alert.alert('Archive Info', 'Indha .zip / .rar archive-kulla video episodes (.mkv / .mp4) edhuvum illa.');
     } catch (e: any) {
       zipParentBackupRef.current = null;
       setFolderLoading(false);
-      setCurrentPath(prevBackup.wasInsideFolder ? prevBackup.currentPath : '/');
+      setPathStack(prevBackup.pathStack);
+      setCurrentPath(prevBackup.currentPath);
       setFolderFiles(prevBackup.folderFiles);
       setSeriesParentTitle(prevBackup.seriesParentTitle);
       setSeasonFolders(prevBackup.seasonFolders);
       setActiveSeason(prevBackup.activeSeason);
-      Alert.alert('Archive Error', String(e?.message || 'Unable to unpack this archive file.'));
+      Alert.alert('Archive Error', String(e?.message || 'Indha archive file-a open panna mudiyala.'));
     }
   };
 
@@ -1450,6 +1461,26 @@ const App = () => {
         setSeriesParentTitle('');
         setHomeFiles(incomingFiles);
       } else {
+        const archiveFiles = incomingFiles.filter((f: any) => /\.(zip|rar)$/i.test(String(f?.name || '')));
+        const normalVideos = incomingFiles.filter((f: any) => !f.mimeType?.includes('folder') && !/\.(zip|rar)$/i.test(String(f?.name || '')));
+        if (archiveFiles.length === 1 && normalVideos.length === 0 && SecurityVault?.listZipMediaEntries) {
+          try {
+            const archItem = archiveFiles[0];
+            const archUrl = archItem.link
+              ? (archItem.link.startsWith('http') ? archItem.link : `${baseUrl}${archItem.link.startsWith('/') ? '' : '/'}${archItem.link}`)
+              : `${baseUrl}${path}${encodeURIComponent(archItem.name)}`;
+            const rawJson = await SecurityVault.listZipMediaEntries(archUrl, Number(archItem.size || 0));
+            const entries = rawJson ? JSON.parse(rawJson) : [];
+            if (Array.isArray(entries) && entries.length > 0) {
+              const rawFolderTitle = decodeURIComponent(path.split('/').filter(Boolean).pop() || '');
+              setSeriesParentTitle(parseMediaFilename(rawFolderTitle, true).cleanTitle);
+              setFolderFiles(entries);
+              setCurrentPath(path);
+              if (!isPullRefresh) setSearchQuery('');
+              return;
+            }
+          } catch (_archErr) {}
+        }
         setFolderFiles(incomingFiles);
       }
       setCurrentPath(path);
@@ -1593,19 +1624,13 @@ const App = () => {
     if (zipParentBackupRef.current) {
       const prev = zipParentBackupRef.current;
       zipParentBackupRef.current = null;
-      if (prev.wasInsideFolder) {
-        setFolderFiles(prev.folderFiles);
-        setCurrentPath(prev.currentPath);
-        setSeriesParentTitle(prev.seriesParentTitle);
-        setSeasonFolders(prev.seasonFolders);
-        setActiveSeason(prev.activeSeason);
-      } else {
-        setCurrentPath('/');
-        setFolderFiles([]);
-        setSeasonFolders([]);
-        setActiveSeason(null);
-        setSeriesParentTitle('');
-      }
+      setPathStack(prev.pathStack.length > 0 ? prev.pathStack : ['/0:/']);
+      setCurrentPath(prev.currentPath || '/0:/');
+      setFolderFiles(prev.folderFiles);
+      setSeriesParentTitle(prev.seriesParentTitle);
+      setSeasonFolders(prev.seasonFolders);
+      setActiveSeason(prev.activeSeason);
+      setFolderLoading(false);
       return;
     }
     if (pathStack.length > 1) {

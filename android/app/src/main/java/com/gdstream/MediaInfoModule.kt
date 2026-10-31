@@ -1043,7 +1043,8 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
 
             // Also fetch last 64 KB for MKV Tags (BPS table) if needed
             var tailBytes: ByteArray? = null
-            if (totalBytes > maxHeaderBytes + tailBytesSize) {
+            val acceptRanges = conn.getHeaderField("Accept-Ranges") ?: ""
+            if (totalBytes > maxHeaderBytes + tailBytesSize && !acceptRanges.equals("none", ignoreCase = true)) {
                 var tailConn: HttpURLConnection? = null
                 try {
                     val tailStart = totalBytes - tailBytesSize
