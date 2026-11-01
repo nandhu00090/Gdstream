@@ -573,10 +573,37 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    // Neutralizes MKV SeekHead Cues (1C 53 BB 6B) & Tags (12 54 C3 67) pointers in the first 8KB of a compressed ZIP stream
+    // so ExoPlayer's MatroskaExtractor NEVER aborts playback to seek to the end of a multi-GB compressed archive!
+    private fun neutralizeMkvTailSeekPointers(buf: ByteArray, len: Int) {
+        val limit = minOf(len, 8192) - 7
+        var i = 0
+        while (i < limit) {
+            // Look for Matroska SeekID element header: 0x53, 0xAB, 0x84 (ID=0x53AB, Size=4)
+            if (buf[i] == 0x53.toByte() && buf[i + 1] == 0xAB.toByte() && buf[i + 2] == 0x84.toByte()) {
+                val b0 = buf[i + 3]
+                val b1 = buf[i + 4]
+                val b2 = buf[i + 5]
+                val b3 = buf[i + 6]
+                val isCues = (b0 == 0x1C.toByte() && b1 == 0x53.toByte() && b2 == 0xBB.toByte() && b3 == 0x6B.toByte())
+                val isTags = (b0 == 0x12.toByte() && b1 == 0x54.toByte() && b2 == 0xC3.toByte() && b3 == 0x67.toByte())
+                if (isCues || isTags) {
+                    buf[i + 3] = 0x53.toByte()
+                    buf[i + 4] = 0xAB.toByte()
+                    buf[i + 5] = 0x00.toByte()
+                    buf[i + 6] = 0x00.toByte()
+                }
+            }
+            i++
+        }
+    }
+
     private fun handleArchiveProxyClient(socket: Socket) {
-        socket.use { sock ->
-            sock.soTimeout = 30000
-            val reader = BufferedReader(InputStreamReader(sock.getInputStream(), StandardCharsets.US_ASCII))
+        var remoteConnToClean: HttpURLConnection? = null
+        var inflaterToClean: Inflater? = null
+        try {
+            socket.soTimeout = 30000
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII))
             val requestLine = reader.readLine() ?: return
             val parts = requestLine.split(" ")
             if (parts.size < 2) return
@@ -594,7 +621,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
             val segments = path.split("/").filter { it.isNotEmpty() }
             if (segments.size < 2 || segments[0] != "zip") {
-                val out = sock.getOutputStream()
+                val out = socket.getOutputStream()
                 out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
                 out.flush()
                 return
@@ -603,7 +630,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val entryId = segments[1]
             val entry = archiveEntryRegistry[entryId]
             if (entry == null) {
-                val out = sock.getOutputStream()
+                val out = socket.getOutputStream()
                 out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
                 out.flush()
                 return
@@ -644,7 +671,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             reqEnd = reqEnd.coerceIn(reqStart, (totalSize - 1L).coerceAtLeast(0L))
             val contentLength = reqEnd - reqStart + 1L
 
-            val out = BufferedOutputStream(sock.getOutputStream(), 65536)
+            val out = BufferedOutputStream(socket.getOutputStream(), 65536)
 
             if (method == "HEAD") {
                 val headers = buildString {
@@ -669,95 +696,114 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val remoteStart = dataStart + reqStart
                 val remoteEnd = dataStart + reqEnd
                 val remoteConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
-                try {
-                    val headers = buildString {
-                        append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
-                        append("Content-Type: $mimeType\r\n")
-                        append("Accept-Ranges: bytes\r\n")
-                        append("Content-Length: $contentLength\r\n")
-                        if (isPartial) {
-                            append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
-                        }
-                        append("Connection: close\r\n\r\n")
-                    }
-                    out.write(headers.toByteArray(StandardCharsets.US_ASCII))
-                    out.flush()
+                remoteConnToClean = remoteConn
 
-                    remoteConn.inputStream.use { input ->
-                        val buf = ByteArray(65536)
-                        var remaining = contentLength
-                        while (remaining > 0L) {
-                            val toRead = minOf(buf.size.toLong(), remaining).toInt()
-                            val read = input.read(buf, 0, toRead)
-                            if (read <= 0) break
-                            out.write(buf, 0, read)
-                            remaining -= read.toLong()
-                        }
-                        out.flush()
+                val headers = buildString {
+                    append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
+                    append("Content-Type: $mimeType\r\n")
+                    append("Accept-Ranges: bytes\r\n")
+                    append("Content-Length: $contentLength\r\n")
+                    if (isPartial) {
+                        append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
                     }
-                } finally {
-                    remoteConn.disconnect()
+                    append("Connection: close\r\n\r\n")
                 }
+                out.write(headers.toByteArray(StandardCharsets.US_ASCII))
+                out.flush()
+
+                val input = remoteConn.inputStream
+                val buf = ByteArray(65536)
+                var remaining = contentLength
+                while (remaining > 0L) {
+                    val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                    val read = input.read(buf, 0, toRead)
+                    if (read <= 0) break
+                    out.write(buf, 0, read)
+                    remaining -= read.toLong()
+                }
+                out.flush()
             } else if (entry.archiveFormat == "ZIP" && entry.compressionMethod == 8) {
-                // DEFLATE Mode (Compressed ZIP): Prevent ExoPlayer & MediaInfo from hanging on end-of-file Cues/Tags seeks!
-                if (reqStart > 8L * 1024L * 1024L) {
+                // DEFLATE Mode (Compressed ZIP)
+                if (reqStart > 16L * 1024L * 1024L) {
                     val rejectHdr = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$totalSize\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     out.write(rejectHdr.toByteArray(StandardCharsets.US_ASCII))
                     out.flush()
                     return
                 }
-                val remoteStart = dataStart
-                val remoteEnd = dataStart + entry.compressedSize - 1L
-                val remoteConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
-                val inflater = Inflater(true)
-                try {
-                    val send200 = (reqStart == 0L && reqEnd >= totalSize - 1L)
-                    val headers = buildString {
-                        append(if (send200) "HTTP/1.1 200 OK\r\n" else "HTTP/1.1 206 Partial Content\r\n")
-                        append("Content-Type: $mimeType\r\n")
-                        append("Accept-Ranges: none\r\n")
-                        append("Content-Length: $contentLength\r\n")
-                        if (!send200) {
-                            append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
-                        }
-                        append("Connection: close\r\n\r\n")
-                    }
-                    out.write(headers.toByteArray(StandardCharsets.US_ASCII))
-                    out.flush()
 
-                    InflaterInputStream(remoteConn.inputStream, inflater, 65536).use { infStream ->
-                        val buf = ByteArray(65536)
-                        var toSkip = reqStart
-                        while (toSkip > 0L) {
-                            val step = minOf(buf.size.toLong(), toSkip).toInt()
-                            val skipped = infStream.read(buf, 0, step)
-                            if (skipped <= 0) break
-                            toSkip -= skipped.toLong()
-                        }
-
-                        var remaining = contentLength
-                        while (remaining > 0L) {
-                            val toRead = minOf(buf.size.toLong(), remaining).toInt()
-                            val read = infStream.read(buf, 0, toRead)
-                            if (read <= 0) break
-                            out.write(buf, 0, read)
-                            remaining -= read.toLong()
-                        }
-                        out.flush()
-                    }
-                } finally {
-                    inflater.end()
-                    remoteConn.disconnect()
+                // If client only needs a small header range (e.g. MediaInfo 256KB), only fetch that slice from Google Drive!
+                val neededEndByte = reqStart + contentLength
+                val maxCompFetch = if (neededEndByte <= 2L * 1024L * 1024L) {
+                    minOf(entry.compressedSize, neededEndByte + 262144L)
+                } else {
+                    entry.compressedSize
                 }
+
+                val remoteStart = dataStart
+                val remoteEnd = dataStart + maxCompFetch - 1L
+                val remoteConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
+                remoteConnToClean = remoteConn
+
+                val inflater = Inflater(true)
+                inflaterToClean = inflater
+
+                val headers = buildString {
+                    append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
+                    append("Content-Type: $mimeType\r\n")
+                    append("Accept-Ranges: bytes\r\n")
+                    append("Content-Length: $contentLength\r\n")
+                    if (isPartial) {
+                        append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
+                    }
+                    append("Connection: close\r\n\r\n")
+                }
+                out.write(headers.toByteArray(StandardCharsets.US_ASCII))
+                out.flush()
+
+                val infStream = InflaterInputStream(remoteConn.inputStream, inflater, 65536)
+                val buf = ByteArray(65536)
+                var toSkip = reqStart
+                while (toSkip > 0L) {
+                    val step = minOf(buf.size.toLong(), toSkip).toInt()
+                    val skipped = infStream.read(buf, 0, step)
+                    if (skipped <= 0) break
+                    toSkip -= skipped.toLong()
+                }
+
+                var remaining = contentLength
+                var isFirstChunk = (reqStart == 0L)
+                while (remaining > 0L) {
+                    val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                    val read = infStream.read(buf, 0, toRead)
+                    if (read <= 0) break
+                    if (isFirstChunk) {
+                        neutralizeMkvTailSeekPointers(buf, read)
+                        isFirstChunk = false
+                    }
+                    out.write(buf, 0, read)
+                    remaining -= read.toLong()
+                }
+                out.flush()
             } else {
-                val outStream = sock.getOutputStream()
+                val outStream = socket.getOutputStream()
                 outStream.write("HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\n\r\n".toByteArray())
                 outStream.flush()
+            }
+        } catch (_: Throwable) {
+        } finally {
+            // Close local client socket FIRST so MediaInfo & ExoPlayer never wait on upstream teardown!
+            try { socket.close() } catch (_: Throwable) {}
+            val connRef = remoteConnToClean
+            val infRef = inflaterToClean
+            if (connRef != null || infRef != null) {
+                ioExecutor.submit {
+                    try { connRef?.disconnect() } catch (_: Throwable) {}
+                    try { infRef?.end() } catch (_: Throwable) {}
+                }
             }
         }
     }
 
-    // Hop across RAR 5.0 block headers via tiny Range reads (Works even if .rar was renamed to .zip!)
     private fun parseRar5ArchiveEntries(archiveUrl: String, totalSize: Long, port: Int): List<JSONObject> {
         val mediaExtensions = listOf(".mkv", ".mp4", ".avi", ".mov", ".m4v", ".webm", ".ts", ".m2ts")
         val items = ArrayList<JSONObject>()

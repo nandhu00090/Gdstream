@@ -973,8 +973,8 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         var redirects = 0
         while (redirects < 5) {
             val conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 6000
-                readTimeout = 6000
+                connectTimeout = 15000
+                readTimeout = 15000
                 instanceFollowRedirects = false
                 setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; GDStream/2.0)")
                 setRequestProperty("Range", rangeHeader)
@@ -994,7 +994,8 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
     }
 
     private fun fetchAndParseHeader(urlStr: String): HeaderParseResult {
-        val maxHeaderBytes = 1024 * 1024 // 1 MB covers EBML Header + Tracks + First Cluster packets
+        val isLocalProxy = urlStr.contains("127.0.0.1") || urlStr.contains("localhost")
+        val maxHeaderBytes = if (isLocalProxy) 256 * 1024 else 1024 * 1024 // 1 MB covers EBML Header + Tracks + First Cluster packets
         val tailBytesSize = 64 * 1024    // 64 KB at end of file covers mkvmerge Tags (BPS)
 
         if (urlStr.startsWith("file://") || urlStr.startsWith("/")) {
@@ -1044,7 +1045,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             // Also fetch last 64 KB for MKV Tags (BPS table) if needed
             var tailBytes: ByteArray? = null
             val acceptRanges = conn.getHeaderField("Accept-Ranges") ?: ""
-            if (totalBytes > maxHeaderBytes + tailBytesSize && !acceptRanges.equals("none", ignoreCase = true)) {
+            if (!urlStr.contains("127.0.0.1") && totalBytes > maxHeaderBytes + tailBytesSize) {
                 var tailConn: HttpURLConnection? = null
                 try {
                     val tailStart = totalBytes - tailBytesSize

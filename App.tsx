@@ -1228,9 +1228,7 @@ const App = () => {
     try {
       const info = parseMediaFilename(zipItem.name, false);
       const baseUrl = vaultRef.current.baseUrl;
-      const zipUrl = zipItem.link
-        ? (zipItem.link.startsWith('http') ? zipItem.link : `${baseUrl}${zipItem.link.startsWith('/') ? '' : '/'}${zipItem.link}`)
-        : `${baseUrl}${effectiveBasePath}${encodeURIComponent(zipItem.name)}`;
+      const zipUrl = getStreamUrl(zipItem);
       const sizeHint = Number(zipItem.size || 0);
       const virtualZipPath = `${effectiveBasePath}${encodeURIComponent(zipItem.name)}/`;
 
