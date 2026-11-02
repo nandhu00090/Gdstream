@@ -132,8 +132,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         init {
             try {
                 System.loadLibrary("gdcore")
-                val cm = CookieManager(null, CookiePolicy.ACCEPT_ALL)
-                CookieHandler.setDefault(cm)
+                // Keep cookies isolated in sessionCookieHeader so React Native never clears them
             } catch (_: Throwable) {}
         }
     }
@@ -455,17 +454,30 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return Pair(result, count)
     }
 
-    private fun openRangeConnection(urlStr: String, rangeHeader: String?): HttpURLConnection {
+    private fun ensureVaultSessionReady() {
+        val seed = verifyCertificateAndEnv()
+        if (seed == 0x5A3C9E71) {
+            val baseUrl = nSync(1, seed)
+            val shieldToken = nSync(5, seed)
+            if (shieldToken.isNotEmpty()) cachedShieldToken = shieldToken
+            if ((!nativeSessionLoggedIn || sessionCookieHeader.isEmpty()) && baseUrl.isNotEmpty() && shieldToken.isNotEmpty()) {
+                try { performNativeLogin(baseUrl, seed, shieldToken) } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    private fun openRangeConnectionInternal(urlStr: String, rangeHeader: String?): HttpURLConnection {
         var currentUrl = urlStr
         var redirects = 0
         while (redirects < 5) {
             val conn = (URL(currentUrl).openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
-                connectTimeout = 12000
-                readTimeout = 20000
+                connectTimeout = 15000
+                readTimeout = 25000
                 requestMethod = "GET"
                 instanceFollowRedirects = false
                 useCaches = false
                 setRequestProperty("User-Agent", "GDStream-Native-Engine/3.0")
+                setRequestProperty("Accept-Encoding", "identity")
                 if (cachedShieldToken.isNotEmpty()) {
                     setRequestProperty("X-GD-Shield", cachedShieldToken)
                 }
@@ -481,6 +493,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
             }
             val code = conn.responseCode
+            val setCookies = conn.headerFields["Set-Cookie"] ?: conn.headerFields["set-cookie"]
+            if (!setCookies.isNullOrEmpty()) {
+                val cookieParts = setCookies.mapNotNull { it.substringBefore(";").trim().takeIf { s -> s.isNotEmpty() } }
+                if (cookieParts.isNotEmpty()) {
+                    sessionCookieHeader = cookieParts.joinToString("; ")
+                }
+            }
             if (code in 300..399) {
                 val loc = conn.getHeaderField("Location")
                 conn.disconnect()
@@ -492,6 +511,21 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             }
         }
         throw IllegalStateException("Too many redirects for archive stream")
+    }
+
+    private fun openRangeConnection(urlStr: String, rangeHeader: String?): HttpURLConnection {
+        ensureVaultSessionReady()
+        var conn = openRangeConnectionInternal(urlStr, rangeHeader)
+        val cType = (conn.contentType ?: "").lowercase(Locale.ROOT)
+        val code = conn.responseCode
+        // If Cloudflare Worker returned an HTML login page or 401/403 instead of binary bytes, re-login immediately and retry!
+        if (code == 401 || code == 403 || cType.contains("text/html")) {
+            conn.disconnect()
+            nativeSessionLoggedIn = false
+            ensureVaultSessionReady()
+            conn = openRangeConnectionInternal(urlStr, rangeHeader)
+        }
+        return conn
     }
 
     private fun readExactBytes(stream: InputStream, maxLen: Int): ByteArray {
@@ -535,24 +569,29 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     private fun resolveEntryDataStartOffset(entry: ArchiveEntryTarget): Long {
         if (entry.dataStartOffset >= 0L) return entry.dataStartOffset
-        val headerBytes = fetchRemoteByteRange(
-            entry.archiveUrl,
-            entry.localHeaderOffset,
-            entry.localHeaderOffset + 63L
-        )
-        if (headerBytes.size >= 30 &&
-            headerBytes[0] == 0x50.toByte() &&
-            headerBytes[1] == 0x4b.toByte() &&
-            headerBytes[2] == 0x03.toByte() &&
-            headerBytes[3] == 0x04.toByte()
-        ) {
-            val nameLen = readUInt16LE(headerBytes, 26)
-            val extraLen = readUInt16LE(headerBytes, 28)
-            val computed = entry.localHeaderOffset + 30L + nameLen.toLong() + extraLen.toLong()
-            entry.dataStartOffset = computed
-            return computed
-        }
-        throw IllegalStateException("Invalid ZIP Local File Header at offset ${entry.localHeaderOffset}")
+        try {
+            val headerBytes = fetchRemoteByteRange(
+                entry.archiveUrl,
+                entry.localHeaderOffset,
+                entry.localHeaderOffset + 63L
+            )
+            if (headerBytes.size >= 30 &&
+                headerBytes[0] == 0x50.toByte() &&
+                headerBytes[1] == 0x4b.toByte() &&
+                headerBytes[2] == 0x03.toByte() &&
+                headerBytes[3] == 0x04.toByte()
+            ) {
+                val nameLen = readUInt16LE(headerBytes, 26)
+                val extraLen = readUInt16LE(headerBytes, 28)
+                val computed = entry.localHeaderOffset + 30L + nameLen.toLong() + extraLen.toLong()
+                entry.dataStartOffset = computed
+                return computed
+            }
+        } catch (_: Throwable) {}
+        // Fallback if local header probe had any transient issue
+        val fallbackOffset = entry.localHeaderOffset + 30L + entry.fileName.toByteArray(StandardCharsets.UTF_8).size.toLong()
+        entry.dataStartOffset = fallbackOffset
+        return fallbackOffset
     }
 
     private fun ensureArchiveProxyRunning(): Int {

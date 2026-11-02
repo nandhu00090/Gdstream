@@ -1285,7 +1285,7 @@ const App = () => {
       for (const fileObj of targets) {
         if (cancelled || !fileObj?.name) break;
         const fName = fileObj.name;
-        if (mediaInfoMap[fName]) {
+        if (mediaInfoMap[fName] && (mediaInfoMap[fName].width > 0 || (mediaInfoMap[fName].audioTracks && mediaInfoMap[fName].audioTracks.length > 0))) {
           if (mediaInfoMap[fName].durationSec > 0) {
             savedDurationsRef.current[fName] = mediaInfoMap[fName].durationSec;
             setSavedDurationsMap({ ...savedDurationsRef.current });
@@ -1313,7 +1313,7 @@ const App = () => {
         try {
           const streamUrl = getStreamUrl(fileObj);
           const res: RealMediaInfo = await MediaInfoModule.inspectMedia(streamUrl, fName);
-          if (res && !cancelled) {
+          if (res && !cancelled && (res.width > 0 || (res.audioTracks && res.audioTracks.length > 0))) {
             setMediaInfoMap(prev => ({ ...prev, [fName]: res }));
             if (res.durationSec > 0) {
               savedDurationsRef.current[fName] = res.durationSec;
