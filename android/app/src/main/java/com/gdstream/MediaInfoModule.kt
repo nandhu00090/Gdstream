@@ -12,6 +12,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
+import java.net.Proxy
 import java.net.URL
 import java.nio.ByteBuffer
 import java.util.Locale
@@ -870,10 +871,15 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                 val sizePair = readEbmlSize(buf, p, limit) ?: break
                 p += sizePair.second
                 val sz = sizePair.first.toInt()
-                if (sz < 0 || p + sz > limit) break
+                if (sz < 0) break
+                val entryEnd = minOf(limit, p + sz)
                 if (idPair.first == 0xAEL) {
-                    tracks.add(parseTrackEntry(p, p + sz))
+                    val parsedTrack = parseTrackEntry(p, entryEnd)
+                    if (parsedTrack.trackType > 0) {
+                        tracks.add(parsedTrack)
+                    }
                 }
+                if (p + sz > limit) break
                 p += sz
             }
         }
@@ -933,6 +939,51 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             pos += sz.toInt()
         }
 
+        // Fallback scan if top-level EBML walk exited early before reaching Tracks or Cluster
+        val isEbml = buf.size >= 4 &&
+            (buf[0].toInt() and 0xFF) == 0x1A &&
+            (buf[1].toInt() and 0xFF) == 0x45 &&
+            (buf[2].toInt() and 0xFF) == 0xDF &&
+            (buf[3].toInt() and 0xFF) == 0xA3
+
+        if (isEbml && tracks.isEmpty()) {
+            var i = 4
+            val scanLimit = buf.size - 8
+            while (i < scanLimit) {
+                val b0 = buf[i].toInt() and 0xFF
+                val b1 = buf[i + 1].toInt() and 0xFF
+                val b2 = buf[i + 2].toInt() and 0xFF
+                val b3 = buf[i + 3].toInt() and 0xFF
+                if (b0 == 0x15 && b1 == 0x49 && b2 == 0xA9 && b3 == 0x66 && rawDuration <= 0.0) {
+                    val szPair = readEbmlSize(buf, i + 4, buf.size)
+                    if (szPair != null && szPair.first > 0) {
+                        val cStart = i + 4 + szPair.second
+                        val cEnd = minOf(buf.size.toLong(), cStart.toLong() + szPair.first).toInt()
+                        parseInfoMaster(cStart, cEnd)
+                    }
+                } else if (b0 == 0x16 && b1 == 0x54 && b2 == 0xAE && b3 == 0x6B && tracks.isEmpty()) {
+                    val szPair = readEbmlSize(buf, i + 4, buf.size)
+                    if (szPair != null && szPair.first > 0) {
+                        val cStart = i + 4 + szPair.second
+                        val cEnd = minOf(buf.size.toLong(), cStart.toLong() + szPair.first).toInt()
+                        parseTracksMaster(cStart, cEnd)
+                        for (t in tracks) {
+                            if (t.trackNumber > 0) trackByNum[t.trackNumber] = t
+                        }
+                    }
+                } else if (b0 == 0x1F && b1 == 0x43 && b2 == 0xB6 && b3 == 0x75 && trackByNum.isNotEmpty()) {
+                    val szPair = readEbmlSize(buf, i + 4, buf.size)
+                    if (szPair != null) {
+                        val cStart = i + 4 + szPair.second
+                        val cEnd = if (szPair.first < 0) buf.size else minOf(buf.size.toLong(), cStart.toLong() + szPair.first).toInt()
+                        parseClusterAudioFrames(buf, cStart, cEnd, trackByNum)
+                        break
+                    }
+                }
+                i++
+            }
+        }
+
         if (tailBuf != null) {
             scanBufferForMkvTags(tailBuf, bpsByUid)
         }
@@ -972,11 +1023,14 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         var currentUrl = urlStr
         var redirects = 0
         while (redirects < 5) {
-            val conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+            val conn = (URL(currentUrl).openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
                 connectTimeout = 15000
-                readTimeout = 15000
+                readTimeout = 20000
+                requestMethod = "GET"
                 instanceFollowRedirects = false
+                useCaches = false
                 setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; GDStream/2.0)")
+                setRequestProperty("Accept-Encoding", "identity")
                 setRequestProperty("Range", rangeHeader)
             }
             val code = conn.responseCode
@@ -995,7 +1049,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
 
     private fun fetchAndParseHeader(urlStr: String): HeaderParseResult {
         val isLocalProxy = urlStr.contains("127.0.0.1") || urlStr.contains("localhost")
-        val maxHeaderBytes = if (isLocalProxy) 256 * 1024 else 1024 * 1024 // 1 MB covers EBML Header + Tracks + First Cluster packets
+        val maxHeaderBytes = if (isLocalProxy) 512 * 1024 else 1024 * 1024 // Covers EBML Header + Tracks + First Cluster packets
         val tailBytesSize = 64 * 1024    // 64 KB at end of file covers mkvmerge Tags (BPS)
 
         if (urlStr.startsWith("file://") || urlStr.startsWith("/")) {
@@ -1024,42 +1078,56 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             }
 
             var totalBytes = 0L
-            val contentRange = conn.getHeaderField("Content-Range")
+            val contentRange = conn.getHeaderField("Content-Range") ?: conn.getHeaderField("content-range")
             if (!contentRange.isNullOrEmpty() && contentRange.contains("/")) {
-                totalBytes = contentRange.substringAfter("/").trim().toLongOrNull() ?: 0L
+                totalBytes = contentRange.substringAfterLast("/").trim().toLongOrNull() ?: 0L
             }
             if (totalBytes <= 0L) {
                 totalBytes = conn.contentLengthLong.coerceAtLeast(0L)
             }
 
+            val archiveMode = (conn.getHeaderField("X-Archive-Mode") ?: "").uppercase(Locale.ROOT)
             val out = ByteArrayOutputStream()
-            conn.inputStream.use { input ->
-                val tmp = ByteArray(16 * 1024)
-                var read = 0
-                while (out.size() < maxHeaderBytes && input.read(tmp).also { read = it } != -1) {
-                    out.write(tmp, 0, read)
+            try {
+                conn.inputStream.use { input ->
+                    val tmp = ByteArray(16 * 1024)
+                    while (out.size() < maxHeaderBytes) {
+                        val toRead = minOf(tmp.size, maxHeaderBytes - out.size())
+                        val read = input.read(tmp, 0, toRead)
+                        if (read <= 0) break
+                        out.write(tmp, 0, read)
+                    }
                 }
-            }
-            val headBytes = out.toByteArray()
+            } catch (_: Exception) {}
 
-            // Also fetch last 64 KB for MKV Tags (BPS table) if needed
+            val headBytes = out.toByteArray()
+            if (headBytes.isEmpty()) {
+                return HeaderParseResult(0L, 0.0, emptyList(), false, -1, false)
+            }
+
+            // Also fetch last 64 KB for MKV Tags (BPS table) when supported (including STORE archive streams)
             var tailBytes: ByteArray? = null
-            val acceptRanges = conn.getHeaderField("Accept-Ranges") ?: ""
-            if (!urlStr.contains("127.0.0.1") && totalBytes > maxHeaderBytes + tailBytesSize) {
+            if (archiveMode != "DEFLATE" && totalBytes > maxHeaderBytes + tailBytesSize) {
                 var tailConn: HttpURLConnection? = null
                 try {
                     val tailStart = totalBytes - tailBytesSize
                     tailConn = openRangeConnection(urlStr, "bytes=$tailStart-${totalBytes - 1}")
                     if (tailConn != null && tailConn.responseCode in 200..299) {
                         val tailOut = ByteArrayOutputStream()
-                        tailConn.inputStream.use { input ->
-                            val tmp = ByteArray(16 * 1024)
-                            var read = 0
-                            while (tailOut.size() < tailBytesSize && input.read(tmp).also { read = it } != -1) {
-                                tailOut.write(tmp, 0, read)
+                        try {
+                            tailConn.inputStream.use { input ->
+                                val tmp = ByteArray(16 * 1024)
+                                while (tailOut.size() < tailBytesSize) {
+                                    val toRead = minOf(tmp.size, tailBytesSize - tailOut.size())
+                                    val read = input.read(tmp, 0, toRead)
+                                    if (read <= 0) break
+                                    tailOut.write(tmp, 0, read)
+                                }
                             }
+                        } catch (_: Exception) {}
+                        if (tailOut.size() > 0) {
+                            tailBytes = tailOut.toByteArray()
                         }
-                        tailBytes = tailOut.toByteArray()
                     }
                 } catch (_: Exception) {
                 } finally {

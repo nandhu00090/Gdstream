@@ -127,6 +127,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     private var archiveProxyPort: Int = 0
 
     private val archiveProxyLock = Any()
+    private val loginLock = Any()
 
     companion object {
         init {
@@ -454,20 +455,41 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return Pair(result, count)
     }
 
-    private fun ensureVaultSessionReady() {
+    private fun normalizeRemoteArchiveUrl(rawUrl: String): String {
+        val trimmed = rawUrl.trim().replace(" ", "%20")
+        if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) {
+            return trimmed
+        }
         val seed = verifyCertificateAndEnv()
-        if (seed == 0x5A3C9E71) {
-            val baseUrl = nSync(1, seed)
-            val shieldToken = nSync(5, seed)
-            if (shieldToken.isNotEmpty()) cachedShieldToken = shieldToken
-            if ((!nativeSessionLoggedIn || sessionCookieHeader.isEmpty()) && baseUrl.isNotEmpty() && shieldToken.isNotEmpty()) {
-                try { performNativeLogin(baseUrl, seed, shieldToken) } catch (_: Throwable) {}
+        val baseUrl = if (seed == 0x5A3C9E71) nSync(1, seed).trimEnd('/') else ""
+        return if (baseUrl.isNotEmpty() && trimmed.startsWith("/")) "$baseUrl$trimmed" else trimmed
+    }
+
+    private fun ensureVaultSessionReady(forceRelogin: Boolean = false) {
+        if (!forceRelogin && nativeSessionLoggedIn && sessionCookieHeader.isNotEmpty() && cachedShieldToken.isNotEmpty()) {
+            return
+        }
+        synchronized(loginLock) {
+            if (!forceRelogin && nativeSessionLoggedIn && sessionCookieHeader.isNotEmpty() && cachedShieldToken.isNotEmpty()) {
+                return
+            }
+            val seed = verifyCertificateAndEnv()
+            if (seed == 0x5A3C9E71) {
+                val baseUrl = nSync(1, seed)
+                val shieldToken = nSync(5, seed)
+                if (shieldToken.isNotEmpty()) cachedShieldToken = shieldToken
+                if ((forceRelogin || !nativeSessionLoggedIn || sessionCookieHeader.isEmpty()) &&
+                    baseUrl.isNotEmpty() &&
+                    shieldToken.isNotEmpty()
+                ) {
+                    try { performNativeLogin(baseUrl, seed, shieldToken) } catch (_: Throwable) {}
+                }
             }
         }
     }
 
     private fun openRangeConnectionInternal(urlStr: String, rangeHeader: String?): HttpURLConnection {
-        var currentUrl = urlStr
+        var currentUrl = normalizeRemoteArchiveUrl(urlStr)
         var redirects = 0
         while (redirects < 5) {
             val conn = (URL(currentUrl).openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
@@ -514,15 +536,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     }
 
     private fun openRangeConnection(urlStr: String, rangeHeader: String?): HttpURLConnection {
-        ensureVaultSessionReady()
+        ensureVaultSessionReady(false)
         var conn = openRangeConnectionInternal(urlStr, rangeHeader)
         val cType = (conn.contentType ?: "").lowercase(Locale.ROOT)
         val code = conn.responseCode
         // If Cloudflare Worker returned an HTML login page or 401/403 instead of binary bytes, re-login immediately and retry!
         if (code == 401 || code == 403 || cType.contains("text/html")) {
             conn.disconnect()
-            nativeSessionLoggedIn = false
-            ensureVaultSessionReady()
+            ensureVaultSessionReady(true)
             conn = openRangeConnectionInternal(urlStr, rangeHeader)
         }
         return conn
@@ -543,8 +564,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     }
 
     private fun fetchRemoteByteRange(archiveUrl: String, start: Long, endInclusive: Long): ByteArray {
-        val len = (endInclusive - start + 1L).toInt()
-        val conn = openRangeConnection(archiveUrl, "bytes=$start-$endInclusive")
+        val safeStart = start.coerceAtLeast(0L)
+        if (endInclusive < safeStart) return ByteArray(0)
+        val len = (endInclusive - safeStart + 1L).toInt()
+        val conn = openRangeConnection(archiveUrl, "bytes=$safeStart-$endInclusive")
         try {
             return conn.inputStream.use { readExactBytes(it, len) }
         } finally {
@@ -569,29 +592,31 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     private fun resolveEntryDataStartOffset(entry: ArchiveEntryTarget): Long {
         if (entry.dataStartOffset >= 0L) return entry.dataStartOffset
-        try {
-            val headerBytes = fetchRemoteByteRange(
-                entry.archiveUrl,
-                entry.localHeaderOffset,
-                entry.localHeaderOffset + 63L
-            )
-            if (headerBytes.size >= 30 &&
-                headerBytes[0] == 0x50.toByte() &&
-                headerBytes[1] == 0x4b.toByte() &&
-                headerBytes[2] == 0x03.toByte() &&
-                headerBytes[3] == 0x04.toByte()
-            ) {
-                val nameLen = readUInt16LE(headerBytes, 26)
-                val extraLen = readUInt16LE(headerBytes, 28)
-                val computed = entry.localHeaderOffset + 30L + nameLen.toLong() + extraLen.toLong()
-                entry.dataStartOffset = computed
-                return computed
+        synchronized(entry) {
+            if (entry.dataStartOffset >= 0L) return entry.dataStartOffset
+            for (attempt in 1..2) {
+                try {
+                    val headerBytes = fetchRemoteByteRange(
+                        entry.archiveUrl,
+                        entry.localHeaderOffset,
+                        entry.localHeaderOffset + 63L
+                    )
+                    if (headerBytes.size >= 30 &&
+                        headerBytes[0] == 0x50.toByte() &&
+                        headerBytes[1] == 0x4b.toByte() &&
+                        headerBytes[2] == 0x03.toByte() &&
+                        headerBytes[3] == 0x04.toByte()
+                    ) {
+                        val nameLen = readUInt16LE(headerBytes, 26)
+                        val extraLen = readUInt16LE(headerBytes, 28)
+                        val computed = entry.localHeaderOffset + 30L + nameLen.toLong() + extraLen.toLong()
+                        entry.dataStartOffset = computed
+                        return computed
+                    }
+                } catch (_: Throwable) {}
             }
-        } catch (_: Throwable) {}
-        // Fallback if local header probe had any transient issue
-        val fallbackOffset = entry.localHeaderOffset + 30L + entry.fileName.toByteArray(StandardCharsets.UTF_8).size.toLong()
-        entry.dataStartOffset = fallbackOffset
-        return fallbackOffset
+            return entry.localHeaderOffset + 30L + entry.fileName.toByteArray(StandardCharsets.UTF_8).size.toLong()
+        }
     }
 
     private fun ensureArchiveProxyRunning(): Int {
@@ -612,8 +637,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // Neutralizes MKV SeekHead Cues (1C 53 BB 6B) & Tags (12 54 C3 67) pointers in the first 8KB of a compressed ZIP stream
-    // so ExoPlayer's MatroskaExtractor NEVER aborts playback to seek to the end of a multi-GB compressed archive!
+    // Neutralizes MKV SeekHead tail pointers (Cues, Tags, Chapters, Attachments, secondary SeekHead) in the first 8KB
+    // of a compressed ZIP stream so ExoPlayer's MatroskaExtractor NEVER seeks to the end of a multi-GB compressed archive!
     private fun neutralizeMkvTailSeekPointers(buf: ByteArray, len: Int) {
         val limit = minOf(len, 8192) - 7
         var i = 0
@@ -626,7 +651,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val b3 = buf[i + 6]
                 val isCues = (b0 == 0x1C.toByte() && b1 == 0x53.toByte() && b2 == 0xBB.toByte() && b3 == 0x6B.toByte())
                 val isTags = (b0 == 0x12.toByte() && b1 == 0x54.toByte() && b2 == 0xC3.toByte() && b3 == 0x67.toByte())
-                if (isCues || isTags) {
+                val isChapters = (b0 == 0x10.toByte() && b1 == 0x43.toByte() && b2 == 0xA7.toByte() && b3 == 0x70.toByte())
+                val isAttachments = (b0 == 0x19.toByte() && b1 == 0x41.toByte() && b2 == 0xA4.toByte() && b3 == 0x69.toByte())
+                val isSeekHead = (b0 == 0x11.toByte() && b1 == 0x4D.toByte() && b2 == 0x9B.toByte() && b3 == 0x74.toByte())
+                if (isCues || isTags || isChapters || isAttachments || isSeekHead) {
                     buf[i + 3] = 0x53.toByte()
                     buf[i + 4] = 0xAB.toByte()
                     buf[i + 5] = 0x00.toByte()
@@ -642,6 +670,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         var inflaterToClean: Inflater? = null
         try {
             socket.soTimeout = 30000
+            socket.tcpNoDelay = true
             val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII))
             val requestLine = reader.readLine() ?: return
             val parts = requestLine.split(" ")
@@ -712,11 +741,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
             val out = BufferedOutputStream(socket.getOutputStream(), 65536)
 
+            val modeTag = if (entry.compressionMethod == 0) "STORE" else "DEFLATE"
+
             if (method == "HEAD") {
                 val headers = buildString {
                     append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
                     append("Content-Type: $mimeType\r\n")
                     append("Accept-Ranges: bytes\r\n")
+                    append("X-Archive-Mode: $modeTag\r\n")
                     append("Content-Length: $contentLength\r\n")
                     if (isPartial) {
                         append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
@@ -741,6 +773,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
                     append("Content-Type: $mimeType\r\n")
                     append("Accept-Ranges: bytes\r\n")
+                    append("X-Archive-Mode: STORE\r\n")
                     append("Content-Length: $contentLength\r\n")
                     if (isPartial) {
                         append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
@@ -755,31 +788,53 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 var remaining = contentLength
                 while (remaining > 0L) {
                     val toRead = minOf(buf.size.toLong(), remaining).toInt()
-                    val read = input.read(buf, 0, toRead)
+                    val read = try { input.read(buf, 0, toRead) } catch (_: Throwable) { -1 }
                     if (read <= 0) break
                     out.write(buf, 0, read)
                     remaining -= read.toLong()
+                }
+                if (remaining > 0L && contentLength <= 2L * 1024L * 1024L) {
+                    val zeroPad = ByteArray(minOf(remaining, 16384L).toInt())
+                    while (remaining > 0L) {
+                        val step = minOf(zeroPad.size.toLong(), remaining).toInt()
+                        out.write(zeroPad, 0, step)
+                        remaining -= step.toLong()
+                    }
                 }
                 out.flush()
             } else if (entry.archiveFormat == "ZIP" && entry.compressionMethod == 8) {
                 // DEFLATE Mode (Compressed ZIP)
                 if (reqStart > 16L * 1024L * 1024L) {
-                    val rejectHdr = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$totalSize\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    out.write(rejectHdr.toByteArray(StandardCharsets.US_ASCII))
+                    // Return a clean zero-padded 206 response for tail probes so ExoPlayer & MediaInfo never fail with HTTP 416
+                    val dummyLen = minOf(contentLength, 65536L)
+                    val dummyEnd = reqStart + dummyLen - 1L
+                    val headers = buildString {
+                        append("HTTP/1.1 206 Partial Content\r\n")
+                        append("Content-Type: $mimeType\r\n")
+                        append("Accept-Ranges: bytes\r\n")
+                        append("X-Archive-Mode: DEFLATE\r\n")
+                        append("Content-Length: $dummyLen\r\n")
+                        append("Content-Range: bytes $reqStart-$dummyEnd/$totalSize\r\n")
+                        append("Connection: close\r\n\r\n")
+                    }
+                    out.write(headers.toByteArray(StandardCharsets.US_ASCII))
+                    if (dummyLen > 0L) {
+                        out.write(ByteArray(dummyLen.toInt()))
+                    }
                     out.flush()
                     return
                 }
 
-                // If client only needs a small header range (e.g. MediaInfo 256KB), only fetch that slice from Google Drive!
+                // If client only needs a header range (e.g. MediaInfo 512KB), fetch that slice + safety margin from Google Drive!
                 val neededEndByte = reqStart + contentLength
                 val maxCompFetch = if (neededEndByte <= 2L * 1024L * 1024L) {
-                    minOf(entry.compressedSize, neededEndByte + 262144L)
+                    minOf(entry.compressedSize, neededEndByte + 1048576L)
                 } else {
                     entry.compressedSize
                 }
 
                 val remoteStart = dataStart
-                val remoteEnd = dataStart + maxCompFetch - 1L
+                val remoteEnd = (dataStart + maxCompFetch - 1L).coerceAtLeast(remoteStart)
                 val remoteConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
                 remoteConnToClean = remoteConn
 
@@ -790,6 +845,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
                     append("Content-Type: $mimeType\r\n")
                     append("Accept-Ranges: bytes\r\n")
+                    append("X-Archive-Mode: DEFLATE\r\n")
                     append("Content-Length: $contentLength\r\n")
                     if (isPartial) {
                         append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
@@ -801,26 +857,58 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
                 val infStream = InflaterInputStream(remoteConn.inputStream, inflater, 65536)
                 val buf = ByteArray(65536)
-                var toSkip = reqStart
-                while (toSkip > 0L) {
-                    val step = minOf(buf.size.toLong(), toSkip).toInt()
-                    val skipped = infStream.read(buf, 0, step)
-                    if (skipped <= 0) break
-                    toSkip -= skipped.toLong()
+
+                // Accumulate the full first 8192 bytes before scanning so neutralizeMkvTailSeekPointers sees the entire SeekHead
+                val headWindowTarget = minOf(8192L, reqStart + contentLength).toInt()
+                val headBuf = ByteArray(headWindowTarget)
+                var headFilled = 0
+                while (headFilled < headWindowTarget) {
+                    val r = try {
+                        infStream.read(headBuf, headFilled, headWindowTarget - headFilled)
+                    } catch (_: Throwable) {
+                        -1
+                    }
+                    if (r <= 0) break
+                    headFilled += r
+                }
+                if (headFilled > 0) {
+                    neutralizeMkvTailSeekPointers(headBuf, headFilled)
                 }
 
                 var remaining = contentLength
-                var isFirstChunk = (reqStart == 0L)
+                if (reqStart < headFilled.toLong()) {
+                    val startInHead = reqStart.toInt()
+                    val availFromHead = (headFilled - startInHead).toLong()
+                    val toWriteFromHead = minOf(availFromHead, remaining).toInt()
+                    if (toWriteFromHead > 0) {
+                        out.write(headBuf, startInHead, toWriteFromHead)
+                        out.flush()
+                        remaining -= toWriteFromHead.toLong()
+                    }
+                } else {
+                    var toSkip = reqStart - headFilled.toLong()
+                    while (toSkip > 0L) {
+                        val step = minOf(buf.size.toLong(), toSkip).toInt()
+                        val skipped = try { infStream.read(buf, 0, step) } catch (_: Throwable) { -1 }
+                        if (skipped <= 0) break
+                        toSkip -= skipped.toLong()
+                    }
+                }
+
                 while (remaining > 0L) {
                     val toRead = minOf(buf.size.toLong(), remaining).toInt()
-                    val read = infStream.read(buf, 0, toRead)
+                    val read = try { infStream.read(buf, 0, toRead) } catch (_: Throwable) { -1 }
                     if (read <= 0) break
-                    if (isFirstChunk) {
-                        neutralizeMkvTailSeekPointers(buf, read)
-                        isFirstChunk = false
-                    }
                     out.write(buf, 0, read)
                     remaining -= read.toLong()
+                }
+                if (remaining > 0L && contentLength <= 2L * 1024L * 1024L) {
+                    val zeroPad = ByteArray(minOf(remaining, 16384L).toInt())
+                    while (remaining > 0L) {
+                        val step = minOf(zeroPad.size.toLong(), remaining).toInt()
+                        out.write(zeroPad, 0, step)
+                        remaining -= step.toLong()
+                    }
                 }
                 out.flush()
             } else {
@@ -1172,18 +1260,28 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             val headerId = readUInt16LE(cdBytes, ep)
                             val dataSize = readUInt16LE(cdBytes, ep + 2)
                             var dp = ep + 4
+                            val blockEnd = (dp + dataSize).coerceAtMost(extraEnd)
                             if (headerId == 0x0001) {
-                                if (uncompSize == 0xFFFFFFFFL && dp + 8 <= ep + 4 + dataSize) {
-                                    uncompSize = readInt64LE(cdBytes, dp)
-                                    dp += 8
-                                }
-                                if (compSize == 0xFFFFFFFFL && dp + 8 <= ep + 4 + dataSize) {
-                                    compSize = readInt64LE(cdBytes, dp)
-                                    dp += 8
-                                }
-                                if (localHdrOff == 0xFFFFFFFFL && dp + 8 <= ep + 4 + dataSize) {
-                                    localHdrOff = readInt64LE(cdBytes, dp)
-                                    dp += 8
+                                if (uncompSize != 0xFFFFFFFFL &&
+                                    compSize != 0xFFFFFFFFL &&
+                                    localHdrOff == 0xFFFFFFFFL &&
+                                    dataSize >= 24 &&
+                                    dp + 24 <= blockEnd
+                                ) {
+                                    localHdrOff = readInt64LE(cdBytes, dp + 16)
+                                } else {
+                                    if (uncompSize == 0xFFFFFFFFL && dp + 8 <= blockEnd) {
+                                        uncompSize = readInt64LE(cdBytes, dp)
+                                        dp += 8
+                                    }
+                                    if (compSize == 0xFFFFFFFFL && dp + 8 <= blockEnd) {
+                                        compSize = readInt64LE(cdBytes, dp)
+                                        dp += 8
+                                    }
+                                    if (localHdrOff == 0xFFFFFFFFL && dp + 8 <= blockEnd) {
+                                        localHdrOff = readInt64LE(cdBytes, dp)
+                                        dp += 8
+                                    }
                                 }
                                 break
                             }
