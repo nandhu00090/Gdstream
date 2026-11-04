@@ -94,6 +94,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     @Volatile
     private var cachedShieldToken: String = ""
 
+    @Volatile
+    private var cachedBaseUrl: String = ""
+
+    @Volatile
+    private var cachedPinnedSslFactory: SSLSocketFactory? = null
+
     data class DirectTrailerStream(
         val label: String,
         val height: Int,
@@ -143,6 +149,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     private external fun nSync(slot: Int, sigSeed: Int): String
 
     private fun buildPinnedSystemSslFactory(): SSLSocketFactory {
+        cachedPinnedSslFactory?.let { return it }
         val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
         tmf.init(null as KeyStore?)
         val defaultTm = tmf.trustManagers.firstOrNull { it is X509TrustManager } as? X509TrustManager
@@ -192,7 +199,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
         val sslContext = SSLContext.getInstance("TLS")
         sslContext.init(null, arrayOf<TrustManager>(strictTm), SecureRandom())
-        return sslContext.socketFactory
+        return sslContext.socketFactory.also { cachedPinnedSslFactory = it }
     }
 
     private fun isSnifferPackageInstalled(): Boolean {
@@ -460,9 +467,15 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) {
             return trimmed
         }
-        val seed = verifyCertificateAndEnv()
-        val baseUrl = if (seed == 0x5A3C9E71) nSync(1, seed).trimEnd('/') else ""
-        return if (baseUrl.isNotEmpty() && trimmed.startsWith("/")) "$baseUrl$trimmed" else trimmed
+        var base = cachedBaseUrl.trimEnd('/')
+        if (base.isEmpty()) {
+            val seed = verifyCertificateAndEnv()
+            if (seed == 0x5A3C9E71) {
+                base = nSync(1, seed).trimEnd('/')
+                if (base.isNotEmpty()) cachedBaseUrl = base
+            }
+        }
+        return if (base.isNotEmpty() && trimmed.startsWith("/")) "$base$trimmed" else trimmed
     }
 
     private fun ensureVaultSessionReady(forceRelogin: Boolean = false) {
@@ -477,6 +490,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             if (seed == 0x5A3C9E71) {
                 val baseUrl = nSync(1, seed)
                 val shieldToken = nSync(5, seed)
+                if (baseUrl.isNotEmpty()) cachedBaseUrl = baseUrl
                 if (shieldToken.isNotEmpty()) cachedShieldToken = shieldToken
                 if ((forceRelogin || !nativeSessionLoggedIn || sessionCookieHeader.isEmpty()) &&
                     baseUrl.isNotEmpty() &&
@@ -637,10 +651,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // Neutralizes MKV SeekHead tail pointers (Cues, Tags, Chapters, Attachments, secondary SeekHead) in the first 8KB
+    // Neutralizes MKV SeekHead tail pointers (Cues, Tags, Chapters, Attachments, secondary SeekHead) in the first 64KB
     // of a compressed ZIP stream so ExoPlayer's MatroskaExtractor NEVER seeks to the end of a multi-GB compressed archive!
     private fun neutralizeMkvTailSeekPointers(buf: ByteArray, len: Int) {
-        val limit = minOf(len, 8192) - 7
+        val limit = minOf(len, 65536) - 7
         var i = 0
         while (i < limit) {
             // Look for Matroska SeekID element header: 0x53, 0xAB, 0x84 (ID=0x53AB, Size=4)
@@ -687,7 +701,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
             }
 
-            val segments = path.split("/").filter { it.isNotEmpty() }
+            val cleanPath = path.substringBefore("?")
+            val segments = cleanPath.split("/").filter { it.isNotEmpty() }
             if (segments.size < 2 || segments[0] != "zip") {
                 val out = socket.getOutputStream()
                 out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
@@ -793,39 +808,17 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     out.write(buf, 0, read)
                     remaining -= read.toLong()
                 }
-                if (remaining > 0L && contentLength <= 2L * 1024L * 1024L) {
-                    val zeroPad = ByteArray(minOf(remaining, 16384L).toInt())
-                    while (remaining > 0L) {
-                        val step = minOf(zeroPad.size.toLong(), remaining).toInt()
-                        out.write(zeroPad, 0, step)
-                        remaining -= step.toLong()
-                    }
-                }
                 out.flush()
             } else if (entry.archiveFormat == "ZIP" && entry.compressionMethod == 8) {
                 // DEFLATE Mode (Compressed ZIP)
                 if (reqStart > 16L * 1024L * 1024L) {
-                    // Return a clean zero-padded 206 response for tail probes so ExoPlayer & MediaInfo never fail with HTTP 416
-                    val dummyLen = minOf(contentLength, 65536L)
-                    val dummyEnd = reqStart + dummyLen - 1L
-                    val headers = buildString {
-                        append("HTTP/1.1 206 Partial Content\r\n")
-                        append("Content-Type: $mimeType\r\n")
-                        append("Accept-Ranges: bytes\r\n")
-                        append("X-Archive-Mode: DEFLATE\r\n")
-                        append("Content-Length: $dummyLen\r\n")
-                        append("Content-Range: bytes $reqStart-$dummyEnd/$totalSize\r\n")
-                        append("Connection: close\r\n\r\n")
-                    }
-                    out.write(headers.toByteArray(StandardCharsets.US_ASCII))
-                    if (dummyLen > 0L) {
-                        out.write(ByteArray(dummyLen.toInt()))
-                    }
+                    val rejectHdr = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$totalSize\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    out.write(rejectHdr.toByteArray(StandardCharsets.US_ASCII))
                     out.flush()
                     return
                 }
 
-                // If client only needs a header range (e.g. MediaInfo 512KB), fetch that slice + safety margin from Google Drive!
+                // If client only needs a header range (e.g. MediaInfo 256KB), fetch that slice + safety margin from Google Drive!
                 val neededEndByte = reqStart + contentLength
                 val maxCompFetch = if (neededEndByte <= 2L * 1024L * 1024L) {
                     minOf(entry.compressedSize, neededEndByte + 1048576L)
@@ -858,8 +851,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val infStream = InflaterInputStream(remoteConn.inputStream, inflater, 65536)
                 val buf = ByteArray(65536)
 
-                // Accumulate the full first 8192 bytes before scanning so neutralizeMkvTailSeekPointers sees the entire SeekHead
-                val headWindowTarget = minOf(8192L, reqStart + contentLength).toInt()
+                // Accumulate the first 64KB before scanning so neutralizeMkvTailSeekPointers sees the entire SeekHead
+                val headWindowTarget = minOf(65536L, reqStart + contentLength).toInt()
                 val headBuf = ByteArray(headWindowTarget)
                 var headFilled = 0
                 while (headFilled < headWindowTarget) {
@@ -901,14 +894,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     if (read <= 0) break
                     out.write(buf, 0, read)
                     remaining -= read.toLong()
-                }
-                if (remaining > 0L && contentLength <= 2L * 1024L * 1024L) {
-                    val zeroPad = ByteArray(minOf(remaining, 16384L).toInt())
-                    while (remaining > 0L) {
-                        val step = minOf(zeroPad.size.toLong(), remaining).toInt()
-                        out.write(zeroPad, 0, step)
-                        remaining -= step.toLong()
-                    }
                 }
                 out.flush()
             } else {

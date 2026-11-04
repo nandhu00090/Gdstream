@@ -1049,7 +1049,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
 
     private fun fetchAndParseHeader(urlStr: String): HeaderParseResult {
         val isLocalProxy = urlStr.contains("127.0.0.1") || urlStr.contains("localhost")
-        val maxHeaderBytes = if (isLocalProxy) 512 * 1024 else 1024 * 1024 // Covers EBML Header + Tracks + First Cluster packets
+        val maxHeaderBytes = if (isLocalProxy) 256 * 1024 else 1024 * 1024 // Covers EBML Header + Tracks + First Cluster packets
         val tailBytesSize = 64 * 1024    // 64 KB at end of file covers mkvmerge Tags (BPS)
 
         if (urlStr.startsWith("file://") || urlStr.startsWith("/")) {
@@ -1105,9 +1105,9 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                 return HeaderParseResult(0L, 0.0, emptyList(), false, -1, false)
             }
 
-            // Also fetch last 64 KB for MKV Tags (BPS table) when supported (including STORE archive streams)
+            // Fetch last 64 KB for MKV Tags (BPS table) on direct remote streams
             var tailBytes: ByteArray? = null
-            if (archiveMode != "DEFLATE" && totalBytes > maxHeaderBytes + tailBytesSize) {
+            if (!isLocalProxy && archiveMode != "DEFLATE" && totalBytes > maxHeaderBytes + tailBytesSize) {
                 var tailConn: HttpURLConnection? = null
                 try {
                     val tailStart = totalBytes - tailBytesSize
