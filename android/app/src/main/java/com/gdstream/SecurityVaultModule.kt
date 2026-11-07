@@ -810,15 +810,24 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
 
                 var remaining = contentLength
-                var isFirstChunk = (reqStart == 0L)
+                if (reqStart == 0L && remaining > 0L) {
+                    val headTarget = minOf(8192L, remaining).toInt()
+                    var headGot = 0
+                    while (headGot < headTarget) {
+                        val r = infStream.read(buf, headGot, headTarget - headGot)
+                        if (r <= 0) break
+                        headGot += r
+                    }
+                    if (headGot > 0) {
+                        neutralizeMkvTailSeekPointers(buf, headGot)
+                        out.write(buf, 0, headGot)
+                        remaining -= headGot.toLong()
+                    }
+                }
                 while (remaining > 0L) {
                     val toRead = minOf(buf.size.toLong(), remaining).toInt()
                     val read = infStream.read(buf, 0, toRead)
                     if (read <= 0) break
-                    if (isFirstChunk) {
-                        neutralizeMkvTailSeekPointers(buf, read)
-                        isFirstChunk = false
-                    }
                     out.write(buf, 0, read)
                     remaining -= read.toLong()
                 }
