@@ -239,17 +239,45 @@ const extractSeasonNumberFromFolder = (name: string): number | null => {
 
 const FocusableButton = ({ style, focusedStyle, onPress, children, hasTVPreferredFocus, activeOpacity = 0.8, ...rest }: any) => {
   const [isFocused, setIsFocused] = useState(false);
+  const flatStyle = StyleSheet.flatten(style) || {};
+  const btnRadius = typeof flatStyle.borderRadius === 'number' ? flatStyle.borderRadius : 8;
   return (
     <TouchableOpacity
-      focusable={IS_TV ? true : undefined}
-      hasTVPreferredFocus={IS_TV ? hasTVPreferredFocus : undefined}
+      focusable={true}
+      hasTVPreferredFocus={hasTVPreferredFocus}
       activeOpacity={activeOpacity}
       onPress={onPress}
-      onFocus={IS_TV ? () => setIsFocused(true) : undefined}
-      onBlur={IS_TV ? () => setIsFocused(false) : undefined}
-      style={[style, IS_TV && isFocused && styles.tvFocused, IS_TV && isFocused && focusedStyle]}
+      onFocus={() => setIsFocused(true)}
+      onBlur={() => setIsFocused(false)}
+      style={[
+        style,
+        isFocused && styles.tvFocused,
+        isFocused && {
+          transform: [{ scale: 1.04 }],
+          zIndex: 99,
+          elevation: 14,
+        },
+        isFocused && focusedStyle,
+      ]}
       {...rest}>
       {children}
+      {isFocused && (
+        <View
+          pointerEvents="none"
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            borderRadius: btnRadius,
+            borderWidth: 3,
+            borderColor: '#FFFFFF',
+            backgroundColor: 'rgba(229, 9, 20, 0.22)',
+            zIndex: 999,
+          }}
+        />
+      )}
     </TouchableOpacity>
   );
 };
@@ -1882,9 +1910,9 @@ const App = () => {
                 );
               })}
             </ScrollView>
-            <TouchableOpacity style={styles.hdrCancelBtn} onPress={() => setShowSeasonModal(false)}>
+            <FocusableButton style={styles.hdrCancelBtn} onPress={() => setShowSeasonModal(false)}>
               <Text style={{ color: '#99A3B3', fontWeight: '700' }}>Close</Text>
-            </TouchableOpacity>
+            </FocusableButton>
           </View>
         </View>
       </Modal>
@@ -1923,9 +1951,9 @@ const App = () => {
               </View>
               <Icon name="play-circle-outline" size={28} color="#F5C518" />
             </FocusableButton>
-            <TouchableOpacity style={styles.hdrCancelBtn} onPress={() => setShowHdrChoiceModal(false)}>
+            <FocusableButton style={styles.hdrCancelBtn} onPress={() => setShowHdrChoiceModal(false)}>
               <Text style={{ color: '#99A3B3', fontWeight: '700' }}>Cancel</Text>
-            </TouchableOpacity>
+            </FocusableButton>
           </View>
         </View>
       </Modal>
@@ -2982,9 +3010,9 @@ const App = () => {
           returnKeyType="search"
         />
         {!!searchQuery && (
-          <TouchableOpacity onPress={() => setSearchQuery('')} style={{ padding: 8 }}>
+          <FocusableButton onPress={() => setSearchQuery('')} style={{ padding: 8, borderRadius: 8 }}>
             <Icon name="close" size={18} color="#AAA" />
-          </TouchableOpacity>
+          </FocusableButton>
         )}
       </View>
 
