@@ -238,41 +238,40 @@ const extractSeasonNumberFromFolder = (name: string): number | null => {
   return null;
 };
 
-let currentTvFocusedPress: (() => void) | null = null;
-let lastTvPressTime = 0;
-
-const FocusableButton = ({ style, focusedStyle, onPress, children, hasTVPreferredFocus, activeOpacity = 0.8, ...rest }: any) => {
+const FocusableButton = ({ style, focusedStyle, onPress, children, hasTVPreferredFocus, activeOpacity = 0.8, disabled = false, ...rest }: any) => {
   const [isFocused, setIsFocused] = useState(false);
+  const btnRef = useRef<any>(null);
   const flatStyle = StyleSheet.flatten(style) || {};
   const btnRadius = typeof flatStyle.borderRadius === 'number' ? flatStyle.borderRadius : 8;
 
-  const triggerPress = (e?: any) => {
-    const now = Date.now();
-    if (now - lastTvPressTime < 280) return;
-    lastTvPressTime = now;
-    if (onPress) onPress(e);
-  };
+  useEffect(() => {
+    if (hasTVPreferredFocus && !disabled) {
+      const timer = setTimeout(() => {
+        try {
+          btnRef.current?.focus?.();
+        } catch (_e) {}
+      }, 120);
+      return () => clearTimeout(timer);
+    }
+  }, [hasTVPreferredFocus, disabled]);
 
   return (
     <Pressable
-      focusable={true}
-      accessible={true}
-      onPress={triggerPress}
-      onFocus={() => {
-        setIsFocused(true);
-        currentTvFocusedPress = () => triggerPress();
-      }}
-      onBlur={() => {
-        setIsFocused(false);
-      }}
+      ref={btnRef}
+      disabled={disabled}
+      focusable={!disabled}
+      accessible={!disabled}
+      onPress={onPress}
+      onFocus={() => setIsFocused(true)}
+      onBlur={() => setIsFocused(false)}
       style={({ pressed }: any) => [
         style,
         pressed && { opacity: activeOpacity },
         isFocused && styles.tvFocused,
         isFocused && {
-          borderColor: '#FFFFFF',
-          borderWidth: 3,
-          transform: [{ scale: 1.05 }],
+          borderColor: '#FFD700',
+          backgroundColor: flatStyle.backgroundColor || 'rgba(229, 9, 20, 0.28)',
+          transform: [{ scale: 1.03 }],
           zIndex: 99,
           elevation: 16,
         },
@@ -292,7 +291,7 @@ const FocusableButton = ({ style, focusedStyle, onPress, children, hasTVPreferre
             borderRadius: btnRadius,
             borderWidth: 3.5,
             borderColor: '#FFD700',
-            backgroundColor: 'rgba(229, 9, 20, 0.24)',
+            backgroundColor: 'rgba(255, 215, 0, 0.14)',
             zIndex: 999,
           }}
         />
@@ -370,6 +369,7 @@ const App = () => {
   const [pathStack, setPathStack] = useState(['/0:/']);
   const [currentPath, setCurrentPath] = useState('/0:/');
   const [searchQuery, setSearchQuery] = useState('');
+  const searchInputRef = useRef<any>(null);
   const [activeCategory, setActiveCategory] = useState('all');
   const [sortBy, setSortBy] = useState<'newest' | 'az'>('newest');
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
@@ -404,6 +404,7 @@ const App = () => {
   const [seriesMaxSeasonMap, setSeriesMaxSeasonMap] = React.useState<Record<string, number>>({});
 
   React.useEffect(() => {
+    if (IS_TV) return;
     const timer = setInterval(() => {
       setShowSeriesRatingTick(prev => !prev);
     }, 2600);
@@ -2316,14 +2317,14 @@ const App = () => {
                     </View>
                   )}
                   {(effectiveHasDV || effectiveHasHDR) && (
-                    <TouchableOpacity
+                    <FocusableButton
                       onPress={canSwitchDvHdr ? toggleLiveHdrModeInPlayer : undefined}
                       style={[styles.liveHdrStatusPill, activeHdrMode === 'dv' ? styles.liveDvPill : styles.liveHdr10Pill]}>
                       <Icon name={activeHdrMode === 'dv' ? 'auto-awesome' : 'wb-sunny'} size={11} color={activeHdrMode === 'dv' ? '#FFD700' : '#000'} />
                       <Text style={[styles.liveHdrStatusText, activeHdrMode === 'hdr' && { color: '#000' }]}>
                         {activeHdrMode === 'dv' ? 'DOLBY VISION' : 'HDR10'}
                       </Text>
-                    </TouchableOpacity>
+                    </FocusableButton>
                   )}
                 </View>
               </View>
@@ -2606,7 +2607,7 @@ const App = () => {
           {/* Single MediaInfo Card for Currently Selected Version Only */}
           <View style={styles.mediaInfoCard}>
             
-                            <TouchableOpacity
+                            <FocusableButton
                 disabled={trailerState.loading || !trailerState.available}
                 onPress={() => {
                   if (trailerState.available && trailerState.cacheKey && SecurityVault?.playYoutubeTrailer) {
@@ -2638,7 +2639,7 @@ const App = () => {
                     ? `🎬 Watch Official Trailer (In-App • ${trailerState.bestQuality})`
                     : '🎬 Trailer Unavailable'}
                 </Text>
-              </TouchableOpacity>
+              </FocusableButton>
 
               <View style={styles.mediaInfoHeaderRow}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flex: 1 }}>
@@ -2834,7 +2835,7 @@ const App = () => {
 
     if (viewMode === 'list') {
       return (
-        <FocusableButton hasTVPreferredFocus={index === 0 && !searchQuery} style={styles.listCard} onPress={() => handlePress(item)}>
+        <FocusableButton hasTVPreferredFocus={index === 0 && !searchQuery && !selectedFile && playMode === null} style={styles.listCard} onPress={() => handlePress(item)}>
           {meta?.poster ? (
             <Image source={{ uri: meta.poster }} style={styles.listPosterThumb} resizeMode="cover" />
           ) : (
@@ -2859,7 +2860,7 @@ const App = () => {
     }
 
     return (
-      <FocusableButton hasTVPreferredFocus={index === 0 && !searchQuery} style={styles.posterCard} onPress={() => handlePress(item)}>
+      <FocusableButton hasTVPreferredFocus={index === 0 && !searchQuery && !selectedFile && playMode === null} style={styles.posterCard} onPress={() => handlePress(item)}>
         <View style={styles.posterImageContainer}>
           {meta?.poster ? (
             <Image source={{ uri: meta.poster }} style={styles.posterImage} resizeMode="cover" />
@@ -2971,12 +2972,12 @@ const App = () => {
                     <Text style={styles.cwTimeText}>Resume • {formatRemainingLabel(cwSec, cwDur)}</Text>
                   </View>
                 </FocusableButton>
-                <TouchableOpacity
+                <FocusableButton
                   style={styles.cwRemoveBtn}
                   hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                   onPress={() => removeContinueWatchingItem(cwItem)}>
                   <Icon name="close" size={15} color="#FFFFFF" />
-                </TouchableOpacity>
+                </FocusableButton>
               </View>
             );
           })}
@@ -2985,9 +2986,16 @@ const App = () => {
     );
   };
 
+  const isTopOverlayOpen = !!selectedFile || playMode === 'internal' || activeTab === 'downloads' || showSeasonModal || showHdrChoiceModal;
+  const isHomeLayerBlocked = isTopOverlayOpen || isInsideFolder;
+  const isSeriesLayerBlocked = isTopOverlayOpen;
+
   return (
     <View style={styles.container}>
       <StatusBar hidden={false} barStyle="light-content" />
+      <View
+        importantForAccessibility={isTopOverlayOpen ? 'no-hide-descendants' : 'auto'}
+        pointerEvents={isTopOverlayOpen ? 'none' : 'auto'}>
       <View style={styles.topHeaderBar}>
         <View style={{ flexDirection: 'row', alignItems: 'center' }}>
           <View style={styles.logoMark}><Text style={styles.logoMarkText}>▶</Text></View>
@@ -3018,17 +3026,22 @@ const App = () => {
       </View>
 
       <View style={styles.searchRow}>
-        <Icon name="search" size={20} color="#888" style={{ marginLeft: 12 }} />
-        <TextInput
-          style={styles.searchBarInput}
-          focusable={!IS_TV ? true : true}
-          placeholder="Search movies, series, 4K, Tamil..."
-          placeholderTextColor="#777"
-          value={searchQuery}
-          onChangeText={setSearchQuery}
-          autoCorrect={false}
-          returnKeyType="search"
-        />
+        <FocusableButton
+          style={{ flex: 1, flexDirection: 'row', alignItems: 'center', borderRadius: 10 }}
+          onPress={() => searchInputRef.current?.focus?.()}>
+          <Icon name="search" size={20} color="#888" style={{ marginLeft: 12 }} />
+          <TextInput
+            ref={searchInputRef}
+            style={styles.searchBarInput}
+            focusable={!IS_TV}
+            placeholder="Search movies, series, 4K, Tamil..."
+            placeholderTextColor="#777"
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            autoCorrect={false}
+            returnKeyType="search"
+          />
+        </FocusableButton>
         {!!searchQuery && (
           <FocusableButton onPress={() => setSearchQuery('')} style={{ padding: 8, borderRadius: 8 }}>
             <Icon name="close" size={18} color="#AAA" />
@@ -3052,30 +3065,40 @@ const App = () => {
         </ScrollView>
       </View>
 
+      </View>
+
       <View style={{ flex: 1, position: 'relative' }}>
         {/* Home Catalog FlatList stays permanently mounted so scroll position NEVER resets when entering a Series or Movie! */}
-        {loading ? (
-          <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 60 }} />
-        ) : (
-          <FlatList
-            key={`home-catalog-${viewMode}-${numColumns}`}
-            data={homeDisplayedFiles}
-            numColumns={numColumns}
-            keyboardShouldPersistTaps="handled"
-            removeClippedSubviews={false}
-            ListHeaderComponent={!isInsideFolder ? renderContinueWatchingHeader() : null}
-            refreshControl={
-              <RefreshControl refreshing={refreshing && !isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" />
-            }
-            contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
-            keyExtractor={(item, idx) => item.id || item.name || String(idx)}
-            renderItem={renderCatalogCard}
-          />
-        )}
+        <View
+          style={{ flex: 1 }}
+          importantForAccessibility={isHomeLayerBlocked ? 'no-hide-descendants' : 'auto'}
+          pointerEvents={isHomeLayerBlocked ? 'none' : 'auto'}>
+          {loading ? (
+            <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 60 }} />
+          ) : (
+            <FlatList
+              key={`home-catalog-${viewMode}-${numColumns}`}
+              data={homeDisplayedFiles}
+              numColumns={numColumns}
+              keyboardShouldPersistTaps="handled"
+              removeClippedSubviews={false}
+              ListHeaderComponent={!isInsideFolder ? renderContinueWatchingHeader() : null}
+              refreshControl={
+                <RefreshControl refreshing={refreshing && !isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" />
+              }
+              contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
+              keyExtractor={(item, idx) => item.id || item.name || String(idx)}
+              renderItem={renderCatalogCard}
+            />
+          )}
+        </View>
 
         {/* Series / Folder Overlay Layer (Renders over Home FlatList so going Back to Home is instant & preserves scroll offset!) */}
         {isInsideFolder && (
-          <View style={styles.seriesFolderOverlay}>
+          <View
+            style={styles.seriesFolderOverlay}
+            importantForAccessibility={isSeriesLayerBlocked ? 'no-hide-descendants' : 'auto'}
+            pointerEvents={isSeriesLayerBlocked ? 'none' : 'auto'}>
             <View style={styles.seriesNavRow}>
               <FocusableButton style={[styles.backFolderBar, { flex: 1, marginHorizontal: 0, marginBottom: 0 }]} onPress={goBack}>
                 <Icon name="arrow-back" size={18} color="white" />
