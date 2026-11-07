@@ -132,7 +132,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         init {
             try {
                 System.loadLibrary("gdcore")
-                // Keep cookies isolated in sessionCookieHeader so React Native never clears them
+                val cm = CookieManager(null, CookiePolicy.ACCEPT_ALL)
+                CookieHandler.setDefault(cm)
             } catch (_: Throwable) {}
         }
     }
@@ -283,6 +284,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             connectTimeout = 12000
             readTimeout = 15000
             requestMethod = "POST"
+            instanceFollowRedirects = false
             doInput = true
             doOutput = true
             useCaches = false
