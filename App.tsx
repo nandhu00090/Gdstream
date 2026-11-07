@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator,
+  View, Text, FlatList, TouchableOpacity,
+  Pressable, StyleSheet, ActivityIndicator,
   Alert, NativeModules, TextInput, ScrollView, BackHandler, Animated,
   Platform, DeviceEventEmitter, Image, Modal, PanResponder, Dimensions,
   StatusBar, RefreshControl, AppState,
@@ -237,25 +238,43 @@ const extractSeasonNumberFromFolder = (name: string): number | null => {
   return null;
 };
 
+let currentTvFocusedPress: (() => void) | null = null;
+let lastTvPressTime = 0;
+
 const FocusableButton = ({ style, focusedStyle, onPress, children, hasTVPreferredFocus, activeOpacity = 0.8, ...rest }: any) => {
   const [isFocused, setIsFocused] = useState(false);
   const flatStyle = StyleSheet.flatten(style) || {};
   const btnRadius = typeof flatStyle.borderRadius === 'number' ? flatStyle.borderRadius : 8;
+
+  const triggerPress = (e?: any) => {
+    const now = Date.now();
+    if (now - lastTvPressTime < 280) return;
+    lastTvPressTime = now;
+    if (onPress) onPress(e);
+  };
+
   return (
-    <TouchableOpacity
+    <Pressable
       focusable={true}
-      hasTVPreferredFocus={hasTVPreferredFocus}
-      activeOpacity={activeOpacity}
-      onPress={onPress}
-      onFocus={() => setIsFocused(true)}
-      onBlur={() => setIsFocused(false)}
-      style={[
+      accessible={true}
+      onPress={triggerPress}
+      onFocus={() => {
+        setIsFocused(true);
+        currentTvFocusedPress = () => triggerPress();
+      }}
+      onBlur={() => {
+        setIsFocused(false);
+      }}
+      style={({ pressed }: any) => [
         style,
+        pressed && { opacity: activeOpacity },
         isFocused && styles.tvFocused,
         isFocused && {
-          transform: [{ scale: 1.04 }],
+          borderColor: '#FFFFFF',
+          borderWidth: 3,
+          transform: [{ scale: 1.05 }],
           zIndex: 99,
-          elevation: 14,
+          elevation: 16,
         },
         isFocused && focusedStyle,
       ]}
@@ -271,14 +290,14 @@ const FocusableButton = ({ style, focusedStyle, onPress, children, hasTVPreferre
             right: 0,
             bottom: 0,
             borderRadius: btnRadius,
-            borderWidth: 3,
-            borderColor: '#FFFFFF',
-            backgroundColor: 'rgba(229, 9, 20, 0.22)',
+            borderWidth: 3.5,
+            borderColor: '#FFD700',
+            backgroundColor: 'rgba(229, 9, 20, 0.24)',
             zIndex: 999,
           }}
         />
       )}
-    </TouchableOpacity>
+    </Pressable>
   );
 };
 
@@ -3002,6 +3021,7 @@ const App = () => {
         <Icon name="search" size={20} color="#888" style={{ marginLeft: 12 }} />
         <TextInput
           style={styles.searchBarInput}
+          focusable={!IS_TV ? true : true}
           placeholder="Search movies, series, 4K, Tamil..."
           placeholderTextColor="#777"
           value={searchQuery}
