@@ -245,6 +245,7 @@ const tvFocusRegistry: Record<string, any> = {};
 let currentFocusedId = '';
 let previousFocusedId = '';
 let lastFocusChangeTime = 0;
+let pendingInitialFocusId = '';
 let onGlobalTvActivity: (() => void) | null = null;
 
 const focusById = (id: string): boolean => {
@@ -264,6 +265,12 @@ const focusById = (id: string): boolean => {
     } catch (_e) {}
   }
   return triggered;
+};
+
+const requestInitialScreenFocus = (id: string) => {
+  if (!IS_TV || !id) return;
+  pendingInitialFocusId = id;
+  focusById(id);
 };
 
 const FocusableButton = ({
@@ -290,6 +297,20 @@ const FocusableButton = ({
   useEffect(() => {
     if (focusId && isLayerActive && btnRef.current) {
       tvFocusRegistry[focusId] = btnRef.current;
+      if (IS_TV && pendingInitialFocusId === focusId) {
+        const targetToFocus = focusId;
+        const t = setTimeout(() => {
+          if (pendingInitialFocusId === targetToFocus) {
+            focusById(targetToFocus);
+          }
+        }, 25);
+        return () => {
+          clearTimeout(t);
+          if (tvFocusRegistry[focusId] === btnRef.current) {
+            delete tvFocusRegistry[focusId];
+          }
+        };
+      }
       return () => {
         if (tvFocusRegistry[focusId] === btnRef.current) {
           delete tvFocusRegistry[focusId];
@@ -304,18 +325,6 @@ const FocusableButton = ({
     }
   }, [isLayerActive, isFocused]);
 
-  useEffect(() => {
-    if (isLayerActive && hasTVPreferredFocus) {
-      const t = setTimeout(() => {
-        if (focusId) focusById(focusId);
-        else {
-          try { btnRef.current?.focus?.(); } catch (_e) {}
-        }
-      }, 30);
-      return () => clearTimeout(t);
-    }
-  }, [isLayerActive, hasTVPreferredFocus, focusId]);
-
   const showFocus = isFocused && isLayerActive;
 
   return (
@@ -325,12 +334,6 @@ const FocusableButton = ({
       disabled={disabled || !isLayerActive}
       focusable={isLayerActive}
       accessible={isLayerActive}
-      hasTVPreferredFocus={isLayerActive && hasTVPreferredFocus ? true : undefined}
-      onLayout={() => {
-        if (IS_TV && isLayerActive && hasTVPreferredFocus && focusId) {
-          focusById(focusId);
-        }
-      }}
       onPress={(e) => {
         if (onGlobalTvActivity) onGlobalTvActivity();
         if (onPress) onPress(e);
@@ -338,6 +341,9 @@ const FocusableButton = ({
       onFocus={(e) => {
         if (onGlobalTvActivity) onGlobalTvActivity();
         if (focusId) {
+          if (pendingInitialFocusId === focusId) {
+            pendingInitialFocusId = '';
+          }
           previousFocusedId = currentFocusedId;
           currentFocusedId = focusId;
           lastFocusChangeTime = Date.now();
@@ -436,6 +442,7 @@ const App = () => {
   const lastPlayerActivityRef = useRef<number>(Date.now());
   const [headerFocusUnlocked, setHeaderFocusUnlocked] = useState(!IS_TV);
   const [isTvSearchModalOpen, setIsTvSearchModalOpen] = useState(false);
+  const lastFocusedScreenKeyRef = useRef<string>('');
   const [activeCategory, setActiveCategory] = useState('all');
   const [sortBy, setSortBy] = useState<'newest' | 'az'>('newest');
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
@@ -1587,27 +1594,31 @@ const App = () => {
     ? 'folder'
     : 'home';
 
-  // Lock header buttons briefly when entering/returning to Home or Folder so Android OS NEVER jumps to "Newest" first!
+  // Run initial focus ONLY ONCE when entering a new screen (never re-runs while moving D-Pad on that screen!)
   useEffect(() => {
     if (!IS_TV) return;
+
     if (currentActiveLayer === 'home') {
       if (loading || homeDisplayedFiles.length === 0) {
         setHeaderFocusUnlocked(false);
         return;
       }
+      const screenKey = 'home';
+      if (lastFocusedScreenKeyRef.current === screenKey) return;
+      lastFocusedScreenKeyRef.current = screenKey;
+
       setHeaderFocusUnlocked(false);
       const rawTarget = lastHomeCardIdRef.current || 'card_0';
       const targetIdx = parseInt(rawTarget.replace('card_', ''), 10);
       const validId = (!isNaN(targetIdx) && targetIdx < homeDisplayedFiles.length) ? rawTarget : 'card_0';
 
-      const t1 = setTimeout(() => focusById(validId), 20);
-      const t2 = setTimeout(() => focusById(validId), 95);
-      const t3 = setTimeout(() => {
-        focusById(validId);
+      requestInitialScreenFocus(validId);
+      const t1 = setTimeout(() => focusById(validId), 60);
+      const t2 = setTimeout(() => {
+        if (pendingInitialFocusId === validId) focusById(validId);
         setHeaderFocusUnlocked(true);
-      }, 210);
-      const t4 = setTimeout(() => focusById(validId), 320);
-      return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); clearTimeout(t4); };
+      }, 180);
+      return () => { clearTimeout(t1); clearTimeout(t2); };
     }
 
     if (currentActiveLayer === 'folder') {
@@ -1615,35 +1626,77 @@ const App = () => {
         setHeaderFocusUnlocked(false);
         return;
       }
+      const screenKey = `folder:${currentPath}`;
+      if (lastFocusedScreenKeyRef.current === screenKey) return;
+      lastFocusedScreenKeyRef.current = screenKey;
+
       if (folderDisplayedFiles.length === 0) {
         setHeaderFocusUnlocked(true);
-        const tEmpty = setTimeout(() => focusById('f_back'), 50);
-        return () => clearTimeout(tEmpty);
+        requestInitialScreenFocus('f_back');
+        return;
       }
       setHeaderFocusUnlocked(false);
       const rawTarget = lastFolderCardIdRef.current || 'fcard_0';
       const targetIdx = parseInt(rawTarget.replace('fcard_', ''), 10);
       const validId = (!isNaN(targetIdx) && targetIdx < folderDisplayedFiles.length) ? rawTarget : 'fcard_0';
 
-      const t1 = setTimeout(() => focusById(validId), 20);
-      const t2 = setTimeout(() => focusById(validId), 95);
-      const t3 = setTimeout(() => {
-        focusById(validId);
+      requestInitialScreenFocus(validId);
+      const t1 = setTimeout(() => focusById(validId), 60);
+      const t2 = setTimeout(() => {
+        if (pendingInitialFocusId === validId) focusById(validId);
         setHeaderFocusUnlocked(true);
-      }, 210);
-      const t4 = setTimeout(() => focusById(validId), 320);
-      return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); clearTimeout(t4); };
+      }, 180);
+      return () => { clearTimeout(t1); clearTimeout(t2); };
     }
 
     if (currentActiveLayer === 'detail' && selectedFile) {
-      const t1 = setTimeout(() => focusById('detail_play_btn'), 25);
-      const t2 = setTimeout(() => focusById('detail_play_btn'), 120);
-      const t3 = setTimeout(() => focusById('detail_play_btn'), 250);
-      return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
-    }
-  }, [currentActiveLayer, loading, folderLoading, homeDisplayedFiles.length, folderDisplayedFiles.length, selectedFile]);
+      const screenKey = `detail:${selectedFile.name}`;
+      if (lastFocusedScreenKeyRef.current === screenKey) return;
+      lastFocusedScreenKeyRef.current = screenKey;
 
-  // Smart 7-Second Auto-Hide for Player Controls (Never hides while Audio/Subtitle/Episodes menu is open!)
+      requestInitialScreenFocus('detail_play_btn');
+      const t1 = setTimeout(() => {
+        if (pendingInitialFocusId === 'detail_play_btn') focusById('detail_play_btn');
+      }, 70);
+      return () => clearTimeout(t1);
+    }
+
+    if (currentActiveLayer === 'downloads') {
+      const screenKey = 'downloads';
+      if (lastFocusedScreenKeyRef.current === screenKey) return;
+      lastFocusedScreenKeyRef.current = screenKey;
+
+      const targetDlId = downloads.length > 0 ? 'dl_item_0' : 'dl_back_btn';
+      requestInitialScreenFocus(targetDlId);
+      return;
+    }
+
+    if (currentActiveLayer === 'seasonModal') {
+      lastFocusedScreenKeyRef.current = 'seasonModal';
+      const selIdx = Math.max(0, seasonFolders.findIndex(s => s.seasonNum === activeSeason?.seasonNum));
+      requestInitialScreenFocus(`season_opt_${selIdx}`);
+      return;
+    }
+
+    if (currentActiveLayer === 'hdrModal') {
+      lastFocusedScreenKeyRef.current = 'hdrModal';
+      requestInitialScreenFocus('hdr_dv_btn');
+      return;
+    }
+  }, [
+    currentActiveLayer,
+     currentPath,
+    loading,
+    folderLoading,
+    homeDisplayedFiles.length,
+    folderDisplayedFiles.length,
+    selectedFile,
+    downloads.length,
+    seasonFolders,
+    activeSeason,
+  ]);
+
+  // Smart 7-Second Auto-Hide for Player Controls
   useEffect(() => {
     if (playMode !== 'internal') {
       onGlobalTvActivity = null;
@@ -1676,18 +1729,21 @@ const App = () => {
     }
   }, [playMode, showControls, activeMenu, isLocked]);
 
-  // Complete Deterministic D-Pad Router + Top/Bottom End-Stops + Anti-Disappear Watchdog!
+  // Flicker-Free Boundary Router:
+  // ONLY routes across row boundaries (Search <-> All <-> CW Remove <-> CW Play <-> Row 0 Cards, and Ceiling/Floor stops).
+  // Normal card-to-card and Detail button-to-button movement uses native Android focus with ZERO double-focus flicker!
   useEffect(() => {
     if (!IS_TV) return;
     const sub = DeviceEventEmitter.addListener('onTVRemoteKey', event => {
       const keyCode = event?.keyCode;
-      // D-Pad Up=19, Down=20, Left=21, Right=22
       if (keyCode !== 19 && keyCode !== 20 && keyCode !== 21 && keyCode !== 22) return;
 
-      const justChanged = (Date.now() - lastFocusChangeTime) < 85;
+      // Clear any pending initial focus the moment the user presses a D-Pad arrow key!
+      pendingInitialFocusId = '';
+
+      const justChanged = (Date.now() - lastFocusChangeTime) < 80;
       const sourceId = justChanged ? previousFocusedId : currentFocusedId;
 
-      // 1. HOME & SERIES FOLDER NAVIGATION + CEILING/FLOOR END-STOPS
       if (currentActiveLayer === 'home' || currentActiveLayer === 'folder') {
         const isFolder = currentActiveLayer === 'folder';
         const prefix = isFolder ? 'f' : '';
@@ -1697,28 +1753,23 @@ const App = () => {
         const hasSeasons = isFolder && seasonFolders.length > 0 && !!activeSeason;
 
         if (keyCode === 19) {
-          // UP ARROW:
+          // UP ARROW at top boundaries only:
           if (sourceId && sourceId.startsWith(`${prefix}card_`)) {
             const idx = parseInt(sourceId.replace(`${prefix}card_`, ''), 10);
-            if (!isNaN(idx)) {
-              if (idx < cols) {
-                // First Row of Movies/Episodes -> Go UP to CW Play, or Series Back/Season, or Active Filter Chip!
-                setTimeout(() => {
-                  if (hasCW) {
-                    const cwIdx = Math.min(idx, continueWatchingItems.length - 1);
-                    focusById(`${prefix}cw_play_${cwIdx}`);
-                  } else if (isFolder) {
-                    if (hasSeasons && idx >= 3) focusById('f_season');
-                    else focusById('f_back');
-                  } else {
-                    focusById(`chip_${activeCategory}`);
-                  }
-                }, 5);
-              } else {
-                // Row 2+ of Movies/Episodes -> Go UP to exact column in previous row!
-                const targetIdx = Math.max(0, idx - cols);
-                setTimeout(() => focusById(`${prefix}card_${targetIdx}`), 5);
-              }
+            // ONLY intercept Row 0 (idx < cols) so 4th/5th column never jumps into empty space!
+            // Row 1+ (idx >= cols) moves UP natively with zero flicker!
+            if (!isNaN(idx) && idx < cols) {
+              setTimeout(() => {
+                if (hasCW) {
+                  const cwIdx = Math.min(idx, continueWatchingItems.length - 1);
+                  focusById(`${prefix}cw_play_${cwIdx}`);
+                } else if (isFolder) {
+                  if (hasSeasons && idx >= 3) focusById('f_season');
+                  else focusById('f_back');
+                } else {
+                  focusById(`chip_${activeCategory}`);
+                }
+              }, 5);
             }
           } else if (sourceId && sourceId.startsWith(`${prefix}cw_play_`)) {
             const cwIdx = sourceId.replace(`${prefix}cw_play_`, '');
@@ -1729,18 +1780,16 @@ const App = () => {
               else focusById(`chip_${activeCategory}`);
             }, 5);
           } else if (isFolder && (sourceId === 'f_back' || sourceId === 'f_season')) {
-            // TOP CEILING OF SERIES FOLDER: Stay right on f_back / f_season!
             setTimeout(() => focusById(sourceId), 5);
           } else if (!isFolder && sourceId && sourceId.startsWith('chip_')) {
             setTimeout(() => focusById('search_btn'), 5);
           } else if (!isFolder && (sourceId === 'search_btn' || sourceId === 'search_clear')) {
             setTimeout(() => focusById('hdr_sort'), 5);
           } else if (!isFolder && sourceId && sourceId.startsWith('hdr_')) {
-            // TOP CEILING OF HOMEPAGE: Stay right on the top header button!
             setTimeout(() => focusById(sourceId), 5);
           }
         } else if (keyCode === 20) {
-          // DOWN ARROW:
+          // DOWN ARROW at header/CW boundaries only (Card-to-Card Down moves natively with zero flicker!):
           if (!isFolder && sourceId && sourceId.startsWith('hdr_')) {
             setTimeout(() => focusById('search_btn'), 5);
           } else if (!isFolder && (sourceId === 'search_btn' || sourceId === 'search_clear')) {
@@ -1762,97 +1811,26 @@ const App = () => {
             setTimeout(() => {
               if (listLen > 0) focusById(`${prefix}card_0`);
             }, 5);
-          } else if (sourceId && sourceId.startsWith(`${prefix}card_`)) {
-            const idx = parseInt(sourceId.replace(`${prefix}card_`, ''), 10);
-            if (!isNaN(idx)) {
-              const nextIdx = idx + cols;
-              if (nextIdx < listLen) {
-                setTimeout(() => focusById(`${prefix}card_${nextIdx}`), 5);
-              } else {
-                // Bottom-most row: if partial last row exists below, go to last item; else FLOOR STOP!
-                const currentRow = Math.floor(idx / cols);
-                const lastRow = Math.floor((listLen - 1) / cols);
-                if (currentRow < lastRow) {
-                  setTimeout(() => focusById(`${prefix}card_${listLen - 1}`), 5);
-                } else {
-                  setTimeout(() => focusById(sourceId), 5);
-                }
-              }
-            }
-          }
-        } else if (keyCode === 21) {
-          // LEFT ARROW:
-          if (isFolder && sourceId === 'f_season') {
-            setTimeout(() => focusById('f_back'), 5);
-          } else if (isFolder && sourceId === 'f_back') {
-            setTimeout(() => focusById('f_back'), 5);
-          } else if (!isFolder && sourceId === 'hdr_sort') {
-            setTimeout(() => focusById('hdr_sort'), 5);
-          } else if (!isFolder && sourceId === 'chip_all') {
-            setTimeout(() => focusById('chip_all'), 5);
-          } else if (sourceId && sourceId.startsWith(`${prefix}card_`)) {
-            const idx = parseInt(sourceId.replace(`${prefix}card_`, ''), 10);
-            if (!isNaN(idx) && idx > 0) {
-              setTimeout(() => focusById(`${prefix}card_${idx - 1}`), 5);
-            } else {
-              setTimeout(() => focusById(sourceId), 5);
-            }
-          }
-        } else if (keyCode === 22) {
-          // RIGHT ARROW:
-          if (isFolder && sourceId === 'f_back') {
-            setTimeout(() => focusById(hasSeasons ? 'f_season' : 'f_back'), 5);
-          } else if (isFolder && sourceId === 'f_season') {
-            setTimeout(() => focusById('f_season'), 5);
-          } else if (!isFolder && sourceId === 'hdr_view') {
-            setTimeout(() => focusById('hdr_view'), 5);
-          } else if (!isFolder && sourceId === 'chip_watchlist') {
-            setTimeout(() => focusById('chip_watchlist'), 5);
-          } else if (sourceId && sourceId.startsWith(`${prefix}card_`)) {
-            const idx = parseInt(sourceId.replace(`${prefix}card_`, ''), 10);
-            if (!isNaN(idx) && idx + 1 < listLen) {
-              setTimeout(() => focusById(`${prefix}card_${idx + 1}`), 5);
-            } else {
-              setTimeout(() => focusById(sourceId), 5);
-            }
           }
         }
       }
 
-      // 2. DETAILS PAGE CEILING & FLOOR END-STOPS
+      // Details Page: Let native ScrollView D-Pad move smoothly between Play in App -> External Player -> Download -> Trailer -> Source!
+      // Only guard the top ceiling (detail_back_btn / detail_fav_top_btn) and bottom floor (detail_source_btn)!
       if (currentActiveLayer === 'detail') {
-        if (keyCode === 19) {
-          // UP ARROW on Detail Page:
-          if (sourceId === 'detail_back_btn' || sourceId === 'detail_fav_top_btn') {
-            // TOP CEILING OF DETAILS PAGE: Stay on Back / Fav button!
-            setTimeout(() => focusById(sourceId), 5);
-          } else if (sourceId === 'detail_play_btn') {
-            setTimeout(() => {
-              if (versionGroup.length > 1) focusById(`detail_ver_${versionGroup.length - 1}`);
-              else focusById('detail_back_btn');
-            }, 5);
-          } else if (sourceId === 'detail_ver_0') {
-            setTimeout(() => focusById('detail_back_btn'), 5);
-          }
-        } else if (keyCode === 20) {
-          // DOWN ARROW on Detail Page:
-          if (sourceId === 'detail_back_btn' || sourceId === 'detail_fav_top_btn') {
-            setTimeout(() => {
-              if (versionGroup.length > 1) focusById('detail_ver_0');
-              else focusById('detail_play_btn');
-            }, 5);
-          } else if (sourceId === 'detail_source_btn') {
-            // BOTTOM FLOOR OF DETAILS PAGE: Stay on Source File card!
-            setTimeout(() => focusById('detail_source_btn'), 5);
-          }
-        } else if (keyCode === 21 && sourceId === 'detail_fav_top_btn') {
-          setTimeout(() => focusById('detail_back_btn'), 5);
-        } else if (keyCode === 22 && sourceId === 'detail_back_btn') {
-          setTimeout(() => focusById('detail_fav_top_btn'), 5);
+        if (keyCode === 19 && (sourceId === 'detail_back_btn' || sourceId === 'detail_fav_top_btn')) {
+          setTimeout(() => focusById(sourceId), 5);
+        } else if (keyCode === 20 && (sourceId === 'detail_back_btn' || sourceId === 'detail_fav_top_btn')) {
+          setTimeout(() => {
+            if (versionGroup.length > 1) focusById('detail_ver_0');
+            else focusById('detail_play_btn');
+          }, 5);
+        } else if (keyCode === 20 && sourceId === 'detail_source_btn') {
+          setTimeout(() => focusById('detail_source_btn'), 5);
         }
       }
 
-      // 3. ANTI-DISAPPEAR WATCHDOG: Ensure focus never falls onto a ScrollView or null!
+      // Anti-Disappear Watchdog: Only rescues focus if currentFocus became null!
       setTimeout(() => {
         const fallback = currentFocusedId || (
           currentActiveLayer === 'detail' ? 'detail_play_btn' :
@@ -1862,7 +1840,7 @@ const App = () => {
         if (fallback && VideoPlayerManager?.ensureValidFocus) {
           VideoPlayerManager.ensureValidFocus(fallback);
         }
-      }, 65);
+      }, 75);
     });
     return () => sub.remove();
   }, [
@@ -2371,12 +2349,12 @@ const App = () => {
             <Text style={styles.hdrModalEyebrow}>{seriesParentTitle.toUpperCase() || 'SERIES'}</Text>
             <Text style={styles.hdrModalTitle}>Select Season</Text>
             <ScrollView style={{ maxHeight: 300, marginTop: 12 }}>
-              {seasonFolders.map((sItem) => {
+              {seasonFolders.map((sItem, sIdx) => {
                 const isSelected = activeSeason?.seasonNum === sItem.seasonNum;
                 return (
                   <FocusableButton
                     key={sItem.seasonNum}
-                    hasTVPreferredFocus={isSelected}
+                    focusId={`season_opt_${sIdx}`}
                     style={[styles.seasonOptionItem, isSelected && styles.seasonOptionItemActive]}
                     onPress={() => handleSelectSeason(sItem)}>
                     <View style={styles.seasonNumberCircle}>
@@ -2418,7 +2396,7 @@ const App = () => {
             <Text style={styles.hdrModalSub}>
               This title contains both Dolby Vision and HDR10 streams. Choose which hardware engine you want to play with:
             </Text>
-            <FocusableButton hasTVPreferredFocus={true} style={styles.dvOptionBtn} onPress={() => startPlaybackWithMode('dv')}>
+            <FocusableButton focusId="hdr_dv_btn" style={styles.dvOptionBtn} onPress={() => startPlaybackWithMode('dv')}>
               <View style={styles.dvOptionBadge}><Text style={styles.dvOptionBadgeText}>DOLBY VISION</Text></View>
               <View style={{ flex: 1 }}>
                 <Text style={styles.hdrOptionTitle}>Play in Dolby Vision (DV)</Text>
@@ -3207,7 +3185,7 @@ const App = () => {
         <StatusBar hidden={false} barStyle="light-content" />
         <View style={styles.topHeaderBar}>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
-            <FocusableButton hasTVPreferredFocus={downloads.length === 0} style={styles.headerIconBtn} onPress={() => setActiveTab('catalog')}>
+            <FocusableButton focusId="dl_back_btn" style={styles.headerIconBtn} onPress={() => setActiveTab('catalog')}>
               <Icon name="arrow-back" size={22} color="white" />
             </FocusableButton>
             <Text style={styles.headerTitle}>Downloads</Text>
@@ -3262,7 +3240,7 @@ const App = () => {
                   <View style={styles.dlActionsRow}>
                     {isDone ? (
                       <>
-                        <FocusableButton hasTVPreferredFocus={index === 0} style={styles.dlPrimaryBtn} onPress={() => { const lf = { name: item.fileName, localPath: item.filePath }; setVersionGroup([lf]); openFile(lf); handlePlayInAppPress(lf); }}>
+                        <FocusableButton focusId={`dl_item_${index}`} style={styles.dlPrimaryBtn} onPress={() => { const lf = { name: item.fileName, localPath: item.filePath }; setVersionGroup([lf]); openFile(lf); handlePlayInAppPress(lf); }}>
                           <Icon name="play-arrow" size={20} color="white" />
                           <Text style={styles.dlBtnText}>Play in App</Text>
                         </FocusableButton>
@@ -3272,12 +3250,12 @@ const App = () => {
                         </FocusableButton>
                       </>
                     ) : isRunning ? (
-                      <FocusableButton hasTVPreferredFocus={index === 0} style={styles.dlSecondaryBtn} onPress={() => DownloadEngine?.pauseDownload(item.id)}>
+                      <FocusableButton focusId={`dl_item_${index}`} style={styles.dlSecondaryBtn} onPress={() => DownloadEngine?.pauseDownload(item.id)}>
                         <Icon name="pause" size={18} color="white" />
                         <Text style={styles.dlBtnText}>Pause</Text>
                       </FocusableButton>
                     ) : (
-                      <FocusableButton hasTVPreferredFocus={index === 0} style={styles.dlPrimaryBtn} onPress={() => DownloadEngine?.resumeDownload(item.id)}>
+                      <FocusableButton focusId={`dl_item_${index}`} style={styles.dlPrimaryBtn} onPress={() => DownloadEngine?.resumeDownload(item.id)}>
                         <Icon name="play-arrow" size={18} color="white" />
                         <Text style={styles.dlBtnText}>Resume</Text>
                       </FocusableButton>
@@ -3314,11 +3292,6 @@ const App = () => {
     const versionCount = item._versions?.length || 1;
 
     const cardFocusId = isFolderCard ? `fcard_${index}` : `card_${index}`;
-    const preferredTargetId = isFolderCard
-      ? (lastFolderCardIdRef.current || 'fcard_0')
-      : (lastHomeCardIdRef.current || 'card_0');
-    const isPreferredCard = cardFocusId === preferredTargetId;
-
     const recordCardFocus = () => {
       if (isFolderCard) lastFolderCardIdRef.current = cardFocusId;
       else lastHomeCardIdRef.current = cardFocusId;
@@ -3328,7 +3301,6 @@ const App = () => {
       return (
         <FocusableButton
           focusId={cardFocusId}
-          hasTVPreferredFocus={isPreferredCard}
           style={styles.listCard}
           onFocus={recordCardFocus}
           onPress={() => {
@@ -3360,7 +3332,6 @@ const App = () => {
     return (
       <FocusableButton
         focusId={cardFocusId}
-        hasTVPreferredFocus={isPreferredCard}
         style={styles.posterCard}
         onFocus={recordCardFocus}
         onPress={() => {
@@ -3842,7 +3813,7 @@ const styles = StyleSheet.create({
   cardSeasonTag: { backgroundColor: '#293242', color: '#FFD166', fontSize: 11, fontWeight: '700', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
   cardQualityTag: { backgroundColor: '#E50914', color: '#FFF', fontSize: 11, fontWeight: '800', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
   cardResumeTag: { backgroundColor: 'rgba(229,9,20,0.18)', color: '#FF6B72', fontSize: 11, fontWeight: '800', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
-  tvFocused: { borderColor: '#FFD700', borderWidth: 3, backgroundColor: 'rgba(255, 215, 0, 0.18)' },
+  tvFocused: { borderColor: '#FFD700', borderWidth: 2, backgroundColor: 'rgba(255, 215, 0, 0.22)' },
   detailScreen: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 50, backgroundColor: '#0B0C10' },
   detailHero: { width: '100%', height: 240, backgroundColor: '#141821', position: 'relative' },
   detailBackdrop: { width: '100%', height: '100%' },

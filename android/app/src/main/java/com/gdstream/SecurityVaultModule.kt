@@ -120,6 +120,16 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     )
 
     private val verifiedTrailerCache = ConcurrentHashMap<String, VerifiedTrailerInfo>()
+    data class YoutubeProxyTarget(
+        val id: String,
+        val rawUrl: String,
+        val userAgent: String,
+        val totalSize: Long
+    )
+
+    private val youtubeStreamRegistry = ConcurrentHashMap<String, YoutubeProxyTarget>()
+    private val youtubeChunkCache = ConcurrentHashMap<String, ByteArray>()
+    private val youtubeChunkInflight = ConcurrentHashMap<String, java.util.concurrent.Future<ByteArray?>>()
     private val archiveEntryRegistry = ConcurrentHashMap<String, ArchiveEntryTarget>()
     private val archiveEntryCounter = AtomicInteger(1)
 
@@ -696,6 +706,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             }
 
             val segments = path.split("/").filter { it.isNotEmpty() }
+            if (segments.size >= 2 && segments[0] == "yt") {
+                handleYoutubeProxyClient(socket, segments[1], method, rangeHeader)
+                return
+            }
             if (segments.size < 2 || segments[0] != "zip") {
                 val out = socket.getOutputStream()
                 out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
@@ -1466,99 +1480,246 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     }
 
 
+        private fun fetchYtChunkBytes(target: YoutubeProxyTarget, chunkIndex: Long): ByteArray? {
+        val chunkKey = "${target.id}_$chunkIndex"
+        youtubeChunkCache[chunkKey]?.let { return it }
+
+        val future = youtubeChunkInflight.computeIfAbsent(chunkKey) {
+            ioExecutor.submit<ByteArray?> {
+                val cStart = chunkIndex * 524288L
+                val cEnd = minOf(target.totalSize - 1L, cStart + 524288L - 1L)
+                if (cStart > cEnd) return@submit ByteArray(0)
+                val expectedLen = (cEnd - cStart + 1L).toInt()
+                val sep = if (target.rawUrl.contains("?")) "&" else "?"
+                val rangedUrl = "${target.rawUrl}${sep}range=$cStart-$cEnd"
+
+                for (attempt in 0..2) {
+                    var conn: HttpURLConnection? = null
+                    try {
+                        conn = (URL(rangedUrl).openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
+                            connectTimeout = 6000
+                            readTimeout = 8000
+                            requestMethod = "GET"
+                            instanceFollowRedirects = true
+                            setRequestProperty("User-Agent", target.userAgent)
+                            setRequestProperty("Accept", "*/*")
+                            setRequestProperty("Connection", "keep-alive")
+                        }
+                        if (conn.responseCode in 200..299) {
+                            val bytes = conn.inputStream.use { readExactBytes(it, expectedLen) }
+                            if (bytes.isNotEmpty()) {
+                                if (youtubeChunkCache.size > 48) {
+                                    val firstKey = youtubeChunkCache.keys().nextElement()
+                                    if (firstKey != null) youtubeChunkCache.remove(firstKey)
+                                }
+                                youtubeChunkCache[chunkKey] = bytes
+                                return@submit bytes
+                            }
+                        }
+                    } catch (_: Throwable) {
+                    } finally {
+                        try { conn?.disconnect() } catch (_: Throwable) {}
+                    }
+                }
+                null
+            }
+        }
+
+        return try {
+            future.get()
+        } catch (_: Throwable) {
+            null
+        } finally {
+            youtubeChunkInflight.remove(chunkKey)
+        }
+    }
+
+    private fun prewarmYoutubeChunks(target: YoutubeProxyTarget, startChunk: Long, count: Int) {
+        val maxChunk = (target.totalSize - 1L) / 524288L
+        for (i in 0 until count) {
+            val idx = startChunk + i
+            if (idx > maxChunk) break
+            val key = "${target.id}_$idx"
+            if (!youtubeChunkCache.containsKey(key) && !youtubeChunkInflight.containsKey(key)) {
+                ioExecutor.submit { fetchYtChunkBytes(target, idx) }
+            }
+        }
+    }
+
+    private fun handleYoutubeProxyClient(socket: Socket, ytId: String, method: String, rangeHeader: String?) {
+        val target = youtubeStreamRegistry[ytId]
+        if (target == null || target.totalSize <= 0L) {
+            val out = socket.getOutputStream()
+            out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
+            out.flush()
+            return
+        }
+
+        val totalSize = target.totalSize
+        var reqStart = 0L
+        var reqEnd = totalSize - 1L
+        var isPartial = false
+
+        if (!rangeHeader.isNullOrEmpty() && rangeHeader.startsWith("bytes=")) {
+            isPartial = true
+            val spec = rangeHeader.removePrefix("bytes=").substringBefore(",").trim()
+            val dashIdx = spec.indexOf('-')
+            if (dashIdx >= 0) {
+                val sPart = spec.substring(0, dashIdx).trim()
+                val ePart = spec.substring(dashIdx + 1).trim()
+                if (sPart.isNotEmpty()) {
+                    reqStart = sPart.toLongOrNull() ?: 0L
+                    if (ePart.isNotEmpty()) {
+                        reqEnd = ePart.toLongOrNull() ?: (totalSize - 1L)
+                    }
+                } else if (ePart.isNotEmpty()) {
+                    val suffixLen = ePart.toLongOrNull() ?: 0L
+                    reqStart = (totalSize - suffixLen).coerceAtLeast(0L)
+                }
+            }
+        }
+
+        reqStart = reqStart.coerceIn(0L, (totalSize - 1L).coerceAtLeast(0L))
+        reqEnd = reqEnd.coerceIn(reqStart, (totalSize - 1L).coerceAtLeast(0L))
+        val contentLength = reqEnd - reqStart + 1L
+
+        val out = BufferedOutputStream(socket.getOutputStream(), 65536)
+        val headers = buildString {
+            append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
+            append("Content-Type: video/mp4\r\n")
+            append("Accept-Ranges: bytes\r\n")
+            append("Content-Length: $contentLength\r\n")
+            if (isPartial) {
+                append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
+            }
+            append("Connection: close\r\n\r\n")
+        }
+        out.write(headers.toByteArray(StandardCharsets.US_ASCII))
+        out.flush()
+
+        if (method == "HEAD") return
+
+        var curPos = reqStart
+        while (curPos <= reqEnd) {
+            val chunkIdx = curPos / 524288L
+            // Pre-fetch the next 4 chunks (2 MB read-ahead) in parallel so MediaPlayer NEVER waits!
+            prewarmYoutubeChunks(target, chunkIdx + 1L, 4)
+
+            val chunkBytes = fetchYtChunkBytes(target, chunkIdx) ?: break
+            if (chunkBytes.isEmpty()) break
+
+            val chunkStartOffset = chunkIdx * 524288L
+            val offsetInChunk = (curPos - chunkStartOffset).toInt()
+            if (offsetInChunk < 0 || offsetInChunk >= chunkBytes.size) break
+
+            val maxAvailable = chunkBytes.size - offsetInChunk
+            val needed = (reqEnd - curPos + 1L).coerceAtMost(maxAvailable.toLong()).toInt()
+            if (needed <= 0) break
+
+            out.write(chunkBytes, offsetInChunk, needed)
+            curPos += needed.toLong()
+        }
+        out.flush()
+    }
+
+    private fun probeYoutubeStreamSize(rawUrl: String, ua: String): Long {
+        var conn: HttpURLConnection? = null
+        try {
+            conn = (URL(rawUrl).openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
+                connectTimeout = 5000
+                readTimeout = 5000
+                requestMethod = "GET"
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", ua)
+                setRequestProperty("Range", "bytes=0-1")
+            }
+            val cr = conn.getHeaderField("Content-Range") ?: conn.getHeaderField("content-range") ?: ""
+            if (cr.contains("/")) {
+                val total = cr.substringAfterLast("/").trim().toLongOrNull() ?: -1L
+                if (total > 0L) return total
+            }
+            return conn.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
+        } catch (_: Throwable) {
+            return -1L
+        } finally {
+            try { conn?.disconnect() } catch (_: Throwable) {}
+        }
+    }
+
     private fun extractDirectYoutubeH264Streams(videoId: String): List<DirectTrailerStream> {
         val results = ArrayList<DirectTrailerStream>()
         if (videoId.length != 11) return results
 
-        // Try ANDROID_VR and IOS Innertube clients for direct hardware-accelerated H.264 MP4 / HLS streams
-        val clients = listOf(
-            Triple(
-                "ANDROID_VR",
-                "1.60.19",
-                "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
-            ),
-            Triple(
-                "IOS",
-                "19.45.4",
-                "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"
-            )
-        )
+        val ua = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+        try {
+            val clientJson = JSONObject().apply {
+                put("clientName", "ANDROID_VR")
+                put("clientVersion", "1.60.19")
+                put("deviceMake", "Oculus")
+                put("deviceModel", "Quest 3")
+                put("osName", "Android")
+                put("osVersion", "12L")
+                put("androidSdkVersion", 32)
+                put("hl", "en")
+                put("gl", "IN")
+            }
+            val payload = JSONObject().apply {
+                put("videoId", videoId)
+                put("context", JSONObject().put("client", clientJson))
+                put("contentCheckOk", true)
+                put("racyCheckOk", true)
+            }.toString()
 
-        for ((clientName, clientVer, ua) in clients) {
-            try {
-                val clientJson = JSONObject().apply {
-                    put("clientName", clientName)
-                    put("clientVersion", clientVer)
-                    put("hl", "en")
-                    put("gl", "IN")
-                    if (clientName == "ANDROID_VR") {
-                        put("deviceMake", "Oculus")
-                        put("deviceModel", "Quest 3")
-                        put("osName", "Android")
-                        put("osVersion", "12L")
-                        put("androidSdkVersion", 32)
-                    } else {
-                        put("deviceMake", "Apple")
-                        put("deviceModel", "iPhone16,2")
-                        put("osName", "iPhone")
-                        put("osVersion", "17.5.1.21F90")
-                    }
-                }
-                val payload = JSONObject().apply {
-                    put("videoId", videoId)
-                    put("context", JSONObject().put("client", clientJson))
-                    put("contentCheckOk", true)
-                    put("racyCheckOk", true)
-                }.toString()
-
-                val conn = (URL("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
-                    .openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
-                    connectTimeout = 5000
-                    readTimeout = 5000
-                    requestMethod = "POST"
-                    doInput = true
-                    doOutput = true
-                    setRequestProperty("Content-Type", "application/json")
-                    setRequestProperty("User-Agent", ua)
-                }
-                conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
-                if (conn.responseCode !in 200..299) {
-                    conn.disconnect()
-                    continue
-                }
+            val conn = (URL("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+                .openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
+                connectTimeout = 5000
+                readTimeout = 5000
+                requestMethod = "POST"
+                doInput = true
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("User-Agent", ua)
+            }
+            conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+            if (conn.responseCode in 200..299) {
                 val resp = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText() }
                 conn.disconnect()
 
                 val root = JSONObject(resp)
-                val streamingData = root.optJSONObject("streamingData") ?: continue
-
-                // 1. Check progressive muxed H.264 MP4 formats first (instant 0ms hardware playback)
-                val formats = streamingData.optJSONArray("formats")
+                val streamingData = root.optJSONObject("streamingData")
+                val formats = streamingData?.optJSONArray("formats")
                 if (formats != null) {
+                    val port = ensureArchiveProxyRunning()
                     for (i in 0 until formats.length()) {
                         val f = formats.optJSONObject(i) ?: continue
-                        val url = f.optString("url", "")
+                        val rawUrl = f.optString("url", "")
                         val mime = f.optString("mimeType", "").lowercase(Locale.ROOT)
-                        val height = f.optInt("height", 0)
-                        if (url.startsWith("http") && mime.contains("video/mp4") && height >= 360) {
-                            val label = if (height >= 1080) "1080p FHD" else if (height >= 720) "720p HD" else "${height}p"
-                            results.add(DirectTrailerStream(label, height, url))
+                        val height = f.optInt("height", 360)
+                        var totalLen = f.optString("contentLength", "").toLongOrNull() ?: -1L
+                        if (rawUrl.startsWith("http") && mime.contains("video/mp4")) {
+                            if (totalLen <= 0L) {
+                                totalLen = probeYoutubeStreamSize(rawUrl, ua)
+                            }
+                            if (totalLen > 1000L) {
+                                val ytKey = "${videoId}_${height}"
+                                val target = YoutubeProxyTarget(ytKey, rawUrl, ua, totalLen)
+                                youtubeStreamRegistry[ytKey] = target
+                                // Immediately pre-warm first 4 chunks (2 MB) in parallel while user is on Details page!
+                                prewarmYoutubeChunks(target, 0L, 4)
+
+                                val proxyUrl = "http://127.0.0.1:$port/yt/$ytKey/trailer.mp4"
+                                val label = if (height >= 1080) "1080p FHD" else if (height >= 720) "720p HD" else "HD Ready"
+                                results.add(DirectTrailerStream(label, height, proxyUrl))
+                            }
                         }
                     }
                 }
+            } else {
+                conn.disconnect()
+            }
+        } catch (_: Throwable) {}
 
-                // 2. Also check HLS Manifest URL (Hardware H.264 adaptive stream from IOS client)
-                val hlsUrl = streamingData.optString("hlsManifestUrl", "")
-                if (hlsUrl.startsWith("http") && results.isEmpty()) {
-                    results.add(DirectTrailerStream("1080p FHD", 1080, hlsUrl))
-                }
-
-                if (results.isNotEmpty()) {
-                    results.sortByDescending { it.height }
-                    return results
-                }
-            } catch (_: Throwable) {}
-        }
+        results.sortByDescending { it.height }
         return results
     }
 
