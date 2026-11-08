@@ -167,6 +167,39 @@ for (const file of targets) {
       );
     }
 
+    
+    // Fix Audio Track Switch freeze/infinite spinner on MKV streams by re-syncing SampleQueue at currentPosition
+    // and skipping redundant re-selection of the already-active audio TrackGroup
+    const oldAudioSelect = 'TrackSelectionOverride selectionOverride = new TrackSelectionOverride(groups.get(groupIndex), tracks);';
+    const newAudioSelect = `if (trackType == C.TRACK_TYPE_AUDIO && player != null) {
+                TrackSelection curAudioSel = player.getCurrentTrackSelections().get(C.TRACK_TYPE_AUDIO);
+                if (curAudioSel != null && curAudioSel.getTrackGroup() == groups.get(groupIndex)) {
+                    return;
+                }
+            }
+            TrackSelectionOverride selectionOverride = new TrackSelectionOverride(groups.get(groupIndex), tracks);`;
+    if (content.includes(oldAudioSelect) && !content.includes('curAudioSel')) {
+      content = content.replace(oldAudioSelect, newAudioSelect);
+    }
+
+    const oldApplyTrack = 'trackSelector.setParameters(selectionParameters.build());';
+    const newApplyTrack = `trackSelector.setParameters(selectionParameters.build());
+            if (trackType == C.TRACK_TYPE_AUDIO && player != null) {
+                long curPos = player.getCurrentPosition();
+                if (curPos > 0) {
+                    player.seekTo(curPos);
+                }
+            }`;
+    if (content.includes(oldApplyTrack) && !content.includes('long curPos = player.getCurrentPosition()')) {
+      content = content.replace(oldApplyTrack, newApplyTrack);
+    }
+
+    // Cap custom RNVLoadControl targetBufferBytes to 24MB and prioritize size over time so 4K/REMUX never stalls RAM
+    content = content.replace(
+      ': DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,\n                    -1,\n                    true,',
+      ': DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,\n                    24 * 1024 * 1024,\n                    false,'
+    );
+
     fs.writeFileSync(file, content, 'utf8');
     console.log('Patched Dolby Vision / HDR selector & Subtitles in:', file);
   }

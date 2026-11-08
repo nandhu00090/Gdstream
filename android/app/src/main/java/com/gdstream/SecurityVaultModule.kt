@@ -1566,6 +1566,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             dialog.window?.apply {
                 addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+                addFlags(WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED)
                 decorView.systemUiVisibility = (
                     View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                     or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
@@ -1898,6 +1899,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     )
                     settings.javaScriptEnabled = true
                     settings.mediaPlaybackRequiresUserGesture = false
+                setLayerType(View.LAYER_TYPE_HARDWARE, null)
                     settings.domStorageEnabled = true
                     settings.cacheMode = WebSettings.LOAD_DEFAULT
                     settings.userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -2039,7 +2041,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     <script src="https://www.youtube.com/iframe_api"></script>
                     <script>
                       var player;
-                      var targetVq = 'hd1080';
+                      var targetVq = 'hd720';
                       function onYouTubeIframeAPIReady() {
                         player = new YT.Player('player', {
                           videoId: '$vid',
