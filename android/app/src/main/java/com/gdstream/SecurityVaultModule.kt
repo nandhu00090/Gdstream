@@ -376,6 +376,43 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     )
                 }
 
+                try {
+                    val rootObj = JSONObject(responseText)
+                    val dataObj = rootObj.optJSONObject("data")
+                    val filesArr = dataObj?.optJSONArray("files")
+                    var nextToken = rootObj.optString("nextPageToken", "").takeIf { it.isNotEmpty() && it != "null" }
+                        ?: dataObj?.optString("nextPageToken", "")?.takeIf { it.isNotEmpty() && it != "null" }
+                        ?: ""
+
+                    var curPage = pageIndex + 1
+                    while (filesArr != null && nextToken.isNotEmpty() && curPage < 25) {
+                        val nextPayloadObj = JSONObject().apply {
+                            put("page_index", curPage)
+                            put("page_token", nextToken)
+                        }
+                        val nextRespText = executePinnedPost(
+                            "$baseUrl$path",
+                            nextPayloadObj.toString().toByteArray(Charsets.UTF_8),
+                            "application/json",
+                            shieldToken
+                        )
+                        if (!nextRespText.contains("\"files\"")) break
+                        val nextRoot = JSONObject(nextRespText)
+                        val nextData = nextRoot.optJSONObject("data")
+                        val nextFiles = nextData?.optJSONArray("files") ?: break
+                        if (nextFiles.length() == 0) break
+                        for (i in 0 until nextFiles.length()) {
+                            filesArr.put(nextFiles.get(i))
+                        }
+                        nextToken = nextRoot.optString("nextPageToken", "").takeIf { it.isNotEmpty() && it != "null" }
+                            ?: nextData.optString("nextPageToken", "").takeIf { it.isNotEmpty() && it != "null" }
+                            ?: ""
+                        curPage++
+                    }
+                    promise.resolve(rootObj.toString())
+                    return@submit
+                } catch (_: Throwable) {}
+
                 promise.resolve(responseText)
             } catch (e: Exception) {
                 promise.reject("E_NET", e.message ?: "Network error")
