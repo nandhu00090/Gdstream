@@ -244,6 +244,7 @@ const tvFocusRegistry: Record<string, any> = {};
 let currentFocusedId = '';
 let previousFocusedId = '';
 let lastFocusChangeTime = 0;
+let onGlobalTvActivity: (() => void) | null = null;
 
 const focusById = (id: string): boolean => {
   const target = tvFocusRegistry[id];
@@ -310,8 +311,12 @@ const FocusableButton = ({
       focusable={isLayerActive}
       accessible={isLayerActive}
       hasTVPreferredFocus={isLayerActive && hasTVPreferredFocus ? true : undefined}
-      onPress={onPress}
+      onPress={(e) => {
+        if (onGlobalTvActivity) onGlobalTvActivity();
+        if (onPress) onPress(e);
+      }}
       onFocus={(e) => {
+        if (onGlobalTvActivity) onGlobalTvActivity();
         if (focusId) {
           previousFocusedId = currentFocusedId;
           currentFocusedId = focusId;
@@ -406,10 +411,9 @@ const App = () => {
   const [currentPath, setCurrentPath] = useState('/0:/');
   const [searchQuery, setSearchQuery] = useState('');
   const searchInputRef = useRef<any>(null);
-  const [lastHomeFocusName, setLastHomeFocusName] = useState<string>('');
-  const [lastFolderFocusName, setLastFolderFocusName] = useState<string>('');
-  const [controlsActivityTick, setControlsActivityTick] = useState(0);
-  const initialHomeFocusedRef = useRef(false);
+  const lastHomeCardIdRef = useRef<string>('card_0');
+  const lastFolderCardIdRef = useRef<string>('fcard_0');
+  const lastPlayerActivityRef = useRef<number>(Date.now());
   const [activeCategory, setActiveCategory] = useState('all');
   const [sortBy, setSortBy] = useState<'newest' | 'az'>('newest');
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
@@ -1385,6 +1389,7 @@ const App = () => {
   } | null>(null);
 
   const openZipArchiveFile = async (zipItem: any, basePathOverride?: string) => {
+    lastFolderCardIdRef.current = 'fcard_0';
     const effectiveBasePath = basePathOverride || (currentPath.startsWith('/0:/') ? currentPath : '/0:/');
     const prevBackup = {
       pathStack: [...pathStack],
@@ -1544,45 +1549,90 @@ const App = () => {
   }, [fadeAnim, seekBothPlayers]);
 
 
-  // Auto-select 1st Movie on Homepage when app opens!
-  useEffect(() => {
-    if (!loading && homeDisplayedFiles.length > 0 && !isInsideFolder && !selectedFile && playMode === null) {
-      if (!initialHomeFocusedRef.current) {
-        initialHomeFocusedRef.current = true;
-        const t1 = setTimeout(() => focusById('card_0'), 80);
-        const t2 = setTimeout(() => focusById('card_0'), 240);
-        return () => { clearTimeout(t1); clearTimeout(t2); };
-      }
-    }
-  }, [loading, homeDisplayedFiles.length, isInsideFolder, selectedFile, playMode]);
+  const currentActiveLayer = showHdrChoiceModal
+    ? 'hdrModal'
+    : showSeasonModal
+    ? 'seasonModal'
+    : playMode === 'internal'
+    ? (activeMenu ? 'playerMenu' : 'player')
+    : selectedFile
+    ? 'detail'
+    : activeTab === 'downloads'
+    ? 'downloads'
+    : isInsideFolder
+    ? 'folder'
+    : 'home';
 
-  // Auto-select 1st Episode/Item when entering a Series/Folder!
+  // Restore exact D-Pad focus when entering or returning to Home, Series Folder, or Details Page!
   useEffect(() => {
-    if (isInsideFolder && !folderLoading && folderDisplayedFiles.length > 0 && !selectedFile && playMode === null) {
-      const targetId = lastFolderFocusName ? `fcard_${lastFolderFocusName}` : 'fcard_0';
-      const t = setTimeout(() => {
+    if (currentActiveLayer === 'home' && !loading && homeDisplayedFiles.length > 0) {
+      const targetId = lastHomeCardIdRef.current || 'card_0';
+      const restore = () => {
+        if (!focusById(targetId)) focusById('card_0');
+      };
+      const t1 = setTimeout(restore, 30);
+      const t2 = setTimeout(restore, 130);
+      const t3 = setTimeout(restore, 280);
+      return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
+    }
+    if (currentActiveLayer === 'folder' && !folderLoading && folderDisplayedFiles.length > 0) {
+      const targetId = lastFolderCardIdRef.current || 'fcard_0';
+      const restore = () => {
         if (!focusById(targetId)) focusById('fcard_0');
-      }, 90);
+      };
+      const t1 = setTimeout(restore, 30);
+      const t2 = setTimeout(restore, 130);
+      const t3 = setTimeout(restore, 280);
+      return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
+    }
+    if (currentActiveLayer === 'detail' && selectedFile) {
+      const t1 = setTimeout(() => focusById('detail_play_btn'), 30);
+      const t2 = setTimeout(() => focusById('detail_play_btn'), 140);
+      return () => { clearTimeout(t1); clearTimeout(t2); };
+    }
+  }, [currentActiveLayer, loading, folderLoading, homeDisplayedFiles.length, folderDisplayedFiles.length, selectedFile]);
+
+  // Smart 7-Second Auto-Hide for Player Controls:
+  // Resets on EVERY D-Pad focus/click/key, and NEVER hides while Audio/Subtitle/Episodes menu is open, or while buffering/paused!
+  useEffect(() => {
+    if (playMode !== 'internal') {
+      onGlobalTvActivity = null;
+      return;
+    }
+    lastPlayerActivityRef.current = Date.now();
+    onGlobalTvActivity = () => {
+      lastPlayerActivityRef.current = Date.now();
+    };
+    const checkTimer = setInterval(() => {
+      if (!showControls || isPaused || isVideoBuffering || !!activeMenu || isLocked) {
+        lastPlayerActivityRef.current = Date.now();
+        return;
+      }
+      if (Date.now() - lastPlayerActivityRef.current >= 7000) {
+        setShowControls(false);
+      }
+    }, 500);
+    return () => {
+      clearInterval(checkTimer);
+      onGlobalTvActivity = null;
+    };
+  }, [playMode, showControls, isPaused, isVideoBuffering, activeMenu, isLocked]);
+
+  // When Controls become visible in Player, auto-focus Play/Pause button so D-Pad works immediately!
+  useEffect(() => {
+    if (playMode === 'internal' && showControls && !activeMenu && !isLocked) {
+      lastPlayerActivityRef.current = Date.now();
+      const t = setTimeout(() => focusById('player_play_btn'), 50);
       return () => clearTimeout(t);
     }
-  }, [isInsideFolder, folderLoading, folderDisplayedFiles.length, selectedFile, playMode, lastFolderFocusName]);
+  }, [playMode, showControls, activeMenu, isLocked]);
 
-  // Auto-hide Player Controls after 3.8 seconds of playback inactivity!
+  // Deterministic D-Pad Navigation Router for Search -> All -> CW Remove (X) -> CW Play -> 1st Movie!
   useEffect(() => {
-    if (playMode !== 'internal' || !showControls || isPaused || !!activeMenu || isLocked) return;
-    const hideTimer = setTimeout(() => {
-      setShowControls(false);
-    }, 3800);
-    return () => clearTimeout(hideTimer);
-  }, [playMode, showControls, isPaused, activeMenu, isLocked, controlsActivityTick]);
-
-  // Deterministic D-Pad Navigation Router for Search -> All -> CW X -> CW Play -> 1st Movie!
-  useEffect(() => {
-    if (playMode === 'internal' || selectedFile || activeTab === 'downloads' || showSeasonModal || showHdrChoiceModal) return;
+    if (currentActiveLayer !== 'home' && currentActiveLayer !== 'folder') return;
     const sub = DeviceEventEmitter.addListener('onTVRemoteKey', event => {
-      setControlsActivityTick(t => t + 1);
+      lastPlayerActivityRef.current = Date.now();
       const keyCode = event?.keyCode;
-      // Only handle Down (20) and Up (19) for deterministic vertical row transitions
       if (keyCode !== 20 && keyCode !== 19) return;
       const justChanged = (Date.now() - lastFocusChangeTime) < 65;
       const sourceId = justChanged ? previousFocusedId : currentFocusedId;
@@ -1590,7 +1640,6 @@ const App = () => {
       const hasCW = !searchQuery && activeCategory === 'all' && continueWatchingItems.length > 0;
 
       if (keyCode === 20) {
-        // DOWN ARROW:
         if (sourceId === 'search_btn' || sourceId === 'search_clear') {
           setTimeout(() => focusById('chip_all'), 5);
         } else if (sourceId && sourceId.startsWith('chip_')) {
@@ -1605,7 +1654,6 @@ const App = () => {
           setTimeout(() => focusById(`${prefix}card_0`), 5);
         }
       } else if (keyCode === 19) {
-        // UP ARROW:
         if (sourceId && sourceId.startsWith(`${prefix}cw_play_`)) {
           const idx = sourceId.replace(`${prefix}cw_play_`, '');
           setTimeout(() => focusById(`${prefix}cw_remove_${idx}`), 5);
@@ -1617,7 +1665,7 @@ const App = () => {
       }
     });
     return () => sub.remove();
-  }, [playMode, selectedFile, activeTab, showSeasonModal, showHdrChoiceModal, isInsideFolder, searchQuery, activeCategory, continueWatchingItems.length]);
+  }, [currentActiveLayer, isInsideFolder, searchQuery, activeCategory, continueWatchingItems.length]);
 
   useEffect(() => {
     if (playMode !== 'internal') return;
@@ -1783,7 +1831,7 @@ const App = () => {
     setShowHdrChoiceModal(false);
     setActiveHdrMode(mode);
     setShowControls(true);
-    setControlsActivityTick(t => t + 1);
+    lastPlayerActivityRef.current = Date.now();
     setPlayerInstanceKey(k => k + 1);
     setPlayMode('internal');
     try { VideoPlayerManager?.setPreferredHdrMode?.(mode); } catch {}
@@ -1839,10 +1887,6 @@ const App = () => {
   };
 
   const handlePress = (item: any) => {
-    if (item?.name) {
-      if (isInsideFolder) setLastFolderFocusName(item.name);
-      else setLastHomeFocusName(item.name);
-    }
     if (item?.name && /\.(zip|rar)$/i.test(String(item.name)) && !item?.isZipEntry) {
       openZipArchiveFile(item);
       return;
@@ -1858,6 +1902,7 @@ const App = () => {
       return;
     }
     if (item.mimeType?.includes('folder')) {
+      lastFolderCardIdRef.current = 'fcard_0';
       const newPath = `${currentPath}${encodeURIComponent(item.name)}/`;
       setPathStack([...pathStack, newPath]);
       fetchDirectory(newPath, false, false);
@@ -1871,7 +1916,6 @@ const App = () => {
 
   // Instant Back from Series to Homepage: Home FlatList stays mounted at exact scroll position!
   const goBack = () => {
-    setLastFolderFocusName('');
     if (zipParentBackupRef.current) {
       const prev = zipParentBackupRef.current;
       zipParentBackupRef.current = null;
@@ -2032,6 +2076,10 @@ const App = () => {
     }
     if (meta.audioTracks) {
       setAudioTracks(meta.audioTracks);
+      if (!selectedAudio && meta.audioTracks.length > 0) {
+        const selectedIdx = meta.audioTracks.findIndex((t: any) => t.selected);
+        setSelectedAudio({ type: 'index', value: String(selectedIdx >= 0 ? selectedIdx : 0) });
+      }
     }
     if (meta.textTracks) setTextTracks(meta.textTracks);
     try {
@@ -2041,17 +2089,14 @@ const App = () => {
         if (savedTimeStr) savedTime = parseFloat(savedTimeStr);
       }
       if (savedTime > 3 && (loadedDur <= 0 || loadedDur - savedTime > 90)) {
-        const curPos = typeof meta?.currentTime === 'number' ? meta.currentTime : 0;
-        if (Math.abs(curPos - savedTime) > 4) {
-          videoRef.current?.seek(savedTime);
-        }
+        videoRef.current?.seek(savedTime);
         setCurrentTime(savedTime);
         currentTimeRef.current = savedTime;
       }
     } catch {} finally {
       setTimeout(() => {
         hasRestoredResumeRef.current = true;
-      }, 500);
+      }, 650);
     }
   };
 
@@ -2337,11 +2382,12 @@ const App = () => {
             {tracks.map((track, index) => {
               const indexStr = String(index);
               const isSelected = isAudio
-                ? (selectedAudio ? (selectedAudio.type === 'index' && String(selectedAudio.value) === indexStr) : index === 0)
+                ? selectedAudio?.type === 'index' && String(selectedAudio?.value) === indexStr
                 : selectedText?.type === 'index' && String(selectedText?.value) === indexStr;
               return (
                 <FocusableButton
                   key={index}
+                  hasTVPreferredFocus={isAudio && isSelected}
                   style={styles.menuItem}
                   onPress={() => {
                     if (isAudio) { setSelectedAudio({ type: 'index', value: indexStr }); setActiveMenu(null); }
@@ -2379,14 +2425,7 @@ const App = () => {
         <Video
           key={`${selectedFile.link || selectedFile.name}-${playerInstanceKey}-${activeHdrMode}`}
           ref={videoRef}
-          source={{
-            uri: getStreamUrl(selectedFile),
-            startPosition:
-              (savedTimesRef.current[selectedFile.name] || 0) > 3 &&
-              selectedFile.zipCompression !== 'DEFLATE'
-                ? Math.floor((savedTimesRef.current[selectedFile.name] || 0) * 1000)
-                : undefined,
-          }}
+          source={{ uri: getStreamUrl(selectedFile) }}
           style={styles.videoPlayer}
           resizeMode={resizeMode}
           paused={isPaused}
@@ -2395,12 +2434,12 @@ const App = () => {
           disableFocus={isExternalAudioSelected}
           rate={playbackRate}
           focusable={false}
-          progressUpdateInterval={900}
+          progressUpdateInterval={500}
           bufferConfig={{
-            minBufferMs: 4000,
-            maxBufferMs: 12000,
-            bufferForPlaybackMs: 800,
-            bufferForPlaybackAfterRebufferMs: 1800,
+            minBufferMs: 20000,
+            maxBufferMs: 50000,
+            bufferForPlaybackMs: 2500,
+            bufferForPlaybackAfterRebufferMs: 5000,
           }}
           onLoad={handleVideoLoad}
           onBuffer={(b: any) => setIsVideoBuffering(!!b?.isBuffering)}
@@ -2568,7 +2607,7 @@ const App = () => {
               <FocusableButton style={styles.netflixSeekCircleBtn} onPress={() => triggerStepSeek(false)}>
                 <Icon name="replay-10" size={40} color="white" />
               </FocusableButton>
-              <FocusableButton hasTVPreferredFocus={true} onPress={() => {
+              <FocusableButton focusId="player_play_btn" hasTVPreferredFocus={true} onPress={() => {
                 const nextPaused = !isPaused;
                 setIsPaused(nextPaused);
                 if (nextPaused && selectedFile?.name && currentTimeRef.current > 3) {
@@ -2774,7 +2813,7 @@ const App = () => {
           )}
 
           <View style={styles.detailActionButtons}>
-            <FocusableButton hasTVPreferredFocus={true} style={styles.primaryPlayButton} onPress={() => handlePlayInAppPress(selectedFile)}>
+            <FocusableButton focusId="detail_play_btn" hasTVPreferredFocus={true} style={styles.primaryPlayButton} onPress={() => handlePlayInAppPress(selectedFile)}>
               <Icon name="play-arrow" size={26} color="white" />
               <Text style={styles.primaryPlayButtonText}>
                 {savedSec > 3
@@ -3060,13 +3099,22 @@ const App = () => {
     const isFav = !!watchlist[item.name];
     const versionCount = item._versions?.length || 1;
 
-    const rememberedName = isInsideFolder ? lastFolderFocusName : lastHomeFocusName;
-    const isPreferredCard = rememberedName ? item.name === rememberedName : (index === 0 && !searchQuery);
     const cardFocusId = isInsideFolder ? `fcard_${index}` : `card_${index}`;
+    const recordCardFocus = () => {
+      if (isInsideFolder) lastFolderCardIdRef.current = cardFocusId;
+      else lastHomeCardIdRef.current = cardFocusId;
+    };
 
     if (viewMode === 'list') {
       return (
-        <FocusableButton focusId={cardFocusId} hasTVPreferredFocus={isPreferredCard} style={styles.listCard} onPress={() => handlePress(item)}>
+        <FocusableButton
+          focusId={cardFocusId}
+          style={styles.listCard}
+          onFocus={recordCardFocus}
+          onPress={() => {
+            recordCardFocus();
+            handlePress(item);
+          }}>
           <View style={styles.listPosterFallback}>
             <Icon name={isFolder ? 'folder' : 'movie'} size={26} color={isFolder ? '#F5C518' : '#E50914'} />
             {!!meta?.poster && (
@@ -3090,7 +3138,14 @@ const App = () => {
     }
 
     return (
-      <FocusableButton focusId={cardFocusId} hasTVPreferredFocus={isPreferredCard} style={styles.posterCard} onPress={() => handlePress(item)}>
+      <FocusableButton
+        focusId={cardFocusId}
+        style={styles.posterCard}
+        onFocus={recordCardFocus}
+        onPress={() => {
+          recordCardFocus();
+          handlePress(item);
+        }}>
         <View style={styles.posterImageContainer}>
           <View style={styles.posterFallback}>
             <Icon name={isFolder ? 'folder-special' : 'local-movies'} size={38} color={isFolder ? '#F5C518' : '#E50914'} />
@@ -3177,31 +3232,38 @@ const App = () => {
             const imgUri = cwMeta?.backdrop || cwMeta?.poster;
             return (
               <View key={cwItem.id || cwItem.name || idx} style={styles.cwCard}>
-                {/* 1. Top Cancel/Remove Bar (Down from Filter Chips lands here first!) */}
-                <FocusableButton
-                  focusId={`${prefix}cw_remove_${idx}`}
-                  style={{
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    backgroundColor: '#1B202C',
-                    paddingHorizontal: 10,
-                    paddingVertical: 5,
-                    borderBottomWidth: 1,
-                    borderBottomColor: '#262D3D',
-                    borderTopLeftRadius: 8,
-                    borderTopRightRadius: 8,
-                    borderWidth: 2,
-                    borderColor: 'transparent',
-                  }}
-                  onPress={() => removeContinueWatchingItem(cwItem)}>
-                  <Text style={{ color: '#9BA6B8', fontSize: 10, fontWeight: '800' }} numberOfLines={1}>
-                    Remove
-                  </Text>
-                  <Icon name="close" size={14} color="#FFFFFF" />
-                </FocusableButton>
-
-                {/* 2. Bottom Play Card (Down from Remove Bar lands here, and Down from here goes to 1st Movie!) */}
+                {IS_TV && (
+                  <FocusableButton
+                    focusId={`${prefix}cw_remove_${idx}`}
+                    style={{
+                      flexDirection: 'row',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      backgroundColor: '#1B202C',
+                      paddingHorizontal: 10,
+                      paddingVertical: 5,
+                      borderBottomWidth: 1,
+                      borderBottomColor: '#262D3D',
+                      borderTopLeftRadius: 8,
+                      borderTopRightRadius: 8,
+                      borderWidth: 2,
+                      borderColor: 'transparent',
+                    }}
+                    onPress={() => removeContinueWatchingItem(cwItem)}>
+                    <Text style={{ color: '#9BA6B8', fontSize: 10, fontWeight: '800' }} numberOfLines={1}>
+                      Remove
+                    </Text>
+                    <Icon name="close" size={14} color="#FFFFFF" />
+                  </FocusableButton>
+                )}
+                {!IS_TV && (
+                  <TouchableOpacity
+                    style={styles.cwRemoveBtn}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    onPress={() => removeContinueWatchingItem(cwItem)}>
+                    <Icon name="close" size={15} color="#FFFFFF" />
+                  </TouchableOpacity>
+                )}
                 <FocusableButton
                   focusId={`${prefix}cw_play_${idx}`}
                   style={{ borderWidth: 2, borderColor: 'transparent', borderBottomLeftRadius: 8, borderBottomRightRadius: 8 }}
@@ -3237,20 +3299,6 @@ const App = () => {
     );
   };
 
-  const currentActiveLayer = showHdrChoiceModal
-    ? 'hdrModal'
-    : showSeasonModal
-    ? 'seasonModal'
-    : playMode === 'internal'
-    ? (activeMenu ? 'playerMenu' : 'player')
-    : selectedFile
-    ? 'detail'
-    : activeTab === 'downloads'
-    ? 'downloads'
-    : isInsideFolder
-    ? 'folder'
-    : 'home';
-
   const isCatalogCovered = !!selectedFile || playMode === 'internal' || activeTab === 'downloads';
 
   return (
@@ -3259,8 +3307,10 @@ const App = () => {
     <View style={styles.container}>
       <StatusBar hidden={false} barStyle="light-content" />
 
-      {/* Hide catalog container via display:'none' (View.GONE) when Details/Player/Downloads is open so D-Pad has 0ms lag! */}
-      <View style={{ flex: 1, display: isCatalogCovered ? 'none' : 'flex' }}>
+      <View
+        style={{ flex: 1 }}
+        importantForAccessibility={isCatalogCovered ? 'no-hide-descendants' : 'auto'}
+        pointerEvents={isCatalogCovered ? 'none' : 'auto'}>
         <View style={styles.topHeaderBar}>
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
             <View style={styles.logoMark}><Text style={styles.logoMarkText}>▶</Text></View>
@@ -3292,27 +3342,42 @@ const App = () => {
         </View>
 
         <View style={styles.searchRow}>
-          {/* Left-aligned focus anchor directly above "All" chip so pressing Down from Search ALWAYS lands on "All"! */}
-          <FocusableButton
-            focusId="search_btn"
-            style={{ flexDirection: 'row', alignItems: 'center', borderRadius: 10, paddingVertical: 10, paddingHorizontal: 12, minWidth: 90, borderWidth: 2, borderColor: 'transparent' }}
-            onPress={() => searchInputRef.current?.focus?.()}>
-            <Icon name="search" size={20} color="#888" />
-            <Text style={{ color: searchQuery ? '#FFF' : '#777', fontSize: 15, marginLeft: 10 }} numberOfLines={1}>
-              {searchQuery || 'Search movies, series, 4K, Tamil...'}
-            </Text>
-          </FocusableButton>
-          <TextInput
-            ref={searchInputRef}
-            style={[styles.searchBarInput, { position: 'absolute', left: 36, right: 40, opacity: IS_TV ? 0 : 1 }]}
-            focusable={!IS_TV}
-            placeholder={IS_TV ? '' : 'Search movies, series, 4K, Tamil...'}
-            placeholderTextColor="#777"
-            value={searchQuery}
-            onChangeText={setSearchQuery}
-            autoCorrect={false}
-            returnKeyType="search"
-          />
+          {IS_TV ? (
+            <>
+              <FocusableButton
+                focusId="search_btn"
+                style={{ flexDirection: 'row', alignItems: 'center', borderRadius: 10, paddingVertical: 10, paddingHorizontal: 12, minWidth: 90, borderWidth: 2, borderColor: 'transparent' }}
+                onPress={() => searchInputRef.current?.focus?.()}>
+                <Icon name="search" size={20} color="#888" />
+                <Text style={{ color: searchQuery ? '#FFF' : '#777', fontSize: 15, marginLeft: 10 }} numberOfLines={1}>
+                  {searchQuery || 'Search movies, series, 4K, Tamil...'}
+                </Text>
+              </FocusableButton>
+              <TextInput
+                ref={searchInputRef}
+                style={[styles.searchBarInput, { position: 'absolute', left: 36, right: 40, opacity: 0 }]}
+                focusable={false}
+                value={searchQuery}
+                onChangeText={setSearchQuery}
+                autoCorrect={false}
+                returnKeyType="search"
+              />
+            </>
+          ) : (
+            <>
+              <Icon name="search" size={20} color="#888" style={{ marginLeft: 12 }} />
+              <TextInput
+                ref={searchInputRef}
+                style={styles.searchBarInput}
+                placeholder="Search movies, series, 4K, Tamil..."
+                placeholderTextColor="#777"
+                value={searchQuery}
+                onChangeText={setSearchQuery}
+                autoCorrect={false}
+                returnKeyType="search"
+              />
+            </>
+          )}
           {!!searchQuery && (
             <FocusableButton focusId="search_clear" onPress={() => setSearchQuery('')} style={{ padding: 8, borderRadius: 8, marginLeft: 'auto' }}>
               <Icon name="close" size={18} color="#AAA" />
@@ -3338,9 +3403,12 @@ const App = () => {
         </View>
 
         <View style={{ flex: 1, position: 'relative' }}>
-          {/* Home Catalog FlatList (Hidden via display:'none' when inside a Series folder so D-Pad only sees folder items!) */}
+          {/* Home Catalog FlatList stays permanently mounted so scroll position & card focus ref NEVER reset! */}
           <FocusLayerContext.Provider value="home">
-          <View style={{ flex: 1, display: isInsideFolder ? 'none' : 'flex' }}>
+          <View
+            style={{ flex: 1 }}
+            importantForAccessibility={isInsideFolder ? 'no-hide-descendants' : 'auto'}
+            pointerEvents={isInsideFolder ? 'none' : 'auto'}>
             {loading ? (
               <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 60 }} />
             ) : (
@@ -3351,9 +3419,9 @@ const App = () => {
                 numColumns={numColumns}
                 initialNumToRender={15}
                 maxToRenderPerBatch={10}
-                windowSize={5}
+                windowSize={7}
                 keyboardShouldPersistTaps="handled"
-                removeClippedSubviews={IS_TV}
+                removeClippedSubviews={false}
                 ListHeaderComponent={!isInsideFolder ? renderContinueWatchingHeader() : null}
                 refreshControl={
                   <RefreshControl refreshing={refreshing && !isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" />
@@ -3396,9 +3464,9 @@ const App = () => {
                   numColumns={numColumns}
                   initialNumToRender={15}
                   maxToRenderPerBatch={10}
-                  windowSize={5}
+                  windowSize={7}
                   keyboardShouldPersistTaps="handled"
-                  removeClippedSubviews={IS_TV}
+                  removeClippedSubviews={false}
                   ListHeaderComponent={renderContinueWatchingHeader()}
                   refreshControl={
                     <RefreshControl refreshing={refreshing && isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" />

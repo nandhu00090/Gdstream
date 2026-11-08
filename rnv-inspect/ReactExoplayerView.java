@@ -716,7 +716,7 @@ public class ReactExoplayerView extends FrameLayout implements
         ExoTrackSelection.Factory videoTrackSelectionFactory = new AdaptiveTrackSelection.Factory();
         self.trackSelector = new DefaultTrackSelector(getContext(), videoTrackSelectionFactory);
         self.trackSelector.setParameters(trackSelector.buildUponParameters()
-                .setMaxVideoBitrate(maxBitRate == 0 ? Integer.MAX_VALUE : maxBitRate));
+                .setExceedAudioConstraintsIfNecessary(true).setExceedRendererCapabilitiesIfNecessary(true).setExceedVideoConstraintsIfNecessary(true).setMaxVideoBitrate(maxBitRate == 0 ? Integer.MAX_VALUE : maxBitRate));
 
         DefaultAllocator allocator = new DefaultAllocator(true, C.DEFAULT_BUFFER_SEGMENT_SIZE);
         RNVLoadControl loadControl = new RNVLoadControl(
@@ -730,8 +730,20 @@ public class ReactExoplayerView extends FrameLayout implements
             this.bandwidthMeter = config.getBandwidthMeter();
         }
 
-                DefaultRenderersFactory renderersFactory =
-                new DefaultRenderersFactory(getContext())
+                        DefaultRenderersFactory renderersFactory =
+                new DefaultRenderersFactory(getContext()) {
+                    @Override
+                    protected androidx.media3.exoplayer.audio.AudioSink buildAudioSink(
+                            Context context,
+                            boolean enableFloatOutput,
+                            boolean enableAudioTrackPlaybackParams) {
+                        return new androidx.media3.exoplayer.audio.DefaultAudioSink.Builder(context)
+                                .setAudioCapabilities(androidx.media3.exoplayer.audio.AudioCapabilities.DEFAULT_AUDIO_CAPABILITIES)
+                                .setEnableFloatOutput(false)
+                                .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                                .build();
+                    }
+                }
                         .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
                         .setEnableDecoderFallback(true)
                         .setMediaCodecSelector((mimeType, requiresSecureDecoder, requiresTunnelingDecoder) -> {
