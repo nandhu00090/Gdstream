@@ -14,6 +14,9 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Rational
 import android.view.Display
+import android.view.View
+import android.view.ViewGroup
+import com.facebook.react.uimanager.util.ReactFindViewUtil
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -375,4 +378,71 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
             applyLoudnessBoostInternal()
         } catch (_: Exception) {}
     }
+
+    private fun findViewByTagId(root: View?, targetId: String): View? {
+        if (root == null) return null
+        try {
+            val found = ReactFindViewUtil.findView(root, targetId)
+            if (found != null) return found
+        } catch (_: Exception) {}
+        return findViewByTagRecursive(root, targetId)
+    }
+
+    private fun findViewByTagRecursive(view: View?, targetId: String): View? {
+        if (view == null) return null
+        try {
+            val resId = reactApplicationContext.resources.getIdentifier("view_tag_native_id", "id", reactApplicationContext.packageName)
+            if (resId != 0) {
+                val tagVal = view.getTag(resId)
+                if (tagVal is String && tagVal == targetId) return view
+            }
+        } catch (_: Exception) {}
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                val childFound = findViewByTagRecursive(view.getChildAt(i), targetId)
+                if (childFound != null) return childFound
+            }
+        }
+        return null
+    }
+
+    @ReactMethod
+    fun focusByNativeId(nativeId: String) {
+        if (nativeId.isEmpty()) return
+        UiThreadUtil.runOnUiThread {
+            try {
+                val activity = reactApplicationContext.currentActivity ?: return@runOnUiThread
+                val decor = activity.window?.decorView ?: return@runOnUiThread
+                val target = findViewByTagId(decor, nativeId)
+                if (target != null) {
+                    target.isFocusable = true
+                    target.isFocusableInTouchMode = false
+                    target.requestFocus()
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    @ReactMethod
+    fun ensureValidFocus(fallbackNativeId: String) {
+        if (fallbackNativeId.isEmpty()) return
+        UiThreadUtil.runOnUiThread {
+            try {
+                val activity = reactApplicationContext.currentActivity ?: return@runOnUiThread
+                val decor = activity.window?.decorView ?: return@runOnUiThread
+                val current = activity.currentFocus
+                val resId = reactApplicationContext.resources.getIdentifier("view_tag_native_id", "id", reactApplicationContext.packageName)
+                val currentTag = if (current != null && resId != 0) current.getTag(resId) as? String else null
+                if (current == null || currentTag.isNullOrEmpty()) {
+                    val target = findViewByTagId(decor, fallbackNativeId)
+                    if (target != null) {
+                        target.isFocusable = true
+                        target.isFocusableInTouchMode = false
+                        target.requestFocus()
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
 }

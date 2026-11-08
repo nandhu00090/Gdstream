@@ -239,6 +239,7 @@ const extractSeasonNumberFromFolder = (name: string): number | null => {
 
 const ActiveLayerContext = createContext<string>('home');
 const FocusLayerContext = createContext<string>('home');
+const HeaderFocusableContext = createContext<boolean>(true);
 
 const tvFocusRegistry: Record<string, any> = {};
 let currentFocusedId = '';
@@ -247,14 +248,22 @@ let lastFocusChangeTime = 0;
 let onGlobalTvActivity: (() => void) | null = null;
 
 const focusById = (id: string): boolean => {
+  if (!id) return false;
+  let triggered = false;
+  if (IS_TV && VideoPlayerManager?.focusByNativeId) {
+    try {
+      VideoPlayerManager.focusByNativeId(id);
+      triggered = true;
+    } catch (_e) {}
+  }
   const target = tvFocusRegistry[id];
   if (target && typeof target.focus === 'function') {
     try {
       target.focus();
-      return true;
+      triggered = true;
     } catch (_e) {}
   }
-  return false;
+  return triggered;
 };
 
 const FocusableButton = ({
@@ -268,13 +277,15 @@ const FocusableButton = ({
   activeOpacity = 0.8,
   disabled = false,
   focusId,
+  isHeaderControl = false,
   ...rest
 }: any) => {
   const [isFocused, setIsFocused] = useState(false);
   const btnRef = useRef<any>(null);
   const activeLayer = useContext(ActiveLayerContext);
   const myLayer = useContext(FocusLayerContext);
-  const isLayerActive = !disabled && (myLayer === activeLayer);
+  const headerAllowed = useContext(HeaderFocusableContext);
+  const isLayerActive = !disabled && (myLayer === activeLayer) && (!isHeaderControl || headerAllowed);
 
   useEffect(() => {
     if (focusId && isLayerActive && btnRef.current) {
@@ -296,17 +307,21 @@ const FocusableButton = ({
   useEffect(() => {
     if (isLayerActive && hasTVPreferredFocus) {
       const t = setTimeout(() => {
-        try { btnRef.current?.focus?.(); } catch (_e) {}
-      }, 40);
+        if (focusId) focusById(focusId);
+        else {
+          try { btnRef.current?.focus?.(); } catch (_e) {}
+        }
+      }, 30);
       return () => clearTimeout(t);
     }
-  }, [isLayerActive, hasTVPreferredFocus]);
+  }, [isLayerActive, hasTVPreferredFocus, focusId]);
 
   const showFocus = isFocused && isLayerActive;
 
   return (
     <Pressable
       ref={btnRef}
+      nativeID={focusId || undefined}
       disabled={disabled || !isLayerActive}
       focusable={isLayerActive}
       accessible={isLayerActive}
@@ -414,6 +429,8 @@ const App = () => {
   const lastHomeCardIdRef = useRef<string>('card_0');
   const lastFolderCardIdRef = useRef<string>('fcard_0');
   const lastPlayerActivityRef = useRef<number>(Date.now());
+  const [headerFocusUnlocked, setHeaderFocusUnlocked] = useState(!IS_TV);
+  const [isTvSearchModalOpen, setIsTvSearchModalOpen] = useState(false);
   const [activeCategory, setActiveCategory] = useState('all');
   const [sortBy, setSortBy] = useState<'newest' | 'az'>('newest');
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
@@ -1549,7 +1566,9 @@ const App = () => {
   }, [fadeAnim, seekBothPlayers]);
 
 
-  const currentActiveLayer = showHdrChoiceModal
+  const currentActiveLayer = isTvSearchModalOpen
+    ? 'searchModal'
+    : showHdrChoiceModal
     ? 'hdrModal'
     : showSeasonModal
     ? 'seasonModal'
@@ -1563,37 +1582,63 @@ const App = () => {
     ? 'folder'
     : 'home';
 
-  // Restore exact D-Pad focus when entering or returning to Home, Series Folder, or Details Page!
+  // Lock header buttons briefly when entering/returning to Home or Folder so Android OS NEVER jumps to "Newest" first!
   useEffect(() => {
-    if (currentActiveLayer === 'home' && !loading && homeDisplayedFiles.length > 0) {
-      const targetId = lastHomeCardIdRef.current || 'card_0';
-      const restore = () => {
-        if (!focusById(targetId)) focusById('card_0');
-      };
-      const t1 = setTimeout(restore, 30);
-      const t2 = setTimeout(restore, 130);
-      const t3 = setTimeout(restore, 280);
-      return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
+    if (!IS_TV) return;
+    if (currentActiveLayer === 'home') {
+      if (loading || homeDisplayedFiles.length === 0) {
+        setHeaderFocusUnlocked(false);
+        return;
+      }
+      setHeaderFocusUnlocked(false);
+      const rawTarget = lastHomeCardIdRef.current || 'card_0';
+      const targetIdx = parseInt(rawTarget.replace('card_', ''), 10);
+      const validId = (!isNaN(targetIdx) && targetIdx < homeDisplayedFiles.length) ? rawTarget : 'card_0';
+
+      const t1 = setTimeout(() => focusById(validId), 20);
+      const t2 = setTimeout(() => focusById(validId), 95);
+      const t3 = setTimeout(() => {
+        focusById(validId);
+        setHeaderFocusUnlocked(true);
+      }, 210);
+      const t4 = setTimeout(() => focusById(validId), 320);
+      return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); clearTimeout(t4); };
     }
-    if (currentActiveLayer === 'folder' && !folderLoading && folderDisplayedFiles.length > 0) {
-      const targetId = lastFolderCardIdRef.current || 'fcard_0';
-      const restore = () => {
-        if (!focusById(targetId)) focusById('fcard_0');
-      };
-      const t1 = setTimeout(restore, 30);
-      const t2 = setTimeout(restore, 130);
-      const t3 = setTimeout(restore, 280);
-      return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
+
+    if (currentActiveLayer === 'folder') {
+      if (folderLoading) {
+        setHeaderFocusUnlocked(false);
+        return;
+      }
+      if (folderDisplayedFiles.length === 0) {
+        setHeaderFocusUnlocked(true);
+        const tEmpty = setTimeout(() => focusById('f_back'), 50);
+        return () => clearTimeout(tEmpty);
+      }
+      setHeaderFocusUnlocked(false);
+      const rawTarget = lastFolderCardIdRef.current || 'fcard_0';
+      const targetIdx = parseInt(rawTarget.replace('fcard_', ''), 10);
+      const validId = (!isNaN(targetIdx) && targetIdx < folderDisplayedFiles.length) ? rawTarget : 'fcard_0';
+
+      const t1 = setTimeout(() => focusById(validId), 20);
+      const t2 = setTimeout(() => focusById(validId), 95);
+      const t3 = setTimeout(() => {
+        focusById(validId);
+        setHeaderFocusUnlocked(true);
+      }, 210);
+      const t4 = setTimeout(() => focusById(validId), 320);
+      return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); clearTimeout(t4); };
     }
+
     if (currentActiveLayer === 'detail' && selectedFile) {
-      const t1 = setTimeout(() => focusById('detail_play_btn'), 30);
-      const t2 = setTimeout(() => focusById('detail_play_btn'), 140);
-      return () => { clearTimeout(t1); clearTimeout(t2); };
+      const t1 = setTimeout(() => focusById('detail_play_btn'), 25);
+      const t2 = setTimeout(() => focusById('detail_play_btn'), 120);
+      const t3 = setTimeout(() => focusById('detail_play_btn'), 250);
+      return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
     }
   }, [currentActiveLayer, loading, folderLoading, homeDisplayedFiles.length, folderDisplayedFiles.length, selectedFile]);
 
-  // Smart 7-Second Auto-Hide for Player Controls:
-  // Resets on EVERY D-Pad focus/click/key, and NEVER hides while Audio/Subtitle/Episodes menu is open, or while buffering/paused!
+  // Smart 7-Second Auto-Hide for Player Controls (Never hides while Audio/Subtitle/Episodes menu is open!)
   useEffect(() => {
     if (playMode !== 'internal') {
       onGlobalTvActivity = null;
@@ -1618,54 +1663,215 @@ const App = () => {
     };
   }, [playMode, showControls, isPaused, isVideoBuffering, activeMenu, isLocked]);
 
-  // When Controls become visible in Player, auto-focus Play/Pause button so D-Pad works immediately!
   useEffect(() => {
     if (playMode === 'internal' && showControls && !activeMenu && !isLocked) {
       lastPlayerActivityRef.current = Date.now();
-      const t = setTimeout(() => focusById('player_play_btn'), 50);
+      const t = setTimeout(() => focusById('player_play_btn'), 45);
       return () => clearTimeout(t);
     }
   }, [playMode, showControls, activeMenu, isLocked]);
 
-  // Deterministic D-Pad Navigation Router for Search -> All -> CW Remove (X) -> CW Play -> 1st Movie!
+  // Complete Deterministic D-Pad Router + Top/Bottom End-Stops + Anti-Disappear Watchdog!
   useEffect(() => {
-    if (currentActiveLayer !== 'home' && currentActiveLayer !== 'folder') return;
+    if (!IS_TV) return;
     const sub = DeviceEventEmitter.addListener('onTVRemoteKey', event => {
-      lastPlayerActivityRef.current = Date.now();
       const keyCode = event?.keyCode;
-      if (keyCode !== 20 && keyCode !== 19) return;
-      const justChanged = (Date.now() - lastFocusChangeTime) < 65;
-      const sourceId = justChanged ? previousFocusedId : currentFocusedId;
-      const prefix = isInsideFolder ? 'f' : '';
-      const hasCW = !searchQuery && activeCategory === 'all' && continueWatchingItems.length > 0;
+      // D-Pad Up=19, Down=20, Left=21, Right=22
+      if (keyCode !== 19 && keyCode !== 20 && keyCode !== 21 && keyCode !== 22) return;
 
-      if (keyCode === 20) {
-        if (sourceId === 'search_btn' || sourceId === 'search_clear') {
-          setTimeout(() => focusById('chip_all'), 5);
-        } else if (sourceId && sourceId.startsWith('chip_')) {
-          setTimeout(() => {
-            if (hasCW) focusById(`${prefix}cw_remove_0`);
-            else focusById(`${prefix}card_0`);
-          }, 5);
-        } else if (sourceId && sourceId.startsWith(`${prefix}cw_remove_`)) {
-          const idx = sourceId.replace(`${prefix}cw_remove_`, '');
-          setTimeout(() => focusById(`${prefix}cw_play_${idx}`), 5);
-        } else if (sourceId && sourceId.startsWith(`${prefix}cw_play_`)) {
-          setTimeout(() => focusById(`${prefix}card_0`), 5);
-        }
-      } else if (keyCode === 19) {
-        if (sourceId && sourceId.startsWith(`${prefix}cw_play_`)) {
-          const idx = sourceId.replace(`${prefix}cw_play_`, '');
-          setTimeout(() => focusById(`${prefix}cw_remove_${idx}`), 5);
-        } else if (sourceId && sourceId.startsWith(`${prefix}cw_remove_`)) {
-          setTimeout(() => focusById('chip_all'), 5);
-        } else if (sourceId && sourceId.startsWith('chip_')) {
-          setTimeout(() => focusById('search_btn'), 5);
+      const justChanged = (Date.now() - lastFocusChangeTime) < 85;
+      const sourceId = justChanged ? previousFocusedId : currentFocusedId;
+
+      // 1. HOME & SERIES FOLDER NAVIGATION + CEILING/FLOOR END-STOPS
+      if (currentActiveLayer === 'home' || currentActiveLayer === 'folder') {
+        const isFolder = currentActiveLayer === 'folder';
+        const prefix = isFolder ? 'f' : '';
+        const cols = viewMode === 'grid' ? 5 : 1;
+        const listLen = isFolder ? folderDisplayedFiles.length : homeDisplayedFiles.length;
+        const hasCW = !searchQuery && activeCategory === 'all' && continueWatchingItems.length > 0;
+        const hasSeasons = isFolder && seasonFolders.length > 0 && !!activeSeason;
+
+        if (keyCode === 19) {
+          // UP ARROW:
+          if (sourceId && sourceId.startsWith(`${prefix}card_`)) {
+            const idx = parseInt(sourceId.replace(`${prefix}card_`, ''), 10);
+            if (!isNaN(idx)) {
+              if (idx < cols) {
+                // First Row of Movies/Episodes -> Go UP to CW Play, or Series Back/Season, or Active Filter Chip!
+                setTimeout(() => {
+                  if (hasCW) {
+                    const cwIdx = Math.min(idx, continueWatchingItems.length - 1);
+                    focusById(`${prefix}cw_play_${cwIdx}`);
+                  } else if (isFolder) {
+                    if (hasSeasons && idx >= 3) focusById('f_season');
+                    else focusById('f_back');
+                  } else {
+                    focusById(`chip_${activeCategory}`);
+                  }
+                }, 5);
+              } else {
+                // Row 2+ of Movies/Episodes -> Go UP to exact column in previous row!
+                const targetIdx = Math.max(0, idx - cols);
+                setTimeout(() => focusById(`${prefix}card_${targetIdx}`), 5);
+              }
+            }
+          } else if (sourceId && sourceId.startsWith(`${prefix}cw_play_`)) {
+            const cwIdx = sourceId.replace(`${prefix}cw_play_`, '');
+            setTimeout(() => focusById(`${prefix}cw_remove_${cwIdx}`), 5);
+          } else if (sourceId && sourceId.startsWith(`${prefix}cw_remove_`)) {
+            setTimeout(() => {
+              if (isFolder) focusById('f_back');
+              else focusById(`chip_${activeCategory}`);
+            }, 5);
+          } else if (isFolder && (sourceId === 'f_back' || sourceId === 'f_season')) {
+            // TOP CEILING OF SERIES FOLDER: Stay right on f_back / f_season!
+            setTimeout(() => focusById(sourceId), 5);
+          } else if (!isFolder && sourceId && sourceId.startsWith('chip_')) {
+            setTimeout(() => focusById('search_btn'), 5);
+          } else if (!isFolder && (sourceId === 'search_btn' || sourceId === 'search_clear')) {
+            setTimeout(() => focusById('hdr_sort'), 5);
+          } else if (!isFolder && sourceId && sourceId.startsWith('hdr_')) {
+            // TOP CEILING OF HOMEPAGE: Stay right on the top header button!
+            setTimeout(() => focusById(sourceId), 5);
+          }
+        } else if (keyCode === 20) {
+          // DOWN ARROW:
+          if (!isFolder && sourceId && sourceId.startsWith('hdr_')) {
+            setTimeout(() => focusById('search_btn'), 5);
+          } else if (!isFolder && (sourceId === 'search_btn' || sourceId === 'search_clear')) {
+            setTimeout(() => focusById('chip_all'), 5);
+          } else if (!isFolder && sourceId && sourceId.startsWith('chip_')) {
+            setTimeout(() => {
+              if (hasCW) focusById('cw_remove_0');
+              else if (listLen > 0) focusById('card_0');
+            }, 5);
+          } else if (isFolder && (sourceId === 'f_back' || sourceId === 'f_season')) {
+            setTimeout(() => {
+              if (hasCW) focusById('fcw_remove_0');
+              else if (listLen > 0) focusById('fcard_0');
+            }, 5);
+          } else if (sourceId && sourceId.startsWith(`${prefix}cw_remove_`)) {
+            const cwIdx = sourceId.replace(`${prefix}cw_remove_`, '');
+            setTimeout(() => focusById(`${prefix}cw_play_${cwIdx}`), 5);
+          } else if (sourceId && sourceId.startsWith(`${prefix}cw_play_`)) {
+            setTimeout(() => {
+              if (listLen > 0) focusById(`${prefix}card_0`);
+            }, 5);
+          } else if (sourceId && sourceId.startsWith(`${prefix}card_`)) {
+            const idx = parseInt(sourceId.replace(`${prefix}card_`, ''), 10);
+            if (!isNaN(idx)) {
+              const nextIdx = idx + cols;
+              if (nextIdx < listLen) {
+                setTimeout(() => focusById(`${prefix}card_${nextIdx}`), 5);
+              } else {
+                // Bottom-most row: if partial last row exists below, go to last item; else FLOOR STOP!
+                const currentRow = Math.floor(idx / cols);
+                const lastRow = Math.floor((listLen - 1) / cols);
+                if (currentRow < lastRow) {
+                  setTimeout(() => focusById(`${prefix}card_${listLen - 1}`), 5);
+                } else {
+                  setTimeout(() => focusById(sourceId), 5);
+                }
+              }
+            }
+          }
+        } else if (keyCode === 21) {
+          // LEFT ARROW:
+          if (isFolder && sourceId === 'f_season') {
+            setTimeout(() => focusById('f_back'), 5);
+          } else if (isFolder && sourceId === 'f_back') {
+            setTimeout(() => focusById('f_back'), 5);
+          } else if (!isFolder && sourceId === 'hdr_sort') {
+            setTimeout(() => focusById('hdr_sort'), 5);
+          } else if (!isFolder && sourceId === 'chip_all') {
+            setTimeout(() => focusById('chip_all'), 5);
+          } else if (sourceId && sourceId.startsWith(`${prefix}card_`)) {
+            const idx = parseInt(sourceId.replace(`${prefix}card_`, ''), 10);
+            if (!isNaN(idx) && idx > 0) {
+              setTimeout(() => focusById(`${prefix}card_${idx - 1}`), 5);
+            } else {
+              setTimeout(() => focusById(sourceId), 5);
+            }
+          }
+        } else if (keyCode === 22) {
+          // RIGHT ARROW:
+          if (isFolder && sourceId === 'f_back') {
+            setTimeout(() => focusById(hasSeasons ? 'f_season' : 'f_back'), 5);
+          } else if (isFolder && sourceId === 'f_season') {
+            setTimeout(() => focusById('f_season'), 5);
+          } else if (!isFolder && sourceId === 'hdr_view') {
+            setTimeout(() => focusById('hdr_view'), 5);
+          } else if (!isFolder && sourceId === 'chip_watchlist') {
+            setTimeout(() => focusById('chip_watchlist'), 5);
+          } else if (sourceId && sourceId.startsWith(`${prefix}card_`)) {
+            const idx = parseInt(sourceId.replace(`${prefix}card_`, ''), 10);
+            if (!isNaN(idx) && idx + 1 < listLen) {
+              setTimeout(() => focusById(`${prefix}card_${idx + 1}`), 5);
+            } else {
+              setTimeout(() => focusById(sourceId), 5);
+            }
+          }
         }
       }
+
+      // 2. DETAILS PAGE CEILING & FLOOR END-STOPS
+      if (currentActiveLayer === 'detail') {
+        if (keyCode === 19) {
+          // UP ARROW on Detail Page:
+          if (sourceId === 'detail_back_btn' || sourceId === 'detail_fav_top_btn') {
+            // TOP CEILING OF DETAILS PAGE: Stay on Back / Fav button!
+            setTimeout(() => focusById(sourceId), 5);
+          } else if (sourceId === 'detail_play_btn') {
+            setTimeout(() => {
+              if (versionGroup.length > 1) focusById(`detail_ver_${versionGroup.length - 1}`);
+              else focusById('detail_back_btn');
+            }, 5);
+          } else if (sourceId === 'detail_ver_0') {
+            setTimeout(() => focusById('detail_back_btn'), 5);
+          }
+        } else if (keyCode === 20) {
+          // DOWN ARROW on Detail Page:
+          if (sourceId === 'detail_back_btn' || sourceId === 'detail_fav_top_btn') {
+            setTimeout(() => {
+              if (versionGroup.length > 1) focusById('detail_ver_0');
+              else focusById('detail_play_btn');
+            }, 5);
+          } else if (sourceId === 'detail_source_btn') {
+            // BOTTOM FLOOR OF DETAILS PAGE: Stay on Source File card!
+            setTimeout(() => focusById('detail_source_btn'), 5);
+          }
+        } else if (keyCode === 21 && sourceId === 'detail_fav_top_btn') {
+          setTimeout(() => focusById('detail_back_btn'), 5);
+        } else if (keyCode === 22 && sourceId === 'detail_back_btn') {
+          setTimeout(() => focusById('detail_fav_top_btn'), 5);
+        }
+      }
+
+      // 3. ANTI-DISAPPEAR WATCHDOG: Ensure focus never falls onto a ScrollView or null!
+      setTimeout(() => {
+        const fallback = currentFocusedId || (
+          currentActiveLayer === 'detail' ? 'detail_play_btn' :
+          currentActiveLayer === 'folder' ? (lastFolderCardIdRef.current || 'fcard_0') :
+          currentActiveLayer === 'home' ? (lastHomeCardIdRef.current || 'card_0') : ''
+        );
+        if (fallback && VideoPlayerManager?.ensureValidFocus) {
+          VideoPlayerManager.ensureValidFocus(fallback);
+        }
+      }, 65);
     });
     return () => sub.remove();
-  }, [currentActiveLayer, isInsideFolder, searchQuery, activeCategory, continueWatchingItems.length]);
+  }, [
+    currentActiveLayer,
+    viewMode,
+    folderDisplayedFiles.length,
+    homeDisplayedFiles.length,
+    searchQuery,
+    activeCategory,
+    continueWatchingItems.length,
+    seasonFolders.length,
+    activeSeason,
+    versionGroup.length,
+  ]);
 
   useEffect(() => {
     if (playMode !== 'internal') return;
@@ -2732,10 +2938,10 @@ const App = () => {
             </View>
           )}
           <View style={styles.detailHeroShade} />
-          <FocusableButton style={styles.detailBackTopBtn} onPress={() => { setSelectedFile(null); setVersionGroup([]); }}>
+          <FocusableButton focusId="detail_back_btn" style={styles.detailBackTopBtn} onPress={() => { setSelectedFile(null); setVersionGroup([]); }}>
             <Icon name="arrow-back" size={24} color="white" />
           </FocusableButton>
-          <FocusableButton style={styles.detailFavTopBtn} onPress={() => toggleWatchlist(selectedFile.name)}>
+          <FocusableButton focusId="detail_fav_top_btn" style={styles.detailFavTopBtn} onPress={() => toggleWatchlist(selectedFile.name)}>
             <Icon name={isFav ? 'favorite' : 'favorite-border'} size={22} color={isFav ? '#E50914' : 'white'} />
           </FocusableButton>
         </View>
@@ -2790,6 +2996,7 @@ const App = () => {
                   return (
                     <FocusableButton
                       key={vFile.name || vIdx}
+                      focusId={`detail_ver_${vIdx}`}
                       style={[styles.versionPillBtn, isCurrentVer && styles.versionPillBtnActive]}
                       onPress={() => openFile(vFile)}>
                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
@@ -2825,11 +3032,12 @@ const App = () => {
             </FocusableButton>
 
             <View style={{ flexDirection: 'row', gap: 10 }}>
-              <FocusableButton style={[styles.secondaryPlayButton, { flex: 1 }]} onPress={() => openInExternalPlayer(selectedFile)}>
+              <FocusableButton focusId="detail_ext_btn" style={[styles.secondaryPlayButton, { flex: 1 }]} onPress={() => openInExternalPlayer(selectedFile)}>
                 <Icon name="open-in-new" size={20} color="white" />
                 <Text style={styles.secondaryPlayButtonText}>External Player</Text>
               </FocusableButton>
               <FocusableButton
+                focusId="detail_fav_btn"
                 style={[styles.secondaryPlayButton, { paddingHorizontal: 16 }, isFav && { borderColor: '#E50914' }]}
                 onPress={() => toggleWatchlist(selectedFile.name)}>
                 <Icon name={isFav ? 'favorite' : 'favorite-border'} size={20} color={isFav ? '#E50914' : 'white'} />
@@ -2838,19 +3046,19 @@ const App = () => {
             </View>
 
             {!dlTask ? (
-              <FocusableButton style={styles.downloadActionBtn} onPress={() => handleStartDownload(selectedFile)}>
+              <FocusableButton focusId="detail_dl_btn" style={styles.downloadActionBtn} onPress={() => handleStartDownload(selectedFile)}>
                 <Icon name="file-download" size={22} color="#46d369" />
                 <Text style={styles.downloadActionText}>
                   {versionGroup.length > 1 ? `Download (${getVersionTag(selectedFile.name)})` : 'Download'}
                 </Text>
               </FocusableButton>
             ) : dlTask.status === 'completed' ? (
-              <FocusableButton style={styles.downloadedReadyCard} onPress={handleOpenDownloadFolder}>
+              <FocusableButton focusId="detail_dl_btn" style={styles.downloadedReadyCard} onPress={handleOpenDownloadFolder}>
                 <Icon name="check-circle" size={20} color="#46d369" />
                 <Text style={styles.downloadedReadyText}>Saved in Download/GDStream • Tap to Open Folder</Text>
               </FocusableButton>
             ) : (
-              <FocusableButton style={styles.downloadProgressCard} onPress={() => { setSelectedFile(null); setVersionGroup([]); setActiveTab('downloads'); }}>
+              <FocusableButton focusId="detail_dl_btn" style={styles.downloadProgressCard} onPress={() => { setSelectedFile(null); setVersionGroup([]); setActiveTab('downloads'); }}>
                 <View style={styles.dlCardHeaderRow}>
                   <Text style={styles.dlCardStatusText}>
                     {dlTask.status === 'downloading' ? `Downloading • ${formatBytes(dlTask.speedBytesPerSec)}/s` : `Download ${dlTask.status.toUpperCase()}`}
@@ -2871,6 +3079,7 @@ const App = () => {
           <View style={styles.mediaInfoCard}>
             
                             <FocusableButton
+                focusId="detail_trailer_btn"
                 disabled={trailerState.loading || !trailerState.available}
                 onPress={() => {
                   if (trailerState.available && trailerState.cacheKey && SecurityVault?.playYoutubeTrailer) {
@@ -2973,7 +3182,7 @@ const App = () => {
               <Text style={styles.rawFileName}>{vItem.name}</Text>
             ) : null}
 
-            <FocusableButton style={styles.sourceFileDivider} onPress={() => {}}>
+            <FocusableButton focusId="detail_source_btn" style={styles.sourceFileDivider} onPress={() => {}}>
               <Text style={styles.rawFileLabel}>SOURCE FILE</Text>
               <Text style={styles.rawFileName}>{vItem.name}</Text>
             </FocusableButton>
@@ -3222,7 +3431,7 @@ const App = () => {
     return (
       <View style={styles.cwSection}>
         <Text style={styles.cwSectionTitle}>Continue Watching ⏯️</Text>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 10, paddingHorizontal: 6 }}>
+        <ScrollView focusable={false} horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 10, paddingHorizontal: 6 }}>
           {continueWatchingItems.map((cwItem, idx) => {
             const cwInfo = parseMediaFilename(cwItem.name, false);
             const cwMeta = metadataMap[cwItem.name];
@@ -3303,7 +3512,8 @@ const App = () => {
 
   return (
     <ActiveLayerContext.Provider value={currentActiveLayer}>
-    <FocusLayerContext.Provider value={isInsideFolder ? 'folder' : 'home'}>
+    <HeaderFocusableContext.Provider value={headerFocusUnlocked}>
+    <FocusLayerContext.Provider value="home">
     <View style={styles.container}>
       <StatusBar hidden={false} barStyle="light-content" />
 
@@ -3319,23 +3529,23 @@ const App = () => {
 
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
             <FocusableButton
-              focusId="hdr_sort"
+              focusId="hdr_sort" isHeaderControl={true}
               style={styles.sortToggleBtn}
               onPress={() => setSortBy(prev => (prev === 'newest' ? 'az' : 'newest'))}>
               <Icon name="sort" size={16} color="#E50914" />
               <Text style={styles.sortToggleText}>{sortBy === 'newest' ? 'Newest' : 'A - Z'}</Text>
             </FocusableButton>
 
-            <FocusableButton focusId="hdr_dl" style={styles.headerIconBtn} onPress={() => setActiveTab('downloads')}>
+            <FocusableButton focusId="hdr_dl" isHeaderControl={true} style={styles.headerIconBtn} onPress={() => setActiveTab('downloads')}>
               <Icon name="file-download" size={22} color={activeDownloadsCount > 0 ? '#46d369' : 'white'} />
               {downloads.length > 0 && (
                 <View style={styles.dlBadgeDot}><Text style={styles.dlBadgeDotText}>{downloads.length}</Text></View>
               )}
             </FocusableButton>
-            <FocusableButton focusId="hdr_refresh" style={styles.headerIconBtn} onPress={handleRefresh}>
+            <FocusableButton focusId="hdr_refresh" isHeaderControl={true} style={styles.headerIconBtn} onPress={handleRefresh}>
               <Icon name="refresh" size={21} color="white" />
             </FocusableButton>
-            <FocusableButton focusId="hdr_view" style={styles.headerIconBtn} onPress={() => setViewMode(prev => (prev === 'grid' ? 'list' : 'grid'))}>
+            <FocusableButton focusId="hdr_view" isHeaderControl={true} style={styles.headerIconBtn} onPress={() => setViewMode(prev => (prev === 'grid' ? 'list' : 'grid'))}>
               <Icon name={viewMode === 'grid' ? 'view-list' : 'grid-view'} size={22} color="white" />
             </FocusableButton>
           </View>
@@ -3343,26 +3553,16 @@ const App = () => {
 
         <View style={styles.searchRow}>
           {IS_TV ? (
-            <>
-              <FocusableButton
-                focusId="search_btn"
-                style={{ flexDirection: 'row', alignItems: 'center', borderRadius: 10, paddingVertical: 10, paddingHorizontal: 12, minWidth: 90, borderWidth: 2, borderColor: 'transparent' }}
-                onPress={() => searchInputRef.current?.focus?.()}>
-                <Icon name="search" size={20} color="#888" />
-                <Text style={{ color: searchQuery ? '#FFF' : '#777', fontSize: 15, marginLeft: 10 }} numberOfLines={1}>
-                  {searchQuery || 'Search movies, series, 4K, Tamil...'}
-                </Text>
-              </FocusableButton>
-              <TextInput
-                ref={searchInputRef}
-                style={[styles.searchBarInput, { position: 'absolute', left: 36, right: 40, opacity: 0 }]}
-                focusable={false}
-                value={searchQuery}
-                onChangeText={setSearchQuery}
-                autoCorrect={false}
-                returnKeyType="search"
-              />
-            </>
+            <FocusableButton
+              focusId="search_btn"
+              isHeaderControl={true}
+              style={{ flex: 1, flexDirection: 'row', alignItems: 'center', borderRadius: 10, paddingVertical: 10, paddingHorizontal: 12, borderWidth: 2, borderColor: 'transparent' }}
+              onPress={() => setIsTvSearchModalOpen(true)}>
+              <Icon name="search" size={20} color="#888" />
+              <Text style={{ color: searchQuery ? '#FFF' : '#777', fontSize: 15, marginLeft: 10 }} numberOfLines={1}>
+                {searchQuery || 'Search movies, series, 4K, Tamil...'}
+              </Text>
+            </FocusableButton>
           ) : (
             <>
               <Icon name="search" size={20} color="#888" style={{ marginLeft: 12 }} />
@@ -3379,20 +3579,20 @@ const App = () => {
             </>
           )}
           {!!searchQuery && (
-            <FocusableButton focusId="search_clear" onPress={() => setSearchQuery('')} style={{ padding: 8, borderRadius: 8, marginLeft: 'auto' }}>
+            <FocusableButton focusId="search_clear" isHeaderControl={true} onPress={() => setSearchQuery('')} style={{ padding: 8, borderRadius: 8, marginLeft: 'auto' }}>
               <Icon name="close" size={18} color="#AAA" />
             </FocusableButton>
           )}
         </View>
 
         <View style={{ marginBottom: 10 }}>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 14, gap: 8 }}>
+          <ScrollView focusable={false} horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 14, gap: 8 }}>
             {FILTER_CATEGORIES.map(cat => {
               const isSelected = activeCategory === cat.id;
               return (
                 <FocusableButton
                   key={cat.id}
-                  focusId={`chip_${cat.id}`}
+                  focusId={`chip_${cat.id}`} isHeaderControl={true}
                   style={[styles.filterChip, isSelected && styles.filterChipActive]}
                   onPress={() => setActiveCategory(cat.id)}>
                   <Text style={[styles.filterChipText, isSelected && styles.filterChipTextActive]}>{cat.label}</Text>
@@ -3424,7 +3624,7 @@ const App = () => {
                 removeClippedSubviews={false}
                 ListHeaderComponent={!isInsideFolder ? renderContinueWatchingHeader() : null}
                 refreshControl={
-                  <RefreshControl refreshing={refreshing && !isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" />
+                  !IS_TV ? <RefreshControl refreshing={refreshing && !isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" /> : undefined
                 }
                 contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
                 keyExtractor={(item, idx) => item.id || item.name || String(idx)}
@@ -3439,7 +3639,7 @@ const App = () => {
             <FocusLayerContext.Provider value="folder">
             <View style={styles.seriesFolderOverlay}>
               <View style={styles.seriesNavRow}>
-                <FocusableButton focusId="f_back" style={[styles.backFolderBar, { flex: 1, marginHorizontal: 0, marginBottom: 0 }]} onPress={goBack}>
+                <FocusableButton focusId="f_back" isHeaderControl={true} style={[styles.backFolderBar, { flex: 1, marginHorizontal: 0, marginBottom: 0 }]} onPress={goBack}>
                   <Icon name="arrow-back" size={18} color="white" />
                   <Text style={styles.backFolderText} numberOfLines={1}>
                     {seriesParentTitle ? `Back • ${seriesParentTitle}` : `Back • ${decodeURIComponent(currentPath)}`}
@@ -3447,7 +3647,7 @@ const App = () => {
                 </FocusableButton>
 
                 {seasonFolders.length > 0 && activeSeason && (
-                  <FocusableButton focusId="f_season" style={styles.seasonDropdownBtn} onPress={() => setShowSeasonModal(true)}>
+                  <FocusableButton focusId="f_season" isHeaderControl={true} style={styles.seasonDropdownBtn} onPress={() => setShowSeasonModal(true)}>
                     <Text style={styles.seasonDropdownBtnText}>{activeSeason.label}</Text>
                     <Icon name="arrow-drop-down" size={22} color="white" />
                   </FocusableButton>
@@ -3469,7 +3669,7 @@ const App = () => {
                   removeClippedSubviews={false}
                   ListHeaderComponent={renderContinueWatchingHeader()}
                   refreshControl={
-                    <RefreshControl refreshing={refreshing && isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" />
+                    !IS_TV ? <RefreshControl refreshing={refreshing && isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" /> : undefined
                   }
                   contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
                   keyExtractor={(item, idx) => item.id || item.name || String(idx)}
@@ -3487,8 +3687,70 @@ const App = () => {
       {renderPlayerOverlay()}
       {renderSeasonModal()}
       {renderHdrChoiceModal()}
+      {IS_TV && isTvSearchModalOpen && (
+        <Modal
+          visible={isTvSearchModalOpen}
+          transparent={true}
+          animationType="fade"
+          onRequestClose={() => {
+            setIsTvSearchModalOpen(false);
+            setTimeout(() => focusById(homeDisplayedFiles.length > 0 ? 'card_0' : 'search_btn'), 80);
+          }}>
+          <FocusLayerContext.Provider value="searchModal">
+            <View style={styles.modalBackdrop}>
+              <View style={styles.hdrModalCard}>
+                <Text style={styles.hdrModalEyebrow}>SEARCH CATALOG</Text>
+                <Text style={styles.hdrModalTitle}>Type Movie or Series Name</Text>
+                <View style={{ backgroundColor: '#1B1F2C', borderRadius: 10, borderWidth: 2, borderColor: '#FFD700', marginTop: 12, paddingHorizontal: 10 }}>
+                  <TextInput
+                    autoFocus={true}
+                    style={{ color: 'white', fontSize: 16, paddingVertical: 10 }}
+                    placeholder="Search movies, series, 4K, Tamil..."
+                    placeholderTextColor="#777"
+                    value={searchQuery}
+                    onChangeText={(txt) => {
+                      lastHomeCardIdRef.current = 'card_0';
+                      setSearchQuery(txt);
+                    }}
+                    autoCorrect={false}
+                    returnKeyType="search"
+                    onSubmitEditing={() => {
+                      setIsTvSearchModalOpen(false);
+                      setTimeout(() => focusById(homeDisplayedFiles.length > 0 ? 'card_0' : 'search_btn'), 80);
+                    }}
+                  />
+                </View>
+                <View style={{ flexDirection: 'row', gap: 10, marginTop: 14 }}>
+                  <FocusableButton
+                    focusId="tv_search_done"
+                    style={[styles.primaryPlayButton, { flex: 1, paddingVertical: 10 }]}
+                    onPress={() => {
+                      setIsTvSearchModalOpen(false);
+                      setTimeout(() => focusById(homeDisplayedFiles.length > 0 ? 'card_0' : 'search_btn'), 80);
+                    }}>
+                    <Icon name="search" size={20} color="white" />
+                    <Text style={{ color: 'white', fontWeight: '800' }}>View Results</Text>
+                  </FocusableButton>
+                  {!!searchQuery && (
+                    <FocusableButton
+                      focusId="tv_search_clear"
+                      style={[styles.secondaryPlayButton, { paddingVertical: 10, paddingHorizontal: 14 }]}
+                      onPress={() => {
+                        lastHomeCardIdRef.current = 'card_0';
+                        setSearchQuery('');
+                      }}>
+                      <Text style={{ color: 'white', fontWeight: '700' }}>Clear</Text>
+                    </FocusableButton>
+                  )}
+                </View>
+              </View>
+            </View>
+          </FocusLayerContext.Provider>
+        </Modal>
+      )}
     </View>
     </FocusLayerContext.Provider>
+    </HeaderFocusableContext.Provider>
     </ActiveLayerContext.Provider>
   );
 };
