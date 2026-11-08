@@ -46,7 +46,7 @@ jobs:
         run: |
           cd android
           chmod +x ./gradlew
-          ./gradlew assembleRelease
+          ./gradlew assembleRelease || (sleep 5 && ./gradlew assembleRelease) || (sleep 10 && ./gradlew assembleRelease)
 
       - name: Upload APK File
         uses: actions/upload-artifact@v4
