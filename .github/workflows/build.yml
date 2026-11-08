@@ -12,6 +12,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.internal.http.connectionTimeout=120000 -Dorg.gradle.internal.http.socketTimeout=120000 -Dorg.gradle.internal.repository.max.tentatives=10 -Dorg.gradle.internal.repository.initial.backoff=3000"
 
     steps:
       - name: Checkout repository
@@ -27,6 +29,44 @@ jobs:
         with:
           distribution: 'zulu'
           java-version: '17'
+          cache: 'gradle'
+
+      - name: Configure Google Maven Central Mirror for Gradle
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat << 'INITEOF' > ~/.gradle/init.d/mirrors.init.gradle
+          allprojects {
+              buildscript {
+                  repositories {
+                      maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2/") }
+                      google()
+                      mavenCentral()
+                  }
+              }
+              repositories {
+                  maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2/") }
+                  google()
+                  mavenCentral()
+              }
+          }
+          settingsEvaluated { settings ->
+              settings.pluginManagement {
+                  repositories {
+                      maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2/") }
+                      google()
+                      mavenCentral()
+                      gradlePluginPortal()
+                  }
+              }
+              settings.dependencyResolutionManagement {
+                  repositories {
+                      maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2/") }
+                      google()
+                      mavenCentral()
+                  }
+              }
+          }
+          INITEOF
 
       - name: Install dependencies
         run: npm install --no-audit
@@ -46,7 +86,7 @@ jobs:
         run: |
           cd android
           chmod +x ./gradlew
-          ./gradlew assembleRelease || (sleep 5 && ./gradlew assembleRelease) || (sleep 10 && ./gradlew assembleRelease)
+          ./gradlew assembleRelease || (sleep 5 && ./gradlew assembleRelease --refresh-dependencies) || (sleep 10 && ./gradlew assembleRelease --refresh-dependencies)
 
       - name: Upload APK File
         uses: actions/upload-artifact@v4

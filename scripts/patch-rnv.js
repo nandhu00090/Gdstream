@@ -192,3 +192,26 @@ if (fs.existsSync(cmakeFile)) {
     console.log('Patched CMakeLists.txt to build native libgdcore.so shield');
   }
 }
+
+
+// Inject Google Cloud Maven Central Mirror into @react-native/gradle-plugin to prevent 504 Gateway Timeouts on GitHub Actions
+const rnPluginDir = path.resolve(__dirname, '../node_modules/@react-native/gradle-plugin');
+function injectMavenMirror(dir) {
+  if (!fs.existsSync(dir)) return;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory() && entry.name !== 'build' && entry.name !== '.gradle') {
+      injectMavenMirror(fullPath);
+    } else if (entry.isFile() && (entry.name.endsWith('.gradle') || entry.name.endsWith('.gradle.kts'))) {
+      let g = fs.readFileSync(fullPath, 'utf8');
+      if (g.includes('mavenCentral()') && !g.includes('maven-central.storage-download.googleapis.com')) {
+        g = g.replace(
+          /mavenCentral\(\)/g,
+          'maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2/") }\n        mavenCentral()'
+        );
+        fs.writeFileSync(fullPath, g, 'utf8');
+      }
+    }
+  }
+}
+injectMavenMirror(rnPluginDir);
