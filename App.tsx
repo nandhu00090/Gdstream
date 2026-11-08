@@ -1,7 +1,6 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback, useContext, createContext } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity,
-  Pressable, StyleSheet, ActivityIndicator,
+  View, Text, FlatList, TouchableOpacity, Pressable, StyleSheet, ActivityIndicator,
   Alert, NativeModules, TextInput, ScrollView, BackHandler, Animated,
   Platform, DeviceEventEmitter, Image, Modal, PanResponder, Dimensions,
   StatusBar, RefreshControl, AppState,
@@ -238,64 +237,84 @@ const extractSeasonNumberFromFolder = (name: string): number | null => {
   return null;
 };
 
-const FocusableButton = ({ style, focusedStyle, onPress, children, hasTVPreferredFocus, activeOpacity = 0.8, disabled = false, ...rest }: any) => {
+const ActiveLayerContext = createContext<string>('home');
+const FocusLayerContext = createContext<string>('home');
+
+const FocusableButton = ({ style, focusedStyle, onPress, onFocus: userOnFocus, children, hasTVPreferredFocus, activeOpacity = 0.8, disabled = false, ...rest }: any) => {
   const [isFocused, setIsFocused] = useState(false);
   const btnRef = useRef<any>(null);
+  const activeLayer = useContext(ActiveLayerContext);
+  const myLayer = useContext(FocusLayerContext);
+  const isLayerActive = !disabled && (myLayer === activeLayer);
+
   const flatStyle = StyleSheet.flatten(style) || {};
   const btnRadius = typeof flatStyle.borderRadius === 'number' ? flatStyle.borderRadius : 8;
 
   useEffect(() => {
-    if (hasTVPreferredFocus && !disabled) {
-      const timer = setTimeout(() => {
-        try {
-          btnRef.current?.focus?.();
-        } catch (_e) {}
-      }, 120);
-      return () => clearTimeout(timer);
+    if (!isLayerActive && isFocused) {
+      setIsFocused(false);
     }
-  }, [hasTVPreferredFocus, disabled]);
+  }, [isLayerActive, isFocused]);
+
+  useEffect(() => {
+    if (isLayerActive && hasTVPreferredFocus) {
+      const t1 = setTimeout(() => {
+        try { btnRef.current?.focus?.(); } catch (_e) {}
+      }, 45);
+      const t2 = setTimeout(() => {
+        try { btnRef.current?.focus?.(); } catch (_e) {}
+      }, 170);
+      return () => {
+        clearTimeout(t1);
+        clearTimeout(t2);
+      };
+    }
+  }, [isLayerActive, hasTVPreferredFocus]);
+
+  const showFocus = isFocused && isLayerActive;
 
   return (
     <Pressable
       ref={btnRef}
-      disabled={disabled}
-      focusable={!disabled}
-      accessible={!disabled}
+      disabled={disabled || !isLayerActive}
+      focusable={isLayerActive}
+      accessible={isLayerActive}
+      hasTVPreferredFocus={isLayerActive && hasTVPreferredFocus ? true : undefined}
       onPress={onPress}
-      onFocus={() => setIsFocused(true)}
+      onFocus={(e) => {
+        setIsFocused(true);
+        if (userOnFocus) userOnFocus(e);
+      }}
       onBlur={() => setIsFocused(false)}
       style={({ pressed }: any) => [
         style,
         pressed && { opacity: activeOpacity },
-        isFocused && styles.tvFocused,
-        isFocused && {
+        showFocus && styles.tvFocused,
+        showFocus && {
           borderColor: '#FFD700',
-          backgroundColor: flatStyle.backgroundColor || 'rgba(229, 9, 20, 0.28)',
-          transform: [{ scale: 1.03 }],
+          transform: [{ scale: 1.025 }],
           zIndex: 99,
           elevation: 16,
         },
-        isFocused && focusedStyle,
+        showFocus && focusedStyle,
       ]}
       {...rest}>
       {children}
-      {isFocused && (
-        <View
-          pointerEvents="none"
-          style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            borderRadius: btnRadius,
-            borderWidth: 3.5,
-            borderColor: '#FFD700',
-            backgroundColor: 'rgba(255, 215, 0, 0.14)',
-            zIndex: 999,
-          }}
-        />
-      )}
+      <View
+        pointerEvents="none"
+        style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          borderRadius: btnRadius,
+          borderWidth: showFocus ? 3.5 : 0,
+          borderColor: '#FFD700',
+          backgroundColor: showFocus ? 'rgba(255, 215, 0, 0.14)' : 'transparent',
+          opacity: showFocus ? 1 : 0,
+        }}
+      />
     </Pressable>
   );
 };
@@ -370,6 +389,10 @@ const App = () => {
   const [currentPath, setCurrentPath] = useState('/0:/');
   const [searchQuery, setSearchQuery] = useState('');
   const searchInputRef = useRef<any>(null);
+  const homeListRef = useRef<FlatList<any> | null>(null);
+  const folderListRef = useRef<FlatList<any> | null>(null);
+  const [lastHomeFocusName, setLastHomeFocusName] = useState<string>('');
+  const [lastFolderFocusName, setLastFolderFocusName] = useState<string>('');
   const [activeCategory, setActiveCategory] = useState('all');
   const [sortBy, setSortBy] = useState<'newest' | 'az'>('newest');
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
@@ -539,9 +562,8 @@ const App = () => {
         maxSeasons: maxS,
         rating: tmdbRating,
       };
-      setSeriesMaxSeasonMap(prev => ({ ...prev, [cleanKey]: maxS }));
-      forceSeriesBadgeUpdate(v => v + 1);
-    }, 20);
+      setSeriesMaxSeasonMap(prev => (prev[cleanKey] === maxS ? prev : { ...prev, [cleanKey]: maxS }));
+    }, 2400);
 
     return null;
   };
@@ -1076,7 +1098,7 @@ const App = () => {
 
         if (match) {
           const meta: MediaMetadata = {
-            poster: match.poster_path ? `https://image.tmdb.org/t/p/w500${match.poster_path}` : undefined,
+            poster: match.poster_path ? `https://image.tmdb.org/t/p/w342${match.poster_path}` : undefined,
             backdrop: match.backdrop_path ? `https://image.tmdb.org/t/p/w780${match.backdrop_path}` : undefined,
             rating: match.vote_average && match.vote_average > 0 ? Number(match.vote_average).toFixed(1) : undefined,
             overview: match.overview || undefined,
@@ -1121,20 +1143,106 @@ const App = () => {
   useEffect(() => {
     if (!activeRawFiles.length || !vaultReady) return;
     let cancelled = false;
-    const enrichAll = async () => {
+
+    const enrichAllFast = async () => {
       await loadSavedTimesForFiles(activeRawFiles);
-      for (const item of activeRawFiles) {
-        if (cancelled) break;
+      if (cancelled) return;
+
+      // Sort items so newest/top-of-screen items get posters FIRST!
+      const orderedItems = [...activeRawFiles].sort((a, b) => {
+        const ma = a?.modifiedTime ? Date.parse(a.modifiedTime) || 0 : 0;
+        const mb = b?.modifiedTime ? Date.parse(b.modifiedTime) || 0 : 0;
+        return mb - ma;
+      });
+
+      const pendingItems: Array<{ itemKey: string; info: ParsedMediaInfo; cacheKey: string }> = [];
+      for (const item of orderedItems) {
+        if (!item?.name) continue;
         const itemKey = item.name;
         if (fetchedKeysRef.current.has(itemKey)) continue;
-        fetchedKeysRef.current.add(itemKey);
         const isFolder = !!item.mimeType?.includes('folder') || (/\.(zip|rar)$/i.test(String(item.name || '')) && !item.isZipEntry);
-        const info = parseMediaFilename(item.name, isFolder);
-        const meta = await fetchSingleMetadata(info);
-        if (meta && !cancelled) setMetadataMap(prev => ({ ...prev, [itemKey]: meta }));
+        const info = parseMediaFilename(itemKey, isFolder);
+        const cacheKey = `meta_v7_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
+        pendingItems.push({ itemKey, info, cacheKey });
       }
+
+      if (!pendingItems.length) return;
+
+      // 1. Bulk-load all cached posters from AsyncStorage in ONE call (< 50ms)!
+      const uncachedQueue: Array<{ itemKey: string; info: ParsedMediaInfo; cacheKey: string }> = [];
+      try {
+        const uniqueCacheKeys = Array.from(new Set(pendingItems.map(p => p.cacheKey)));
+        const cachedPairs = await AsyncStorage.multiGet(uniqueCacheKeys);
+        const cacheLookup: Record<string, MediaMetadata> = {};
+        for (const [k, v] of cachedPairs) {
+          if (v) {
+            try { cacheLookup[k] = JSON.parse(v); } catch {}
+          }
+        }
+
+        const instantBatch: Record<string, MediaMetadata> = {};
+        for (const p of pendingItems) {
+          if (cacheLookup[p.cacheKey]) {
+            instantBatch[p.itemKey] = cacheLookup[p.cacheKey];
+            fetchedKeysRef.current.add(p.itemKey);
+          } else {
+            uncachedQueue.push(p);
+          }
+        }
+
+        if (!cancelled && Object.keys(instantBatch).length > 0) {
+          setMetadataMap(prev => ({ ...prev, ...instantBatch }));
+        }
+      } catch {
+        uncachedQueue.push(...pendingItems);
+      }
+
+      if (cancelled || !uncachedQueue.length) return;
+
+      // 2. Fetch uncached posters with 8x Parallel Workers & deduplicated title promises + batched state updates!
+      const inflightByCacheKey = new Map<string, Promise<MediaMetadata | null>>();
+      let stagedUpdates: Record<string, MediaMetadata> = {};
+      let lastFlushTime = Date.now();
+
+      const flushStaged = (force = false) => {
+        if (cancelled) return;
+        const keys = Object.keys(stagedUpdates);
+        if (!keys.length) return;
+        const now = Date.now();
+        if (force || keys.length >= 6 || now - lastFlushTime >= 240) {
+          const toApply = stagedUpdates;
+          stagedUpdates = {};
+          lastFlushTime = now;
+          setMetadataMap(prev => ({ ...prev, ...toApply }));
+        }
+      };
+
+      let cursor = 0;
+      const CONCURRENCY = 8;
+      const runWorker = async () => {
+        while (!cancelled && cursor < uncachedQueue.length) {
+          const current = uncachedQueue[cursor++];
+          if (!current) break;
+          fetchedKeysRef.current.add(current.itemKey);
+
+          let p = inflightByCacheKey.get(current.cacheKey);
+          if (!p) {
+            p = fetchSingleMetadata(current.info);
+            inflightByCacheKey.set(current.cacheKey, p);
+          }
+          const meta = await p;
+          if (meta && !cancelled) {
+            stagedUpdates[current.itemKey] = meta;
+            flushStaged(false);
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: Math.min(CONCURRENCY, uncachedQueue.length) }, () => runWorker()));
+      flushStaged(true);
     };
-    enrichAll();
+
+    enrichAllFast();
     return () => { cancelled = true; };
   }, [activeRawFiles, vaultReady, fetchSingleMetadata, loadSavedTimesForFiles]);
 
@@ -1639,6 +1747,10 @@ const App = () => {
   };
 
   const handlePress = (item: any) => {
+    if (item?.name) {
+      if (isInsideFolder) setLastFolderFocusName(item.name);
+      else setLastHomeFocusName(item.name);
+    }
     if (item?.name && /\.(zip|rar)$/i.test(String(item.name)) && !item?.isZipEntry) {
       openZipArchiveFile(item);
       return;
@@ -1667,6 +1779,7 @@ const App = () => {
 
   // Instant Back from Series to Homepage: Home FlatList stays mounted at exact scroll position!
   const goBack = () => {
+    setLastFolderFocusName('');
     if (zipParentBackupRef.current) {
       const prev = zipParentBackupRef.current;
       zipParentBackupRef.current = null;
@@ -1905,6 +2018,7 @@ const App = () => {
         transparent={true}
         animationType="fade"
         onRequestClose={() => setShowSeasonModal(false)}>
+        <FocusLayerContext.Provider value="seasonModal">
         <View style={styles.modalBackdrop}>
           <View style={styles.hdrModalCard}>
             <Text style={styles.hdrModalEyebrow}>{seriesParentTitle.toUpperCase() || 'SERIES'}</Text>
@@ -1935,6 +2049,7 @@ const App = () => {
             </FocusableButton>
           </View>
         </View>
+        </FocusLayerContext.Provider>
       </Modal>
     );
   };
@@ -1948,6 +2063,7 @@ const App = () => {
         transparent={true}
         animationType="fade"
         onRequestClose={() => setShowHdrChoiceModal(false)}>
+        <FocusLayerContext.Provider value="hdrModal">
         <View style={styles.modalBackdrop}>
           <View style={styles.hdrModalCard}>
             <Text style={styles.hdrModalEyebrow}>SELECT DISPLAY FORMAT</Text>
@@ -1976,6 +2092,7 @@ const App = () => {
             </FocusableButton>
           </View>
         </View>
+        </FocusLayerContext.Provider>
       </Modal>
     );
   };
@@ -1984,6 +2101,7 @@ const App = () => {
     if (!activeMenu) return null;
     if (activeMenu === 'episodes') {
       return (
+        <FocusLayerContext.Provider value="playerMenu">
         <View style={styles.netflixSheetOverlay}>
           <View style={[styles.floatingMenu, { width: 400 }]}>
             <View style={styles.floatingMenuHeader}>
@@ -2024,6 +2142,7 @@ const App = () => {
             </ScrollView>
           </View>
         </View>
+        </FocusLayerContext.Provider>
       );
     }
 
@@ -2032,6 +2151,7 @@ const App = () => {
     const isSubtitleDisabled = !selectedText || selectedText.type === 'disabled';
 
     return (
+      <FocusLayerContext.Provider value="playerMenu">
       <View style={styles.netflixSheetOverlay}>
         <View style={styles.floatingMenu}>
           <View style={styles.floatingMenuHeader}>
@@ -2146,6 +2266,7 @@ const App = () => {
           </ScrollView>
         </View>
       </View>
+      </FocusLayerContext.Provider>
     );
   };
 
@@ -2161,6 +2282,7 @@ const App = () => {
     const canSwitchDvHdr = effectiveHasDV && effectiveHasHDR;
 
     return (
+      <FocusLayerContext.Provider value="player">
       <View style={styles.playerWrapper}>
         <StatusBar hidden={true} />
         <Video
@@ -2317,14 +2439,14 @@ const App = () => {
                     </View>
                   )}
                   {(effectiveHasDV || effectiveHasHDR) && (
-                    <FocusableButton
+                    <TouchableOpacity
                       onPress={canSwitchDvHdr ? toggleLiveHdrModeInPlayer : undefined}
                       style={[styles.liveHdrStatusPill, activeHdrMode === 'dv' ? styles.liveDvPill : styles.liveHdr10Pill]}>
                       <Icon name={activeHdrMode === 'dv' ? 'auto-awesome' : 'wb-sunny'} size={11} color={activeHdrMode === 'dv' ? '#FFD700' : '#000'} />
                       <Text style={[styles.liveHdrStatusText, activeHdrMode === 'hdr' && { color: '#000' }]}>
                         {activeHdrMode === 'dv' ? 'DOLBY VISION' : 'HDR10'}
                       </Text>
-                    </FocusableButton>
+                    </TouchableOpacity>
                   )}
                 </View>
               </View>
@@ -2423,6 +2545,7 @@ const App = () => {
         )}
         {renderFloatingMenu()}
       </View>
+      </FocusLayerContext.Provider>
     );
   };
 
@@ -2458,7 +2581,8 @@ const App = () => {
     const vRes = effectiveResolution;
 
     return (
-      <ScrollView style={styles.detailScreen} contentContainerStyle={{ paddingBottom: 40 }}>
+      <FocusLayerContext.Provider value="detail">
+      <ScrollView focusable={false} style={styles.detailScreen} contentContainerStyle={{ paddingBottom: 40 }}>
         <StatusBar hidden={false} barStyle="light-content" />
         <View style={styles.detailHero}>
           {bannerImage ? (
@@ -2710,13 +2834,14 @@ const App = () => {
               <Text style={styles.rawFileName}>{vItem.name}</Text>
             ) : null}
 
-            <View style={styles.sourceFileDivider}>
+            <FocusableButton style={styles.sourceFileDivider} onPress={() => {}}>
               <Text style={styles.rawFileLabel}>SOURCE FILE</Text>
               <Text style={styles.rawFileName}>{vItem.name}</Text>
-            </View>
+            </FocusableButton>
           </View>
         </View>
       </ScrollView>
+      </FocusLayerContext.Provider>
     );
   };
 
@@ -2724,6 +2849,7 @@ const App = () => {
   const renderDownloadsOverlay = () => {
     if (activeTab !== 'downloads') return null;
     return (
+      <FocusLayerContext.Provider value="downloads">
       <View style={styles.downloadsOverlayScreen}>
         <StatusBar hidden={false} barStyle="light-content" />
         <View style={styles.topHeaderBar}>
@@ -2813,6 +2939,7 @@ const App = () => {
           />
         )}
       </View>
+      </FocusLayerContext.Provider>
     );
   };
 
@@ -2833,16 +2960,18 @@ const App = () => {
     const isFav = !!watchlist[item.name];
     const versionCount = item._versions?.length || 1;
 
+    const rememberedName = isInsideFolder ? lastFolderFocusName : lastHomeFocusName;
+    const isPreferredCard = rememberedName ? item.name === rememberedName : (index === 0 && !searchQuery);
+
     if (viewMode === 'list') {
       return (
-        <FocusableButton hasTVPreferredFocus={index === 0 && !searchQuery && !selectedFile && playMode === null} style={styles.listCard} onPress={() => handlePress(item)}>
-          {meta?.poster ? (
-            <Image source={{ uri: meta.poster }} style={styles.listPosterThumb} resizeMode="cover" />
-          ) : (
-            <View style={styles.listPosterFallback}>
-              <Icon name={isFolder ? 'folder' : 'movie'} size={26} color={isFolder ? '#F5C518' : '#E50914'} />
-            </View>
-          )}
+        <FocusableButton hasTVPreferredFocus={isPreferredCard} style={styles.listCard} onPress={() => handlePress(item)}>
+          <View style={styles.listPosterFallback}>
+            <Icon name={isFolder ? 'folder' : 'movie'} size={26} color={isFolder ? '#F5C518' : '#E50914'} />
+            {!!meta?.poster && (
+              <Image source={{ uri: meta.poster }} style={[styles.listPosterThumb, StyleSheet.absoluteFill]} resizeMode="cover" />
+            )}
+          </View>
           <View style={styles.listCardBody}>
             <Text style={styles.listCardTitle} numberOfLines={1}>
               {info.episodeNum > 0 ? `E${info.episodeNum < 10 ? `0${info.episodeNum}` : info.episodeNum} • ${info.cleanTitle}` : info.cleanTitle}
@@ -2860,15 +2989,14 @@ const App = () => {
     }
 
     return (
-      <FocusableButton hasTVPreferredFocus={index === 0 && !searchQuery && !selectedFile && playMode === null} style={styles.posterCard} onPress={() => handlePress(item)}>
+      <FocusableButton hasTVPreferredFocus={isPreferredCard} style={styles.posterCard} onPress={() => handlePress(item)}>
         <View style={styles.posterImageContainer}>
-          {meta?.poster ? (
-            <Image source={{ uri: meta.poster }} style={styles.posterImage} resizeMode="cover" />
-          ) : (
-            <View style={styles.posterFallback}>
-              <Icon name={isFolder ? 'folder-special' : 'local-movies'} size={38} color={isFolder ? '#F5C518' : '#E50914'} />
-              <Text style={styles.posterFallbackTitle} numberOfLines={3}>{info.cleanTitle}</Text>
-            </View>
+          <View style={styles.posterFallback}>
+            <Icon name={isFolder ? 'folder-special' : 'local-movies'} size={38} color={isFolder ? '#F5C518' : '#E50914'} />
+            <Text style={styles.posterFallbackTitle} numberOfLines={3}>{info.cleanTitle}</Text>
+          </View>
+          {!!meta?.poster && (
+            <Image source={{ uri: meta.poster }} style={[styles.posterImage, StyleSheet.absoluteFill]} resizeMode="cover" />
           )}
 
           <View style={styles.posterTopBadges}>
@@ -2972,12 +3100,12 @@ const App = () => {
                     <Text style={styles.cwTimeText}>Resume • {formatRemainingLabel(cwSec, cwDur)}</Text>
                   </View>
                 </FocusableButton>
-                <FocusableButton
+                <TouchableOpacity
                   style={styles.cwRemoveBtn}
                   hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                   onPress={() => removeContinueWatchingItem(cwItem)}>
                   <Icon name="close" size={15} color="#FFFFFF" />
-                </FocusableButton>
+                </TouchableOpacity>
               </View>
             );
           })}
@@ -2986,16 +3114,25 @@ const App = () => {
     );
   };
 
-  const isTopOverlayOpen = !!selectedFile || playMode === 'internal' || activeTab === 'downloads' || showSeasonModal || showHdrChoiceModal;
-  const isHomeLayerBlocked = isTopOverlayOpen || isInsideFolder;
-  const isSeriesLayerBlocked = isTopOverlayOpen;
+  const currentActiveLayer = showHdrChoiceModal
+    ? 'hdrModal'
+    : showSeasonModal
+    ? 'seasonModal'
+    : playMode === 'internal'
+    ? (activeMenu ? 'playerMenu' : 'player')
+    : selectedFile
+    ? 'detail'
+    : activeTab === 'downloads'
+    ? 'downloads'
+    : isInsideFolder
+    ? 'folder'
+    : 'home';
 
   return (
+    <ActiveLayerContext.Provider value={currentActiveLayer}>
+    <FocusLayerContext.Provider value="home">
     <View style={styles.container}>
       <StatusBar hidden={false} barStyle="light-content" />
-      <View
-        importantForAccessibility={isTopOverlayOpen ? 'no-hide-descendants' : 'auto'}
-        pointerEvents={isTopOverlayOpen ? 'none' : 'auto'}>
       <View style={styles.topHeaderBar}>
         <View style={{ flexDirection: 'row', alignItems: 'center' }}>
           <View style={styles.logoMark}><Text style={styles.logoMarkText}>▶</Text></View>
@@ -3065,40 +3202,36 @@ const App = () => {
         </ScrollView>
       </View>
 
-      </View>
-
       <View style={{ flex: 1, position: 'relative' }}>
         {/* Home Catalog FlatList stays permanently mounted so scroll position NEVER resets when entering a Series or Movie! */}
-        <View
-          style={{ flex: 1 }}
-          importantForAccessibility={isHomeLayerBlocked ? 'no-hide-descendants' : 'auto'}
-          pointerEvents={isHomeLayerBlocked ? 'none' : 'auto'}>
-          {loading ? (
-            <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 60 }} />
-          ) : (
-            <FlatList
-              key={`home-catalog-${viewMode}-${numColumns}`}
-              data={homeDisplayedFiles}
-              numColumns={numColumns}
-              keyboardShouldPersistTaps="handled"
-              removeClippedSubviews={false}
-              ListHeaderComponent={!isInsideFolder ? renderContinueWatchingHeader() : null}
-              refreshControl={
-                <RefreshControl refreshing={refreshing && !isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" />
-              }
-              contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
-              keyExtractor={(item, idx) => item.id || item.name || String(idx)}
-              renderItem={renderCatalogCard}
-            />
-          )}
-        </View>
+        {loading ? (
+          <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 60 }} />
+        ) : (
+          <FlatList
+            ref={homeListRef}
+            focusable={false}
+            key={`home-catalog-${viewMode}-${numColumns}`}
+            data={homeDisplayedFiles}
+            numColumns={numColumns}
+            initialNumToRender={15}
+            maxToRenderPerBatch={10}
+            windowSize={7}
+            keyboardShouldPersistTaps="handled"
+            removeClippedSubviews={false}
+            ListHeaderComponent={!isInsideFolder ? renderContinueWatchingHeader() : null}
+            refreshControl={
+              <RefreshControl refreshing={refreshing && !isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" />
+            }
+            contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
+            keyExtractor={(item, idx) => item.id || item.name || String(idx)}
+            renderItem={renderCatalogCard}
+          />
+        )}
 
         {/* Series / Folder Overlay Layer (Renders over Home FlatList so going Back to Home is instant & preserves scroll offset!) */}
         {isInsideFolder && (
-          <View
-            style={styles.seriesFolderOverlay}
-            importantForAccessibility={isSeriesLayerBlocked ? 'no-hide-descendants' : 'auto'}
-            pointerEvents={isSeriesLayerBlocked ? 'none' : 'auto'}>
+          <FocusLayerContext.Provider value="folder">
+          <View style={styles.seriesFolderOverlay}>
             <View style={styles.seriesNavRow}>
               <FocusableButton style={[styles.backFolderBar, { flex: 1, marginHorizontal: 0, marginBottom: 0 }]} onPress={goBack}>
                 <Icon name="arrow-back" size={18} color="white" />
@@ -3119,9 +3252,14 @@ const App = () => {
               <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 60 }} />
             ) : (
               <FlatList
+                ref={folderListRef}
+                focusable={false}
                 key={`folder-catalog-${currentPath}-${viewMode}-${numColumns}`}
                 data={folderDisplayedFiles}
                 numColumns={numColumns}
+                initialNumToRender={15}
+                maxToRenderPerBatch={10}
+                windowSize={7}
                 keyboardShouldPersistTaps="handled"
                 removeClippedSubviews={false}
                 ListHeaderComponent={renderContinueWatchingHeader()}
@@ -3134,6 +3272,7 @@ const App = () => {
               />
             )}
           </View>
+          </FocusLayerContext.Provider>
         )}
       </View>
 
@@ -3143,6 +3282,8 @@ const App = () => {
       {renderSeasonModal()}
       {renderHdrChoiceModal()}
     </View>
+    </FocusLayerContext.Provider>
+    </ActiveLayerContext.Provider>
   );
 };
 
