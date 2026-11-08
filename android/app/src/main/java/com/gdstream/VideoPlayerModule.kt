@@ -381,24 +381,27 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
 
     private fun findViewByTagId(root: View?, targetId: String): View? {
         if (root == null) return null
+        val recursiveMatch = findViewByTagRecursive(root, targetId)
+        if (recursiveMatch != null) return recursiveMatch
         try {
             val found = ReactFindViewUtil.findView(root, targetId)
-            if (found != null) return found
+            if (found != null && found.isShown) return found
         } catch (_: Exception) {}
-        return findViewByTagRecursive(root, targetId)
+        return null
     }
 
     private fun findViewByTagRecursive(view: View?, targetId: String): View? {
-        if (view == null) return null
+        if (view == null || view.visibility != View.VISIBLE) return null
         try {
             val resId = reactApplicationContext.resources.getIdentifier("view_tag_native_id", "id", reactApplicationContext.packageName)
             if (resId != 0) {
                 val tagVal = view.getTag(resId)
-                if (tagVal is String && tagVal == targetId) return view
+                if (tagVal is String && tagVal == targetId && view.isShown) return view
             }
         } catch (_: Exception) {}
         if (view is ViewGroup) {
-            for (i in 0 until view.childCount) {
+            // Search top-most overlay children first (reverse order) so active overlays always win!
+            for (i in view.childCount - 1 downTo 0) {
                 val childFound = findViewByTagRecursive(view.getChildAt(i), targetId)
                 if (childFound != null) return childFound
             }

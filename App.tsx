@@ -321,11 +321,16 @@ const FocusableButton = ({
   return (
     <Pressable
       ref={btnRef}
-      nativeID={focusId || undefined}
+      nativeID={isLayerActive && focusId ? focusId : undefined}
       disabled={disabled || !isLayerActive}
       focusable={isLayerActive}
       accessible={isLayerActive}
       hasTVPreferredFocus={isLayerActive && hasTVPreferredFocus ? true : undefined}
+      onLayout={() => {
+        if (IS_TV && isLayerActive && hasTVPreferredFocus && focusId) {
+          focusById(focusId);
+        }
+      }}
       onPress={(e) => {
         if (onGlobalTvActivity) onGlobalTvActivity();
         if (onPress) onPress(e);
@@ -3295,7 +3300,7 @@ const App = () => {
   const numColumns = viewMode === 'grid' ? (IS_TV ? 5 : 2) : 1;
   const activeDownloadsCount = downloads.filter(d => d.status === 'downloading').length;
 
-  const renderCatalogCard = ({ item, index }: { item: any; index: number }) => {
+  const renderCatalogCard = ({ item, index, isFolderCard = false }: { item: any; index: number; isFolderCard?: boolean }) => {
     const isFolder = !!item.mimeType?.includes('folder') || (/\.(zip|rar)$/i.test(String(item.name || '')) && !item.isZipEntry);
     const info = parseMediaFilename(item.name, isFolder);
     const meta = metadataMap[item.name];
@@ -3308,9 +3313,14 @@ const App = () => {
     const isFav = !!watchlist[item.name];
     const versionCount = item._versions?.length || 1;
 
-    const cardFocusId = isInsideFolder ? `fcard_${index}` : `card_${index}`;
+    const cardFocusId = isFolderCard ? `fcard_${index}` : `card_${index}`;
+    const preferredTargetId = isFolderCard
+      ? (lastFolderCardIdRef.current || 'fcard_0')
+      : (lastHomeCardIdRef.current || 'card_0');
+    const isPreferredCard = cardFocusId === preferredTargetId;
+
     const recordCardFocus = () => {
-      if (isInsideFolder) lastFolderCardIdRef.current = cardFocusId;
+      if (isFolderCard) lastFolderCardIdRef.current = cardFocusId;
       else lastHomeCardIdRef.current = cardFocusId;
     };
 
@@ -3318,6 +3328,7 @@ const App = () => {
       return (
         <FocusableButton
           focusId={cardFocusId}
+          hasTVPreferredFocus={isPreferredCard}
           style={styles.listCard}
           onFocus={recordCardFocus}
           onPress={() => {
@@ -3349,6 +3360,7 @@ const App = () => {
     return (
       <FocusableButton
         focusId={cardFocusId}
+        hasTVPreferredFocus={isPreferredCard}
         style={styles.posterCard}
         onFocus={recordCardFocus}
         onPress={() => {
@@ -3628,7 +3640,7 @@ const App = () => {
                 }
                 contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
                 keyExtractor={(item, idx) => item.id || item.name || String(idx)}
-                renderItem={renderCatalogCard}
+                renderItem={({ item, index }) => renderCatalogCard({ item, index, isFolderCard: false })}
               />
             )}
           </View>
@@ -3673,7 +3685,7 @@ const App = () => {
                   }
                   contentContainerStyle={{ paddingHorizontal: 10, paddingBottom: 30 }}
                   keyExtractor={(item, idx) => item.id || item.name || String(idx)}
-                  renderItem={renderCatalogCard}
+                  renderItem={({ item, index }) => renderCatalogCard({ item, index, isFolderCard: true })}
                 />
               )}
             </View>

@@ -1465,6 +1465,111 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return candidates
     }
 
+
+    private fun extractDirectYoutubeH264Streams(videoId: String): List<DirectTrailerStream> {
+        val results = ArrayList<DirectTrailerStream>()
+        if (videoId.length != 11) return results
+
+        // Try ANDROID_VR and IOS Innertube clients for direct hardware-accelerated H.264 MP4 / HLS streams
+        val clients = listOf(
+            Triple(
+                "ANDROID_VR",
+                "1.60.19",
+                "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+            ),
+            Triple(
+                "IOS",
+                "19.45.4",
+                "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"
+            )
+        )
+
+        for ((clientName, clientVer, ua) in clients) {
+            try {
+                val clientJson = JSONObject().apply {
+                    put("clientName", clientName)
+                    put("clientVersion", clientVer)
+                    put("hl", "en")
+                    put("gl", "IN")
+                    if (clientName == "ANDROID_VR") {
+                        put("deviceMake", "Oculus")
+                        put("deviceModel", "Quest 3")
+                        put("osName", "Android")
+                        put("osVersion", "12L")
+                        put("androidSdkVersion", 32)
+                    } else {
+                        put("deviceMake", "Apple")
+                        put("deviceModel", "iPhone16,2")
+                        put("osName", "iPhone")
+                        put("osVersion", "17.5.1.21F90")
+                    }
+                }
+                val payload = JSONObject().apply {
+                    put("videoId", videoId)
+                    put("context", JSONObject().put("client", clientJson))
+                    put("contentCheckOk", true)
+                    put("racyCheckOk", true)
+                }.toString()
+
+                val conn = (URL("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+                    .openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
+                    connectTimeout = 5000
+                    readTimeout = 5000
+                    requestMethod = "POST"
+                    doInput = true
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("User-Agent", ua)
+                }
+                conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+                if (conn.responseCode !in 200..299) {
+                    conn.disconnect()
+                    continue
+                }
+                val resp = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText() }
+                conn.disconnect()
+
+                val root = JSONObject(resp)
+                val streamingData = root.optJSONObject("streamingData") ?: continue
+
+                // 1. Check progressive muxed H.264 MP4 formats first (instant 0ms hardware playback)
+                val formats = streamingData.optJSONArray("formats")
+                if (formats != null) {
+                    for (i in 0 until formats.length()) {
+                        val f = formats.optJSONObject(i) ?: continue
+                        val url = f.optString("url", "")
+                        val mime = f.optString("mimeType", "").lowercase(Locale.ROOT)
+                        val height = f.optInt("height", 0)
+                        if (url.startsWith("http") && mime.contains("video/mp4") && height >= 360) {
+                            val label = if (height >= 1080) "1080p FHD" else if (height >= 720) "720p HD" else "${height}p"
+                            results.add(DirectTrailerStream(label, height, url))
+                        }
+                    }
+                }
+
+                // 2. Also check HLS Manifest URL (Hardware H.264 adaptive stream from IOS client)
+                val hlsUrl = streamingData.optString("hlsManifestUrl", "")
+                if (hlsUrl.startsWith("http") && results.isEmpty()) {
+                    results.add(DirectTrailerStream("1080p FHD", 1080, hlsUrl))
+                }
+
+                if (results.isNotEmpty()) {
+                    results.sortByDescending { it.height }
+                    return results
+                }
+            } catch (_: Throwable) {}
+        }
+        return results
+    }
+
+    private fun buildVerifiedYoutubeTrailerInfo(videoId: String, defaultLabel: String): VerifiedTrailerInfo {
+        val directStreams = extractDirectYoutubeH264Streams(videoId)
+        if (directStreams.isNotEmpty()) {
+            return VerifiedTrailerInfo("IMDB_DIRECT", videoId, directStreams, directStreams.first().label)
+        }
+        return VerifiedTrailerInfo("YT_VERIFIED", videoId, emptyList(), defaultLabel)
+    }
+
     @ReactMethod
     fun resolveVerifiedTrailer(
         cacheKey: String,
@@ -1491,7 +1596,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     for (i in 0 until arr.length()) {
                         val key = arr.optString(i, "").trim()
                         if (key.length == 11 && verifyYoutubeOembedClean(key, true)) {
-                            val info = VerifiedTrailerInfo("YT_VERIFIED", key, emptyList(), "4K / 1080p")
+                            val info = buildVerifiedYoutubeTrailerInfo(key, "1080p FHD")
                             verifiedTrailerCache[cacheKey] = info
                             val res = Arguments.createMap()
                             res.putBoolean("available", true)
@@ -1509,7 +1614,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val isTv = (parts.getOrNull(1) == "tv")
                     val kcKey = fetchKinocheckTrailerId(tmdbIdStr, isTv)
                     if (kcKey.length == 11) {
-                        val info = VerifiedTrailerInfo("YT_VERIFIED", kcKey, emptyList(), "4K / 1080p")
+                        val info = buildVerifiedYoutubeTrailerInfo(kcKey, "1080p FHD")
                         verifiedTrailerCache[cacheKey] = info
                         val res = Arguments.createMap()
                         res.putBoolean("available", true)
@@ -1536,7 +1641,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val ytCandidates = searchStrictOfficialTrailerIds(title, year)
                 for (candId in ytCandidates) {
                     if (verifyYoutubeOembedClean(candId, false)) {
-                        val info = VerifiedTrailerInfo("YT_VERIFIED", candId, emptyList(), "1080p FHD")
+                        val info = buildVerifiedYoutubeTrailerInfo(candId, "1080p FHD")
                         verifiedTrailerCache[cacheKey] = info
                         val res = Arguments.createMap()
                         res.putBoolean("available", true)
@@ -2056,7 +2161,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val html = """
                     <!DOCTYPE html>
                     <html>
-                    <head>
+                    <head><script>(function(){try{var m=window.MediaSource;if(m&&m.isTypeSupported){var o=m.isTypeSupported.bind(m);m.isTypeSupported=function(t){if(!t)return false;var s=String(t).toLowerCase();if(s.indexOf('vp9')!==-1||s.indexOf('vp8')!==-1||s.indexOf('av01')!==-1||s.indexOf('webm')!==-1)return false;return o(t);};}}catch(e){}})();</script>
                     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
                     <style>
                       * { margin: 0; padding: 0; box-sizing: border-box; background: #000; user-select: none; }
