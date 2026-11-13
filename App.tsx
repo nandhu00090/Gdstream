@@ -600,7 +600,8 @@ const App = () => {
         if (tmdbKey) {
           const sUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(searchName)}`;
           const sData = await fetch(sUrl).then(r => r.json());
-          const first = sData?.results?.[0];
+          const sList: any[] = sData?.results || [];
+          const first = sList.find((r: any) => String(r?.name || r?.original_name || '').toLowerCase().trim() === searchName.toLowerCase()) || sList[0];
           if (first?.id) {
             const dUrl = `https://api.themoviedb.org/3/tv/${first.id}?api_key=${encodeURIComponent(tmdbKey)}`;
             const dData = await fetch(dUrl).then(r => r.json());
@@ -1255,7 +1256,7 @@ const App = () => {
   }, [playMode, selectedFile, pathStack, activeMenu, showHdrChoiceModal, showSeasonModal, isLocked, activeTab, closeInternalPlayer]);
 
   const fetchSingleMetadata = useCallback(async (info: ParsedMediaInfo): Promise<MediaMetadata | null> => {
-    const cacheKey = `meta_v7_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
+    const cacheKey = `meta_v8_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
     try {
       const cached = await AsyncStorage.getItem(cacheKey);
       if (cached) return JSON.parse(cached);
@@ -1268,17 +1269,24 @@ const App = () => {
     if (tmdbKey && tmdbKey.trim().length >= 20) {
       try {
         const key = tmdbKey.trim();
-        const endpoint = info.seasonEpisode ? 'tv' : 'multi';
+        const isTvQuery = Boolean(info.seasonEpisode || info.seasonNum > 0 || info.isFolder);
+        const endpoint = isTvQuery ? 'tv' : 'multi';
         const multiUrl = `https://api.themoviedb.org/3/search/${endpoint}?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}`;
         const res = await axios.get(multiUrl, { timeout: 6000 });
         const results: any[] = (res.data?.results || []).filter((r: any) => r.media_type !== 'person' && r.poster_path);
+        const normTitle = (r: any) => String(r.title || r.name || r.original_title || r.original_name || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+        const cleanTarget = targetLower.replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
 
-        let match = results.find((r: any) => {
-          const rYear = parseInt(String(r.release_date || r.first_air_date || '').slice(0, 4), 10);
-          if (!infoYearNum || !rYear) return false;
-          const rTitle = String(r.title || r.name || r.original_title || '').toLowerCase().trim();
-          return Math.abs(rYear - infoYearNum) <= 1 && (rTitle === targetLower || rTitle.includes(targetLower));
-        });
+        let match =
+          results.find((r: any) => {
+            const rYear = parseInt(String(r.release_date || r.first_air_date || '').slice(0, 4), 10);
+            return infoYearNum > 0 && rYear > 0 && Math.abs(rYear - infoYearNum) <= 1 && normTitle(r) === cleanTarget;
+          }) ||
+          (isTvQuery ? results.find((r: any) => normTitle(r) === cleanTarget) : null) ||
+          results.find((r: any) => {
+            const rYear = parseInt(String(r.release_date || r.first_air_date || '').slice(0, 4), 10);
+            return infoYearNum > 0 && rYear > 0 && Math.abs(rYear - infoYearNum) <= 1 && normTitle(r).includes(cleanTarget);
+          });
 
         if (!match && infoYearNum > 0 && !info.seasonEpisode) {
           const yearUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}&primary_release_year=${info.year}`;
@@ -1364,7 +1372,7 @@ const App = () => {
         if (fetchedKeysRef.current.has(itemKey)) continue;
         const isFolder = !!item.mimeType?.includes('folder') || (/\.(zip|rar)$/i.test(String(item.name || '')) && !item.isZipEntry);
         const info = parseMediaFilename(itemKey, isFolder);
-        const cacheKey = `meta_v7_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
+        const cacheKey = `meta_v8_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
         pendingItems.push({ itemKey, info, cacheKey });
       }
 
