@@ -53,21 +53,13 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         var frameInspected: Boolean = false
     )
 
-    private data class MkvChapter(
-        val title: String,
-        val startSec: Double,
-        val endSec: Double,
-        val type: String
-    )
-
     private data class HeaderParseResult(
         val totalBytes: Long,
         val durationSec: Double,
         val tracks: List<MkvTrack>,
         val hasDoviRecord: Boolean,
         val dvProfile: Int,
-        val dvHasHdr10Base: Boolean,
-        val chapters: List<MkvChapter> = emptyList()
+        val dvHasHdr10Base: Boolean
     )
 
     private class BitReader(private val data: ByteArray, startByte: Int, private val limitByte: Int) {
@@ -735,111 +727,6 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun parseChapterDisplay(buf: ByteArray, start: Int, limit: Int): Pair<String, String> {
-        var p = start
-        var title = ""
-        var lang = ""
-        while (p < limit) {
-            val idP = readEbmlId(buf, p, limit) ?: break; p += idP.second
-            val szP = readEbmlSize(buf, p, limit) ?: break; p += szP.second
-            val sz = szP.first.toInt()
-            if (sz < 0 || p + sz > limit) break
-            if (idP.first == 0x85L) title = readEbmlString(buf, p, sz)
-            else if (idP.first == 0x437CL) lang = readEbmlString(buf, p, sz)
-            p += sz
-        }
-        return Pair(title, lang)
-    }
-
-    private fun parseChapterAtom(buf: ByteArray, start: Int, limit: Int, out: MutableList<Triple<String, Double, Double>>) {
-        var p = start; var tStart = -1L; var tEnd = -1L; var hidden = false; var best = ""; var isEng = false
-        while (p < limit) {
-            val idP = readEbmlId(buf, p, limit) ?: break; p += idP.second
-            val szP = readEbmlSize(buf, p, limit) ?: break; p += szP.second
-            val sz = szP.first.toInt()
-            if (sz < 0 || p + sz > limit) break
-            when (idP.first) {
-                0x91L -> tStart = readEbmlUint(buf, p, sz)
-                0x92L -> tEnd = readEbmlUint(buf, p, sz)
-                0x98L -> hidden = readEbmlUint(buf, p, sz) == 1L
-                0x80L -> {
-                    val (t, l) = parseChapterDisplay(buf, p, p + sz)
-                    if (t.isNotEmpty() && (best.isEmpty() || ((l.equals("eng", true) || l.equals("en", true)) && !isEng))) {
-                        best = t; isEng = l.equals("eng", true) || l.equals("en", true)
-                    }
-                }
-                0xB6L -> parseChapterAtom(buf, p, p + sz, out)
-            }
-            p += sz
-        }
-        if (!hidden && tStart >= 0L) {
-            out.add(Triple(best, tStart / 1_000_000_000.0, if (tEnd > tStart) tEnd / 1_000_000_000.0 else -1.0))
-        }
-    }
-
-    private fun parseChaptersMaster(buf: ByteArray, start: Int, limit: Int): List<Triple<String, Double, Double>> {
-        var p = start
-        var fallback = emptyList<Triple<String, Double, Double>>()
-        while (p < limit) {
-            val idP = readEbmlId(buf, p, limit) ?: break; p += idP.second
-            val szP = readEbmlSize(buf, p, limit) ?: break; p += szP.second
-            val sz = szP.first.toInt()
-            if (sz < 0 || p + sz > limit) break
-            if (idP.first == 0x45B9L) {
-                var ep = p; val eEnd = p + sz; var isDef = false
-                val atoms = mutableListOf<Triple<String, Double, Double>>()
-                while (ep < eEnd) {
-                    val eid = readEbmlId(buf, ep, eEnd) ?: break; ep += eid.second
-                    val eszP = readEbmlSize(buf, ep, eEnd) ?: break; ep += eszP.second
-                    val esz = eszP.first.toInt()
-                    if (esz < 0 || ep + esz > eEnd) break
-                    if (eid.first == 0x45DBL) isDef = readEbmlUint(buf, ep, esz) == 1L
-                    else if (eid.first == 0xB6L) parseChapterAtom(buf, ep, ep + esz, atoms)
-                    ep += esz
-                }
-                if (atoms.isNotEmpty()) { if (isDef) return atoms; if (fallback.isEmpty()) fallback = atoms }
-            }
-            p += sz
-        }
-        return fallback
-    }
-
-    private fun scanBufferForMkvChapters(buf: ByteArray): List<Triple<String, Double, Double>> {
-        for (i in 0 until (buf.size - 8)) {
-            if ((buf[i].toInt() and 0xFF) == 0x10 && (buf[i + 1].toInt() and 0xFF) == 0x43 &&
-                (buf[i + 2].toInt() and 0xFF) == 0xA7 && (buf[i + 3].toInt() and 0xFF) == 0x70) {
-                val szP = readEbmlSize(buf, i + 4, buf.size)
-                if (szP != null && szP.first > 0L) {
-                    val s = i + 4 + szP.second
-                    val found = parseChaptersMaster(buf, s, minOf(buf.size.toLong(), s + szP.first).toInt())
-                    if (found.isNotEmpty()) return found
-                }
-            }
-        }
-        return emptyList()
-    }
-
-    private fun classifyMkvChapters(raw: List<Triple<String, Double, Double>>, dur: Double): List<MkvChapter> {
-        if (raw.isEmpty()) return emptyList()
-        val sorted = raw.sortedBy { it.second }
-        val genericRe = Regex("^(chapter|part|scene|ch)?\\s*0*\\d+$")
-        return sorted.mapIndexed { i, (rawT, sSec, rEnd) ->
-            val title = rawT.ifBlank { "Chapter ${i + 1}" }
-            val eSec = when { rEnd > sSec + 0.5 -> rEnd; i + 1 < sorted.size -> sorted[i + 1].second; dur > sSec -> dur; else -> sSec }
-            val cDur = (eSec - sSec).coerceAtLeast(0.0)
-            val l = rawT.trim().lowercase(Locale.ROOT)
-            val type = when {
-                l.contains("recap") || l.contains("previously on") -> "recap"
-                l == "op" || l.startsWith("op ") || l.endsWith(" op") || l.contains("opening") || l.contains("intro") || l.contains("title sequence") -> "intro"
-                l == "ed" || l.startsWith("ed ") || l.endsWith(" ed") || l.contains("ending") || l.contains("outro") || l.contains("credits") || l.contains("closing") -> "credits"
-                (l.isEmpty() || genericRe.matches(l)) && sSec <= 300.0 && cDur in 45.0..155.0 && (dur <= 0.0 || dur < 4800.0) -> "intro"
-                (l.isEmpty() || genericRe.matches(l)) && i == sorted.lastIndex && dur > 0.0 && sSec >= dur * 0.86 && cDur >= 30.0 -> "credits"
-                else -> "chapter"
-            }
-            MkvChapter(title, sSec, eSec, type)
-        }
-    }
-
     private fun parseMkvHeaderAndClusters(
         buf: ByteArray,
         tailBuf: ByteArray?,
@@ -847,7 +734,6 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
     ): HeaderParseResult {
         val tracks = mutableListOf<MkvTrack>()
         val bpsByUid = mutableMapOf<Long, Long>()
-        var rawChapters = emptyList<Triple<String, Double, Double>>()
         var timestampScale = 1_000_000L
         var rawDuration = 0.0
 
@@ -1034,7 +920,6 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                         if (t.trackNumber > 0) trackByNum[t.trackNumber] = t
                     }
                 }
-                0x1043A770L -> if (rawChapters.isEmpty()) rawChapters = parseChaptersMaster(buf, pos, elemEnd)
                 0x1254C367L -> parseMkvTagsIntoMap(buf, pos, elemEnd, bpsByUid)
                 0x1F43B675L -> {
                     // Inspect real audio frames inside the Cluster!
@@ -1050,9 +935,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
 
         if (tailBuf != null) {
             scanBufferForMkvTags(tailBuf, bpsByUid)
-            if (rawChapters.isEmpty()) rawChapters = scanBufferForMkvChapters(tailBuf)
         }
-        if (rawChapters.isEmpty()) rawChapters = scanBufferForMkvChapters(buf)
 
         for (t in tracks) {
             if (t.realBitrateBps <= 0L && t.trackUid != 0L) {
@@ -1081,8 +964,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             tracks = tracks,
             hasDoviRecord = globalHasDovi,
             dvProfile = globalDvProfile,
-            dvHasHdr10Base = globalDvHasHdr10Base,
-            chapters = classifyMkvChapters(rawChapters, durationSec)
+            dvHasHdr10Base = globalDvHasHdr10Base
         )
     }
 
@@ -1114,7 +996,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
     private fun fetchAndParseHeader(urlStr: String): HeaderParseResult {
         val isLocalProxy = urlStr.contains("127.0.0.1") || urlStr.contains("localhost")
         val maxHeaderBytes = if (isLocalProxy) 512 * 1024 else 1024 * 1024 // 1 MB covers EBML Header + Tracks + First Cluster packets
-        val tailBytesSize = 128 * 1024    // 64 KB at end of file covers mkvmerge Tags (BPS)
+        val tailBytesSize = 64 * 1024    // 64 KB at end of file covers mkvmerge Tags (BPS)
 
         if (urlStr.startsWith("file://") || urlStr.startsWith("/")) {
             val f = File(urlStr.removePrefix("file://"))
@@ -1401,9 +1283,6 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                     putArray("audioTracks", audioList)
                     putArray("subtitleTracks", subtitleList)
                     putArray("languages", langArray)
-                    putArray("chapters", Arguments.createArray().apply {
-                        parsed.chapters.forEach { ch -> pushMap(Arguments.createMap().apply { putString("title", ch.title); putDouble("startSec", ch.startSec); putDouble("endSec", ch.endSec); putString("type", ch.type) }) }
-                    })
                 }
                 promise.resolve(result)
             } catch (e: Exception) {

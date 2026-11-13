@@ -59,7 +59,6 @@ interface RealMediaInfo {
   audioTracks: Array<{ language: string; codec: string; channels: string; bitrateKbps: number; summary: string }>;
   subtitleTracks: Array<{ language: string; format: string }>;
   languages: string[];
-  chapters?: Array<{ title: string; startSec: number; endSec: number; type: 'intro' | 'recap' | 'credits' | 'chapter' }>;
 }
 
 interface DownloadItem {
@@ -1047,7 +1046,7 @@ const App = () => {
     try {
       const timeKeys = items.map(f => `time_${f.name}`);
       const durKeys = items.map(f => `dur_${f.name}`);
-      const miKeys = items.map(f => `mediainfo_v9_${f.name}`);
+      const miKeys = items.map(f => `mediainfo_v8_${f.name}`);
       const [timePairs, durPairs, miPairs] = await Promise.all([
         AsyncStorage.multiGet(timeKeys),
         AsyncStorage.multiGet(durKeys),
@@ -1082,7 +1081,7 @@ const App = () => {
       const nextMiMap: Record<string, RealMediaInfo> = {};
       miPairs.forEach(([k, val]) => {
         if (val) {
-          try { nextMiMap[k.replace(/^mediainfo_v9_/, '')] = JSON.parse(val); } catch {}
+          try { nextMiMap[k.replace(/^mediainfo_v8_/, '')] = JSON.parse(val); } catch {}
         }
       });
       if (Object.keys(nextMiMap).length > 0) {
@@ -1508,9 +1507,8 @@ const App = () => {
 
 
   useEffect(() => {
-    if (!selectedFile) return;
-    if (playMode !== null && mediaInfoMap[selectedFile.name]?.chapters) return;
-    const targets = (playMode === null && versionGroup.length > 1) ? versionGroup : [selectedFile];
+    if (!selectedFile || playMode !== null) return;
+    const targets = versionGroup.length > 1 ? versionGroup : [selectedFile];
     let cancelled = false;
 
     const runMultiMediaInfo = async () => {
@@ -1524,7 +1522,7 @@ const App = () => {
           }
           continue;
         }
-        const cacheKey = `mediainfo_v9_${fName}`;
+        const cacheKey = `mediainfo_v8_${fName}`;
         try {
           const cached = await AsyncStorage.getItem(cacheKey);
           if (cached) {
@@ -1748,18 +1746,6 @@ const App = () => {
       onGlobalTvActivity = null;
     };
   }, [playMode, showControls, isPaused, isVideoBuffering, activeMenu, isLocked]);
-
-  const activeSkipChapter = useMemo(() => {
-    const chaps = selectedFile?.name ? (mediaInfoMap[selectedFile.name]?.chapters || []) : [];
-    return chaps.find(c => (c.type === 'intro' || c.type === 'recap' || c.type === 'credits') && currentTime >= c.startSec && currentTime < c.endSec - 1.5) || null;
-  }, [selectedFile?.name, mediaInfoMap, currentTime]);
-
-  useEffect(() => {
-    if (IS_TV && playMode === 'internal' && !showControls && !activeMenu && !isLocked && activeSkipChapter) {
-      const t = setTimeout(() => focusById('player_skip_btn'), 60);
-      return () => clearTimeout(t);
-    }
-  }, [playMode, showControls, activeMenu, isLocked, activeSkipChapter]);
 
   useEffect(() => {
     if (playMode === 'internal' && showControls && !activeMenu && !isLocked) {
@@ -2464,33 +2450,6 @@ const App = () => {
 
   const renderFloatingMenu = () => {
     if (!activeMenu) return null;
-    if (activeMenu === 'chapters') {
-      const chaps = selectedFile?.name ? (mediaInfoMap[selectedFile.name]?.chapters || []) : [];
-      return (
-        <FocusLayerContext.Provider value="playerMenu">
-        <View style={styles.netflixSheetOverlay}>
-          <View style={[styles.floatingMenu, { width: 400 }]}>
-            <View style={styles.floatingMenuHeader}>
-              <Text style={styles.floatingMenuTitle}>Chapters ({chaps.length})</Text>
-              <FocusableButton style={styles.menuCloseBtn} onPress={() => setActiveMenu(null)}><Icon name="close" size={20} color="white" /></FocusableButton>
-            </View>
-            <ScrollView style={{ maxHeight: 270 }}>
-              {chaps.map((ch, idx) => {
-                const cur = currentTime >= ch.startSec && currentTime < ch.endSec;
-                return (
-                  <FocusableButton key={idx} hasTVPreferredFocus={cur || idx === 0} style={[styles.menuItem, cur && { backgroundColor: 'rgba(229,9,20,0.18)' }]} onPress={() => { setActiveMenu(null); seekBothPlayers(Math.max(0, ch.startSec)); }}>
-                    <Icon name={cur ? 'play-circle-fill' : 'bookmark-border'} size={20} color={cur ? '#E50914' : '#AAA'} />
-                    <Text style={[styles.menuItemText, cur && { color: '#E50914', fontWeight: '800' }]} numberOfLines={1}>{ch.title}</Text>
-                    <Text style={{ color: '#9BA6B8', fontSize: 12, fontWeight: '700' }}>{formatTime(ch.startSec)}</Text>
-                  </FocusableButton>
-                );
-              })}
-            </ScrollView>
-          </View>
-        </View>
-        </FocusLayerContext.Provider>
-      );
-    }
     if (activeMenu === 'episodes') {
       return (
         <FocusLayerContext.Provider value="playerMenu">
@@ -2709,7 +2668,7 @@ const App = () => {
           }}
           onProgress={(p: any) => {
             currentTimeRef.current = p.currentTime;
-            if (showControls || isExternalSubtitleSelected || (realMi?.chapters && realMi.chapters.length > 0)) {
+            if (showControls || isExternalSubtitleSelected) {
               setCurrentTime(p.currentTime);
             }
             if (p.seekableDuration > 0 && durationRef.current <= 0) {
@@ -2891,9 +2850,6 @@ const App = () => {
                     }
                   }}>
                   <View style={styles.netflixProgressTrack} />
-                  {duration > 0 && (realMi?.chapters || []).map((ch, idx) => ch.startSec > 2 && ch.startSec < duration - 2 ? (
-                    <View key={idx} pointerEvents="none" style={[styles.chapterTickMark, { left: `${Math.min(99, Math.max(1, (ch.startSec / duration) * 100))}%` }, ch.type !== 'chapter' && styles.chapterTickMarkSpecial]} />
-                  ) : null)}
                   <View style={[styles.netflixProgressFill, { width: `${progressPercent}%` }]} pointerEvents="none" />
                   <View style={[styles.netflixProgressThumb, { left: `${progressPercent}%` }]} pointerEvents="none" />
                 </TouchableOpacity>
@@ -2915,12 +2871,6 @@ const App = () => {
                   <FocusableButton style={[styles.netflixActionPill, activeMenu === 'episodes' && styles.netflixActionPillActive]} onPress={() => setActiveMenu(activeMenu === 'episodes' ? null : 'episodes')}>
                     <Icon name="video-library" size={19} color={activeMenu === 'episodes' ? '#E50914' : 'white'} />
                     <Text style={styles.netflixActionText}>Episodes</Text>
-                  </FocusableButton>
-                )}
-                {(realMi?.chapters && realMi.chapters.length > 0) && (
-                  <FocusableButton style={[styles.netflixActionPill, activeMenu === 'chapters' && styles.netflixActionPillActive]} onPress={() => setActiveMenu(activeMenu === 'chapters' ? null : 'chapters')}>
-                    <Icon name="format-list-bulleted" size={20} color={activeMenu === 'chapters' ? '#E50914' : 'white'} />
-                    <Text style={styles.netflixActionText}>Chapters ({realMi.chapters.length})</Text>
                   </FocusableButton>
                 )}
                 <FocusableButton style={styles.netflixActionPill} onPress={cyclePlaybackSpeed}>
@@ -2945,17 +2895,6 @@ const App = () => {
                 )}
               </View>
             </View>
-          </View>
-        )}
-        {!isLocked && !activeMenu && !!activeSkipChapter && (
-          <View style={[styles.skipIntroFloatingWrap, { bottom: showControls ? 116 : 28 }]} pointerEvents="box-none">
-            <FocusableButton focusId="player_skip_btn" hasTVPreferredFocus={true} style={styles.skipIntroPillBtn} onPress={() => {
-              if (activeSkipChapter.type === 'credits' && nextEpisodeFile) playNextEpisode();
-              else seekBothPlayers(Math.max(0, Math.min(durationRef.current > 0 ? durationRef.current - 1 : activeSkipChapter.endSec, activeSkipChapter.endSec)));
-            }}>
-              <Icon name="skip-next" size={22} color="#000" />
-              <Text style={styles.skipIntroPillText}>{activeSkipChapter.type === 'recap' ? 'Skip Recap' : activeSkipChapter.type === 'credits' ? (nextEpisodeFile ? 'Next Episode' : 'Skip Credits') : 'Skip Intro'}</Text>
-            </FocusableButton>
           </View>
         )}
         {renderFloatingMenu()}
@@ -4061,11 +4000,6 @@ const styles = StyleSheet.create({
   adjustLabel: { color: '#AAA', fontSize: 13, width: 95, fontWeight: '600' },
   adjustBtn: { width: 34, height: 34, borderRadius: 17, backgroundColor: '#232936', justifyContent: 'center', alignItems: 'center' },
   adjustValue: { color: 'white', fontSize: 14, fontWeight: 'bold', width: 68, textAlign: 'center' },
-  chapterTickMark: { position: 'absolute', width: 3, height: 6, borderRadius: 1.5, backgroundColor: 'rgba(255,255,255,0.75)', top: 11, marginLeft: -1.5 },
-  chapterTickMarkSpecial: { backgroundColor: '#F5C518', width: 4, height: 8, top: 10 },
-  skipIntroFloatingWrap: { position: 'absolute', right: 24, zIndex: 90 },
-  skipIntroPillBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: '#FFFFFF', paddingVertical: 10, paddingHorizontal: 18, borderRadius: 8, borderWidth: 2, borderColor: 'rgba(255,255,255,0.4)', elevation: 6 },
-  skipIntroPillText: { color: '#000000', fontSize: 14, fontWeight: '900', letterSpacing: 0.3 },
 });
 
 export default App;
