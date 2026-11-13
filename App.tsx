@@ -846,11 +846,12 @@ const App = () => {
   const zipPrewarmQueuedRef = useRef<Set<string>>(new Set());
 
   const fetchZipRawJsonFast = useCallback(async (url: string, sizeHint: number, cacheId?: string) => {
-    const key = cacheId || `${url.split('?')[0]}|${sizeHint}`;
+    const idMatch = url.match(/[?&]id=([a-zA-Z0-9_-]{15,})/) || url.match(/\/d\/([a-zA-Z0-9_-]{15,})/);
+    const key = idMatch ? `gd_${idMatch[1]}` : (cacheId || `${url.split('?')[0]}|${sizeHint}`);
     if (zipRawJsonCacheRef.current[key]) {
       return zipRawJsonCacheRef.current[key];
     }
-    const rawJson = await fetchZipRawJsonFast(url, sizeHint);
+    const rawJson = await SecurityVault.listZipMediaEntries(url, sizeHint);
     if (typeof rawJson === 'string' && rawJson.startsWith('[') && rawJson.length > 2) {
       zipRawJsonCacheRef.current[key] = rawJson;
     }
