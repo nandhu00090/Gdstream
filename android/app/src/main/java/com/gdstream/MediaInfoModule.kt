@@ -1701,7 +1701,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
 
         latestPreviewTargetMs.set(targetMs)
         inspectorPool.submit {
-            if (kotlin.math.abs(latestPreviewTargetMs.get() - targetMs) > 3500L) {
+            if (latestPreviewTargetMs.get() != targetMs) {
                 promise.resolve(null); return@submit
             }
             try {
@@ -1716,6 +1716,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                     val clusterPos = mkvIdx.cues[bestIdx].clusterOffset
                     val clusterSlice = fetchRangeSlice(url, clusterPos, clusterPos + 524287L)
                     if (clusterSlice != null) {
+                        if (latestPreviewTargetMs.get() != targetMs) { promise.resolve(null); return@submit }
                         val rawFrame = extractKeyframeFromCluster(clusterSlice, mkvIdx.trackNumber, mkvIdx.strippedHeader)
                         if (rawFrame != null) {
                             val annexB = convertFrameToAnnexB(rawFrame, mkvIdx.nalLengthSize)

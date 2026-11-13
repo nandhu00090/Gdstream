@@ -849,6 +849,7 @@ const App = () => {
   const scrubTimeRef = useRef(0);
   const [previewFrameUri, setPreviewFrameUri] = useState<string | null>(null);
   const lastPreviewBucketRef = useRef<number>(-1);
+  const lastScrubPageXRef = useRef<number>(-1);
 
   const requestPreviewAtTime = useCallback((sec: number) => {
     const active = selectedFileRef.current;
@@ -860,7 +861,7 @@ const App = () => {
     if (!streamUrl) return;
     MediaInfoModule.extractPreviewFrame(streamUrl, sec * 1000)
       .then((uri: string | null) => {
-        if (uri && isScrubbingRef.current) {
+        if (uri && isScrubbingRef.current && lastPreviewBucketRef.current === bucket) {
           setPreviewFrameUri(uri);
         }
       })
@@ -887,6 +888,7 @@ const App = () => {
         requestPreviewAtTime(target);
       };
       const pageX = evt.nativeEvent.pageX;
+      lastScrubPageXRef.current = pageX;
       if (progressBarRef.current?.measureInWindow) {
         progressBarRef.current.measureInWindow((x: number, _y: number, w: number) => {
           if (w > 0) progressBarMetrics.current = { pageX: x, width: w };
@@ -900,8 +902,11 @@ const App = () => {
       const dur = durationRef.current;
       const { pageX: barX, width: barW } = progressBarMetrics.current;
       if (dur <= 0 || barW <= 0) return;
+      const curPageX = evt.nativeEvent.pageX;
+      if (lastScrubPageXRef.current >= 0 && Math.abs(curPageX - lastScrubPageXRef.current) < 5) return;
+      lastScrubPageXRef.current = curPageX;
       lastPlayerActivityRef.current = Date.now();
-      const ratio = Math.max(0, Math.min(1, (evt.nativeEvent.pageX - barX) / barW));
+      const ratio = Math.max(0, Math.min(1, (curPageX - barX) / barW));
       const target = ratio * dur;
       scrubTimeRef.current = target;
       setScrubTime(target);
@@ -915,6 +920,7 @@ const App = () => {
       setIsScrubbing(false);
       setPreviewFrameUri(null);
       lastPreviewBucketRef.current = -1;
+      lastScrubPageXRef.current = -1;
       lastPlayerActivityRef.current = Date.now();
     },
     onPanResponderTerminate: () => {
