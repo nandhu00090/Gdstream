@@ -841,6 +841,89 @@ const App = () => {
   const currentTimeRef = useRef(0);
   const durationRef = useRef(0);
   const [progressWidth, setProgressWidth] = useState(0);
+  const progressBarRef = useRef<any>(null);
+  const progressBarMetrics = useRef<{ pageX: number; width: number }>({ pageX: 0, width: 0 });
+  const [isScrubbing, setIsScrubbing] = useState(false);
+  const isScrubbingRef = useRef(false);
+  const [scrubTime, setScrubTime] = useState(0);
+  const scrubTimeRef = useRef(0);
+  const [previewFrameUri, setPreviewFrameUri] = useState<string | null>(null);
+  const lastPreviewBucketRef = useRef<number>(-1);
+
+  const requestPreviewAtTime = useCallback((sec: number) => {
+    const active = selectedFileRef.current;
+    if (!active || !MediaInfoModule?.extractPreviewFrame) return;
+    const bucket = Math.floor(sec / 4);
+    if (bucket === lastPreviewBucketRef.current) return;
+    lastPreviewBucketRef.current = bucket;
+    const streamUrl = getStreamUrl(active);
+    if (!streamUrl) return;
+    MediaInfoModule.extractPreviewFrame(streamUrl, sec * 1000)
+      .then((uri: string | null) => {
+        if (uri && isScrubbingRef.current) {
+          setPreviewFrameUri(uri);
+        }
+      })
+      .catch(() => {});
+  }, [getStreamUrl]);
+
+  const seekbarPanResponder = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: () => true,
+    onPanResponderTerminationRequest: () => false,
+    onPanResponderGrant: evt => {
+      const dur = durationRef.current;
+      if (dur <= 0) return;
+      lastPlayerActivityRef.current = Date.now();
+      isScrubbingRef.current = true;
+      setIsScrubbing(true);
+      lastPreviewBucketRef.current = -1;
+      const calcAndApply = (px: number, barX: number, barW: number) => {
+        if (barW <= 0) return;
+        const ratio = Math.max(0, Math.min(1, (px - barX) / barW));
+        const target = ratio * dur;
+        scrubTimeRef.current = target;
+        setScrubTime(target);
+        requestPreviewAtTime(target);
+      };
+      const pageX = evt.nativeEvent.pageX;
+      if (progressBarRef.current?.measureInWindow) {
+        progressBarRef.current.measureInWindow((x: number, _y: number, w: number) => {
+          if (w > 0) progressBarMetrics.current = { pageX: x, width: w };
+          calcAndApply(pageX, progressBarMetrics.current.pageX, progressBarMetrics.current.width);
+        });
+      } else {
+        calcAndApply(pageX, progressBarMetrics.current.pageX, progressBarMetrics.current.width);
+      }
+    },
+    onPanResponderMove: evt => {
+      const dur = durationRef.current;
+      const { pageX: barX, width: barW } = progressBarMetrics.current;
+      if (dur <= 0 || barW <= 0) return;
+      lastPlayerActivityRef.current = Date.now();
+      const ratio = Math.max(0, Math.min(1, (evt.nativeEvent.pageX - barX) / barW));
+      const target = ratio * dur;
+      scrubTimeRef.current = target;
+      setScrubTime(target);
+      requestPreviewAtTime(target);
+    },
+    onPanResponderRelease: () => {
+      if (isScrubbingRef.current) {
+        seekBothPlayers(scrubTimeRef.current);
+      }
+      isScrubbingRef.current = false;
+      setIsScrubbing(false);
+      setPreviewFrameUri(null);
+      lastPreviewBucketRef.current = -1;
+      lastPlayerActivityRef.current = Date.now();
+    },
+    onPanResponderTerminate: () => {
+      isScrubbingRef.current = false;
+      setIsScrubbing(false);
+      setPreviewFrameUri(null);
+      lastPreviewBucketRef.current = -1;
+    },
+  }), [requestPreviewAtTime, seekBothPlayers]);
   const videoRef = useRef<any>(null);
   const externalAudioRef = useRef<any>(null);
   const externalAudioTimeRef = useRef(0);
@@ -1099,6 +1182,10 @@ const App = () => {
       setIsFullscreen(false);
     }
     setIsLocked(false);
+    isScrubbingRef.current = false;
+    setIsScrubbing(false);
+    setPreviewFrameUri(null);
+    try { MediaInfoModule?.releasePreviewExtractor?.(); } catch {}
     setActiveMenu(null);
     setPlayMode(null);
   }, [selectedFile, persistPlaybackProgress]);
@@ -1733,7 +1820,7 @@ const App = () => {
       lastPlayerActivityRef.current = Date.now();
     };
     const checkTimer = setInterval(() => {
-      if (!showControls || isPaused || isVideoBuffering || !!activeMenu || isLocked) {
+      if (!showControls || isPaused || isVideoBuffering || !!activeMenu || isLocked || isScrubbingRef.current) {
         lastPlayerActivityRef.current = Date.now();
         return;
       }
@@ -2625,8 +2712,13 @@ const App = () => {
   // 🔥 1. INTERNAL VIDEO PLAYER OVERLAY (Keeps Home & Series FlatLists mounted underneath!) 🔥
   const renderPlayerOverlay = () => {
     if (!selectedFile || playMode !== 'internal') return null;
-    const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
-    const remainingTime = Math.max(0, duration - currentTime);
+    const effectiveDisplayTime = isScrubbing ? scrubTime : currentTime;
+    const progressPercent = duration > 0 ? Math.min(100, Math.max(0, (effectiveDisplayTime / duration) * 100)) : 0;
+    const remainingTime = Math.max(0, duration - effectiveDisplayTime);
+    const previewBoxWidth = 160;
+    const safeBarWidth = progressWidth > 0 ? progressWidth : 300;
+    const thumbPixelX = (progressPercent / 100) * safeBarWidth;
+    const previewLeftPx = Math.max(0, Math.min(safeBarWidth - previewBoxWidth, thumbPixelX - previewBoxWidth / 2));
     const playerInfo = parseMediaFilename(selectedFile.name, false);
     const realMi = mediaInfoMap[selectedFile.name];
     const effectiveHasDV = realMi ? realMi.hasDV : playerInfo.hasDV;
@@ -2838,21 +2930,47 @@ const App = () => {
 
             <View style={styles.netflixBottomContainer}>
               <View style={styles.netflixScrubberRow}>
-                <Text style={styles.netflixTimeLabel}>{formatTime(currentTime)}</Text>
-                <TouchableOpacity
-                  focusable={false}
-                  activeOpacity={1}
+                <Text style={styles.netflixTimeLabel}>{formatTime(effectiveDisplayTime)}</Text>
+                <View
+                  ref={progressBarRef}
                   style={styles.netflixProgressHitBox}
-                  onLayout={e => setProgressWidth(e.nativeEvent.layout.width)}
-                  onPress={e => {
-                    if (progressWidth > 0 && duration > 0) {
-                      seekBothPlayers((e.nativeEvent.locationX / progressWidth) * duration);
-                    }
-                  }}>
-                  <View style={styles.netflixProgressTrack} />
-                  <View style={[styles.netflixProgressFill, { width: `${progressPercent}%` }]} pointerEvents="none" />
-                  <View style={[styles.netflixProgressThumb, { left: `${progressPercent}%` }]} pointerEvents="none" />
-                </TouchableOpacity>
+                  onLayout={e => {
+                    const w = e.nativeEvent.layout.width;
+                    setProgressWidth(w);
+                    progressBarRef.current?.measureInWindow?.((x: number, _y: number, mw: number) => {
+                      progressBarMetrics.current = { pageX: x, width: mw || w };
+                    });
+                  }}
+                  {...seekbarPanResponder.panHandlers}>
+                  {isScrubbing && duration > 0 && (
+                    <View style={[styles.ytPreviewCard, { left: previewLeftPx }]} pointerEvents="none">
+                      <View style={styles.ytPreviewFrameBox}>
+                        {previewFrameUri ? (
+                          <Image source={{ uri: previewFrameUri }} style={styles.ytPreviewImage} resizeMode="cover" />
+                        ) : (
+                          <View style={styles.ytPreviewPlaceholder}>
+                            <Icon name="movie" size={24} color="#E50914" />
+                          </View>
+                        )}
+                      </View>
+                      <View style={styles.ytPreviewTimePill}>
+                        <Text style={styles.ytPreviewTimeText}>
+                          {formatTime(scrubTime)} / {formatTime(duration)}
+                        </Text>
+                      </View>
+                    </View>
+                  )}
+                  <View style={[styles.netflixProgressTrack, isScrubbing && { height: 6, borderRadius: 3 }]} pointerEvents="none" />
+                  <View style={[styles.netflixProgressFill, { width: `${progressPercent}%` }, isScrubbing && { height: 6, borderRadius: 3 }]} pointerEvents="none" />
+                  <View
+                    style={[
+                      styles.netflixProgressThumb,
+                      { left: `${progressPercent}%` },
+                      isScrubbing && styles.netflixProgressThumbActive,
+                    ]}
+                    pointerEvents="none"
+                  />
+                </View>
                 <Text style={styles.netflixTimeLabel}>-{formatTime(remainingTime)}</Text>
               </View>
 
@@ -3983,6 +4101,13 @@ const styles = StyleSheet.create({
   netflixProgressTrack: { height: 4, backgroundColor: 'rgba(255,255,255,0.28)', borderRadius: 2 },
   netflixProgressFill: { height: 4, backgroundColor: '#E50914', borderRadius: 2, position: 'absolute' },
   netflixProgressThumb: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: '#E50914', top: 7, marginLeft: -7, borderWidth: 2, borderColor: '#FFFFFF' },
+  netflixProgressThumbActive: { width: 22, height: 22, borderRadius: 11, top: 3, marginLeft: -11, borderWidth: 2.5, borderColor: '#FFFFFF', elevation: 6 },
+  ytPreviewCard: { position: 'absolute', bottom: 30, width: 160, alignItems: 'center', zIndex: 110 },
+  ytPreviewFrameBox: { width: 160, height: 90, borderRadius: 8, overflow: 'hidden', backgroundColor: '#0F1117', borderWidth: 1.5, borderColor: 'rgba(255,255,255,0.4)', elevation: 8 },
+  ytPreviewImage: { width: '100%', height: '100%' },
+  ytPreviewPlaceholder: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#161922' },
+  ytPreviewTimePill: { marginTop: 5, backgroundColor: 'rgba(10, 12, 18, 0.88)', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 5, borderWidth: 1, borderColor: 'rgba(255,255,255,0.18)' },
+  ytPreviewTimeText: { color: '#FFFFFF', fontSize: 11, fontWeight: '800' },
   netflixActionRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-around', flexWrap: 'wrap', gap: 8 },
   netflixActionPill: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 7, paddingHorizontal: 13, borderRadius: 999, backgroundColor: 'rgba(22, 25, 34, 0.78)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)' },
   netflixActionPillActive: { borderColor: '#E50914', backgroundColor: 'rgba(229, 9, 20, 0.2)' },

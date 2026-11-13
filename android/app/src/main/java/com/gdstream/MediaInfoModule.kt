@@ -1290,4 +1290,80 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             }
         }
     }
+
+    private val previewLock = Any()
+    private var previewRetriever: android.media.MediaMetadataRetriever? = null
+    private var previewSourceUrl: String = ""
+    private val previewFrameCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val latestPreviewTargetMs = java.util.concurrent.atomic.AtomicLong(-1L)
+
+    @ReactMethod
+    fun extractPreviewFrame(url: String, timeMs: Double, promise: Promise) {
+        val targetMs = timeMs.toLong().coerceAtLeast(0L)
+        val bucket = targetMs / 4000L
+        val cacheKey = "$url|$bucket"
+        previewFrameCache[cacheKey]?.let {
+            promise.resolve(it)
+            return
+        }
+
+        latestPreviewTargetMs.set(targetMs)
+        inspectorPool.submit {
+            if (kotlin.math.abs(latestPreviewTargetMs.get() - targetMs) > 3500L) {
+                promise.resolve(null)
+                return@submit
+            }
+            try {
+                val dataUri = synchronized(previewLock) {
+                    previewFrameCache[cacheKey]?.let { return@synchronized it }
+                    if (previewRetriever == null || previewSourceUrl != url) {
+                        try { previewRetriever?.release() } catch (_: Exception) {}
+                        val mmr = android.media.MediaMetadataRetriever()
+                        if (url.startsWith("file://") || url.startsWith("/")) {
+                            mmr.setDataSource(url.removePrefix("file://"))
+                        } else {
+                            val headers = mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 14; GDStream/2.0)")
+                            mmr.setDataSource(url, headers)
+                        }
+                        previewRetriever = mmr
+                        previewSourceUrl = url
+                    }
+                    val rawBmp = previewRetriever?.getFrameAtTime(
+                        targetMs * 1000L,
+                        android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                    ) ?: return@synchronized null
+
+                    val scaled = android.graphics.Bitmap.createScaledBitmap(rawBmp, 240, 135, true)
+                    if (scaled != rawBmp) rawBmp.recycle()
+                    val baos = java.io.ByteArrayOutputStream()
+                    scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 68, baos)
+                    scaled.recycle()
+                    val b64 = android.util.Base64.encodeToString(baos.toByteArray(), android.util.Base64.NO_WRAP)
+                    val uri = "data:image/jpeg;base64,$b64"
+                    if (previewFrameCache.size > 90) {
+                        val first = previewFrameCache.keys().nextElement()
+                        if (first != null) previewFrameCache.remove(first)
+                    }
+                    previewFrameCache[cacheKey] = uri
+                    uri
+                }
+                promise.resolve(dataUri)
+            } catch (_: Exception) {
+                promise.resolve(null)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun releasePreviewExtractor() {
+        latestPreviewTargetMs.set(-1L)
+        inspectorPool.submit {
+            synchronized(previewLock) {
+                try { previewRetriever?.release() } catch (_: Exception) {}
+                previewRetriever = null
+                previewSourceUrl = ""
+                previewFrameCache.clear()
+            }
+        }
+    }
 }
