@@ -1390,11 +1390,11 @@ const App = () => {
   const playableFolderEpisodes = useMemo(() => {
     if (!selectedFile) return [];
     const currentInfo = parseMediaFilename(selectedFile.name, false);
-    if (!currentInfo.seasonEpisode && seasonFolders.length === 0) return [];
+    if (!currentInfo.seasonEpisode && seasonFolders.length === 0 && !selectedFile.isZipEntry) return [];
     return displayedFiles.filter(f => {
       if (f.mimeType?.includes('folder')) return false;
       const fInfo = parseMediaFilename(f.name, false);
-      return !!fInfo.seasonEpisode || seasonFolders.length > 0;
+      return !!fInfo.seasonEpisode || seasonFolders.length > 0 || !!f.isZipEntry;
     });
   }, [displayedFiles, selectedFile, seasonFolders]);
 

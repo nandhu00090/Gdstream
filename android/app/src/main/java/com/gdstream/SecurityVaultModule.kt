@@ -88,8 +88,23 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     @Volatile
     private var nativeSessionLoggedIn = false
 
-    @Volatile
-    private var sessionCookieHeader: String = ""
+    private val cookieJar = ConcurrentHashMap<String, String>()
+
+    private fun storeCookiesFromHeaders(headers: Map<String, List<String>>) {
+        val setCookies = headers["Set-Cookie"] ?: headers["set-cookie"] ?: return
+        for (raw in setCookies) {
+            val pair = raw.substringBefore(";").trim()
+            val eq = pair.indexOf('=')
+            if (eq > 0) {
+                cookieJar[pair.substring(0, eq).trim()] = pair.substring(eq + 1).trim()
+            }
+        }
+    }
+
+    private fun buildCookieHeader(): String {
+        if (cookieJar.isEmpty()) return ""
+        return cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }
+    }
 
     @Volatile
     private var cachedShieldToken: String = ""
@@ -299,8 +314,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             setRequestProperty("Content-Type", contentType)
             setRequestProperty("User-Agent", "GDStream-Native-Engine/3.0")
             setRequestProperty("X-GD-Shield", shieldToken)
-            if (sessionCookieHeader.isNotEmpty()) {
-                setRequestProperty("Cookie", sessionCookieHeader)
+            val ck = buildCookieHeader()
+            if (ck.isNotEmpty()) {
+                setRequestProperty("Cookie", ck)
             }
             if (this is HttpsURLConnection) {
                 sslSocketFactory = buildPinnedSystemSslFactory()
@@ -314,13 +330,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 os.flush()
             }
 
-            val setCookies = conn.headerFields["Set-Cookie"] ?: conn.headerFields["set-cookie"]
-            if (!setCookies.isNullOrEmpty()) {
-                val cookieParts = setCookies.mapNotNull { it.substringBefore(";").trim().takeIf { s -> s.isNotEmpty() } }
-                if (cookieParts.isNotEmpty()) {
-                    sessionCookieHeader = cookieParts.joinToString("; ")
-                }
-            }
+            storeCookiesFromHeaders(conn.headerFields)
 
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
@@ -507,7 +517,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val baseUrl = nSync(1, seed)
             val shieldToken = nSync(5, seed)
             if (shieldToken.isNotEmpty()) cachedShieldToken = shieldToken
-            if ((!nativeSessionLoggedIn || sessionCookieHeader.isEmpty()) && baseUrl.isNotEmpty() && shieldToken.isNotEmpty()) {
+            if ((!nativeSessionLoggedIn || cookieJar.isEmpty()) && baseUrl.isNotEmpty() && shieldToken.isNotEmpty()) {
                 try { performNativeLogin(baseUrl, seed, shieldToken) } catch (_: Throwable) {}
             }
         }
@@ -528,9 +538,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 if (cachedShieldToken.isNotEmpty()) {
                     setRequestProperty("X-GD-Shield", cachedShieldToken)
                 }
-                if (sessionCookieHeader.isNotEmpty()) {
-                    setRequestProperty("Cookie", sessionCookieHeader)
-                }
+                val ck = buildCookieHeader()
+            if (ck.isNotEmpty()) {
+                setRequestProperty("Cookie", ck)
+            }
                 if (!rangeHeader.isNullOrEmpty()) {
                     setRequestProperty("Range", rangeHeader)
                 }
@@ -540,13 +551,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
             }
             val code = conn.responseCode
-            val setCookies = conn.headerFields["Set-Cookie"] ?: conn.headerFields["set-cookie"]
-            if (!setCookies.isNullOrEmpty()) {
-                val cookieParts = setCookies.mapNotNull { it.substringBefore(";").trim().takeIf { s -> s.isNotEmpty() } }
-                if (cookieParts.isNotEmpty()) {
-                    sessionCookieHeader = cookieParts.joinToString("; ")
-                }
-            }
+            storeCookiesFromHeaders(conn.headerFields)
             if (code in 300..399) {
                 val loc = conn.getHeaderField("Location")
                 conn.disconnect()
@@ -662,10 +667,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     // Neutralizes MKV SeekHead Cues (1C 53 BB 6B) & Tags (12 54 C3 67) pointers in the first 8KB of a compressed ZIP stream
     // so ExoPlayer's MatroskaExtractor NEVER aborts playback to seek to the end of a multi-GB compressed archive!
     private fun neutralizeMkvTailSeekPointers(buf: ByteArray, len: Int) {
-        val limit = minOf(len, 8192) - 7
+        val limit = len - 7
         var i = 0
         while (i < limit) {
-            // Look for Matroska SeekID element header: 0x53, 0xAB, 0x84 (ID=0x53AB, Size=4)
             if (buf[i] == 0x53.toByte() && buf[i + 1] == 0xAB.toByte() && buf[i + 2] == 0x84.toByte()) {
                 val b0 = buf[i + 3]
                 val b1 = buf[i + 4]
@@ -787,6 +791,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val remoteEnd = dataStart + reqEnd
                 val remoteConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
                 remoteConnToClean = remoteConn
+                val upstreamCode = remoteConn.responseCode
+                if (upstreamCode !in 200..299) {
+                    out.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
+                    out.flush()
+                    return
+                }
 
                 val headers = buildString {
                     append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
@@ -803,6 +813,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
                 val input = remoteConn.inputStream
                 val buf = ByteArray(65536)
+                if (upstreamCode == 200 && remoteStart > 0L) {
+                    var skipLeft = remoteStart
+                    while (skipLeft > 0L) {
+                        val s = input.read(buf, 0, minOf(buf.size.toLong(), skipLeft).toInt())
+                        if (s <= 0) break
+                        skipLeft -= s.toLong()
+                    }
+                }
                 var remaining = contentLength
                 while (remaining > 0L) {
                     val toRead = minOf(buf.size.toLong(), remaining).toInt()
@@ -833,6 +851,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val remoteEnd = dataStart + maxCompFetch - 1L
                 val remoteConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
                 remoteConnToClean = remoteConn
+                val upstreamCode = remoteConn.responseCode
+                if (upstreamCode !in 200..299) {
+                    out.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
+                    out.flush()
+                    return
+                }
 
                 val inflater = Inflater(true)
                 inflaterToClean = inflater
@@ -852,6 +876,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
                 val infStream = InflaterInputStream(remoteConn.inputStream, inflater, 65536)
                 val buf = ByteArray(65536)
+                if (upstreamCode == 200 && remoteStart > 0L) {
+                    var skipArchive = remoteStart
+                    while (skipArchive > 0L) {
+                        val s = remoteConn.inputStream.read(buf, 0, minOf(buf.size.toLong(), skipArchive).toInt())
+                        if (s <= 0) break
+                        skipArchive -= s.toLong()
+                    }
+                }
                 var toSkip = reqStart
                 while (toSkip > 0L) {
                     val step = minOf(buf.size.toLong(), toSkip).toInt()
@@ -861,14 +893,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
 
                 var remaining = contentLength
-                var isFirstChunk = (reqStart == 0L)
+                var scannedBytes = 0L
                 while (remaining > 0L) {
                     val toRead = minOf(buf.size.toLong(), remaining).toInt()
                     val read = infStream.read(buf, 0, toRead)
                     if (read <= 0) break
-                    if (isFirstChunk) {
+                    if (reqStart == 0L && scannedBytes < 65536L) {
                         neutralizeMkvTailSeekPointers(buf, read)
-                        isFirstChunk = false
+                        scannedBytes += read.toLong()
                     }
                     out.write(buf, 0, read)
                     remaining -= read.toLong()
