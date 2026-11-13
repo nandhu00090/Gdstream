@@ -1125,7 +1125,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     private fun ensureZipDiskCacheLoaded() {
         if (!zipDiskLoaded.compareAndSet(false, true)) return
         try {
-            val file = File(reactContext.filesDir, "gdstream_zip_index_v1.json")
+            val file = java.io.File(reactContext.filesDir, "gdstream_zip_index_v1.json")
             if (file.exists() && file.length() > 2L) {
                 val rootObj = JSONObject(file.readText(Charsets.UTF_8))
                 val keys = rootObj.keys()
@@ -1144,8 +1144,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 try {
                     val obj = JSONObject()
                     for ((k, v) in zipDiskCache) obj.put(k, v)
-                    val tmp = File(reactContext.filesDir, "gdstream_zip_index_v1.tmp")
-                    val dest = File(reactContext.filesDir, "gdstream_zip_index_v1.json")
+                    val tmp = java.io.File(reactContext.filesDir, "gdstream_zip_index_v1.tmp")
+                    val dest = java.io.File(reactContext.filesDir, "gdstream_zip_index_v1.json")
                     tmp.writeText(obj.toString(), Charsets.UTF_8)
                     tmp.renameTo(dest)
                 } catch (_: Throwable) {}
@@ -1245,41 +1245,41 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                     for (p in list) p.resolve(value)
                 }
-                override fun reject(code: String, message: String?) {
+                override fun reject(code: String?, message: String?) {
                     val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
-                    for (p in list) p.reject(code, message)
+                    for (p in list) p.reject(code ?: "E_ZIP", message)
                 }
-                override fun reject(code: String, throwable: Throwable?) {
+                override fun reject(code: String?, throwable: Throwable?) {
                     val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
-                    for (p in list) p.reject(code, throwable)
+                    for (p in list) p.reject(code ?: "E_ZIP", throwable)
                 }
-                override fun reject(code: String, message: String?, throwable: Throwable?) {
+                override fun reject(code: String?, message: String?, throwable: Throwable?) {
                     val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
-                    for (p in list) p.reject(code, message, throwable)
+                    for (p in list) p.reject(code ?: "E_ZIP", message, throwable)
                 }
                 override fun reject(throwable: Throwable) {
                     val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
                     for (p in list) p.reject(throwable)
                 }
-                override fun reject(throwable: Throwable, userInfo: WritableMap) {
+                override fun reject(throwable: Throwable, userInfo: com.facebook.react.bridge.WritableMap) {
                     val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
                     for (p in list) p.reject(throwable, userInfo)
                 }
-                override fun reject(code: String, userInfo: WritableMap) {
+                override fun reject(code: String?, userInfo: com.facebook.react.bridge.WritableMap) {
                     val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
-                    for (p in list) p.reject(code, userInfo)
+                    for (p in list) p.reject(code ?: "E_ZIP", userInfo)
                 }
-                override fun reject(code: String, throwable: Throwable?, userInfo: WritableMap) {
+                override fun reject(code: String?, throwable: Throwable?, userInfo: com.facebook.react.bridge.WritableMap) {
                     val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
-                    for (p in list) p.reject(code, throwable, userInfo)
+                    for (p in list) p.reject(code ?: "E_ZIP", throwable, userInfo)
                 }
-                override fun reject(code: String, message: String?, userInfo: WritableMap) {
+                override fun reject(code: String?, message: String?, userInfo: com.facebook.react.bridge.WritableMap) {
                     val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
-                    for (p in list) p.reject(code, message, userInfo)
+                    for (p in list) p.reject(code ?: "E_ZIP", message, userInfo)
                 }
-                override fun reject(code: String?, message: String?, throwable: Throwable?, userInfo: WritableMap?) {
+                override fun reject(code: String?, message: String?, throwable: Throwable?, userInfo: com.facebook.react.bridge.WritableMap?) {
                     val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
-                    for (p in list) p.reject(code, message, throwable, userInfo)
+                    for (p in list) p.reject(code ?: "E_ZIP", message, throwable, userInfo)
                 }
                 @Deprecated("Deprecated in React Native")
                 override fun reject(message: String) {
