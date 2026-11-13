@@ -1291,79 +1291,484 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    private data class MkvCuePoint(
+        val timeSec: Double,
+        val clusterOffset: Long
+    )
+
+    private data class MkvVideoSeekIndex(
+        val trackNumber: Int,
+        val mimeType: String,
+        val width: Int,
+        val height: Int,
+        val csd0: ByteArray,
+        val csd1: ByteArray?,
+        val nalLengthSize: Int,
+        val strippedHeader: ByteArray?,
+        val cues: List<MkvCuePoint>
+    )
+
     private val previewLock = Any()
-    private var previewRetriever: android.media.MediaMetadataRetriever? = null
-    private var previewSourceUrl: String = ""
+    private val previewIndexCache = java.util.concurrent.ConcurrentHashMap<String, MkvVideoSeekIndex>()
     private val previewFrameCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val latestPreviewTargetMs = java.util.concurrent.atomic.AtomicLong(-1L)
+
+    private fun parseAvccOrHvcc(codecId: String, priv: ByteArray): Triple<ByteArray, ByteArray?, Int> {
+        val upper = codecId.uppercase(Locale.ROOT)
+        val out0 = ByteArrayOutputStream()
+        val startCode = byteArrayOf(0, 0, 0, 1)
+
+        if (upper.contains("HEVC") || upper.contains("H265")) {
+            if (priv.size < 23) return Triple(priv, null, 4)
+            val nalLenSize = (priv[21].toInt() and 0x03) + 1
+            val numArrays = priv[22].toInt() and 0xFF
+            var p = 23
+            for (a in 0 until numArrays) {
+                if (p + 3 > priv.size) break
+                val numNalus = ((priv[p + 1].toInt() and 0xFF) shl 8) or (priv[p + 2].toInt() and 0xFF)
+                p += 3
+                for (n in 0 until numNalus) {
+                    if (p + 2 > priv.size) break
+                    val nLen = ((priv[p].toInt() and 0xFF) shl 8) or (priv[p + 1].toInt() and 0xFF)
+                    p += 2
+                    if (p + nLen > priv.size) break
+                    out0.write(startCode)
+                    out0.write(priv, p, nLen)
+                    p += nLen
+                }
+            }
+            return Triple(out0.toByteArray(), null, nalLenSize)
+        } else if (upper.contains("AVC") || upper.contains("H264")) {
+            if (priv.size < 7) return Triple(priv, null, 4)
+            val nalLenSize = (priv[4].toInt() and 0x03) + 1
+            val numSps = priv[5].toInt() and 0x1F
+            var p = 6
+            for (s in 0 until numSps) {
+                if (p + 2 > priv.size) break
+                val sLen = ((priv[p].toInt() and 0xFF) shl 8) or (priv[p + 1].toInt() and 0xFF)
+                p += 2
+                if (p + sLen > priv.size) break
+                out0.write(startCode)
+                out0.write(priv, p, sLen)
+                p += sLen
+            }
+            val out1 = ByteArrayOutputStream()
+            if (p < priv.size) {
+                val numPps = priv[p].toInt() and 0xFF
+                p += 1
+                for (k in 0 until numPps) {
+                    if (p + 2 > priv.size) break
+                    val pLen = ((priv[p].toInt() and 0xFF) shl 8) or (priv[p + 1].toInt() and 0xFF)
+                    p += 2
+                    if (p + pLen > priv.size) break
+                    out1.write(startCode)
+                    out1.write(priv, p, pLen)
+                    p += pLen
+                }
+            }
+            return Triple(out0.toByteArray(), out1.toByteArray(), nalLenSize)
+        }
+        return Triple(priv, null, 4)
+    }
+
+    private fun convertFrameToAnnexB(raw: ByteArray, nalLenSize: Int): ByteArray {
+        if (raw.size >= 4 && raw[0] == 0.toByte() && raw[1] == 0.toByte() &&
+            (raw[2] == 1.toByte() || (raw[2] == 0.toByte() && raw[3] == 1.toByte()))) {
+            return raw
+        }
+        val out = ByteArrayOutputStream(raw.size + 64)
+        val startCode = byteArrayOf(0, 0, 0, 1)
+        var p = 0
+        while (p + nalLenSize <= raw.size) {
+            var nLen = 0
+            for (i in 0 until nalLenSize) {
+                nLen = (nLen shl 8) or (raw[p + i].toInt() and 0xFF)
+            }
+            p += nalLenSize
+            if (nLen <= 0 || p + nLen > raw.size) break
+            out.write(startCode)
+            out.write(raw, p, nLen)
+            p += nLen
+        }
+        return if (out.size() > 0) out.toByteArray() else raw
+    }
+
+    private fun fetchRangeSlice(urlStr: String, start: Long, endInclusive: Long): ByteArray? {
+        if (urlStr.startsWith("file://") || urlStr.startsWith("/")) {
+            return try {
+                val f = File(urlStr.removePrefix("file://"))
+                if (!f.exists() || start >= f.length()) return null
+                val actualEnd = minOf(f.length() - 1L, endInclusive)
+                val len = (actualEnd - start + 1L).toInt()
+                val buf = ByteArray(len)
+                RandomAccessFile(f, "r").use { raf ->
+                    raf.seek(start)
+                    raf.readFully(buf)
+                }
+                buf
+            } catch (_: Exception) { null }
+        }
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = openRangeConnection(urlStr, "bytes=$start-$endInclusive") ?: return null
+            if (conn.responseCode !in 200..299) return null
+            val out = ByteArrayOutputStream()
+            conn.inputStream.use { inp ->
+                val tmp = ByteArray(16384)
+                var r: Int
+                while (inp.read(tmp).also { r = it } != -1) out.write(tmp, 0, r)
+            }
+            out.toByteArray()
+        } catch (_: Exception) { null } finally { conn?.disconnect() }
+    }
+
+    private fun parseCuesElements(buf: ByteArray, start: Int, limit: Int, segOffset: Long, tsScale: Long, videoTrk: Int): List<MkvCuePoint> {
+        val list = ArrayList<MkvCuePoint>()
+        var p = start
+        while (p < limit) {
+            val idP = readEbmlId(buf, p, limit) ?: break; p += idP.second
+            val szP = readEbmlSize(buf, p, limit) ?: break; p += szP.second
+            val sz = szP.first.toInt()
+            if (sz < 0 || p + sz > limit) break
+            if (idP.first == 0xBBL) {
+                var cp = p; val cEnd = p + sz; var cueTime = -1L; var clusterPos = -1L
+                while (cp < cEnd) {
+                    val cid = readEbmlId(buf, cp, cEnd) ?: break; cp += cid.second
+                    val cszP = readEbmlSize(buf, cp, cEnd) ?: break; cp += cszP.second
+                    val csz = cszP.first.toInt()
+                    if (csz < 0 || cp + csz > cEnd) break
+                    if (cid.first == 0xB3L) cueTime = readEbmlUint(buf, cp, csz)
+                    else if (cid.first == 0xB7L) {
+                        var tp = cp; val tEnd = cp + csz; var trk = -1; var clPos = -1L
+                        while (tp < tEnd) {
+                            val tid = readEbmlId(buf, tp, tEnd) ?: break; tp += tid.second
+                            val tszP = readEbmlSize(buf, tp, tEnd) ?: break; tp += tszP.second
+                            val tsz = tszP.first.toInt()
+                            if (tsz < 0 || tp + tsz > tEnd) break
+                            if (tid.first == 0xF7L) trk = readEbmlUint(buf, tp, tsz).toInt()
+                            else if (tid.first == 0xF1L) clPos = readEbmlUint(buf, tp, tsz)
+                            tp += tsz
+                        }
+                        if (trk == videoTrk && clPos >= 0L) clusterPos = clPos
+                    }
+                    cp += csz
+                }
+                if (cueTime >= 0L && clusterPos >= 0L) {
+                    list.add(MkvCuePoint((cueTime.toDouble() * tsScale.toDouble()) / 1_000_000_000.0, segOffset + clusterPos))
+                }
+            }
+            p += sz
+        }
+        return list.sortedBy { it.timeSec }
+    }
+
+    private fun buildMkvSeekIndex(urlStr: String): MkvVideoSeekIndex? {
+        previewIndexCache[urlStr]?.let { return it }
+        val head = fetchRangeSlice(urlStr, 0L, 524287L) ?: return null
+        var segDataOffset = -1L; var tsScale = 1_000_000L; var cuesRelPos = -1L
+        var vTrk = 1; var codecId = ""; var w = 1920; var h = 1080
+        var codecPriv: ByteArray? = null; var stripped: ByteArray? = null
+        var cues = emptyList<MkvCuePoint>()
+
+        var pos = 0
+        while (pos < head.size) {
+            val idP = readEbmlId(head, pos, head.size) ?: break; pos += idP.second
+            val szP = readEbmlSize(head, pos, head.size) ?: break; pos += szP.second
+            if (idP.first == 0x18538067L) { segDataOffset = pos.toLong(); continue }
+            val sz = szP.first
+            val end = if (sz < 0L) head.size else minOf(head.size.toLong(), pos.toLong() + sz).toInt()
+            when (idP.first) {
+                0x114D9B74L -> {
+                    var sp = pos
+                    while (sp < end) {
+                        val sid = readEbmlId(head, sp, end) ?: break; sp += sid.second
+                        val sszP = readEbmlSize(head, sp, end) ?: break; sp += sszP.second
+                        val ssz = sszP.first.toInt(); if (ssz < 0 || sp + ssz > end) break
+                        if (sid.first == 0x4DBBL) {
+                            var ep = sp; val eEnd = sp + ssz; var isCues = false; var sPos = -1L
+                            while (ep < eEnd) {
+                                val eid = readEbmlId(head, ep, eEnd) ?: break; ep += eid.second
+                                val eszP = readEbmlSize(head, ep, eEnd) ?: break; ep += eszP.second
+                                val esz = eszP.first.toInt(); if (esz < 0 || ep + esz > eEnd) break
+                                if (eid.first == 0x53ABL && esz == 4 &&
+                                    (head[ep].toInt() and 0xFF) == 0x1C && (head[ep + 1].toInt() and 0xFF) == 0x53 &&
+                                    (head[ep + 2].toInt() and 0xFF) == 0xBB && (head[ep + 3].toInt() and 0xFF) == 0x6B) isCues = true
+                                else if (eid.first == 0x53ACL) sPos = readEbmlUint(head, ep, esz)
+                                ep += esz
+                            }
+                            if (isCues && sPos >= 0L) cuesRelPos = sPos
+                        }
+                        sp += ssz
+                    }
+                }
+                0x1549A966L -> {
+                    var ip = pos
+                    while (ip < end) {
+                        val iid = readEbmlId(head, ip, end) ?: break; ip += iid.second
+                        val iszP = readEbmlSize(head, ip, end) ?: break; ip += iszP.second
+                        val isz = iszP.first.toInt(); if (isz < 0 || ip + isz > end) break
+                        if (iid.first == 0x2AD7B1L) tsScale = readEbmlUint(head, ip, isz)
+                        ip += isz
+                    }
+                }
+                0x1654AE6BL -> {
+                    var tp = pos
+                    while (tp < end) {
+                        val tid = readEbmlId(head, tp, end) ?: break; tp += tid.second
+                        val tszP = readEbmlSize(head, tp, end) ?: break; tp += tszP.second
+                        val tsz = tszP.first.toInt(); if (tsz < 0 || tp + tsz > end) break
+                        if (tid.first == 0xAEL) {
+                            var ep = tp; val eEnd = tp + tsz; var tNum = 0; var tType = 0; var cId = ""; var cPriv: ByteArray? = null; var vw = 0; var vh = 0; var strp: ByteArray? = null
+                            while (ep < eEnd) {
+                                val eid = readEbmlId(head, ep, eEnd) ?: break; ep += eid.second
+                                val eszP = readEbmlSize(head, ep, eEnd) ?: break; ep += eszP.second
+                                val esz = eszP.first.toInt(); if (esz < 0 || ep + esz > eEnd) break
+                                when (eid.first) {
+                                    0xD7L -> tNum = readEbmlUint(head, ep, esz).toInt()
+                                    0x83L -> tType = readEbmlUint(head, ep, esz).toInt()
+                                    0x86L -> cId = readEbmlString(head, ep, esz)
+                                    0x63A2L -> cPriv = head.copyOfRange(ep, ep + esz)
+                                    0xE0L -> {
+                                        var vp = ep; val vEnd = ep + esz
+                                        while (vp < vEnd) {
+                                            val vid = readEbmlId(head, vp, vEnd) ?: break; vp += vid.second
+                                            val vszP = readEbmlSize(head, vp, vEnd) ?: break; vp += vszP.second
+                                            val vsz = vszP.first.toInt(); if (vsz < 0 || vp + vsz > vEnd) break
+                                            if (vid.first == 0xB0L) vw = readEbmlUint(head, vp, vsz).toInt()
+                                            else if (vid.first == 0xBAL) vh = readEbmlUint(head, vp, vsz).toInt()
+                                            vp += vsz
+                                        }
+                                    }
+                                    0x6D80L -> {
+                                        for (k in ep until (ep + esz - 4)) {
+                                            if ((head[k].toInt() and 0xFF) == 0x42 && (head[k + 1].toInt() and 0xFF) == 0x55) {
+                                                val sszP = readEbmlSize(head, k + 2, ep + esz)
+                                                if (sszP != null && sszP.first > 0L && k + 2 + sszP.second + sszP.first.toInt() <= ep + esz) {
+                                                    val ds = k + 2 + sszP.second
+                                                    strp = head.copyOfRange(ds, ds + sszP.first.toInt())
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                ep += esz
+                            }
+                            if (tType == 1) {
+                                vTrk = tNum; codecId = cId; codecPriv = cPriv; stripped = strp
+                                if (vw > 0) w = vw; if (vh > 0) h = vh
+                            }
+                        }
+                        tp += tsz
+                    }
+                }
+                0x1C53BB6BL -> if (segDataOffset >= 0L) cues = parseCuesElements(head, pos, end, segDataOffset, tsScale, vTrk)
+                0x1F43B675L -> break
+            }
+            if (sz < 0L || pos.toLong() + sz > head.size) break
+            pos += sz.toInt()
+        }
+
+        if (cues.isEmpty() && segDataOffset >= 0L && cuesRelPos > 0L) {
+            val cuesStart = segDataOffset + cuesRelPos
+            val cuesBuf = fetchRangeSlice(urlStr, cuesStart, cuesStart + 393215L)
+            if (cuesBuf != null && cuesBuf.size > 8) {
+                val idP = readEbmlId(cuesBuf, 0, cuesBuf.size)
+                if (idP != null && idP.first == 0x1C53BB6BL) {
+                    val szP = readEbmlSize(cuesBuf, idP.second, cuesBuf.size)
+                    if (szP != null) {
+                        val cStart = idP.second + szP.second
+                        val cEnd = if (szP.first < 0L) cuesBuf.size else minOf(cuesBuf.size.toLong(), cStart.toLong() + szP.first).toInt()
+                        cues = parseCuesElements(cuesBuf, cStart, cEnd, segDataOffset, tsScale, vTrk)
+                    }
+                }
+            }
+        }
+
+        if (cues.isEmpty() || codecPriv == null) return null
+        val mime = when {
+            codecId.uppercase(Locale.ROOT).contains("HEVC") || codecId.uppercase(Locale.ROOT).contains("H265") -> "video/hevc"
+            codecId.uppercase(Locale.ROOT).contains("AVC") || codecId.uppercase(Locale.ROOT).contains("H264") -> "video/avc"
+            else -> return null
+        }
+        val (csd0, csd1, nalLen) = parseAvccOrHvcc(codecId, codecPriv!!)
+        val idx = MkvVideoSeekIndex(vTrk, mime, w, h, csd0, csd1, nalLen, stripped, cues)
+        previewIndexCache[urlStr] = idx
+        return idx
+    }
+
+    private fun extractKeyframeFromCluster(buf: ByteArray, videoTrk: Int, stripped: ByteArray?): ByteArray? {
+        var p = 0
+        while (p < buf.size - 6) {
+            val idP = readEbmlId(buf, p, buf.size) ?: break; p += idP.second
+            val szP = readEbmlSize(buf, p, buf.size) ?: break; p += szP.second
+            if (idP.first == 0x1F43B675L) continue
+            val sz = szP.first
+            val elemEnd = if (sz < 0L) buf.size else minOf(buf.size.toLong(), p.toLong() + sz).toInt()
+            if (idP.first == 0xA3L && elemEnd > p + 4) {
+                val trkV = readEbmlSize(buf, p, elemEnd)
+                if (trkV != null && trkV.first.toInt() == videoTrk) {
+                    val payStart = p + trkV.second + 3
+                    if (elemEnd > payStart + 16) {
+                        val rawFrame = buf.copyOfRange(payStart, elemEnd)
+                        return if (stripped != null && stripped.isNotEmpty()) stripped + rawFrame else rawFrame
+                    }
+                }
+            }
+            if (sz < 0L || p.toLong() + sz > buf.size) break
+            p += sz.toInt()
+        }
+        return null
+    }
+
+    private fun decodeSingleFrameToDataUri(mime: String, w: Int, h: Int, csd0: ByteArray, csd1: ByteArray?, frameAnnexB: ByteArray): String? {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) return null
+        var codec: android.media.MediaCodec? = null
+        var surface: android.view.Surface? = null
+        var surfTex: android.graphics.SurfaceTexture? = null
+        return try {
+            surfTex = android.graphics.SurfaceTexture(0).apply {
+                detachFromGLContext()
+                setDefaultBufferSize(240, 135)
+            }
+            surface = android.view.Surface(surfTex)
+            val format = android.media.MediaFormat.createVideoFormat(mime, w, h).apply {
+                setByteBuffer("csd-0", ByteBuffer.wrap(csd0))
+                if (csd1 != null && csd1.isNotEmpty()) setByteBuffer("csd-1", ByteBuffer.wrap(csd1))
+            }
+            codec = android.media.MediaCodec.createDecoderByType(mime)
+            codec.configure(format, surface, null, 0)
+            codec.start()
+
+            val inIdx = codec.dequeueInputBuffer(150000L)
+            if (inIdx >= 0) {
+                val inBuf = codec.getInputBuffer(inIdx)
+                inBuf?.clear()
+                inBuf?.put(frameAnnexB)
+                codec.queueInputBuffer(inIdx, 0, frameAnnexB.size, 0L, android.media.MediaCodec.BUFFER_FLAG_SYNC_FRAME)
+            }
+            val eosIdx = codec.dequeueInputBuffer(50000L)
+            if (eosIdx >= 0) {
+                codec.queueInputBuffer(eosIdx, 0, 0, 0L, android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+            }
+
+            val info = android.media.MediaCodec.BufferInfo()
+            var rendered = false
+            val deadline = System.currentTimeMillis() + 900L
+            while (System.currentTimeMillis() < deadline && !rendered) {
+                val outIdx = codec.dequeueOutputBuffer(info, 40000L)
+                if (outIdx >= 0) {
+                    val hasFrame = info.size > 0
+                    codec.releaseOutputBuffer(outIdx, hasFrame)
+                    if (hasFrame) rendered = true
+                }
+            }
+            if (!rendered) return null
+            Thread.sleep(25L)
+
+            val bmp = android.graphics.Bitmap.createBitmap(240, 135, android.graphics.Bitmap.Config.ARGB_8888)
+            val latch = java.util.concurrent.CountDownLatch(1)
+            var copyOk = false
+            val hThread = android.os.HandlerThread("GDPreviewCopy").apply { start() }
+            try {
+                android.view.PixelCopy.request(surface, bmp, { res ->
+                    copyOk = (res == android.view.PixelCopy.SUCCESS)
+                    latch.countDown()
+                }, android.os.Handler(hThread.looper))
+                latch.await(500L, java.util.concurrent.TimeUnit.MILLISECONDS)
+            } finally {
+                hThread.quitSafely()
+            }
+            if (!copyOk) { bmp.recycle(); return null }
+
+            val baos = ByteArrayOutputStream()
+            bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 72, baos)
+            bmp.recycle()
+            "data:image/jpeg;base64," + android.util.Base64.encodeToString(baos.toByteArray(), android.util.Base64.NO_WRAP)
+        } catch (_: Throwable) { null } finally {
+            try { codec?.stop() } catch (_: Throwable) {}
+            try { codec?.release() } catch (_: Throwable) {}
+            try { surface?.release() } catch (_: Throwable) {}
+            try { surfTex?.release() } catch (_: Throwable) {}
+        }
+    }
 
     @ReactMethod
     fun extractPreviewFrame(url: String, timeMs: Double, promise: Promise) {
         val targetMs = timeMs.toLong().coerceAtLeast(0L)
         val bucket = targetMs / 4000L
         val cacheKey = "$url|$bucket"
-        previewFrameCache[cacheKey]?.let {
-            promise.resolve(it)
-            return
-        }
+        previewFrameCache[cacheKey]?.let { promise.resolve(it); return }
 
         latestPreviewTargetMs.set(targetMs)
         inspectorPool.submit {
             if (kotlin.math.abs(latestPreviewTargetMs.get() - targetMs) > 3500L) {
-                promise.resolve(null)
-                return@submit
+                promise.resolve(null); return@submit
             }
             try {
-                val dataUri = synchronized(previewLock) {
-                    previewFrameCache[cacheKey]?.let { return@synchronized it }
-                    if (previewRetriever == null || previewSourceUrl != url) {
-                        try { previewRetriever?.release() } catch (_: Exception) {}
-                        val mmr = android.media.MediaMetadataRetriever()
-                        if (url.startsWith("file://") || url.startsWith("/")) {
-                            mmr.setDataSource(url.removePrefix("file://"))
-                        } else {
-                            val headers = mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 14; GDStream/2.0)")
-                            mmr.setDataSource(url, headers)
+                val targetSec = targetMs.toDouble() / 1000.0
+                val mkvIdx = buildMkvSeekIndex(url)
+                if (mkvIdx != null && mkvIdx.cues.isNotEmpty()) {
+                    var lo = 0; var hi = mkvIdx.cues.size - 1; var bestIdx = 0
+                    while (lo <= hi) {
+                        val mid = (lo + hi) ushr 1
+                        if (mkvIdx.cues[mid].timeSec <= targetSec) { bestIdx = mid; lo = mid + 1 } else { hi = mid - 1 }
+                    }
+                    val clusterPos = mkvIdx.cues[bestIdx].clusterOffset
+                    val clusterSlice = fetchRangeSlice(url, clusterPos, clusterPos + 524287L)
+                    if (clusterSlice != null) {
+                        val rawFrame = extractKeyframeFromCluster(clusterSlice, mkvIdx.trackNumber, mkvIdx.strippedHeader)
+                        if (rawFrame != null) {
+                            val annexB = convertFrameToAnnexB(rawFrame, mkvIdx.nalLengthSize)
+                            val uri = synchronized(previewLock) {
+                                decodeSingleFrameToDataUri(mkvIdx.mimeType, mkvIdx.width, mkvIdx.height, mkvIdx.csd0, mkvIdx.csd1, annexB)
+                            }
+                            if (uri != null) {
+                                if (previewFrameCache.size > 90) {
+                                    val first = previewFrameCache.keys().nextElement()
+                                    if (first != null) previewFrameCache.remove(first)
+                                }
+                                previewFrameCache[cacheKey] = uri
+                                promise.resolve(uri); return@submit
+                            }
                         }
-                        previewRetriever = mmr
-                        previewSourceUrl = url
                     }
-                    val rawBmp = previewRetriever?.getFrameAtTime(
-                        targetMs * 1000L,
-                        android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC
-                    ) ?: return@synchronized null
-
-                    val scaled = android.graphics.Bitmap.createScaledBitmap(rawBmp, 240, 135, true)
-                    if (scaled != rawBmp) rawBmp.recycle()
-                    val baos = java.io.ByteArrayOutputStream()
-                    scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 68, baos)
-                    scaled.recycle()
-                    val b64 = android.util.Base64.encodeToString(baos.toByteArray(), android.util.Base64.NO_WRAP)
-                    val uri = "data:image/jpeg;base64,$b64"
-                    if (previewFrameCache.size > 90) {
-                        val first = previewFrameCache.keys().nextElement()
-                        if (first != null) previewFrameCache.remove(first)
-                    }
-                    previewFrameCache[cacheKey] = uri
-                    uri
                 }
-                promise.resolve(dataUri)
-            } catch (_: Exception) {
+
+                // Fallback for MP4/MOV via MediaExtractor + Hardware MediaCodec
+                val ext = MediaExtractor()
+                try {
+                    if (url.startsWith("file://") || url.startsWith("/")) ext.setDataSource(url.removePrefix("file://"))
+                    else ext.setDataSource(url, mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 14; GDStream/2.0)"))
+                    for (i in 0 until ext.trackCount) {
+                        val fmt = ext.getTrackFormat(i)
+                        val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                        if (mime.startsWith("video/")) {
+                            ext.selectTrack(i)
+                            ext.seekTo(targetMs * 1000L, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                            val sampleBuf = ByteBuffer.allocate(2 * 1024 * 1024)
+                            val sz = ext.readSampleData(sampleBuf, 0)
+                            if (sz > 0) {
+                                val bytes = ByteArray(sz); sampleBuf.get(bytes)
+                                val csd0 = fmt.getByteBuffer("csd-0")?.let { b -> ByteArray(b.remaining()).also { b.get(it) } } ?: ByteArray(0)
+                                val csd1 = fmt.getByteBuffer("csd-1")?.let { b -> ByteArray(b.remaining()).also { b.get(it) } }
+                                val vw = if (fmt.containsKey(MediaFormat.KEY_WIDTH)) fmt.getInteger(MediaFormat.KEY_WIDTH) else 1280
+                                val vh = if (fmt.containsKey(MediaFormat.KEY_HEIGHT)) fmt.getInteger(MediaFormat.KEY_HEIGHT) else 720
+                                val uri = synchronized(previewLock) { decodeSingleFrameToDataUri(mime, vw, vh, csd0, csd1, bytes) }
+                                if (uri != null) { previewFrameCache[cacheKey] = uri; promise.resolve(uri); return@submit }
+                            }
+                            break
+                        }
+                    }
+                } finally { try { ext.release() } catch (_: Exception) {} }
                 promise.resolve(null)
-            }
+            } catch (_: Exception) { promise.resolve(null) }
         }
     }
 
     @ReactMethod
     fun releasePreviewExtractor() {
         latestPreviewTargetMs.set(-1L)
-        inspectorPool.submit {
-            synchronized(previewLock) {
-                try { previewRetriever?.release() } catch (_: Exception) {}
-                previewRetriever = null
-                previewSourceUrl = ""
-                previewFrameCache.clear()
-            }
-        }
+        previewFrameCache.clear()
+        previewIndexCache.clear()
     }
 }
