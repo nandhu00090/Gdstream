@@ -88,23 +88,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     @Volatile
     private var nativeSessionLoggedIn = false
 
-    private val cookieJar = ConcurrentHashMap<String, String>()
-
-    private fun storeCookiesFromHeaders(headers: Map<String, List<String>>) {
-        val setCookies = headers["Set-Cookie"] ?: headers["set-cookie"] ?: return
-        for (raw in setCookies) {
-            val pair = raw.substringBefore(";").trim()
-            val eq = pair.indexOf('=')
-            if (eq > 0) {
-                cookieJar[pair.substring(0, eq).trim()] = pair.substring(eq + 1).trim()
-            }
-        }
-    }
-
-    private fun buildCookieHeader(): String {
-        if (cookieJar.isEmpty()) return ""
-        return cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }
-    }
+    @Volatile
+    private var sessionCookieHeader: String = ""
 
     @Volatile
     private var cachedShieldToken: String = ""
@@ -314,9 +299,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             setRequestProperty("Content-Type", contentType)
             setRequestProperty("User-Agent", "GDStream-Native-Engine/3.0")
             setRequestProperty("X-GD-Shield", shieldToken)
-            val ck = buildCookieHeader()
-            if (ck.isNotEmpty()) {
-                setRequestProperty("Cookie", ck)
+            if (sessionCookieHeader.isNotEmpty()) {
+                setRequestProperty("Cookie", sessionCookieHeader)
             }
             if (this is HttpsURLConnection) {
                 sslSocketFactory = buildPinnedSystemSslFactory()
@@ -330,7 +314,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 os.flush()
             }
 
-            storeCookiesFromHeaders(conn.headerFields)
+            val setCookies = conn.headerFields["Set-Cookie"] ?: conn.headerFields["set-cookie"]
+            if (!setCookies.isNullOrEmpty()) {
+                val cookieParts = setCookies.mapNotNull { it.substringBefore(";").trim().takeIf { s -> s.isNotEmpty() } }
+                if (cookieParts.isNotEmpty()) {
+                    sessionCookieHeader = cookieParts.joinToString("; ")
+                }
+            }
 
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
@@ -517,7 +507,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val baseUrl = nSync(1, seed)
             val shieldToken = nSync(5, seed)
             if (shieldToken.isNotEmpty()) cachedShieldToken = shieldToken
-            if ((!nativeSessionLoggedIn || cookieJar.isEmpty()) && baseUrl.isNotEmpty() && shieldToken.isNotEmpty()) {
+            if ((!nativeSessionLoggedIn || sessionCookieHeader.isEmpty()) && baseUrl.isNotEmpty() && shieldToken.isNotEmpty()) {
                 try { performNativeLogin(baseUrl, seed, shieldToken) } catch (_: Throwable) {}
             }
         }
@@ -538,9 +528,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 if (cachedShieldToken.isNotEmpty()) {
                     setRequestProperty("X-GD-Shield", cachedShieldToken)
                 }
-                val ck = buildCookieHeader()
-            if (ck.isNotEmpty()) {
-                setRequestProperty("Cookie", ck)
+                if (sessionCookieHeader.isNotEmpty()) {
+                setRequestProperty("Cookie", sessionCookieHeader)
             }
                 if (!rangeHeader.isNullOrEmpty()) {
                     setRequestProperty("Range", rangeHeader)
@@ -551,7 +540,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
             }
             val code = conn.responseCode
-            storeCookiesFromHeaders(conn.headerFields)
+            val setCookies = conn.headerFields["Set-Cookie"] ?: conn.headerFields["set-cookie"]
+            if (!setCookies.isNullOrEmpty()) {
+                val cookieParts = setCookies.mapNotNull { it.substringBefore(";").trim().takeIf { s -> s.isNotEmpty() } }
+                if (cookieParts.isNotEmpty()) {
+                    sessionCookieHeader = cookieParts.joinToString("; ")
+                }
+            }
             if (code in 300..399) {
                 val loc = conn.getHeaderField("Location")
                 conn.disconnect()

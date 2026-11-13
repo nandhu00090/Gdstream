@@ -1967,7 +1967,7 @@ const App = () => {
       setCurrentPath(path);
       if (!isPullRefresh) setSearchQuery('');
     } catch (error) {
-      Alert.alert('Error', 'Folder load aagala!');
+      Alert.alert('Error', `Folder load aagala! (${(error as any)?.message || 'Network'})`);
     } finally {
       setLoading(false);
       setFolderLoading(false);
