@@ -1312,6 +1312,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
     private val previewIndexCache = java.util.concurrent.ConcurrentHashMap<String, MkvVideoSeekIndex>()
     private val previewFrameCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val latestPreviewTargetMs = java.util.concurrent.atomic.AtomicLong(-1L)
+    private val previewSessionGen = java.util.concurrent.atomic.AtomicInteger(0)
 
     private fun parseAvccOrHvcc(codecId: String, priv: ByteArray): Triple<ByteArray, ByteArray?, Int> {
         val upper = codecId.uppercase(Locale.ROOT)
@@ -1603,7 +1604,8 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             val szP = readEbmlSize(buf, p, buf.size) ?: break; p += szP.second
             if (idP.first == 0x1F43B675L) continue
             val sz = szP.first
-            val elemEnd = if (sz < 0L) buf.size else minOf(buf.size.toLong(), p.toLong() + sz).toInt()
+            if (sz < 0L || p.toLong() + sz > buf.size) return null
+            val elemEnd = p + sz.toInt()
             if (idP.first == 0xA3L && elemEnd > p + 4) {
                 val trkV = readEbmlSize(buf, p, elemEnd)
                 if (trkV != null && trkV.first.toInt() == videoTrk) {
@@ -1614,10 +1616,46 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                     }
                 }
             }
-            if (sz < 0L || p.toLong() + sz > buf.size) break
-            p += sz.toInt()
+            p = elemEnd
         }
         return null
+    }
+
+    private fun decodeMkvTimestampFast(url: String, mkvIdx: MkvVideoSeekIndex, targetMs: Long): String? {
+        val bucket = targetMs / 4000L
+        val cacheKey = "$url|$bucket"
+        previewFrameCache[cacheKey]?.let { return it }
+
+        val targetSec = targetMs.toDouble() / 1000.0
+        var lo = 0; var hi = mkvIdx.cues.size - 1; var bestIdx = 0
+        while (lo <= hi) {
+            val mid = (lo + hi) ushr 1
+            if (mkvIdx.cues[mid].timeSec <= targetSec) { bestIdx = mid; lo = mid + 1 } else { hi = mid - 1 }
+        }
+        val clusterPos = mkvIdx.cues[bestIdx].clusterOffset
+        var rawFrame: ByteArray? = null
+        val fastSlice = fetchRangeSlice(url, clusterPos, clusterPos + 196607L)
+        if (fastSlice != null) {
+            rawFrame = extractKeyframeFromCluster(fastSlice, mkvIdx.trackNumber, mkvIdx.strippedHeader)
+        }
+        if (rawFrame == null) {
+            val bigSlice = fetchRangeSlice(url, clusterPos, clusterPos + 655359L)
+            if (bigSlice != null) {
+                rawFrame = extractKeyframeFromCluster(bigSlice, mkvIdx.trackNumber, mkvIdx.strippedHeader)
+            }
+        }
+        if (rawFrame == null) return null
+        val annexB = convertFrameToAnnexB(rawFrame, mkvIdx.nalLengthSize)
+        val uri = synchronized(previewLock) {
+            decodeSingleFrameToDataUri(mkvIdx.mimeType, mkvIdx.width, mkvIdx.height, mkvIdx.csd0, mkvIdx.csd1, annexB)
+        } ?: return null
+
+        if (previewFrameCache.size > 120) {
+            val first = previewFrameCache.keys().nextElement()
+            if (first != null) previewFrameCache.remove(first)
+        }
+        previewFrameCache[cacheKey] = uri
+        return uri
     }
 
     private fun decodeSingleFrameToDataUri(mime: String, w: Int, h: Int, csd0: ByteArray, csd1: ByteArray?, frameAnnexB: ByteArray): String? {
@@ -1663,7 +1701,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                 }
             }
             if (!rendered) return null
-            Thread.sleep(25L)
+            Thread.sleep(8L)
 
             val bmp = android.graphics.Bitmap.createBitmap(240, 135, android.graphics.Bitmap.Config.ARGB_8888)
             val latch = java.util.concurrent.CountDownLatch(1)
@@ -1705,33 +1743,13 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                 promise.resolve(null); return@submit
             }
             try {
-                val targetSec = targetMs.toDouble() / 1000.0
                 val mkvIdx = buildMkvSeekIndex(url)
                 if (mkvIdx != null && mkvIdx.cues.isNotEmpty()) {
-                    var lo = 0; var hi = mkvIdx.cues.size - 1; var bestIdx = 0
-                    while (lo <= hi) {
-                        val mid = (lo + hi) ushr 1
-                        if (mkvIdx.cues[mid].timeSec <= targetSec) { bestIdx = mid; lo = mid + 1 } else { hi = mid - 1 }
-                    }
-                    val clusterPos = mkvIdx.cues[bestIdx].clusterOffset
-                    val clusterSlice = fetchRangeSlice(url, clusterPos, clusterPos + 524287L)
-                    if (clusterSlice != null) {
-                        if (latestPreviewTargetMs.get() != targetMs) { promise.resolve(null); return@submit }
-                        val rawFrame = extractKeyframeFromCluster(clusterSlice, mkvIdx.trackNumber, mkvIdx.strippedHeader)
-                        if (rawFrame != null) {
-                            val annexB = convertFrameToAnnexB(rawFrame, mkvIdx.nalLengthSize)
-                            val uri = synchronized(previewLock) {
-                                decodeSingleFrameToDataUri(mkvIdx.mimeType, mkvIdx.width, mkvIdx.height, mkvIdx.csd0, mkvIdx.csd1, annexB)
-                            }
-                            if (uri != null) {
-                                if (previewFrameCache.size > 90) {
-                                    val first = previewFrameCache.keys().nextElement()
-                                    if (first != null) previewFrameCache.remove(first)
-                                }
-                                previewFrameCache[cacheKey] = uri
-                                promise.resolve(uri); return@submit
-                            }
-                        }
+                    if (latestPreviewTargetMs.get() != targetMs) { promise.resolve(null); return@submit }
+                    val uri = decodeMkvTimestampFast(url, mkvIdx, targetMs)
+                    if (uri != null) {
+                        promise.resolve(uri)
+                        return@submit
                     }
                 }
 
@@ -1767,7 +1785,45 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun prewarmTimelinePreviews(url: String, durationSec: Double, promise: Promise) {
+        val gen = previewSessionGen.incrementAndGet()
+        inspectorPool.submit {
+            val outArr = Arguments.createArray()
+            try {
+                val mkvIdx = buildMkvSeekIndex(url)
+                if (mkvIdx == null || mkvIdx.cues.isEmpty() || durationSec <= 12.0) {
+                    promise.resolve(outArr)
+                    return@submit
+                }
+                val steps = 24
+                for (i in 0 until steps) {
+                    if (previewSessionGen.get() != gen) break
+                    while (latestPreviewTargetMs.get() > 0L && previewSessionGen.get() == gen) {
+                        Thread.sleep(250L)
+                    }
+                    if (previewSessionGen.get() != gen) break
+                    val frac = 0.02 + (0.94 * i.toDouble() / (steps - 1).toDouble())
+                    val sampleMs = (durationSec * frac * 1000.0).toLong()
+                    val bucket = (sampleMs / 4000L).toInt()
+                    val uri = decodeMkvTimestampFast(url, mkvIdx, sampleMs)
+                    if (uri != null) {
+                        outArr.pushMap(Arguments.createMap().apply {
+                            putInt("bucket", bucket)
+                            putString("uri", uri)
+                        })
+                    }
+                    Thread.sleep(90L)
+                }
+                promise.resolve(outArr)
+            } catch (_: Throwable) {
+                promise.resolve(outArr)
+            }
+        }
+    }
+
+    @ReactMethod
     fun releasePreviewExtractor() {
+        previewSessionGen.incrementAndGet()
         latestPreviewTargetMs.set(-1L)
         previewFrameCache.clear()
         previewIndexCache.clear()

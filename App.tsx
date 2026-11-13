@@ -848,25 +848,55 @@ const App = () => {
   const [scrubTime, setScrubTime] = useState(0);
   const scrubTimeRef = useRef(0);
   const [previewFrameUri, setPreviewFrameUri] = useState<string | null>(null);
+  const previewCacheRef = useRef<Record<number, string>>({});
+  const prewarmedUrlRef = useRef<string>('');
   const lastPreviewBucketRef = useRef<number>(-1);
   const lastScrubPageXRef = useRef<number>(-1);
 
+  const findNearestCachedPreview = useCallback((sec: number): string | null => {
+    const cache = previewCacheRef.current;
+    const targetBucket = Math.floor(sec / 4);
+    if (cache[targetBucket]) return cache[targetBucket];
+    let bestUri: string | null = null;
+    let bestDist = Infinity;
+    for (const k of Object.keys(cache)) {
+      const b = Number(k);
+      const dist = Math.abs(b - targetBucket);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestUri = cache[b];
+      }
+    }
+    return bestUri;
+  }, []);
+
   const requestPreviewAtTime = useCallback((sec: number) => {
     const active = selectedFileRef.current;
-    if (!active || !MediaInfoModule?.extractPreviewFrame) return;
+    if (!active) return;
     const bucket = Math.floor(sec / 4);
+    const instantUri = findNearestCachedPreview(sec);
+    if (instantUri) {
+      setPreviewFrameUri(instantUri);
+    }
     if (bucket === lastPreviewBucketRef.current) return;
     lastPreviewBucketRef.current = bucket;
+    if (previewCacheRef.current[bucket]) {
+      setPreviewFrameUri(previewCacheRef.current[bucket]);
+      return;
+    }
     const streamUrl = getStreamUrl(active);
-    if (!streamUrl) return;
+    if (!streamUrl || !MediaInfoModule?.extractPreviewFrame) return;
     MediaInfoModule.extractPreviewFrame(streamUrl, sec * 1000)
       .then((uri: string | null) => {
-        if (uri && isScrubbingRef.current && lastPreviewBucketRef.current === bucket) {
-          setPreviewFrameUri(uri);
+        if (uri) {
+          previewCacheRef.current[bucket] = uri;
+          if (isScrubbingRef.current && lastPreviewBucketRef.current === bucket) {
+            setPreviewFrameUri(uri);
+          }
         }
       })
       .catch(() => {});
-  }, [getStreamUrl]);
+  }, [getStreamUrl, findNearestCachedPreview]);
 
   const seekbarPanResponder = useMemo(() => PanResponder.create({
     onStartShouldSetPanResponder: () => true,
@@ -1191,6 +1221,8 @@ const App = () => {
     isScrubbingRef.current = false;
     setIsScrubbing(false);
     setPreviewFrameUri(null);
+    previewCacheRef.current = {};
+    prewarmedUrlRef.current = '';
     try { MediaInfoModule?.releasePreviewExtractor?.(); } catch {}
     setActiveMenu(null);
     setPlayMode(null);
@@ -2376,6 +2408,28 @@ const App = () => {
     if (loadedDur > 0) {
       setDuration(loadedDur);
       durationRef.current = loadedDur;
+      if (selectedFile && MediaInfoModule?.prewarmTimelinePreviews) {
+        const sUrl = getStreamUrl(selectedFile);
+        if (sUrl && prewarmedUrlRef.current !== sUrl) {
+          prewarmedUrlRef.current = sUrl;
+          previewCacheRef.current = {};
+          setTimeout(() => {
+            if (prewarmedUrlRef.current === sUrl) {
+              MediaInfoModule.prewarmTimelinePreviews(sUrl, loadedDur)
+                .then((items: Array<{ bucket: number; uri: string }>) => {
+                  if (Array.isArray(items) && prewarmedUrlRef.current === sUrl) {
+                    for (const it of items) {
+                      if (it && typeof it.bucket === 'number' && it.uri) {
+                        previewCacheRef.current[it.bucket] = it.uri;
+                      }
+                    }
+                  }
+                })
+                .catch(() => {});
+            }
+          }, 1200);
+        }
+      }
       if (selectedFile?.name) {
         savedDurationsRef.current[selectedFile.name] = loadedDur;
         setSavedDurationsMap({ ...savedDurationsRef.current });
