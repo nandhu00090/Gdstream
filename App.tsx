@@ -842,6 +842,63 @@ const App = () => {
   const currentTimeRef = useRef(0);
   const durationRef = useRef(0);
   const [progressWidth, setProgressWidth] = useState(0);
+  const zipRawJsonCacheRef = useRef<Record<string, string>>({});
+  const zipPrewarmQueuedRef = useRef<Set<string>>(new Set());
+
+  const fetchZipRawJsonFast = useCallback(async (url: string, sizeHint: number, cacheId?: string) => {
+    const key = cacheId || `${url.split('?')[0]}|${sizeHint}`;
+    if (zipRawJsonCacheRef.current[key]) {
+      return zipRawJsonCacheRef.current[key];
+    }
+    const rawJson = await fetchZipRawJsonFast(url, sizeHint);
+    if (typeof rawJson === 'string' && rawJson.startsWith('[') && rawJson.length > 2) {
+      zipRawJsonCacheRef.current[key] = rawJson;
+    }
+    return rawJson;
+  }, []);
+
+  useEffect(() => {
+    if (playMode !== null || !Array.isArray(files) || files.length === 0) return;
+    const archives = files.filter(
+      (f: any) => f && !f.isFolder && /\.(zip|rar)$/i.test(String(f.name || ''))
+    );
+    if (archives.length === 0) return;
+
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      const queue = archives.filter((a: any) => {
+        const k = a.id || a.name;
+        if (zipRawJsonCacheRef.current[k] || zipPrewarmQueuedRef.current.has(k)) return false;
+        zipPrewarmQueuedRef.current.add(k);
+        return true;
+      }).slice(0, 35);
+
+      if (queue.length === 0) return;
+      let cursor = 0;
+
+      const worker = async () => {
+        while (!cancelled && cursor < queue.length) {
+          const item = queue[cursor++];
+          const k = item.id || item.name;
+          try {
+            const sUrl = getStreamUrl(item);
+            if (sUrl) {
+              await fetchZipRawJsonFast(sUrl, Number(item.size || 0), k);
+            }
+          } catch {}
+          await new Promise(r => setTimeout(r, 120));
+        }
+      };
+
+      worker();
+      worker();
+    }, 700);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [files, playMode, getStreamUrl, fetchZipRawJsonFast]);
   const progressBarRef = useRef<any>(null);
   const progressBarMetrics = useRef<{ pageX: number; width: number }>({ pageX: 0, width: 0 });
   const [isScrubbing, setIsScrubbing] = useState(false);
@@ -1606,7 +1663,7 @@ const App = () => {
       setPathStack(prev => [...prev, virtualZipPath]);
 
       if (SecurityVault?.listZipMediaEntries) {
-        const rawJson = await SecurityVault.listZipMediaEntries(zipUrl, sizeHint);
+        const rawJson = await fetchZipRawJsonFast(zipUrl, sizeHint);
         const entries = rawJson ? JSON.parse(rawJson) : [];
         if (Array.isArray(entries) && entries.length > 0) {
           setFolderFiles(entries);
@@ -2109,7 +2166,7 @@ const App = () => {
             const archUrl = archItem.link
               ? (archItem.link.startsWith('http') ? archItem.link : `${baseUrl}${archItem.link.startsWith('/') ? '' : '/'}${archItem.link}`)
               : `${baseUrl}${path}${encodeURIComponent(archItem.name)}`;
-            const rawJson = await SecurityVault.listZipMediaEntries(archUrl, Number(archItem.size || 0));
+            const rawJson = await fetchZipRawJsonFast(archUrl, Number(archItem.size || 0));
             const entries = rawJson ? JSON.parse(rawJson) : [];
             if (Array.isArray(entries) && entries.length > 0) {
               const rawFolderTitle = decodeURIComponent(path.split('/').filter(Boolean).pop() || '');

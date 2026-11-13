@@ -1110,8 +1110,189 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return items
     }
 
+    private val zipDiskCache = ConcurrentHashMap<String, String>()
+    private val zipDiskLoaded = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val zipDiskWriteLock = Any()
+    private val zipInflightMap = ConcurrentHashMap<String, MutableList<Promise>>()
+
+    private fun extractArchiveCacheKey(rawUrl: String, sizeHint: Double): String {
+        val qId = Regex("[?&]id=([a-zA-Z0-9_-]{15,})").find(rawUrl)?.groupValues?.getOrNull(1)
+        val pId = Regex("/d/([a-zA-Z0-9_-]{15,})").find(rawUrl)?.groupValues?.getOrNull(1)
+        val driveId = qId ?: pId
+        return if (!driveId.isNullOrEmpty()) "gd_$driveId" else "${rawUrl.substringBefore("?")}|${sizeHint.toLong()}"
+    }
+
+    private fun ensureZipDiskCacheLoaded() {
+        if (!zipDiskLoaded.compareAndSet(false, true)) return
+        try {
+            val file = File(reactContext.filesDir, "gdstream_zip_index_v1.json")
+            if (file.exists() && file.length() > 2L) {
+                val rootObj = JSONObject(file.readText(Charsets.UTF_8))
+                val keys = rootObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val v = rootObj.optString(k, "")
+                    if (v.isNotEmpty()) zipDiskCache[k] = v
+                }
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun saveZipDiskCacheAsync() {
+        ioExecutor.submit {
+            synchronized(zipDiskWriteLock) {
+                try {
+                    val obj = JSONObject()
+                    for ((k, v) in zipDiskCache) obj.put(k, v)
+                    val tmp = File(reactContext.filesDir, "gdstream_zip_index_v1.tmp")
+                    val dest = File(reactContext.filesDir, "gdstream_zip_index_v1.json")
+                    tmp.writeText(obj.toString(), Charsets.UTF_8)
+                    tmp.renameTo(dest)
+                } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    private fun restoreArchiveFromDisk(cachedBlob: String, freshUrl: String): String? {
+        return try {
+            val root = JSONObject(cachedBlob)
+            val rawJson = root.optString("rawJson", "")
+            val targetsArr = root.optJSONArray("targets") ?: return null
+            if (rawJson.isEmpty() || targetsArr.length() == 0) return null
+            for (i in 0 until targetsArr.length()) {
+                val o = targetsArr.optJSONObject(i) ?: continue
+                val id = o.optString("id", "")
+                if (id.isEmpty()) continue
+                val entry = ArchiveEntryTarget(
+                    id = id,
+                    archiveUrl = freshUrl,
+                    fileName = o.optString("fileName", ""),
+                    archiveFormat = o.optString("archiveFormat", "ZIP"),
+                    compressionMethod = o.optInt("compressionMethod", 0),
+                    compressedSize = o.optLong("compressedSize", 0L),
+                    uncompressedSize = o.optLong("uncompressedSize", 0L),
+                    localHeaderOffset = o.optLong("localHeaderOffset", 0L),
+                    dataStartOffset = o.optLong("dataStartOffset", -1L)
+                )
+                archiveEntryRegistry[id] = entry
+            }
+            rawJson
+        } catch (_: Throwable) { null }
+    }
+
+    private fun persistArchiveToDisk(cacheKey: String, rawJson: String) {
+        try {
+            val arr = JSONArray(rawJson)
+            if (arr.length() == 0) return
+            val targetsArr = JSONArray()
+            for (i in 0 until arr.length()) {
+                val item = arr.optJSONObject(i) ?: continue
+                val id = item.optString("id", "")
+                val t = archiveEntryRegistry[id] ?: continue
+                targetsArr.put(JSONObject().apply {
+                    put("id", t.id)
+                    put("fileName", t.fileName)
+                    put("archiveFormat", t.archiveFormat)
+                    put("compressionMethod", t.compressionMethod)
+                    put("compressedSize", t.compressedSize)
+                    put("uncompressedSize", t.uncompressedSize)
+                    put("localHeaderOffset", t.localHeaderOffset)
+                    put("dataStartOffset", t.dataStartOffset)
+                })
+            }
+            if (targetsArr.length() > 0) {
+                val root = JSONObject().apply {
+                    put("rawJson", rawJson)
+                    put("targets", targetsArr)
+                }
+                zipDiskCache[cacheKey] = root.toString()
+                saveZipDiskCacheAsync()
+            }
+        } catch (_: Throwable) {}
+    }
+
     @ReactMethod
     fun listZipMediaEntries(zipUrl: String, fileSizeHint: Double, promise: Promise) {
+        ioExecutor.submit {
+            ensureZipDiskCacheLoaded()
+            val cacheKey = extractArchiveCacheKey(zipUrl, fileSizeHint)
+            val cachedBlob = zipDiskCache[cacheKey]
+            if (!cachedBlob.isNullOrEmpty()) {
+                val restoredJson = restoreArchiveFromDisk(cachedBlob, zipUrl)
+                if (!restoredJson.isNullOrEmpty()) {
+                    promise.resolve(restoredJson)
+                    return@submit
+                }
+            }
+
+            var isLeader = false
+            zipInflightMap.compute(cacheKey) { _, existing ->
+                if (existing == null) {
+                    isLeader = true
+                    java.util.Collections.synchronizedList(mutableListOf(promise))
+                } else {
+                    existing.add(promise)
+                    existing
+                }
+            }
+            if (!isLeader) return@submit
+
+            val proxyPromise = object : Promise {
+                override fun resolve(value: Any?) {
+                    val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
+                    if (value is String && value.startsWith("[") && value.length > 2) {
+                        persistArchiveToDisk(cacheKey, value)
+                    }
+                    for (p in list) p.resolve(value)
+                }
+                override fun reject(code: String, message: String?) {
+                    val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
+                    for (p in list) p.reject(code, message)
+                }
+                override fun reject(code: String, throwable: Throwable?) {
+                    val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
+                    for (p in list) p.reject(code, throwable)
+                }
+                override fun reject(code: String, message: String?, throwable: Throwable?) {
+                    val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
+                    for (p in list) p.reject(code, message, throwable)
+                }
+                override fun reject(throwable: Throwable) {
+                    val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
+                    for (p in list) p.reject(throwable)
+                }
+                override fun reject(throwable: Throwable, userInfo: WritableMap) {
+                    val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
+                    for (p in list) p.reject(throwable, userInfo)
+                }
+                override fun reject(code: String, userInfo: WritableMap) {
+                    val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
+                    for (p in list) p.reject(code, userInfo)
+                }
+                override fun reject(code: String, throwable: Throwable?, userInfo: WritableMap) {
+                    val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
+                    for (p in list) p.reject(code, throwable, userInfo)
+                }
+                override fun reject(code: String, message: String?, userInfo: WritableMap) {
+                    val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
+                    for (p in list) p.reject(code, message, userInfo)
+                }
+                override fun reject(code: String?, message: String?, throwable: Throwable?, userInfo: WritableMap?) {
+                    val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
+                    for (p in list) p.reject(code, message, throwable, userInfo)
+                }
+                @Deprecated("Deprecated in React Native")
+                override fun reject(message: String) {
+                    val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
+                    for (p in list) p.reject(message)
+                }
+            }
+
+            scanZipMediaEntriesUncached(zipUrl, fileSizeHint, proxyPromise)
+        }
+    }
+
+    private fun scanZipMediaEntriesUncached(zipUrl: String, fileSizeHint: Double, promise: Promise) {
         ioExecutor.submit {
             try {
                 val seed = verifyCertificateAndEnv()
