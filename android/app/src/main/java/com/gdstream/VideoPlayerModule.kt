@@ -297,6 +297,14 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
     @ReactMethod
     fun playVideo(url: String, promise: Promise) {
         try {
+            if (url.contains("127.0.0.1") || url.contains("localhost")) {
+                DownloadForegroundService.updateService(
+                    reactApplicationContext,
+                    "GDStream Archive Bridge",
+                    "Streaming video to external player...",
+                    0
+                )
+            }
             val playableUri = resolvePlayableUri(url)
             val intent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(playableUri, "video/*")
@@ -309,6 +317,13 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
             promise.resolve(true)
         } catch (e: Exception) {
             promise.reject("ERROR", "No player found")
+        }
+    }
+
+    @ReactMethod
+    fun stopExternalStreamBridge() {
+        if (DownloadEngineModule.activeDownloadCount <= 0) {
+            DownloadForegroundService.stopService(reactApplicationContext)
         }
     }
 

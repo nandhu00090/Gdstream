@@ -957,6 +957,9 @@ const App = () => {
     });
 
     const appStateSub = AppState.addEventListener('change', nextState => {
+      if (nextState === 'active') {
+        VideoPlayerManager?.stopExternalStreamBridge?.();
+      }
       const activeFile = selectedFileRef.current;
       if ((nextState === 'background' || nextState === 'inactive') && activeFile?.name && currentTimeRef.current > 3) {
         persistPlaybackProgress(activeFile.name, currentTimeRef.current, durationRef.current);

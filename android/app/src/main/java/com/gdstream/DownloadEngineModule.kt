@@ -31,6 +31,12 @@ import java.util.concurrent.atomic.AtomicLong
 class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
+    companion object {
+        @JvmStatic
+        @Volatile
+        var activeDownloadCount: Int = 0
+    }
+
     data class ChunkRange(
         val index: Int,
         val start: Long,
@@ -92,6 +98,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
 
     private fun syncForegroundService() {
         val activeTasks = tasks.values.filter { it.status == "downloading" }
+        activeDownloadCount = activeTasks.size
         if (activeTasks.isEmpty()) {
             DownloadForegroundService.stopService(reactContext)
             return
