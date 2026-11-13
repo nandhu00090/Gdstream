@@ -100,11 +100,21 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val videoUrl: String
     )
 
+    data class TrailerLanguageOption(
+        val langCode: String,
+        val langName: String,
+        val videoId: String,
+        val label: String,
+        val isOriginal: Boolean
+    )
+
     data class VerifiedTrailerInfo(
         val engine: String,
         val videoId: String,
         val directStreams: List<DirectTrailerStream>,
-        val maxQualityLabel: String
+        val maxQualityLabel: String,
+        val languages: List<TrailerLanguageOption> = emptyList(),
+        val activeLangName: String = ""
     )
 
     data class ArchiveEntryTarget(
@@ -1438,13 +1448,55 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return list
     }
 
-    private fun searchStrictOfficialTrailerIds(titleQuery: String, year: String): List<String> {
+    private fun langCodeToDisplayName(rawCode: String): String {
+        return when (rawCode.trim().lowercase(Locale.ROOT).substringBefore("-")) {
+            "ta", "tam" -> "Tamil"
+            "te", "tel" -> "Telugu"
+            "hi", "hin" -> "Hindi"
+            "ml", "mal" -> "Malayalam"
+            "kn", "kan" -> "Kannada"
+            "en", "eng" -> "English"
+            "ja", "jpn" -> "Japanese"
+            "ko", "kor" -> "Korean"
+            "es", "spa" -> "Spanish"
+            "fr", "fre", "fra" -> "French"
+            else -> ""
+        }
+    }
+
+    private fun detectLanguageFromTitle(titleText: String, fallbackCode: String): Pair<String, String> {
+        val lower = titleText.lowercase(Locale.ROOT)
+        val checks = listOf(
+            Triple("tamil", "ta", "Tamil"),
+            Triple("telugu", "te", "Telugu"),
+            Triple("hindi", "hi", "Hindi"),
+            Triple("malayalam", "ml", "Malayalam"),
+            Triple("kannada", "kn", "Kannada"),
+            Triple("english", "en", "English"),
+            Triple("japanese", "ja", "Japanese"),
+            Triple("korean", "ko", "Korean")
+        )
+        for ((word, c, name) in checks) {
+            if (Regex("\\b$word\\b").containsMatchIn(lower)) {
+                return Pair(c, name)
+            }
+        }
+        val mapped = langCodeToDisplayName(fallbackCode)
+        return if (mapped.isNotEmpty()) Pair(fallbackCode.lowercase(Locale.ROOT), mapped) else Pair("en", "Original")
+    }
+
+    private fun searchStrictOfficialTrailerIds(titleQuery: String, year: String, langHint: String = ""): List<String> {
         val candidates = ArrayList<String>()
         try {
             val clean = titleQuery.trim()
             if (clean.isEmpty()) return emptyList()
 
-            val searchQuery = if (year.isNotEmpty()) "$clean $year Official Trailer" else "$clean Official Trailer"
+            val searchQuery = buildString {
+                append(clean)
+                if (year.isNotEmpty()) append(" $year")
+                if (langHint.isNotEmpty()) append(" $langHint")
+                append(" Official Trailer")
+            }
             val payload = JSONObject().apply {
                 put("context", JSONObject().apply {
                     put("client", JSONObject().apply {
@@ -1459,8 +1511,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
             val conn = (URL("https://www.youtube.com/youtubei/v1/search?prettyPrint=false")
                 .openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
-                connectTimeout = 7000
-                readTimeout = 7000
+                connectTimeout = 6000
+                readTimeout = 6000
                 requestMethod = "POST"
                 doInput = true
                 doOutput = true
@@ -1484,12 +1536,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val vid = chunk.substring(0, 11)
                 if (!vid.matches(Regex("[a-zA-Z0-9_-]{11}"))) continue
 
-                val titleMatch = Pattern.compile("\"title\":\\{\"runs\":\\[\\{\"text\":\"([^\"]+)\"").matcher(chunk)
+                val titleMatch = Pattern.compile("\"title\":\{\"runs\":\[\{\"text\":\"([^\"]+)\"").matcher(chunk)
                 if (!titleMatch.find()) continue
                 val vTitle = (titleMatch.group(1) ?: "").lowercase(Locale.ROOT)
 
-                if (!vTitle.contains("trailer")) continue
+                if (!vTitle.contains("trailer") && !vTitle.contains("teaser")) continue
                 if (isReviewOrJunkTitle(vTitle)) continue
+                if (langHint.isNotEmpty() && !vTitle.contains(langHint.lowercase(Locale.ROOT))) continue
 
                 val matchesMovie = if (titleWords.isNotEmpty()) {
                     titleWords.all { w -> vTitle.contains(w) }
@@ -1499,15 +1552,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
                 if (matchesMovie && !candidates.contains(vid)) {
                     candidates.add(vid)
-                    if (candidates.size >= 4) break
+                    if (candidates.size >= 3) break
                 }
             }
         } catch (_: Throwable) {}
         return candidates
     }
 
-
-        private fun fetchYtChunkBytes(target: YoutubeProxyTarget, chunkIndex: Long): ByteArray? {
+    private fun fetchYtChunkBytes(target: YoutubeProxyTarget, chunkIndex: Long): ByteArray? {
         val chunkKey = "${target.id}_$chunkIndex"
         youtubeChunkCache[chunkKey]?.let { return it }
 
@@ -1629,7 +1681,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         var curPos = reqStart
         while (curPos <= reqEnd) {
             val chunkIdx = curPos / 524288L
-            // Pre-fetch the next 4 chunks (2 MB read-ahead) in parallel so MediaPlayer NEVER waits!
             prewarmYoutubeChunks(target, chunkIdx + 1L, 4)
 
             val chunkBytes = fetchYtChunkBytes(target, chunkIdx) ?: break
@@ -1649,115 +1700,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         out.flush()
     }
 
-    private fun probeYoutubeStreamSize(rawUrl: String, ua: String): Long {
-        var conn: HttpURLConnection? = null
-        try {
-            conn = (URL(rawUrl).openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
-                connectTimeout = 5000
-                readTimeout = 5000
-                requestMethod = "GET"
-                instanceFollowRedirects = true
-                setRequestProperty("User-Agent", ua)
-                setRequestProperty("Range", "bytes=0-1")
-            }
-            val cr = conn.getHeaderField("Content-Range") ?: conn.getHeaderField("content-range") ?: ""
-            if (cr.contains("/")) {
-                val total = cr.substringAfterLast("/").trim().toLongOrNull() ?: -1L
-                if (total > 0L) return total
-            }
-            return conn.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
-        } catch (_: Throwable) {
-            return -1L
-        } finally {
-            try { conn?.disconnect() } catch (_: Throwable) {}
-        }
-    }
-
-    private fun extractDirectYoutubeH264Streams(videoId: String): List<DirectTrailerStream> {
-        val results = ArrayList<DirectTrailerStream>()
-        if (videoId.length != 11) return results
-
-        val ua = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
-        try {
-            val clientJson = JSONObject().apply {
-                put("clientName", "ANDROID_VR")
-                put("clientVersion", "1.60.19")
-                put("deviceMake", "Oculus")
-                put("deviceModel", "Quest 3")
-                put("osName", "Android")
-                put("osVersion", "12L")
-                put("androidSdkVersion", 32)
-                put("hl", "en")
-                put("gl", "IN")
-            }
-            val payload = JSONObject().apply {
-                put("videoId", videoId)
-                put("context", JSONObject().put("client", clientJson))
-                put("contentCheckOk", true)
-                put("racyCheckOk", true)
-            }.toString()
-
-            val conn = (URL("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
-                .openConnection(Proxy.NO_PROXY) as HttpsURLConnection).apply {
-                connectTimeout = 5000
-                readTimeout = 5000
-                requestMethod = "POST"
-                doInput = true
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("User-Agent", ua)
-            }
-            conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
-            if (conn.responseCode in 200..299) {
-                val resp = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText() }
-                conn.disconnect()
-
-                val root = JSONObject(resp)
-                val streamingData = root.optJSONObject("streamingData")
-                val formats = streamingData?.optJSONArray("formats")
-                if (formats != null) {
-                    val port = ensureArchiveProxyRunning()
-                    for (i in 0 until formats.length()) {
-                        val f = formats.optJSONObject(i) ?: continue
-                        val rawUrl = f.optString("url", "")
-                        val mime = f.optString("mimeType", "").lowercase(Locale.ROOT)
-                        val height = f.optInt("height", 360)
-                        var totalLen = f.optString("contentLength", "").toLongOrNull() ?: -1L
-                        if (rawUrl.startsWith("http") && mime.contains("video/mp4")) {
-                            if (totalLen <= 0L) {
-                                totalLen = probeYoutubeStreamSize(rawUrl, ua)
-                            }
-                            if (totalLen > 1000L) {
-                                val ytKey = "${videoId}_${height}"
-                                val target = YoutubeProxyTarget(ytKey, rawUrl, ua, totalLen)
-                                youtubeStreamRegistry[ytKey] = target
-                                // Immediately pre-warm first 4 chunks (2 MB) in parallel while user is on Details page!
-                                prewarmYoutubeChunks(target, 0L, 4)
-
-                                val proxyUrl = "http://127.0.0.1:$port/yt/$ytKey/trailer.mp4"
-                                val label = if (height >= 1080) "1080p FHD" else if (height >= 720) "720p HD" else "HD Ready"
-                                results.add(DirectTrailerStream(label, height, proxyUrl))
-                            }
-                        }
-                    }
-                }
-            } else {
-                conn.disconnect()
-            }
-        } catch (_: Throwable) {}
-
-        results.sortByDescending { it.height }
-        return results
-    }
-
-    private fun buildVerifiedYoutubeTrailerInfo(videoId: String, defaultLabel: String): VerifiedTrailerInfo {
-        val directStreams = extractDirectYoutubeH264Streams(videoId)
-        if (directStreams.isNotEmpty()) {
-            return VerifiedTrailerInfo("IMDB_DIRECT", videoId, directStreams, directStreams.first().label)
-        }
-        return VerifiedTrailerInfo("YT_VERIFIED", videoId, emptyList(), defaultLabel)
-    }
-
     @ReactMethod
     fun resolveVerifiedTrailer(
         cacheKey: String,
@@ -1775,81 +1717,193 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     res.putBoolean("available", true)
                     res.putString("cacheKey", cacheKey)
                     res.putString("bestQuality", cached.maxQualityLabel)
+                    res.putString("activeLang", cached.activeLangName)
+                    res.putInt("langCount", cached.languages.size)
                     promise.resolve(res)
                     return@submit
                 }
 
+                val imdbParts = imdbId.split("|")
+                val tmdbIdStr = imdbParts.getOrNull(0) ?: ""
+                val isTv = (imdbParts.getOrNull(1) == "tv")
+                val origLangCode = (imdbParts.getOrNull(2) ?: "").trim().lowercase(Locale.ROOT)
+                val origLangName = langCodeToDisplayName(origLangCode)
+
+                val langOptionsMap = LinkedHashMap<String, TrailerLanguageOption>()
+                val usedVideoIds = HashSet<String>()
+
+                // 1. Parse TMDb videos (supports both structured JSON objects and legacy string array)
                 try {
                     val arr = JSONArray(tmdbYtKeysJson)
                     for (i in 0 until arr.length()) {
-                        val key = arr.optString(i, "").trim()
-                        if (key.length == 11 && verifyYoutubeOembedClean(key, true)) {
-                            val info = buildVerifiedYoutubeTrailerInfo(key, "1080p FHD")
-                            verifiedTrailerCache[cacheKey] = info
-                            val res = Arguments.createMap()
-                            res.putBoolean("available", true)
-                            res.putString("cacheKey", cacheKey)
-                            res.putString("bestQuality", "4K / 1080p")
-                            promise.resolve(res)
-                            return@submit
+                        val rawElem = arr.opt(i)
+                        var key = ""
+                        var vLang = origLangCode
+                        var vName = ""
+                        if (rawElem is JSONObject) {
+                            key = rawElem.optString("key", "").trim()
+                            vLang = rawElem.optString("lang", origLangCode).trim().lowercase(Locale.ROOT)
+                            vName = rawElem.optString("name", "").trim()
+                        } else if (rawElem is String) {
+                            key = rawElem.trim()
+                        }
+
+                        if (key.length == 11 && !usedVideoIds.contains(key) && verifyYoutubeOembedClean(key, true)) {
+                            val (detCode, detName) = detectLanguageFromTitle(vName, vLang)
+                            val isOrig = (origLangCode.isNotEmpty() && detCode == origLangCode) ||
+                                (origLangName.isNotEmpty() && detName.equals(origLangName, ignoreCase = true))
+                            val slotKey = detName.lowercase(Locale.ROOT)
+                            if (!langOptionsMap.containsKey(slotKey)) {
+                                usedVideoIds.add(key)
+                                langOptionsMap[slotKey] = TrailerLanguageOption(
+                                    langCode = detCode,
+                                    langName = detName,
+                                    videoId = key,
+                                    label = if (isOrig && detName != "Original") "$detName (Original)" else detName,
+                                    isOriginal = isOrig
+                                )
+                            }
                         }
                     }
                 } catch (_: Throwable) {}
 
-                if (imdbId.contains("|")) {
-                    val parts = imdbId.split("|")
-                    val tmdbIdStr = parts.getOrNull(0) ?: ""
-                    val isTv = (parts.getOrNull(1) == "tv")
-                    val kcKey = fetchKinocheckTrailerId(tmdbIdStr, isTv)
-                    if (kcKey.length == 11) {
-                        val info = buildVerifiedYoutubeTrailerInfo(kcKey, "1080p FHD")
-                        verifiedTrailerCache[cacheKey] = info
-                        val res = Arguments.createMap()
-                        res.putBoolean("available", true)
-                        res.putString("cacheKey", cacheKey)
-                        res.putString("bestQuality", "4K / 1080p")
-                        promise.resolve(res)
-                        return@submit
+                // 2. If Original Language trailer wasn't in TMDb results, search YouTube specifically for it first!
+                if (origLangName.isNotEmpty() && !langOptionsMap.containsKey(origLangName.lowercase(Locale.ROOT))) {
+                    val origCandidates = searchStrictOfficialTrailerIds(title, year, origLangName)
+                    for (candId in origCandidates) {
+                        if (!usedVideoIds.contains(candId) && verifyYoutubeOembedClean(candId, false)) {
+                            usedVideoIds.add(candId)
+                            langOptionsMap[origLangName.lowercase(Locale.ROOT)] = TrailerLanguageOption(
+                                langCode = origLangCode,
+                                langName = origLangName,
+                                videoId = candId,
+                                label = "$origLangName (Original)",
+                                isOriginal = true
+                            )
+                            break
+                        }
                     }
                 }
 
+                // 3. Fallback to KinoCheck if no YouTube trailer found yet
+                if (langOptionsMap.isEmpty() && tmdbIdStr.isNotEmpty()) {
+                    val kcKey = fetchKinocheckTrailerId(tmdbIdStr, isTv)
+                    if (kcKey.length == 11 && !usedVideoIds.contains(kcKey)) {
+                        usedVideoIds.add(kcKey)
+                        val dName = origLangName.ifEmpty { "Original" }
+                        langOptionsMap[dName.lowercase(Locale.ROOT)] = TrailerLanguageOption(
+                            langCode = origLangCode.ifEmpty { "en" },
+                            langName = dName,
+                            videoId = kcKey,
+                            label = if (origLangName.isNotEmpty()) "$dName (Original)" else "Official Trailer",
+                            isOriginal = true
+                        )
+                    }
+                }
+
+                // 4. General strict YouTube search fallback if still empty
+                if (langOptionsMap.isEmpty()) {
+                    val ytCandidates = searchStrictOfficialTrailerIds(title, year, "")
+                    for (candId in ytCandidates) {
+                        if (!usedVideoIds.contains(candId) && verifyYoutubeOembedClean(candId, false)) {
+                            usedVideoIds.add(candId)
+                            val dName = origLangName.ifEmpty { "Original" }
+                            langOptionsMap[dName.lowercase(Locale.ROOT)] = TrailerLanguageOption(
+                                langCode = origLangCode.ifEmpty { "en" },
+                                langName = dName,
+                                videoId = candId,
+                                label = if (origLangName.isNotEmpty()) "$dName (Original)" else "Official Trailer",
+                                isOriginal = true
+                            )
+                            break
+                        }
+                    }
+                }
+
+                // 5. Discover additional dubbed language trailers (Tamil / Telugu / Hindi / Malayalam / English)
+                if (langOptionsMap.isNotEmpty()) {
+                    val extraLangs = listOf(
+                        Pair("ta", "Tamil"),
+                        Pair("te", "Telugu"),
+                        Pair("hi", "Hindi"),
+                        Pair("ml", "Malayalam"),
+                        Pair("en", "English")
+                    )
+                    for ((code, name) in extraLangs) {
+                        if (langOptionsMap.size >= 4) break
+                        if (langOptionsMap.containsKey(name.lowercase(Locale.ROOT))) continue
+                        val cands = searchStrictOfficialTrailerIds(title, year, name)
+                        for (cid in cands) {
+                            if (!usedVideoIds.contains(cid) && verifyYoutubeOembedClean(cid, false)) {
+                                usedVideoIds.add(cid)
+                                langOptionsMap[name.lowercase(Locale.ROOT)] = TrailerLanguageOption(
+                                    langCode = code,
+                                    langName = name,
+                                    videoId = cid,
+                                    label = name,
+                                    isOriginal = false
+                                )
+                                break
+                            }
+                        }
+                    }
+                }
+
+                if (langOptionsMap.isNotEmpty()) {
+                    val sortedLangs = langOptionsMap.values.sortedWith(
+                        compareByDescending<TrailerLanguageOption> { it.isOriginal }
+                            .thenBy { it.langName }
+                    )
+                    val primary = sortedLangs.first()
+                    val info = VerifiedTrailerInfo(
+                        engine = "YT_CINEMA",
+                        videoId = primary.videoId,
+                        directStreams = emptyList(),
+                        maxQualityLabel = "4K / 1080p",
+                        languages = sortedLangs,
+                        activeLangName = primary.langName
+                    )
+                    verifiedTrailerCache[cacheKey] = info
+                    val res = Arguments.createMap()
+                    res.putBoolean("available", true)
+                    res.putString("cacheKey", cacheKey)
+                    res.putString("bestQuality", "4K / 1080p")
+                    res.putString("activeLang", primary.langName)
+                    res.putInt("langCount", sortedLangs.size)
+                    promise.resolve(res)
+                    return@submit
+                }
+
+                // 6. Final Apple iTunes direct stream fallback
                 val appleStreams = fetchAppleItunesTrailerStreams(title, year)
                 if (appleStreams.isNotEmpty()) {
                     val bestQ = appleStreams.first().label
-                    val info = VerifiedTrailerInfo("IMDB_DIRECT", "", appleStreams, bestQ)
+                    val info = VerifiedTrailerInfo("IMDB_DIRECT", "", appleStreams, bestQ, emptyList(), "English")
                     verifiedTrailerCache[cacheKey] = info
                     val res = Arguments.createMap()
                     res.putBoolean("available", true)
                     res.putString("cacheKey", cacheKey)
                     res.putString("bestQuality", bestQ)
+                    res.putString("activeLang", "English")
+                    res.putInt("langCount", 1)
                     promise.resolve(res)
                     return@submit
-                }
-
-                val ytCandidates = searchStrictOfficialTrailerIds(title, year)
-                for (candId in ytCandidates) {
-                    if (verifyYoutubeOembedClean(candId, false)) {
-                        val info = buildVerifiedYoutubeTrailerInfo(candId, "1080p FHD")
-                        verifiedTrailerCache[cacheKey] = info
-                        val res = Arguments.createMap()
-                        res.putBoolean("available", true)
-                        res.putString("cacheKey", cacheKey)
-                        res.putString("bestQuality", "1080p FHD")
-                        promise.resolve(res)
-                        return@submit
-                    }
                 }
 
                 val res = Arguments.createMap()
                 res.putBoolean("available", false)
                 res.putString("cacheKey", cacheKey)
                 res.putString("bestQuality", "")
+                res.putString("activeLang", "")
+                res.putInt("langCount", 0)
                 promise.resolve(res)
             } catch (_: Throwable) {
                 val res = Arguments.createMap()
                 res.putBoolean("available", false)
                 res.putString("cacheKey", cacheKey)
                 res.putString("bestQuality", "")
+                res.putString("activeLang", "")
+                res.putInt("langCount", 0)
                 promise.resolve(res)
             }
         }
@@ -1870,7 +1924,24 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return String.format(Locale.US, "%02d:%02d", mins, secs)
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
+    private fun makeCinemaPillBg(fillHex: String, strokeHex: String, radiusDp: Int): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(Color.parseColor(fillHex))
+            cornerRadius = dp(radiusDp).toFloat()
+            if (strokeHex.isNotEmpty()) {
+                setStroke(dp(1), Color.parseColor(strokeHex))
+            }
+        }
+    }
+
+    private fun attachTvFocusHighlight(view: View, normalBg: GradientDrawable, focusedBg: GradientDrawable) {
+        view.isFocusable = true
+        view.setOnFocusChangeListener { v, hasFocus ->
+            v.background = if (hasFocus) focusedBg else normalBg
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
     @ReactMethod
     fun playYoutubeTrailer(cacheKey: String, title: String, promise: Promise) {
         val info = verifiedTrailerCache[cacheKey]
@@ -1907,6 +1978,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 )
             }
 
+            val uiHandler = Handler(Looper.getMainLooper())
+            var controlsVisible = true
+            var isZoomed = false
+            var activeQualityLabel = "1080p FHD"
+            var activeLangLabel = info.activeLangName.ifEmpty { "Original" }
+            var currentVideoId = info.videoId
+
             val root = FrameLayout(activity).apply {
                 setBackgroundColor(Color.BLACK)
             }
@@ -1918,17 +1996,106 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     Gravity.CENTER
                 )
             }
+            root.addView(playerStage)
+
+            // Dark translucent scrim when controls are visible (matches GDStream Play in App)
+            val controlsScrim = FrameLayout(activity).apply {
+                setBackgroundColor(Color.parseColor("#66000000"))
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            }
+            root.addView(controlsScrim)
 
             val spinner = ProgressBar(activity).apply {
-                layoutParams = FrameLayout.LayoutParams(dp(48), dp(48), Gravity.CENTER)
+                layoutParams = FrameLayout.LayoutParams(dp(50), dp(50), Gravity.CENTER)
             }
-            root.addView(playerStage)
             root.addView(spinner)
 
-            val topOverlay = LinearLayout(activity).apply {
+            // Double-Tap Seek Bubble Overlay (Left / Right ±10s)
+            val seekBubbleContainer = FrameLayout(activity).apply {
+                visibility = View.GONE
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            }
+            val seekBubbleCard = LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.parseColor("#CC0A0A0F"))
-                setPadding(dp(18), dp(12), dp(18), dp(10))
+                gravity = Gravity.CENTER
+                background = makeCinemaPillBg("#99000000", "#33FFFFFF", 46)
+                layoutParams = FrameLayout.LayoutParams(dp(92), dp(92), Gravity.CENTER_VERTICAL or Gravity.END).apply {
+                    marginStart = dp(56)
+                    marginEnd = dp(56)
+                }
+            }
+            val seekBubbleIcon = TextView(activity).apply {
+                text = "↻"
+                setTextColor(Color.WHITE)
+                textSize = 26f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+            }
+            val seekBubbleText = TextView(activity).apply {
+                text = "+10s"
+                setTextColor(Color.WHITE)
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+            }
+            seekBubbleCard.addView(seekBubbleIcon)
+            seekBubbleCard.addView(seekBubbleText)
+            seekBubbleContainer.addView(seekBubbleCard)
+            root.addView(seekBubbleContainer)
+
+            // Brightness / Volume Vertical Swipe HUD (Phone)
+            val gestureHudPill = LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                visibility = View.GONE
+                setPadding(dp(10), dp(14), dp(10), dp(14))
+                background = makeCinemaPillBg("#E00F1117", "#26FFFFFF", 30)
+                layoutParams = FrameLayout.LayoutParams(dp(58), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_VERTICAL or Gravity.START).apply {
+                    marginStart = dp(38)
+                    marginEnd = dp(38)
+                }
+            }
+            val gestureHudIcon = TextView(activity).apply {
+                text = "☀"
+                setTextColor(Color.parseColor("#E50914"))
+                textSize = 18f
+                gravity = Gravity.CENTER
+            }
+            val gestureBarTrack = FrameLayout(activity).apply {
+                background = makeCinemaPillBg("#33FFFFFF", "", 4)
+                layoutParams = LinearLayout.LayoutParams(dp(7), dp(100)).apply {
+                    topMargin = dp(8)
+                    bottomMargin = dp(8)
+                }
+            }
+            val gestureBarFill = View(activity).apply {
+                background = makeCinemaPillBg("#E50914", "", 4)
+                layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(60), Gravity.BOTTOM)
+            }
+            gestureBarTrack.addView(gestureBarFill)
+            val gestureHudPct = TextView(activity).apply {
+                text = "70%"
+                setTextColor(Color.WHITE)
+                textSize = 11f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+            }
+            gestureHudPill.addView(gestureHudIcon)
+            gestureHudPill.addView(gestureBarTrack)
+            gestureHudPill.addView(gestureHudPct)
+            root.addView(gestureHudPill)
+
+            // ================= TOP BAR (GDStream Netflix-Style Header) =================
+            val topBar = LinearLayout(activity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(20), dp(16), dp(20), dp(10))
                 layoutParams = FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -1936,62 +2103,150 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 )
             }
 
-            val headerRow = LinearLayout(activity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-
-            val closeBtn = TextView(activity).apply {
-                text = "← Back"
+            val backCircleNormal = makeCinemaPillBg("#B814161E", "#26FFFFFF", 21)
+            val backCircleFocus = makeCinemaPillBg("#44FFD700", "#FFD700", 21)
+            val backBtn = TextView(activity).apply {
+                text = "←"
                 setTextColor(Color.WHITE)
-                textSize = 13f
+                textSize = 20f
                 typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(14), dp(6), dp(14), dp(6))
-                background = GradientDrawable().apply {
-                    setColor(Color.parseColor("#E50914"))
-                    cornerRadius = dp(8).toFloat()
-                }
+                gravity = Gravity.CENTER
+                background = backCircleNormal
+                layoutParams = LinearLayout.LayoutParams(dp(42), dp(42))
                 setOnClickListener { dialog.dismiss() }
             }
+            attachTvFocusHighlight(backBtn, backCircleNormal, backCircleFocus)
 
-            val titleView = TextView(activity).apply {
-                text = "  🎬 $title • Official Trailer"
-                setTextColor(Color.WHITE)
-                textSize = 15f
-                typeface = Typeface.DEFAULT_BOLD
-                maxLines = 1
+            val titleCenterBox = LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                setPadding(dp(12), 0, dp(12), 0)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
 
-            headerRow.addView(closeBtn)
-            headerRow.addView(titleView)
-            topOverlay.addView(headerRow)
-
-            val qualityScroll = HorizontalScrollView(activity).apply {
-                isHorizontalScrollBarEnabled = false
-                setPadding(0, dp(8), 0, 0)
+            val mainTitleTv = TextView(activity).apply {
+                text = title
+                setTextColor(Color.WHITE)
+                textSize = 17f
+                typeface = Typeface.DEFAULT_BOLD
+                maxLines = 1
+                gravity = Gravity.CENTER
             }
-            val qualityRow = LinearLayout(activity).apply {
+
+            val subMetaRow = LinearLayout(activity).apply {
                 orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
+                gravity = Gravity.CENTER
+                setPadding(0, dp(4), 0, 0)
             }
 
-            val qualityTagLabel = TextView(activity).apply {
-                text = "QUALITY: "
-                setTextColor(Color.parseColor("#9CA3AF"))
+            val trailerTagTv = TextView(activity).apply {
+                text = "OFFICIAL TRAILER"
+                setTextColor(Color.parseColor("#F5C518"))
                 textSize = 11f
                 typeface = Typeface.DEFAULT_BOLD
                 setPadding(0, 0, dp(8), 0)
             }
-            qualityRow.addView(qualityTagLabel)
-            qualityScroll.addView(qualityRow)
-            topOverlay.addView(qualityScroll)
-            root.addView(topOverlay)
 
-            val bottomOverlay = LinearLayout(activity).apply {
+            val topQualityBadge = TextView(activity).apply {
+                text = activeQualityLabel
+                setTextColor(Color.WHITE)
+                textSize = 10f
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(7), dp(2), dp(7), dp(2))
+                background = makeCinemaPillBg("#E50914", "", 4)
+            }
+
+            val topLangBadge = TextView(activity).apply {
+                text = activeLangLabel.uppercase(Locale.ROOT)
+                setTextColor(Color.parseColor("#FFD700"))
+                textSize = 10f
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(7), dp(2), dp(7), dp(2))
+                background = makeCinemaPillBg("#5E35B1", "#FFD700", 4)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = dp(6) }
+            }
+
+            subMetaRow.addView(trailerTagTv)
+            subMetaRow.addView(topQualityBadge)
+            subMetaRow.addView(topLangBadge)
+            titleCenterBox.addView(mainTitleTv)
+            titleCenterBox.addView(subMetaRow)
+
+            // Spacer on right to keep title dead-center
+            val rightSpacer = View(activity).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(42), dp(42))
+            }
+
+            topBar.addView(backBtn)
+            topBar.addView(titleCenterBox)
+            topBar.addView(rightSpacer)
+            controlsScrim.addView(topBar)
+
+            // ================= CENTER CONTROLS (-10s | PLAY/PAUSE | +10s) =================
+            val centerControlsRow = LinearLayout(activity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.CENTER
+                )
+            }
+
+            val seekCircleNormal = makeCinemaPillBg("#9912141C", "#29FFFFFF", 32)
+            val seekCircleFocus = makeCinemaPillBg("#44FFD700", "#FFD700", 32)
+
+            val rewCircleBtn = TextView(activity).apply {
+                text = "-10s"
+                setTextColor(Color.WHITE)
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                background = seekCircleNormal
+                layoutParams = LinearLayout.LayoutParams(dp(64), dp(64))
+            }
+            attachTvFocusHighlight(rewCircleBtn, seekCircleNormal, seekCircleFocus)
+
+            val playCircleNormal = makeCinemaPillBg("#E6E50914", "#40FFFFFF", 41)
+            val playCircleFocus = makeCinemaPillBg("#E50914", "#FFD700", 41)
+
+            val centerPlayBtn = TextView(activity).apply {
+                text = "❚❚"
+                setTextColor(Color.WHITE)
+                textSize = 26f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                background = playCircleNormal
+                layoutParams = LinearLayout.LayoutParams(dp(82), dp(82)).apply {
+                    marginStart = dp(48)
+                    marginEnd = dp(48)
+                }
+            }
+            attachTvFocusHighlight(centerPlayBtn, playCircleNormal, playCircleFocus)
+
+            val ffCircleBtn = TextView(activity).apply {
+                text = "+10s"
+                setTextColor(Color.WHITE)
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                background = seekCircleNormal
+                layoutParams = LinearLayout.LayoutParams(dp(64), dp(64))
+            }
+            attachTvFocusHighlight(ffCircleBtn, seekCircleNormal, seekCircleFocus)
+
+            centerControlsRow.addView(rewCircleBtn)
+            centerControlsRow.addView(centerPlayBtn)
+            centerControlsRow.addView(ffCircleBtn)
+            controlsScrim.addView(centerControlsRow)
+
+            // ================= BOTTOM BAR (SCRUBBER + ACTION PILLS) =================
+            val bottomContainer = LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.parseColor("#CC0A0A0F"))
-                setPadding(dp(18), dp(8), dp(18), dp(14))
+                setPadding(dp(22), dp(8), dp(22), dp(16))
                 layoutParams = FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -1999,80 +2254,393 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 )
             }
 
-            val seekBar = SeekBar(activity).apply { max = 1000 }
-            bottomOverlay.addView(seekBar)
-
-            val controlsRow = LinearLayout(activity).apply {
+            val scrubberRow = LinearLayout(activity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(4), 0, 0)
+                setPadding(0, 0, 0, dp(10))
             }
 
-            val playPauseBtn = TextView(activity).apply {
-                text = "⏸ Pause"
-                setTextColor(Color.WHITE)
-                textSize = 13f
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(14), dp(6), dp(14), dp(6))
-                background = GradientDrawable().apply {
-                    setColor(Color.parseColor("#E50914"))
-                    cornerRadius = dp(8).toFloat()
-                }
-            }
-
-            val rewBtn = TextView(activity).apply {
-                text = "⏪ -10s"
-                setTextColor(Color.WHITE)
+            val curTimeTv = TextView(activity).apply {
+                text = "00:00"
+                setTextColor(Color.parseColor("#E6ECF5"))
                 textSize = 12f
                 typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(14), dp(6), dp(14), dp(6))
+                gravity = Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(dp(52), ViewGroup.LayoutParams.WRAP_CONTENT)
             }
 
-            val ffBtn = TextView(activity).apply {
-                text = "+10s ⏩"
-                setTextColor(Color.WHITE)
-                textSize = 12f
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(14), dp(6), dp(14), dp(6))
-            }
-
-            val timeLabel = TextView(activity).apply {
-                text = "00:00 / 00:00"
-                setTextColor(Color.parseColor("#E5E7EB"))
-                textSize = 12f
-                typeface = Typeface.DEFAULT_BOLD
-                gravity = Gravity.END
+            val seekBar = SeekBar(activity).apply {
+                max = 1000
+                progressDrawable?.setColorFilter(Color.parseColor("#E50914"), android.graphics.PorterDuff.Mode.SRC_IN)
+                thumb?.setColorFilter(Color.parseColor("#E50914"), android.graphics.PorterDuff.Mode.SRC_IN)
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
 
-            controlsRow.addView(playPauseBtn)
-            controlsRow.addView(rewBtn)
-            controlsRow.addView(ffBtn)
-            controlsRow.addView(timeLabel)
-            bottomOverlay.addView(controlsRow)
-            root.addView(bottomOverlay)
+            val remTimeTv = TextView(activity).apply {
+                text = "-00:00"
+                setTextColor(Color.parseColor("#E6ECF5"))
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(dp(56), ViewGroup.LayoutParams.WRAP_CONTENT)
+            }
 
-            val touchInterceptor = View(activity).apply {
+            scrubberRow.addView(curTimeTv)
+            scrubberRow.addView(seekBar)
+            scrubberRow.addView(remTimeTv)
+            bottomContainer.addView(scrubberRow)
+
+            val actionPillsRow = LinearLayout(activity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+
+            val pillNormalBg = makeCinemaPillBg("#C8161922", "#22FFFFFF", 999)
+            val pillFocusBg = makeCinemaPillBg("#44FFD700", "#FFD700", 999)
+
+            val langPillBtn = TextView(activity).apply {
+                text = "🌐 Language: $activeLangLabel ▾"
+                setTextColor(Color.WHITE)
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(15), dp(8), dp(15), dp(8))
+                background = pillNormalBg
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { marginEnd = dp(12) }
+            }
+            attachTvFocusHighlight(langPillBtn, pillNormalBg, pillFocusBg)
+
+            val qualityPillBtn = TextView(activity).apply {
+                text = "⚙ Quality: $activeQualityLabel ▾"
+                setTextColor(Color.WHITE)
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(15), dp(8), dp(15), dp(8))
+                background = pillNormalBg
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { marginEnd = dp(12) }
+            }
+            attachTvFocusHighlight(qualityPillBtn, pillNormalBg, pillFocusBg)
+
+            val zoomPillBtn = TextView(activity).apply {
+                text = "⛶ Fit"
+                setTextColor(Color.WHITE)
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(15), dp(8), dp(15), dp(8))
+                background = pillNormalBg
+            }
+            attachTvFocusHighlight(zoomPillBtn, pillNormalBg, pillFocusBg)
+
+            actionPillsRow.addView(langPillBtn)
+            actionPillsRow.addView(qualityPillBtn)
+            actionPillsRow.addView(zoomPillBtn)
+            bottomContainer.addView(actionPillsRow)
+            controlsScrim.addView(bottomContainer)
+
+            // ================= FLOATING SHEET OVERLAY (LANGUAGE / QUALITY PICKER) =================
+            val sheetBackdrop = FrameLayout(activity).apply {
+                visibility = View.GONE
+                setBackgroundColor(Color.parseColor("#99000000"))
                 layoutParams = FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT
                 )
-                setOnClickListener {
-                    val vis = if (topOverlay.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-                    topOverlay.visibility = vis
-                    bottomOverlay.visibility = vis
+                setOnClickListener { it.visibility = View.GONE }
+            }
+            val sheetCard = LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+                background = makeCinemaPillBg("#F514171F", "#2B3242", 16)
+                layoutParams = FrameLayout.LayoutParams(dp(330), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER)
+                setOnClickListener { /* consume click */ }
+            }
+            val sheetHeaderRow = LinearLayout(activity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 0, 0, dp(10))
+            }
+            val sheetTitleTv = TextView(activity).apply {
+                text = "Select Option"
+                setTextColor(Color.WHITE)
+                textSize = 15f
+                typeface = Typeface.DEFAULT_BOLD
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            val sheetCloseTv = TextView(activity).apply {
+                text = "✕"
+                setTextColor(Color.WHITE)
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(10), dp(4), dp(10), dp(4))
+                setOnClickListener { sheetBackdrop.visibility = View.GONE }
+            }
+            sheetHeaderRow.addView(sheetTitleTv)
+            sheetHeaderRow.addView(sheetCloseTv)
+            val sheetItemsList = LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+            }
+            sheetCard.addView(sheetHeaderRow)
+            sheetCard.addView(sheetItemsList)
+            sheetBackdrop.addView(sheetCard)
+            root.addView(sheetBackdrop)
+
+            // Auto-hide timer logic (5s like Play in App)
+            val hideControlsRunnable = Runnable {
+                if (sheetBackdrop.visibility != View.VISIBLE) {
+                    controlsVisible = false
+                    controlsScrim.visibility = View.GONE
                 }
             }
-            root.addView(touchInterceptor, 1)
+            fun resetAutoHideTimer() {
+                uiHandler.removeCallbacks(hideControlsRunnable)
+                uiHandler.postDelayed(hideControlsRunnable, 5000L)
+            }
+            fun setControlsShown(show: Boolean) {
+                controlsVisible = show
+                controlsScrim.visibility = if (show) View.VISIBLE else View.GONE
+                if (show) {
+                    resetAutoHideTimer()
+                    centerPlayBtn.requestFocus()
+                } else {
+                    uiHandler.removeCallbacks(hideControlsRunnable)
+                }
+            }
+
+            // Double-Tap Seek Bubble Helper
+            var accumSeekDelta = 0
+            var lastSeekDir = 0
+            val hideSeekBubbleRunnable = Runnable {
+                seekBubbleContainer.visibility = View.GONE
+                accumSeekDelta = 0
+                lastSeekDir = 0
+            }
+            fun showAnimatedSeekBubble(deltaSec: Int) {
+                val dir = if (deltaSec >= 0) 1 else -1
+                if (lastSeekDir != dir) {
+                    accumSeekDelta = 0
+                    lastSeekDir = dir
+                }
+                accumSeekDelta += deltaSec
+                seekBubbleIcon.text = if (dir > 0) "↻" else "↺"
+                seekBubbleText.text = if (accumSeekDelta > 0) "+${accumSeekDelta}s" else "${accumSeekDelta}s"
+                val lp = seekBubbleCard.layoutParams as FrameLayout.LayoutParams
+                lp.gravity = Gravity.CENTER_VERTICAL or (if (dir > 0) Gravity.END else Gravity.START)
+                seekBubbleCard.layoutParams = lp
+                seekBubbleContainer.visibility = View.VISIBLE
+                uiHandler.removeCallbacks(hideSeekBubbleRunnable)
+                uiHandler.postDelayed(hideSeekBubbleRunnable, 850L)
+            }
+
+            // Player Action Callbacks
+            var onSeekDelta: ((Int) -> Unit)? = null
+            var onTogglePlay: (() -> Unit)? = null
+            var onSeekPercent: ((Int) -> Unit)? = null
+            var onOpenQualitySheet: (() -> Unit)? = null
+            var onOpenLanguageSheet: (() -> Unit)? = null
+
+            rewCircleBtn.setOnClickListener {
+                resetAutoHideTimer()
+                onSeekDelta?.invoke(-10)
+                showAnimatedSeekBubble(-10)
+            }
+            ffCircleBtn.setOnClickListener {
+                resetAutoHideTimer()
+                onSeekDelta?.invoke(10)
+                showAnimatedSeekBubble(10)
+            }
+            centerPlayBtn.setOnClickListener {
+                resetAutoHideTimer()
+                onTogglePlay?.invoke()
+            }
+            zoomPillBtn.setOnClickListener {
+                resetAutoHideTimer()
+                isZoomed = !isZoomed
+                val scale = if (isZoomed) 1.28f else 1.0f
+                playerStage.scaleX = scale
+                playerStage.scaleY = scale
+                zoomPillBtn.text = if (isZoomed) "⛶ Zoom" else "⛶ Fit"
+            }
+            qualityPillBtn.setOnClickListener {
+                uiHandler.removeCallbacks(hideControlsRunnable)
+                onOpenQualitySheet?.invoke()
+            }
+            langPillBtn.setOnClickListener {
+                uiHandler.removeCallbacks(hideControlsRunnable)
+                onOpenLanguageSheet?.invoke()
+            }
+
+            // Touch & Gesture Layer (Single Tap = Controls Toggle, Double Tap Left/Right = ±10s, Vertical Swipe = Brightness/Volume)
+            val audioManager = activity.getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager
+            val hideHudRunnable = Runnable { gestureHudPill.visibility = View.GONE }
+
+            val gestureDetector = android.view.GestureDetector(activity, object : android.view.GestureDetector.SimpleOnGestureListener() {
+                override fun onDown(e: android.view.MotionEvent): Boolean = true
+
+                override fun onSingleTapConfirmed(e: android.view.MotionEvent): Boolean {
+                    if (sheetBackdrop.visibility == View.VISIBLE) {
+                        sheetBackdrop.visibility = View.GONE
+                        resetAutoHideTimer()
+                        return true
+                    }
+                    setControlsShown(!controlsVisible)
+                    return true
+                }
+
+                override fun onDoubleTap(e: android.view.MotionEvent): Boolean {
+                    val w = root.width.coerceAtLeast(1)
+                    val isRight = e.x >= (w / 2f)
+                    val delta = if (isRight) 10 else -10
+                    onSeekDelta?.invoke(delta)
+                    showAnimatedSeekBubble(delta)
+                    return true
+                }
+            })
+
+            var swipeMode = 0 // 0=none, 1=brightness, 2=volume
+            var swipeStartY = 0f
+            var swipeStartVal = 0.6f
+
+            val touchOverlay = View(activity).apply {
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                setOnTouchListener { _, event ->
+                    gestureDetector.onTouchEvent(event)
+                    val w = root.width.coerceAtLeast(1)
+                    val h = root.height.coerceAtLeast(1)
+                    when (event.actionMasked) {
+                        android.view.MotionEvent.ACTION_DOWN -> {
+                            swipeMode = 0
+                            swipeStartY = event.y
+                            val isLeft = event.x < (w / 2f)
+                            if (isLeft) {
+                                val curB = dialog.window?.attributes?.screenBrightness ?: -1f
+                                swipeStartVal = if (curB in 0f..1f) curB else 0.6f
+                            } else {
+                                val maxV = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                                val curV = audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
+                                swipeStartVal = curV.toFloat() / maxV.toFloat()
+                            }
+                        }
+                        android.view.MotionEvent.ACTION_MOVE -> {
+                            val dy = swipeStartY - event.y
+                            if (swipeMode == 0 && kotlin.math.abs(dy) > dp(18)) {
+                                swipeMode = if (event.x < (w / 2f)) 1 else 2
+                            }
+                            if (swipeMode == 1) {
+                                val nextB = (swipeStartVal + (dy / (h * 0.65f))).coerceIn(0.05f, 1.0f)
+                                dialog.window?.attributes = dialog.window?.attributes?.apply {
+                                    screenBrightness = nextB
+                                }
+                                val pct = (nextB * 100).toInt()
+                                gestureHudIcon.text = "☀"
+                                gestureHudPct.text = "$pct%"
+                                val lp = gestureBarFill.layoutParams as FrameLayout.LayoutParams
+                                lp.height = (dp(100) * nextB).toInt().coerceAtLeast(dp(4))
+                                gestureBarFill.layoutParams = lp
+                                val hLp = gestureHudPill.layoutParams as FrameLayout.LayoutParams
+                                hLp.gravity = Gravity.CENTER_VERTICAL or Gravity.START
+                                gestureHudPill.layoutParams = hLp
+                                gestureHudPill.visibility = View.VISIBLE
+                                uiHandler.removeCallbacks(hideHudRunnable)
+                            } else if (swipeMode == 2) {
+                                val nextV = (swipeStartVal + (dy / (h * 0.65f))).coerceIn(0f, 1.0f)
+                                val maxV = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                                audioManager.setStreamVolume(android.media.AudioManager.STREAM_MUSIC, (nextV * maxV).toInt(), 0)
+                                val pct = (nextV * 100).toInt()
+                                gestureHudIcon.text = if (pct == 0) "🔇" else "🔊"
+                                gestureHudPct.text = "$pct%"
+                                val lp = gestureBarFill.layoutParams as FrameLayout.LayoutParams
+                                lp.height = (dp(100) * nextV).toInt().coerceAtLeast(dp(4))
+                                gestureBarFill.layoutParams = lp
+                                val hLp = gestureHudPill.layoutParams as FrameLayout.LayoutParams
+                                hLp.gravity = Gravity.CENTER_VERTICAL or Gravity.END
+                                gestureHudPill.layoutParams = hLp
+                                gestureHudPill.visibility = View.VISIBLE
+                                uiHandler.removeCallbacks(hideHudRunnable)
+                            }
+                        }
+                        android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                            if (swipeMode != 0) {
+                                uiHandler.postDelayed(hideHudRunnable, 800L)
+                            }
+                            swipeMode = 0
+                        }
+                    }
+                    true
+                }
+            }
+            // Place touchOverlay right above playerStage and below controlsScrim
+            root.addView(touchOverlay, 1)
+
+            // TV D-Pad Remote Key Support
+            dialog.setOnKeyListener { _, keyCode, event ->
+                if (event.action == android.view.KeyEvent.ACTION_DOWN) {
+                    if (keyCode == android.view.KeyEvent.KEYCODE_BACK) {
+                        if (sheetBackdrop.visibility == View.VISIBLE) {
+                            sheetBackdrop.visibility = View.GONE
+                            resetAutoHideTimer()
+                            return@setOnKeyListener true
+                        }
+                        dialog.dismiss()
+                        return@setOnKeyListener true
+                    }
+                    if (keyCode == android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) {
+                        onTogglePlay?.invoke()
+                        return@setOnKeyListener true
+                    }
+                    if (keyCode == android.view.KeyEvent.KEYCODE_MEDIA_REWIND) {
+                        onSeekDelta?.invoke(-10)
+                        showAnimatedSeekBubble(-10)
+                        return@setOnKeyListener true
+                    }
+                    if (keyCode == android.view.KeyEvent.KEYCODE_MEDIA_FAST_FORWARD) {
+                        onSeekDelta?.invoke(10)
+                        showAnimatedSeekBubble(10)
+                        return@setOnKeyListener true
+                    }
+                    if (!controlsVisible) {
+                        if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_LEFT) {
+                            onSeekDelta?.invoke(-10)
+                            showAnimatedSeekBubble(-10)
+                            return@setOnKeyListener true
+                        } else if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_RIGHT) {
+                            onSeekDelta?.invoke(10)
+                            showAnimatedSeekBubble(10)
+                            return@setOnKeyListener true
+                        } else if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_CENTER ||
+                            keyCode == android.view.KeyEvent.KEYCODE_ENTER ||
+                            keyCode == android.view.KeyEvent.KEYCODE_DPAD_UP ||
+                            keyCode == android.view.KeyEvent.KEYCODE_DPAD_DOWN
+                        ) {
+                            setControlsShown(true)
+                            return@setOnKeyListener true
+                        }
+                    } else {
+                        resetAutoHideTimer()
+                    }
+                }
+                false
+            }
 
             dialog.setContentView(root)
 
-            val uiHandler = Handler(Looper.getMainLooper())
             var mediaPlayer: MediaPlayer? = null
             var activeWebView: WebView? = null
 
             if (info.engine == "IMDB_DIRECT" && info.directStreams.isNotEmpty()) {
                 val streams = info.directStreams
+                activeQualityLabel = streams.first().label
+                topQualityBadge.text = activeQualityLabel
+                qualityPillBtn.text = "⚙ Quality: $activeQualityLabel ▾"
+                langPillBtn.visibility = View.GONE
+
                 val surfaceView = SurfaceView(activity).apply {
                     layoutParams = FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
@@ -2086,25 +2654,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 var prepared = false
                 var isSeeking = false
                 var resumeMs = 0
-                val qButtons = ArrayList<TextView>()
-
-                fun styleButtons() {
-                    for (i in qButtons.indices) {
-                        val b = qButtons[i]
-                        val sel = (i == activeIdx)
-                        b.background = GradientDrawable().apply {
-                            setColor(if (sel) Color.parseColor("#E50914") else Color.parseColor("#1F2029"))
-                            cornerRadius = dp(16).toFloat()
-                            setStroke(dp(1), if (sel) Color.parseColor("#FF4D4D") else Color.parseColor("#374151"))
-                        }
-                        b.setTextColor(if (sel) Color.WHITE else Color.parseColor("#D1D5DB"))
-                    }
-                }
 
                 fun loadDirectStream(idx: Int, seekToMs: Int) {
                     activeIdx = idx
                     resumeMs = seekToMs
-                    styleButtons()
+                    activeQualityLabel = streams[idx].label
+                    topQualityBadge.text = activeQualityLabel
+                    qualityPillBtn.text = "⚙ Quality: $activeQualityLabel ▾"
                     spinner.visibility = View.VISIBLE
                     prepared = false
                     try { mediaPlayer?.stop() } catch (_: Throwable) {}
@@ -2124,10 +2680,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         spinner.visibility = View.GONE
                         if (resumeMs > 0) mp.seekTo(resumeMs)
                         mp.start()
-                        playPauseBtn.text = "⏸ Pause"
+                        centerPlayBtn.text = "❚❚"
+                        resetAutoHideTimer()
                     }
                     mp.setOnCompletionListener {
-                        playPauseBtn.text = "▶ Replay"
+                        centerPlayBtn.text = "▶"
+                        setControlsShown(true)
                     }
                     try {
                         mp.setDataSource(streams[idx].videoUrl)
@@ -2137,47 +2695,53 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 }
 
-                for (i in streams.indices) {
-                    val chip = TextView(activity).apply {
-                        text = streams[i].label
-                        textSize = 12f
-                        typeface = Typeface.DEFAULT_BOLD
-                        setPadding(dp(12), dp(5), dp(12), dp(5))
-                        layoutParams = LinearLayout.LayoutParams(
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                            ViewGroup.LayoutParams.WRAP_CONTENT
-                        ).apply { setMargins(0, 0, dp(8), 0) }
-                        setOnClickListener {
-                            if (activeIdx != i) {
-                                val pos = try { if (prepared) mediaPlayer?.currentPosition ?: 0 else 0 } catch (_: Throwable) { 0 }
-                                loadDirectStream(i, pos)
-                            }
+                onTogglePlay = {
+                    val mp = mediaPlayer
+                    if (mp != null && prepared) {
+                        if (mp.isPlaying) {
+                            mp.pause()
+                            centerPlayBtn.text = "▶"
+                        } else {
+                            mp.start()
+                            centerPlayBtn.text = "❚❚"
                         }
                     }
-                    qButtons.add(chip)
-                    qualityRow.addView(chip)
                 }
-                styleButtons()
-
-                playPauseBtn.setOnClickListener {
-                    val mp = mediaPlayer ?: return@setOnClickListener
-                    if (!prepared) return@setOnClickListener
-                    if (mp.isPlaying) {
-                        mp.pause()
-                        playPauseBtn.text = "▶ Play"
-                    } else {
-                        mp.start()
-                        playPauseBtn.text = "⏸ Pause"
+                onSeekDelta = { delta ->
+                    val mp = mediaPlayer
+                    if (mp != null && prepared) {
+                        mp.seekTo((mp.currentPosition + delta * 1000).coerceIn(0, mp.duration.coerceAtLeast(0)))
                     }
                 }
-                rewBtn.setOnClickListener {
-                    val mp = mediaPlayer ?: return@setOnClickListener
-                    if (prepared) mp.seekTo((mp.currentPosition - 10000).coerceAtLeast(0))
+                onOpenQualitySheet = {
+                    sheetTitleTv.text = "Select Video Quality"
+                    sheetItemsList.removeAllViews()
+                    for (i in streams.indices) {
+                        val sel = (i == activeIdx)
+                        val rowTv = TextView(activity).apply {
+                            text = if (sel) "✓   ${streams[i].label}" else "      ${streams[i].label}"
+                            setTextColor(if (sel) Color.parseColor("#E50914") else Color.WHITE)
+                            textSize = 14f
+                            typeface = Typeface.DEFAULT_BOLD
+                            setPadding(dp(12), dp(11), dp(12), dp(11))
+                            background = makeCinemaPillBg(if (sel) "#2AE50914" else "#1A1E29", if (sel) "#E50914" else "#283040", 8)
+                            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                                bottomMargin = dp(8)
+                            }
+                            setOnClickListener {
+                                sheetBackdrop.visibility = View.GONE
+                                if (activeIdx != i) {
+                                    val pos = try { if (prepared) mediaPlayer?.currentPosition ?: 0 else 0 } catch (_: Throwable) { 0 }
+                                    loadDirectStream(i, pos)
+                                }
+                                resetAutoHideTimer()
+                            }
+                        }
+                        sheetItemsList.addView(rowTv)
+                    }
+                    sheetBackdrop.visibility = View.VISIBLE
                 }
-                ffBtn.setOnClickListener {
-                    val mp = mediaPlayer ?: return@setOnClickListener
-                    if (prepared) mp.seekTo((mp.currentPosition + 10000).coerceAtMost(mp.duration.coerceAtLeast(0)))
-                }
+
                 seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(sb: SeekBar?, p: Int, f: Boolean) {}
                     override fun onStartTrackingTouch(sb: SeekBar?) { isSeeking = true }
@@ -2187,6 +2751,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         if (prepared && sb != null && mp.duration > 0) {
                             mp.seekTo(((sb.progress.toLong() * mp.duration) / 1000L).toInt())
                         }
+                        resetAutoHideTimer()
                     }
                 })
 
@@ -2199,7 +2764,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                                 val dur = mp.duration
                                 if (dur > 0) {
                                     seekBar.progress = ((pos.toLong() * 1000L) / dur).toInt()
-                                    timeLabel.text = "${formatTimeSec(pos / 1000)} / ${formatTimeSec(dur / 1000)}"
+                                    curTimeTv.text = formatTimeSec(pos / 1000)
+                                    remTimeTv.text = "-${formatTimeSec(((dur - pos).coerceAtLeast(0)) / 1000)}"
                                 }
                             } catch (_: Throwable) {}
                         }
@@ -2218,6 +2784,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 })
             } else {
+                // Fullscreen YouTube Cinema Engine with TRUE VP9/AV1 4K Support + Multi-Language Switcher
                 val webView = WebView(activity).apply {
                     setBackgroundColor(Color.BLACK)
                     isClickable = false
@@ -2229,10 +2796,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     )
                     settings.javaScriptEnabled = true
                     settings.mediaPlaybackRequiresUserGesture = false
-                setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                    setLayerType(View.LAYER_TYPE_HARDWARE, null)
                     settings.domStorageEnabled = true
                     settings.cacheMode = WebSettings.LOAD_DEFAULT
-                    settings.userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                    settings.userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
                 }
                 activeWebView = webView
                 playerStage.addView(webView)
@@ -2247,68 +2814,54 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     "large" to "480p",
                     "medium" to "360p"
                 )
-                var activeVq = "hd1080"
-                val qChips = LinkedHashMap<String, TextView>()
+                var availableQualityCodes = listOf("hd2160", "hd1440", "hd1080", "hd720", "large")
+                var selectedQualityCode = "hd1080"
 
-                fun styleYtQualityChips() {
-                    for ((code, btn) in qChips) {
-                        val sel = (code == activeVq)
-                        btn.background = GradientDrawable().apply {
-                            setColor(if (sel) Color.parseColor("#E50914") else Color.parseColor("#1F2029"))
-                            cornerRadius = dp(16).toFloat()
-                            setStroke(dp(1), if (sel) Color.parseColor("#FF4D4D") else Color.parseColor("#374151"))
-                        }
-                        btn.setTextColor(if (sel) Color.WHITE else Color.parseColor("#D1D5DB"))
-                    }
+                if (info.languages.size <= 1) {
+                    langPillBtn.text = "🌐 $activeLangLabel"
                 }
 
-                fun populateQualityChips(codes: List<String>) {
-                    qualityRow.removeAllViews()
-                    qualityRow.addView(qualityTagLabel)
-                    qChips.clear()
-
-                    val validCodes = codes.filter { qualityMap.containsKey(it) }
-                        .ifEmpty { listOf("hd1080", "hd720", "large") }
-
-                    if (!validCodes.contains(activeVq)) {
-                        activeVq = validCodes.first()
+                fun updateBadgesUI() {
+                    val qName = qualityMap[selectedQualityCode] ?: activeQualityLabel
+                    activeQualityLabel = qName
+                    topQualityBadge.text = qName
+                    qualityPillBtn.text = "⚙ Quality: $qName ▾"
+                    topLangBadge.text = activeLangLabel.uppercase(Locale.ROOT)
+                    langPillBtn.text = if (info.languages.size > 1) {
+                        "🌐 $activeLangLabel (${info.languages.size}) ▾"
+                    } else {
+                        "🌐 $activeLangLabel"
                     }
-
-                    for (code in validCodes) {
-                        val label = qualityMap[code] ?: code
-                        val chip = TextView(activity).apply {
-                            text = label
-                            textSize = 12f
-                            typeface = Typeface.DEFAULT_BOLD
-                            setPadding(dp(12), dp(5), dp(12), dp(5))
-                            layoutParams = LinearLayout.LayoutParams(
-                                ViewGroup.LayoutParams.WRAP_CONTENT,
-                                ViewGroup.LayoutParams.WRAP_CONTENT
-                            ).apply { setMargins(0, 0, dp(8), 0) }
-                            setOnClickListener {
-                                activeVq = code
-                                styleYtQualityChips()
-                                spinner.visibility = View.VISIBLE
-                                webView.evaluateJavascript("window.setTrailerQuality('$code');", null)
-                            }
-                        }
-                        qChips[code] = chip
-                        qualityRow.addView(chip)
-                    }
-                    styleYtQualityChips()
                 }
-
-                populateQualityChips(listOf("hd1080", "hd720", "large"))
+                updateBadgesUI()
 
                 webView.addJavascriptInterface(object {
                     @JavascriptInterface
-                    fun onPlayerReady(durSec: Double, qualitiesCsv: String) {
+                    fun onPlayerReady(durSec: Double, qualitiesCsv: String, activeQual: String) {
                         uiHandler.post {
                             spinner.visibility = View.GONE
                             totalDurationSec = durSec.toInt().coerceAtLeast(0)
                             if (qualitiesCsv.isNotEmpty()) {
-                                val list = qualitiesCsv.split(",").map { it.trim() }.filter { it.isNotEmpty() }
-                                if (list.isNotEmpty()) populateQualityChips(list)
+                                val list = qualitiesCsv.split(",").map { it.trim() }.filter { qualityMap.containsKey(it) }
+                                if (list.isNotEmpty()) {
+                                    availableQualityCodes = list
+                                }
+                            }
+                            if (activeQual.isNotEmpty() && qualityMap.containsKey(activeQual)) {
+                                selectedQualityCode = activeQual
+                            }
+                            updateBadgesUI()
+                            resetAutoHideTimer()
+                        }
+                    }
+
+                    @JavascriptInterface
+                    fun onQualityChanged(newQual: String) {
+                        uiHandler.post {
+                            spinner.visibility = View.GONE
+                            if (qualityMap.containsKey(newQual)) {
+                                selectedQualityCode = newQual
+                                updateBadgesUI()
                             }
                         }
                     }
@@ -2320,14 +2873,88 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             val d = durSec.toInt().coerceAtLeast(0)
                             totalDurationSec = d
                             if (playing) spinner.visibility = View.GONE
-                            playPauseBtn.text = if (playing) "⏸ Pause" else "▶ Play"
+                            centerPlayBtn.text = if (playing) "❚❚" else "▶"
                             if (d > 0 && !isSeeking) {
                                 seekBar.progress = ((c.toLong() * 1000L) / d).toInt()
-                                timeLabel.text = "${formatTimeSec(c)} / ${formatTimeSec(d)}"
+                                curTimeTv.text = formatTimeSec(c)
+                                remTimeTv.text = "-${formatTimeSec((d - c).coerceAtLeast(0))}"
                             }
                         }
                     }
                 }, "GDNativeBridge")
+
+                onTogglePlay = {
+                    webView.evaluateJavascript("window.togglePlay();", null)
+                }
+                onSeekDelta = { delta ->
+                    webView.evaluateJavascript("window.seekBySec($delta);", null)
+                }
+                onOpenQualitySheet = {
+                    sheetTitleTv.text = "Select Trailer Quality"
+                    sheetItemsList.removeAllViews()
+                    for (qCode in availableQualityCodes) {
+                        val label = qualityMap[qCode] ?: qCode
+                        val sel = (qCode == selectedQualityCode)
+                        val rowTv = TextView(activity).apply {
+                            text = if (sel) "✓   $label" else "      $label"
+                            setTextColor(if (sel) Color.parseColor("#E50914") else Color.WHITE)
+                            textSize = 14f
+                            typeface = Typeface.DEFAULT_BOLD
+                            setPadding(dp(12), dp(11), dp(12), dp(11))
+                            background = makeCinemaPillBg(if (sel) "#2AE50914" else "#1A1E29", if (sel) "#E50914" else "#283040", 8)
+                            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                                bottomMargin = dp(8)
+                            }
+                            setOnClickListener {
+                                sheetBackdrop.visibility = View.GONE
+                                selectedQualityCode = qCode
+                                updateBadgesUI()
+                                spinner.visibility = View.VISIBLE
+                                webView.evaluateJavascript("window.setTrailerQuality('$qCode');", null)
+                                resetAutoHideTimer()
+                            }
+                        }
+                        sheetItemsList.addView(rowTv)
+                    }
+                    sheetBackdrop.visibility = View.VISIBLE
+                }
+
+                onOpenLanguageSheet = {
+                    if (info.languages.isNotEmpty()) {
+                        sheetTitleTv.text = "Select Trailer Language"
+                        sheetItemsList.removeAllViews()
+                        for (opt in info.languages) {
+                            val sel = (opt.videoId == currentVideoId)
+                            val rowTv = TextView(activity).apply {
+                                text = if (sel) "✓   ${opt.label}" else "      ${opt.label}"
+                                setTextColor(if (sel) Color.parseColor("#FFD700") else Color.WHITE)
+                                textSize = 14f
+                                typeface = Typeface.DEFAULT_BOLD
+                                setPadding(dp(12), dp(11), dp(12), dp(11))
+                                background = makeCinemaPillBg(if (sel) "#335E35B1" else "#1A1E29", if (sel) "#FFD700" else "#283040", 8)
+                                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                                    bottomMargin = dp(8)
+                                }
+                                setOnClickListener {
+                                    sheetBackdrop.visibility = View.GONE
+                                    if (opt.videoId != currentVideoId) {
+                                        currentVideoId = opt.videoId
+                                        activeLangLabel = opt.langName
+                                        updateBadgesUI()
+                                        spinner.visibility = View.VISIBLE
+                                        webView.evaluateJavascript(
+                                            "window.switchTrailerVideo('${opt.videoId}', '$selectedQualityCode');",
+                                            null
+                                        )
+                                    }
+                                    resetAutoHideTimer()
+                                }
+                            }
+                            sheetItemsList.addView(rowTv)
+                        }
+                        sheetBackdrop.visibility = View.VISIBLE
+                    }
+                }
 
                 val blockedAdHosts = listOf(
                     "doubleclick.net", "googlesyndication.com", "googleadservices.com",
@@ -2345,11 +2972,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 }
 
-                val vid = info.videoId
+                // NOTE: VP9 & AV1 are ENABLED so true 2160p 4K & 1440p QHD adaptive streams play natively!
                 val html = """
                     <!DOCTYPE html>
                     <html>
-                    <head><script>(function(){try{var m=window.MediaSource;if(m&&m.isTypeSupported){var o=m.isTypeSupported.bind(m);m.isTypeSupported=function(t){if(!t)return false;var s=String(t).toLowerCase();if(s.indexOf('vp9')!==-1||s.indexOf('vp8')!==-1||s.indexOf('av01')!==-1||s.indexOf('webm')!==-1)return false;return o(t);};}}catch(e){}})();</script>
+                    <head>
                     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
                     <style>
                       * { margin: 0; padding: 0; box-sizing: border-box; background: #000; user-select: none; }
@@ -2371,10 +2998,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     <script src="https://www.youtube.com/iframe_api"></script>
                     <script>
                       var player;
-                      var targetVq = 'hd720';
+                      var activeVid = '$currentVideoId';
+                      var targetVq = 'hd1080';
                       function onYouTubeIframeAPIReady() {
                         player = new YT.Player('player', {
-                          videoId: '$vid',
+                          videoId: activeVid,
                           host: 'https://www.youtube-nocookie.com',
                           playerVars: {
                             'autoplay': 1,
@@ -2390,11 +3018,15 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                           events: {
                             'onReady': function(e) {
                               try {
+                                if (e.target.setPlaybackQualityRange) {
+                                  e.target.setPlaybackQualityRange(targetVq, targetVq);
+                                }
                                 e.target.playVideo();
                                 var qList = e.target.getAvailableQualityLevels ? e.target.getAvailableQualityLevels() : [];
+                                var curQ = e.target.getPlaybackQuality ? e.target.getPlaybackQuality() : targetVq;
                                 var dur = e.target.getDuration ? e.target.getDuration() : 0;
                                 if (window.GDNativeBridge) {
-                                  window.GDNativeBridge.onPlayerReady(dur || 0, (qList || []).join(','));
+                                  window.GDNativeBridge.onPlayerReady(dur || 0, (qList || []).join(','), curQ || targetVq);
                                 }
                               } catch(err) {}
                             },
@@ -2402,13 +3034,18 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                               try {
                                 if (e.data === YT.PlayerState.PLAYING) {
                                   var qList = e.target.getAvailableQualityLevels ? e.target.getAvailableQualityLevels() : [];
+                                  var curQ = e.target.getPlaybackQuality ? e.target.getPlaybackQuality() : targetVq;
                                   var dur = e.target.getDuration ? e.target.getDuration() : 0;
-                                  if (window.GDNativeBridge && qList && qList.length > 0) {
-                                    window.GDNativeBridge.onPlayerReady(dur || 0, qList.join(','));
+                                  if (window.GDNativeBridge) {
+                                    window.GDNativeBridge.onPlayerReady(dur || 0, (qList || []).join(','), curQ || targetVq);
                                   }
-                                  if (targetVq && e.target.setPlaybackQualityRange) {
-                                    e.target.setPlaybackQualityRange(targetVq, targetVq);
-                                  }
+                                }
+                              } catch(err) {}
+                            },
+                            'onPlaybackQualityChange': function(e) {
+                              try {
+                                if (window.GDNativeBridge && e && e.data) {
+                                  window.GDNativeBridge.onQualityChanged(e.data);
                                 }
                               } catch(err) {}
                             }
@@ -2448,7 +3085,20 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                           if (player.setPlaybackQualityRange) {
                             player.setPlaybackQualityRange(vq, vq);
                           }
-                          player.loadVideoById({'videoId': '$vid', 'startSeconds': t, 'suggestedQuality': vq});
+                          if (player.setPlaybackQuality) {
+                            player.setPlaybackQuality(vq);
+                          }
+                          player.loadVideoById({'videoId': activeVid, 'startSeconds': t, 'suggestedQuality': vq});
+                        }
+                      };
+                      window.switchTrailerVideo = function(newVid, vq) {
+                        activeVid = newVid;
+                        targetVq = vq || targetVq;
+                        if (player && player.loadVideoById) {
+                          if (player.setPlaybackQualityRange) {
+                            player.setPlaybackQualityRange(targetVq, targetVq);
+                          }
+                          player.loadVideoById({'videoId': newVid, 'startSeconds': 0, 'suggestedQuality': targetVq});
                         }
                       };
                     </script>
@@ -2464,15 +3114,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     null
                 )
 
-                playPauseBtn.setOnClickListener {
-                    webView.evaluateJavascript("window.togglePlay();", null)
-                }
-                rewBtn.setOnClickListener {
-                    webView.evaluateJavascript("window.seekBySec(-10);", null)
-                }
-                ffBtn.setOnClickListener {
-                    webView.evaluateJavascript("window.seekBySec(10);", null)
-                }
                 seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(sb: SeekBar?, p: Int, f: Boolean) {}
                     override fun onStartTrackingTouch(sb: SeekBar?) { isSeeking = true }
@@ -2482,6 +3123,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             val targetSec = (sb.progress.toLong() * totalDurationSec) / 1000L
                             webView.evaluateJavascript("window.seekToSec($targetSec);", null)
                         }
+                        resetAutoHideTimer()
                     }
                 })
             }
@@ -2502,6 +3144,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             }
 
             dialog.show()
+            resetAutoHideTimer()
             promise.resolve(true)
         }
     }

@@ -686,7 +686,7 @@ const App = () => {
         setEpisodeTmdbMeta(null);
       }
 
-      const tmdbYtKeys: string[] = [];
+      const tmdbYtVideos: Array<{ key: string; lang: string; name: string; official: boolean }> = [];
       let imdbId = '';
 
       try {
@@ -698,10 +698,10 @@ const App = () => {
 
             const tvSearchUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(searchTitle)}`;
             const tvRes = await fetch(tvSearchUrl).then(r => r.json());
-            const tvId = tvRes?.results?.[0]?.id;
+            const tvHit = tvRes?.results?.[0];
+            const tvId = tvHit?.id;
 
             if (tvId && !cancelled) {
-              // 1. Fetch Individual Episode Rating & Overview from TMDb
               try {
                 const epUrl = `https://api.themoviedb.org/3/tv/${tvId}/season/${sNum}/episode/${eNum}?api_key=${encodeURIComponent(tmdbKey)}`;
                 const epData = await fetch(epUrl).then(r => r.json());
@@ -715,44 +715,64 @@ const App = () => {
                 }
               } catch (_e) {}
 
-              // 2. Fetch Series IMDb ID & Official Trailer Videos from TMDb
               try {
                 const tvDetailUrl = `https://api.themoviedb.org/3/tv/${tvId}?api_key=${encodeURIComponent(tmdbKey)}&append_to_response=videos,external_ids&include_video_language=en,ta,ml,hi,te,kn,ja,ko,null`;
                 const tvDetail = await fetch(tvDetailUrl).then(r => r.json());
-                imdbId = `${tvId}|tv`;
+                const origLang = String(tvDetail?.original_language || tvHit?.original_language || parsed.langCode || '').toLowerCase();
+                imdbId = `${tvId}|tv|${origLang}`;
                 const vids = (tvDetail?.videos?.results || []).filter(
                   (v: any) => v.site === 'YouTube' && v.key && (v.type === 'Trailer' || v.type === 'Teaser')
                 );
                 vids.sort((a: any, b: any) => {
-                  const aScore = (a.type === 'Trailer' ? 10 : 0) + (a.official ? 5 : 0);
-                  const bScore = (b.type === 'Trailer' ? 10 : 0) + (b.official ? 5 : 0);
+                  const aOrig = origLang && String(a.iso_639_1 || '').toLowerCase() === origLang ? 25 : 0;
+                  const bOrig = origLang && String(b.iso_639_1 || '').toLowerCase() === origLang ? 25 : 0;
+                  const aScore = aOrig + (a.type === 'Trailer' ? 10 : 0) + (a.official ? 5 : 0);
+                  const bScore = bOrig + (b.type === 'Trailer' ? 10 : 0) + (b.official ? 5 : 0);
                   return bScore - aScore;
                 });
                 for (const v of vids) {
-                  if (v.key && !tmdbYtKeys.includes(v.key)) tmdbYtKeys.push(v.key);
+                  if (v.key && !tmdbYtVideos.some(x => x.key === v.key)) {
+                    tmdbYtVideos.push({
+                      key: v.key,
+                      lang: String(v.iso_639_1 || origLang || 'en').toLowerCase(),
+                      name: String(v.name || ''),
+                      official: Boolean(v.official),
+                    });
+                  }
                 }
               } catch (_e) {}
             }
           } else {
-            // Movie TMDb Lookup
             const mvSearchUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(searchTitle)}${year ? '&year=' + year : ''}`;
             const mvRes = await fetch(mvSearchUrl).then(r => r.json());
-            const movieId = mvRes?.results?.[0]?.id;
+            const mvResults: any[] = mvRes?.results || [];
+            const mvHit = (parsed.langCode ? mvResults.find(r => r.original_language === parsed.langCode) : null) || mvResults[0];
+            const movieId = mvHit?.id;
             if (movieId && !cancelled) {
               try {
                 const mvDetailUrl = `https://api.themoviedb.org/3/movie/${movieId}?api_key=${encodeURIComponent(tmdbKey)}&append_to_response=videos,external_ids&include_video_language=en,ta,ml,hi,te,kn,ja,ko,null`;
                 const mvDetail = await fetch(mvDetailUrl).then(r => r.json());
-                imdbId = `${movieId}|movie`;
+                const origLang = String(mvDetail?.original_language || mvHit?.original_language || parsed.langCode || '').toLowerCase();
+                imdbId = `${movieId}|movie|${origLang}`;
                 const vids = (mvDetail?.videos?.results || []).filter(
                   (v: any) => v.site === 'YouTube' && v.key && (v.type === 'Trailer' || v.type === 'Teaser')
                 );
                 vids.sort((a: any, b: any) => {
-                  const aScore = (a.type === 'Trailer' ? 10 : 0) + (a.official ? 5 : 0);
-                  const bScore = (b.type === 'Trailer' ? 10 : 0) + (b.official ? 5 : 0);
+                  const aOrig = origLang && String(a.iso_639_1 || '').toLowerCase() === origLang ? 25 : 0;
+                  const bOrig = origLang && String(b.iso_639_1 || '').toLowerCase() === origLang ? 25 : 0;
+                  const aScore = aOrig + (a.type === 'Trailer' ? 10 : 0) + (a.official ? 5 : 0);
+                  const bScore = bOrig + (b.type === 'Trailer' ? 10 : 0) + (b.official ? 5 : 0);
                   return bScore - aScore;
                 });
                 for (const v of vids) {
-                  if (v.key && !tmdbYtKeys.includes(v.key)) tmdbYtKeys.push(v.key);
+                  if (v.key && !tmdbYtVideos.some(x => x.key === v.key)) {
+                    tmdbYtVideos.push({
+                      key: v.key,
+                      lang: String(v.iso_639_1 || origLang || 'en').toLowerCase(),
+                      name: String(v.name || ''),
+                      official: Boolean(v.official),
+                    });
+                  }
                 }
               } catch (_e) {}
             }
@@ -765,7 +785,7 @@ const App = () => {
             searchTitle,
             year,
             imdbId,
-            JSON.stringify(tmdbYtKeys)
+            JSON.stringify(tmdbYtVideos)
           );
           if (!cancelled) {
             setTrailerState({
