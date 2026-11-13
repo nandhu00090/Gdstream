@@ -194,10 +194,13 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
   const sMatch = normalized.match(/\b(?:S|Season\s*)(\d{1,2})\b/i);
   if (sMatch) seasonNum = parseInt(sMatch[1], 10);
   const eMatch = normalized.match(/\b(?:S\d{1,2}\s*E|E|Ep\s*|Episode\s*)(\d{1,3})\b/i);
-  if (eMatch) episodeNum = parseInt(eMatch[1], 10);
+  if (eMatch && !isFolder) episodeNum = parseInt(eMatch[1], 10);
 
   const seMatch = normalized.match(/\b(S\d{1,2}(?:\s*E\d{1,3})?|E\d{1,3}|Season\s*\d{1,2})\b/i);
-  const seasonEpisode = seMatch ? seMatch[1].replace(/\s+/g, '').toUpperCase() : '';
+  let seasonEpisode = seMatch ? seMatch[1].replace(/\s+/g, '').toUpperCase() : '';
+  if (isFolder) {
+    seasonEpisode = seasonNum > 0 ? `S${seasonNum < 10 ? `0${seasonNum}` : seasonNum}` : '';
+  }
 
   const yearMatch = normalized.match(/(?:^|[\s(])((?:19|20)\d{2})(?:[\s)]|$)/);
   const year = yearMatch ? yearMatch[1] : '';
@@ -3318,7 +3321,7 @@ const App = () => {
           </View>
           <View style={styles.listCardBody}>
             <Text style={styles.listCardTitle} numberOfLines={1}>
-              {info.episodeNum > 0 ? `E${info.episodeNum < 10 ? `0${info.episodeNum}` : info.episodeNum} • ${info.cleanTitle}` : info.cleanTitle}
+              {!isFolder && info.episodeNum > 0 ? `E${info.episodeNum < 10 ? `0${info.episodeNum}` : info.episodeNum} • ${info.cleanTitle}` : info.cleanTitle}
             </Text>
             <View style={styles.listCardMetaRow}>
               {!!(meta?.year || info.year) && <Text style={styles.cardSubText}>{meta?.year || info.year}</Text>}
@@ -3392,7 +3395,7 @@ const App = () => {
 
         <View style={styles.posterCardFooter}>
           <Text style={styles.posterTitle} numberOfLines={1}>
-            {info.episodeNum > 0 ? `Episode ${info.episodeNum} • ${info.cleanTitle}` : info.cleanTitle}
+            {!isFolder && info.episodeNum > 0 ? `Episode ${info.episodeNum} • ${info.cleanTitle}` : info.cleanTitle}
           </Text>
           <View style={styles.posterSubRow}>
             {savedSec > 3 ? (
