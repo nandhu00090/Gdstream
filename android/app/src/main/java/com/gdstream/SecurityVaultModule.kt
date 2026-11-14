@@ -575,12 +575,33 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         ensureVaultSessionReady()
         var conn = openRangeConnectionInternal(urlStr, rangeHeader)
         val cType = (conn.contentType ?: "").lowercase(Locale.ROOT)
-        val code = conn.responseCode
+        var code = conn.responseCode
         // If Cloudflare Worker returned an HTML login page or 401/403 instead of binary bytes, re-login immediately and retry!
         if (code == 401 || code == 403 || cType.contains("text/html")) {
             conn.disconnect()
             nativeSessionLoggedIn = false
             ensureVaultSessionReady()
+            conn = openRangeConnectionInternal(urlStr, rangeHeader)
+            code = conn.responseCode
+        }
+        // If cold Worker isolate returned 404/5xx on direct file path, warm parent folder cache and retry once!
+        if (code == 404 || code in 500..504) {
+            conn.disconnect()
+            try {
+                val seed = verifyCertificateAndEnv()
+                val baseUrl = if (seed == 0x5A3C9E71) nSync(1, seed) else ""
+                if (baseUrl.isNotEmpty() && urlStr.startsWith(baseUrl) && cachedShieldToken.isNotEmpty()) {
+                    val relPath = urlStr.removePrefix(baseUrl).substringBefore("?")
+                    val parentDir = relPath.substringBeforeLast('/', "/0:") + "/"
+                    executePinnedPost(
+                        baseUrl + parentDir,
+                        "{\"page_index\":0}".toByteArray(Charsets.UTF_8),
+                        "application/json",
+                        cachedShieldToken
+                    )
+                }
+                Thread.sleep(250L)
+            } catch (_: Throwable) {}
             conn = openRangeConnectionInternal(urlStr, rangeHeader)
         }
         return conn
