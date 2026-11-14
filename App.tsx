@@ -231,6 +231,18 @@ const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => 
   };
 };
 
+const isSeriesContainerItem = (item: any): boolean => {
+  if (!item || item.isZipEntry) return false;
+  if (item.mimeType?.includes('folder')) return true;
+  const n = String(item.name || '');
+  if (/\.(zip|rar)$/i.test(n)) return true;
+  if (/\.iso$/i.test(n)) {
+    const p = parseMediaFilename(n, false);
+    return p.seasonNum > 0 || !!p.seasonEpisode;
+  }
+  return false;
+};
+
 const extractSeasonNumberFromFolder = (name: string): number | null => {
   const norm = name.replace(/[._-]+/g, ' ').trim();
   const m1 = norm.match(/\bSeason\s*(\d{1,2})\b/i);
@@ -518,7 +530,7 @@ const App = () => {
       const name = String(f?.name || f?.title || '');
       const parsedRange = extractSeasonRangeFromName(name);
       if (parsedRange) {
-        const isDir = !!f?.mimeType?.includes('folder') || (/\.(zip|rar|iso)$/i.test(name) && !f?.isZipEntry);
+        const isDir = isSeriesContainerItem(f);
         const fInfo = parseMediaFilename(name, isDir);
         const clean = String(fInfo?.searchTitle || fInfo?.cleanTitle || '').trim().toUpperCase();
         if (clean) {
@@ -1403,7 +1415,7 @@ const App = () => {
         if (!item?.name) continue;
         const itemKey = item.name;
         if (fetchedKeysRef.current.has(itemKey)) continue;
-        const isFolder = !!item.mimeType?.includes('folder') || (/\.(zip|rar|iso)$/i.test(String(item.name || '')) && !item.isZipEntry);
+        const isFolder = isSeriesContainerItem(item);
         const info = parseMediaFilename(itemKey, isFolder);
         const cacheKey = `meta_v8_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
         pendingItems.push({ itemKey, info, cacheKey });
@@ -1559,7 +1571,7 @@ const App = () => {
   const buildProcessedList = useCallback((rawList: any[], isEpFolder: boolean) => {
     const q = searchQuery.trim().toLowerCase();
     const filtered = rawList.filter((file) => {
-      const isFolder = !!file.mimeType?.includes('folder') || (/\.(zip|rar|iso)$/i.test(String(file.name || '')) && !file.isZipEntry);
+      const isFolder = isSeriesContainerItem(file);
       const info = parseMediaFilename(file.name, isFolder);
       const realMi = mediaInfoMap[file.name];
 
@@ -1628,7 +1640,7 @@ const App = () => {
     }
 
     return mergedOrder.map(item => {
-      const isFolder = !!item.mimeType?.includes('folder') || (/\.(zip|rar|iso)$/i.test(String(item.name || '')) && !item.isZipEntry);
+      const isFolder = isSeriesContainerItem(item);
       const info = parseMediaFilename(item.name, isFolder);
       if (info.isFolder || info.seasonEpisode || info.episodeNum > 0) return item;
       const key = `${info.cleanTitle.toLowerCase()}|${info.year}`;
@@ -1738,6 +1750,7 @@ const App = () => {
       setSeriesParentTitle(prevBackup.seriesParentTitle);
       setSeasonFolders(prevBackup.seasonFolders);
       setActiveSeason(prevBackup.activeSeason);
+      SecurityVault?.writeDebugLog?.('APP_ARCHIVE_ERR', `${zipItem?.name || ''}: ${e?.message || e}`);
       Alert.alert('Archive Error', String(e?.message || 'Indha archive file-a open panna mudiyala.'));
     }
   };
@@ -3718,7 +3731,7 @@ const App = () => {
   const activeDownloadsCount = downloads.filter(d => d.status === 'downloading').length;
 
   const renderCatalogCard = ({ item, index, isFolderCard = false }: { item: any; index: number; isFolderCard?: boolean }) => {
-    const isFolder = !!item.mimeType?.includes('folder') || (/\.(zip|rar|iso)$/i.test(String(item.name || '')) && !item.isZipEntry);
+    const isFolder = isSeriesContainerItem(item);
     const info = parseMediaFilename(item.name, isFolder);
     const meta = metadataMap[item.name];
     const realMi = mediaInfoMap[item.name];

@@ -160,6 +160,37 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     override fun getName(): String = "SecurityVault"
 
+    private val debugLogLock = Any()
+
+    private fun appendDebugLog(tag: String, msg: String) {
+        synchronized(debugLogLock) {
+            try {
+                val pubDl = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+                val dir = java.io.File(pubDl, "GDStream")
+                if (!dir.exists()) dir.mkdirs()
+                val logFile = if (dir.exists() && dir.canWrite()) {
+                    java.io.File(dir, "gdstream_debug.log")
+                } else {
+                    val fb = java.io.File(reactContext.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS), "GDStream")
+                    fb.mkdirs()
+                    java.io.File(fb, "gdstream_debug.log")
+                }
+                if (logFile.exists() && logFile.length() > 512L * 1024L) {
+                    val bak = java.io.File(logFile.parentFile, "gdstream_debug_prev.log")
+                    if (bak.exists()) bak.delete()
+                    logFile.renameTo(bak)
+                }
+                val ts = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(java.util.Date())
+                logFile.appendText("[$ts] [$tag] $msg\n", Charsets.UTF_8)
+            } catch (_: Throwable) {}
+        }
+    }
+
+    @ReactMethod
+    fun writeDebugLog(tag: String, msg: String) {
+        appendDebugLog(tag, msg)
+    }
+
     private external fun nSync(slot: Int, sigSeed: Int): String
 
     private fun buildPinnedSystemSslFactory(): SSLSocketFactory {
@@ -3503,7 +3534,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     }
 
     // =========================================================================
-    // 📀 BLU-RAY / DVD / DATA .ISO STREAMING ENGINE (ECMA-167 UDF 2.50 + ISO-9660)
+    // 📀 BLU-RAY / DVD / DATA .ISO STREAMING ENGINE (FAST PARALLEL UDF 2.50)
     // =========================================================================
     private data class IsoFileEntry(
         val path: String,
@@ -3565,30 +3596,44 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         port: Int,
         volDescProbe: ByteArray?
     ): Pair<List<JSONObject>, String> {
+        val t0 = System.currentTimeMillis()
+        appendDebugLog("ISO_START", "Opening ISO size=$totalIsoSize url=${isoUrl.substringAfterLast('/')}")
         val allFiles = ArrayList<IsoFileEntry>()
         var udfErr = ""
         var isoErr = ""
 
         try {
             val udfFiles = parseUdfTree(isoUrl, totalIsoSize)
-            if (udfFiles.isNotEmpty()) allFiles.addAll(udfFiles)
-            else udfErr = "UDF 0 entries"
+            if (udfFiles.isNotEmpty()) {
+                allFiles.addAll(udfFiles)
+                appendDebugLog("ISO_UDF_OK", "Parsed ${udfFiles.size} media/playlist entries in ${System.currentTimeMillis() - t0}ms")
+            } else {
+                udfErr = "UDF 0 entries"
+            }
         } catch (e: Throwable) {
             udfErr = "UDF: " + (e.message ?: e.javaClass.simpleName)
+            appendDebugLog("ISO_UDF_ERR", udfErr)
         }
 
         if (allFiles.isEmpty()) {
             try {
                 val isoFiles = parseIso9660Tree(isoUrl, totalIsoSize, volDescProbe)
-                if (isoFiles.isNotEmpty()) allFiles.addAll(isoFiles)
-                else isoErr = "ISO9660 0 entries"
+                if (isoFiles.isNotEmpty()) {
+                    allFiles.addAll(isoFiles)
+                    appendDebugLog("ISO_9660_OK", "Parsed ${isoFiles.size} entries")
+                } else {
+                    isoErr = "ISO9660 0 entries"
+                }
             } catch (e: Throwable) {
                 isoErr = "ISO9660: " + (e.message ?: e.javaClass.simpleName)
+                appendDebugLog("ISO_9660_ERR", isoErr)
             }
         }
 
         if (allFiles.isEmpty()) {
-            return Pair(emptyList(), listOf(udfErr, isoErr).filter { it.isNotEmpty() }.joinToString(" | "))
+            val combined = listOf(udfErr, isoErr).filter { it.isNotEmpty() }.joinToString(" | ")
+            appendDebugLog("ISO_FAIL", combined)
+            return Pair(emptyList(), combined)
         }
 
         val discTitle = cleanIsoDisplayTitle(isoUrl)
@@ -3606,6 +3651,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 mplsList.add(f)
             }
         }
+        appendDebugLog("ISO_BDMV_SCAN", "m2tsCount=${m2tsMap.size}, mplsCount=${mplsList.size}")
 
         if (m2tsMap.isNotEmpty()) {
             data class ResolvedPlaylist(
@@ -3619,9 +3665,21 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val playlists = ArrayList<ResolvedPlaylist>()
             val seenSignatures = HashSet<String>()
 
-            for (mpls in mplsList.sortedByDescending { it.size }.take(40)) {
+            // Fetch top 25 MPLS playlist files in parallel for instant parsing
+            val topMpls = mplsList.sortedByDescending { it.size }.take(25)
+            val mplsFutures = topMpls.map { mpls ->
+                ioExecutor.submit<Pair<IsoFileEntry, ByteArray>> {
+                    try {
+                        Pair(mpls, readIsoFileBytes(isoUrl, mpls, 262144))
+                    } catch (_: Throwable) {
+                        Pair(mpls, ByteArray(0))
+                    }
+                }
+            }
+
+            for (fut in mplsFutures) {
                 try {
-                    val mplsBytes = readIsoFileBytes(isoUrl, mpls, 524288)
+                    val (mpls, mplsBytes) = fut.get()
                     if (mplsBytes.size < 32) continue
                     val sig = String(mplsBytes, 0, 8, StandardCharsets.US_ASCII)
                     if (!sig.startsWith("MPLS0")) continue
@@ -3658,6 +3716,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val clipSig = clipNames.joinToString("+")
                     if (valid && segs.isNotEmpty() && totalBytes >= 50L * 1024L * 1024L && durSec >= 180 && seenSignatures.add(clipSig)) {
                         playlists.add(ResolvedPlaylist(mpls.name, durSec, totalBytes, segs, clipSig))
+                        appendDebugLog("ISO_MPLS_HIT", "mpls=${mpls.name} dur=${durSec}s bytes=$totalBytes clips=$clipSig")
                     }
                 } catch (_: Throwable) {}
             }
@@ -3683,6 +3742,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         val displayName = if (durTag.isNotEmpty()) "$cleanShow $epCode [$durTag].m2ts" else "$cleanShow $epCode.m2ts"
                         outItems.add(registerIsoStreamTarget(isoUrl, displayName, ep.totalBytes, ep.segments, port, "video/mp2t"))
                     }
+                    appendDebugLog("ISO_DONE_SERIES", "Resolved ${outItems.size} episodes in ${System.currentTimeMillis() - t0}ms")
                     return Pair(outItems, "")
                 } else {
                     val sortedMovies = playlists.sortedByDescending { it.durationSec }
@@ -3697,6 +3757,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         }
                         outItems.add(registerIsoStreamTarget(isoUrl, label, pl.totalBytes, pl.segments, port, "video/mp2t"))
                     }
+                    appendDebugLog("ISO_DONE_MOVIE", "Resolved ${outItems.size} features in ${System.currentTimeMillis() - t0}ms")
                     return Pair(outItems, "")
                 }
             }
@@ -3708,6 +3769,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val label = if (idx == 0) "$discTitle [Main Stream - $cName].m2ts" else "$discTitle - $cName"
                     outItems.add(registerIsoStreamTarget(isoUrl, label, f.size, f.extents, port, "video/mp2t"))
                 }
+                appendDebugLog("ISO_DONE_M2TS", "Resolved ${outItems.size} raw M2TS clips in ${System.currentTimeMillis() - t0}ms")
                 return Pair(outItems, "")
             }
         }
@@ -3740,6 +3802,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val label = if (idx == 0) "$discTitle [DVD Main].vob" else "$discTitle - Title $tSet.vob"
                     outItems.add(registerIsoStreamTarget(isoUrl, label, dt.totalBytes, dt.segs, port, "video/mpeg"))
                 }
+                appendDebugLog("ISO_DONE_DVD", "Resolved ${outItems.size} DVD VOB titles in ${System.currentTimeMillis() - t0}ms")
                 return Pair(outItems, "")
             }
         }
@@ -3759,6 +3822,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
 
         val errMsg = if (outItems.isEmpty()) "Found " + allFiles.size + " files in ISO but no >50MB video streams" else ""
+        if (errMsg.isNotEmpty()) appendDebugLog("ISO_EMPTY", errMsg)
         return Pair(outItems, errMsg)
     }
 
@@ -3834,6 +3898,28 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return pBase + blockNum * blockSize
     }
 
+    private fun shouldRecurseUdfDir(fullPathUpper: String, depth: Int): Boolean {
+        if (depth == 0) {
+            return fullPathUpper == "BDMV" || fullPathUpper == "VIDEO_TS"
+        }
+        if (depth == 1) {
+            return fullPathUpper == "BDMV/PLAYLIST" || fullPathUpper == "BDMV/STREAM"
+        }
+        return false
+    }
+
+    private fun isRelevantUdfMediaFile(nameUpper: String): Boolean {
+        return nameUpper.endsWith(".MPLS") ||
+            nameUpper.endsWith(".M2TS") ||
+            nameUpper.endsWith(".VOB") ||
+            nameUpper.endsWith(".MKV") ||
+            nameUpper.endsWith(".MP4") ||
+            nameUpper.endsWith(".AVI") ||
+            nameUpper.endsWith(".MOV") ||
+            nameUpper.endsWith(".M4V") ||
+            nameUpper.endsWith(".TS")
+    }
+
     private fun walkUdfDir(
         isoUrl: String,
         blockSize: Long,
@@ -3848,7 +3934,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         results: MutableList<IsoFileEntry>,
         diagNotes: MutableList<String>
     ) {
-        if (depth > 6) return
+        if (depth > 3) return
         val feByteOff = resolveUdfBlockByte(icbBlock, icbPartRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
         val feBuf = fetchRemoteByteRange(isoUrl, feByteOff, feByteOff + blockSize - 1L)
         val feTag = if (feBuf.size >= 2) readUInt16LE(feBuf, 0) else -1
@@ -3875,11 +3961,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val dirBuf = dirStream.toByteArray()
         val bsInt = blockSize.toInt().coerceAtLeast(512)
 
+        data class PendingChildFile(val fullPath: String, val name: String, val block: Long, val partRef: Int)
+        val pendingFiles = ArrayList<PendingChildFile>()
+
         var p = 0
         while (p + 38 <= dirBuf.size) {
             val tid = readUInt16LE(dirBuf, p)
             if (tid == 0) {
-                // Sector padding at end of logical block: advance to next block boundary
                 val nextBlock = ((p / bsInt) + 1) * bsInt
                 if (nextBlock >= dirBuf.size) break
                 p = nextBlock
@@ -3907,21 +3995,47 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             if (name.isEmpty() || name == "." || name == "..") continue
             val isChildDir = (chars and 0x02) != 0
             val fullPath = if (parentPath.isEmpty()) name else "$parentPath/$name"
+            val upperFull = fullPath.uppercase(Locale.ROOT)
+            val upperName = name.uppercase(Locale.ROOT)
+
             if (depth == 0) diagNotes.add("rootChild=$name(dir=$isChildDir)")
 
             if (isChildDir) {
-                val upper = fullPath.uppercase(Locale.ROOT)
-                if (depth <= 2 || upper.contains("BDMV") || upper.contains("VIDEO_TS")) {
+                if (shouldRecurseUdfDir(upperFull, depth)) {
                     walkUdfDir(isoUrl, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, childBlock, childPartRef, fullPath, depth + 1, results, diagNotes)
                 }
-            } else {
-                val childFeOff = resolveUdfBlockByte(childBlock, childPartRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
-                val childFeBuf = fetchRemoteByteRange(isoUrl, childFeOff, childFeOff + blockSize - 1L)
-                val infoLen = if (childFeBuf.size >= 64) readInt64LE(childFeBuf, 56) else 0L
-                val fileExts = parseUdfFileEntryExtents(childFeBuf, 0, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, childFeOff, childPartRef)
-                if (infoLen > 0L && fileExts.isNotEmpty()) {
-                    results.add(IsoFileEntry(fullPath, name, false, infoLen, fileExts))
+            } else if (isRelevantUdfMediaFile(upperName)) {
+                pendingFiles.add(PendingChildFile(fullPath, name, childBlock, childPartRef))
+            }
+        }
+
+        // Fetch all relevant child File Entries in parallel batches of 8 for sub-second speed!
+        if (pendingFiles.isNotEmpty()) {
+            val batchSize = 8
+            var idx = 0
+            while (idx < pendingFiles.size) {
+                val endIdx = minOf(pendingFiles.size, idx + batchSize)
+                val slice = pendingFiles.subList(idx, endIdx)
+                val futures = slice.map { pf ->
+                    ioExecutor.submit<IsoFileEntry?> {
+                        try {
+                            val childFeOff = resolveUdfBlockByte(pf.block, pf.partRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
+                            val childFeBuf = fetchRemoteByteRange(isoUrl, childFeOff, childFeOff + blockSize - 1L)
+                            val infoLen = if (childFeBuf.size >= 64) readInt64LE(childFeBuf, 56) else 0L
+                            val fileExts = parseUdfFileEntryExtents(childFeBuf, 0, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, childFeOff, pf.partRef)
+                            if (infoLen > 0L && fileExts.isNotEmpty()) {
+                                IsoFileEntry(pf.fullPath, pf.name, false, infoLen, fileExts)
+                            } else null
+                        } catch (_: Throwable) {
+                            null
+                        }
+                    }
                 }
+                for (f in futures) {
+                    val item = try { f.get() } catch (_: Throwable) { null }
+                    if (item != null) results.add(item)
+                }
+                idx = endIdx
             }
         }
     }
@@ -4066,7 +4180,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val tagId = readUInt16LE(buf, secOff)
         if (tagId != 261 && tagId != 266) return emptyList()
 
-        // ECMA-167 ICB Tag Flags live at offset +34 (bytes 16..35 = ICB Tag)
         val icbFlags = readUInt16LE(buf, secOff + 34)
         val allocType = icbFlags and 0x07
         val infoLen = readInt64LE(buf, secOff + 56)
