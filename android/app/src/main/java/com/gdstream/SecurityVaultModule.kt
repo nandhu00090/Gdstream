@@ -161,27 +161,52 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     override fun getName(): String = "SecurityVault"
 
     private val debugLogLock = Any()
+    private val debugLogBuffer = StringBuilder()
 
     private fun appendDebugLog(tag: String, msg: String) {
         synchronized(debugLogLock) {
             try {
-                val pubDl = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
-                val dir = java.io.File(pubDl, "GDStream")
-                if (!dir.exists()) dir.mkdirs()
-                val logFile = if (dir.exists() && dir.canWrite()) {
-                    java.io.File(dir, "gdstream_debug.log")
-                } else {
-                    val fb = java.io.File(reactContext.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS), "GDStream")
-                    fb.mkdirs()
-                    java.io.File(fb, "gdstream_debug.log")
-                }
-                if (logFile.exists() && logFile.length() > 512L * 1024L) {
-                    val bak = java.io.File(logFile.parentFile, "gdstream_debug_prev.log")
-                    if (bak.exists()) bak.delete()
-                    logFile.renameTo(bak)
-                }
                 val ts = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(java.util.Date())
-                logFile.appendText("[$ts] [$tag] $msg\n", Charsets.UTF_8)
+                val line = "[$ts] [$tag] $msg\n"
+                if (debugLogBuffer.length > 64 * 1024) {
+                    debugLogBuffer.delete(0, debugLogBuffer.length - 32 * 1024)
+                }
+                debugLogBuffer.append(line)
+                val fullText = debugLogBuffer.toString()
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val resolver = reactContext.contentResolver
+                    val collection = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                    val relPath = android.os.Environment.DIRECTORY_DOWNLOADS + "/GDStream"
+                    val sel = "${android.provider.MediaStore.MediaColumns.DISPLAY_NAME}=? AND ${android.provider.MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
+                    val selArgs = arrayOf("gdstream_debug.log", "%GDStream%")
+                    var targetUri: android.net.Uri? = null
+                    resolver.query(collection, arrayOf(android.provider.BaseColumns._ID), sel, selArgs, null)?.use { c ->
+                        if (c.moveToFirst()) {
+                            val id = c.getLong(0)
+                            targetUri = android.content.ContentUris.withAppendedId(collection, id)
+                        }
+                    }
+                    if (targetUri == null) {
+                        val values = android.content.ContentValues().apply {
+                            put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, "gdstream_debug.log")
+                            put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                            put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, relPath)
+                        }
+                        targetUri = resolver.insert(collection, values)
+                    }
+                    if (targetUri != null) {
+                        resolver.openOutputStream(targetUri!!, "wt")?.use { os ->
+                            os.write(fullText.toByteArray(Charsets.UTF_8))
+                            os.flush()
+                        }
+                    }
+                } else {
+                    val pubDl = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+                    val dir = java.io.File(pubDl, "GDStream")
+                    if (!dir.exists()) dir.mkdirs()
+                    java.io.File(dir, "gdstream_debug.log").writeText(fullText, Charsets.UTF_8)
+                }
             } catch (_: Throwable) {}
         }
     }
@@ -808,6 +833,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val mimeType = when {
                 entry.fileName.endsWith(".mp4", ignoreCase = true) ||
                 entry.fileName.endsWith(".m4v", ignoreCase = true) -> "video/mp4"
+                entry.fileName.endsWith(".m2ts", ignoreCase = true) ||
+                entry.fileName.endsWith(".ts", ignoreCase = true) -> "video/mp2t"
+                entry.fileName.endsWith(".vob", ignoreCase = true) -> "video/mpeg"
                 entry.fileName.endsWith(".webm", ignoreCase = true) -> "video/webm"
                 else -> "video/x-matroska"
             }
@@ -1249,7 +1277,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val qId = Regex("[?&]id=([a-zA-Z0-9_-]{15,})").find(rawUrl)?.groupValues?.getOrNull(1)
         val pId = Regex("/d/([a-zA-Z0-9_-]{15,})").find(rawUrl)?.groupValues?.getOrNull(1)
         val driveId = qId ?: pId
-        return if (!driveId.isNullOrEmpty()) "gd_$driveId" else "${rawUrl.substringBefore("?")}|${sizeHint.toLong()}"
+        return if (!driveId.isNullOrEmpty()) "gd_$driveId" else "${rawUrl.substringBefore("#").substringBefore("?")}|${sizeHint.toLong()}"
     }
 
     private fun ensureZipDiskCacheLoaded() {
@@ -1506,7 +1534,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
 
                 // 1B. Blu-ray / DVD / Data .ISO (UDF 2.50 + ISO-9660 + MPLS + VOB)
-                val lowerUrlPath = zipUrl.substringBefore("?").lowercase(Locale.ROOT)
+                val lowerUrlPath = zipUrl.substringBefore("#").substringBefore("?").lowercase(Locale.ROOT)
                 var looksLikeIso = lowerUrlPath.endsWith(".iso")
                 var volDescProbe: ByteArray? = null
                 var isoDiagReason = ""
@@ -3572,11 +3600,21 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     private fun cleanIsoDisplayTitle(isoUrl: String): String {
         return try {
-            val rawName = java.net.URLDecoder.decode(
-                isoUrl.substringBefore("?").substringAfterLast('/'),
-                "UTF-8"
-            )
-            val base = rawName.replace(Regex("\\.iso$", RegexOption.IGNORE_CASE), "")
+            val fragName = isoUrl.substringAfter("#name=", "")
+            val rawCandidate = if (fragName.isNotEmpty()) {
+                java.net.URLDecoder.decode(fragName, "UTF-8")
+            } else {
+                val pathPart = java.net.URLDecoder.decode(
+                    isoUrl.substringBefore("#").substringBefore("?").substringAfterLast('/'),
+                    "UTF-8"
+                )
+                if (pathPart.equals("download.aspx", ignoreCase = true) || pathPart.endsWith(".aspx", ignoreCase = true) || pathPart.endsWith(".php", ignoreCase = true)) {
+                    ""
+                } else {
+                    pathPart
+                }
+            }
+            val base = rawCandidate.replace(Regex("\\.iso$", RegexOption.IGNORE_CASE), "").trim()
             if (base.isNotBlank() && base.length >= 2) base else "BluRay Disc"
         } catch (_: Throwable) {
             "BluRay Disc"
