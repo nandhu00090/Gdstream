@@ -4042,7 +4042,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     ): List<Pair<Long, Long>> {
         if (secOff + 180 > buf.size) return emptyList()
         val tagId = readUInt16LE(buf, secOff)
-        if (tagId != 256 && tagId != 261) return emptyList()
+        if (tagId != 261 && tagId != 266) return emptyList()
 
         // ECMA-167 ICB Tag Flags live at offset +34 (bytes 16..35 = ICB Tag)
         val icbFlags = readUInt16LE(buf, secOff + 34)
@@ -4052,7 +4052,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val lEa: Int
         val lAd: Int
         val adBase: Int
-        if (tagId == 261) {
+        if (tagId == 266) {
             if (secOff + 216 > buf.size) return emptyList()
             lEa = readUInt32LE(buf, secOff + 208).toInt()
             lAd = readUInt32LE(buf, secOff + 212).toInt()
