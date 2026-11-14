@@ -121,12 +121,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val id: String,
         val archiveUrl: String,
         val fileName: String,
-        val archiveFormat: String, // "ZIP" or "RAR"
+        val archiveFormat: String, // "ZIP", "RAR", or "ISO"
         val compressionMethod: Int, // 0 = STORE (Uncompressed), 8 = DEFLATE (ZIP), >0 = RAR Compressed
         val compressedSize: Long,
         val uncompressedSize: Long,
         val localHeaderOffset: Long,
-        @Volatile var dataStartOffset: Long = -1L
+        @Volatile var dataStartOffset: Long = -1L,
+        val segments: List<Pair<Long, Long>>? = null
     )
 
     private val verifiedTrailerCache = ConcurrentHashMap<String, VerifiedTrailerInfo>()
@@ -788,10 +789,72 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 return
             }
 
+            if (entry.compressionMethod == 0 && !entry.segments.isNullOrEmpty() && entry.segments.size > 1) {
+                // Multi-segment virtual stream (Blu-ray .mpls seamless branching or DVD multi-VOB)
+                val headers = buildString {
+                    append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
+                    append("Content-Type: $mimeType\r\n")
+                    append("Accept-Ranges: bytes\r\n")
+                    append("Content-Length: $contentLength\r\n")
+                    if (isPartial) {
+                        append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
+                    }
+                    append("Connection: close\r\n\r\n")
+                }
+                out.write(headers.toByteArray(StandardCharsets.US_ASCII))
+                out.flush()
+
+                val buf = ByteArray(65536)
+                var virtualCursor = 0L
+                for ((segOffset, segLen) in entry.segments) {
+                    val segVirtStart = virtualCursor
+                    val segVirtEnd = virtualCursor + segLen - 1L
+                    virtualCursor += segLen
+                    if (segVirtEnd < reqStart) continue
+                    if (segVirtStart > reqEnd) break
+
+                    val overlapStart = maxOf(reqStart, segVirtStart)
+                    val overlapEnd = minOf(reqEnd, segVirtEnd)
+                    if (overlapStart > overlapEnd) continue
+
+                    val remoteStart = segOffset + (overlapStart - segVirtStart)
+                    val remoteEnd = segOffset + (overlapEnd - segVirtStart)
+                    var segRemaining = overlapEnd - overlapStart + 1L
+
+                    val segConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
+                    remoteConnToClean = segConn
+                    val uCode = segConn.responseCode
+                    if (uCode !in 200..299) {
+                        try { segConn.disconnect() } catch (_: Throwable) {}
+                        break
+                    }
+                    val segIn = segConn.inputStream
+                    if (uCode == 200 && remoteStart > 0L) {
+                        var skipLeft = remoteStart
+                        while (skipLeft > 0L) {
+                            val s = segIn.read(buf, 0, minOf(buf.size.toLong(), skipLeft).toInt())
+                            if (s <= 0) break
+                            skipLeft -= s.toLong()
+                        }
+                    }
+                    while (segRemaining > 0L) {
+                        val toRead = minOf(buf.size.toLong(), segRemaining).toInt()
+                        val read = segIn.read(buf, 0, toRead)
+                        if (read <= 0) break
+                        out.write(buf, 0, read)
+                        segRemaining -= read.toLong()
+                    }
+                    try { segConn.disconnect() } catch (_: Throwable) {}
+                    remoteConnToClean = null
+                }
+                out.flush()
+                return
+            }
+
             val dataStart = resolveEntryDataStartOffset(entry)
 
             if (entry.compressionMethod == 0) {
-                // STORE Mode (Uncompressed ZIP or Uncompressed RAR): Direct 1:1 Byte-Slice Range Streaming!
+                // STORE Mode (Uncompressed ZIP, Uncompressed RAR, or Single-Clip ISO): Direct 1:1 Byte-Slice Range Streaming!
                 val remoteStart = dataStart + reqStart
                 val remoteEnd = dataStart + reqEnd
                 val remoteConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
@@ -1175,6 +1238,17 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val o = targetsArr.optJSONObject(i) ?: continue
                 val id = o.optString("id", "")
                 if (id.isEmpty()) continue
+                val segsJson = o.optJSONArray("segments")
+                val restoredSegs = if (segsJson != null && segsJson.length() > 0) {
+                    val list = ArrayList<Pair<Long, Long>>(segsJson.length())
+                    for (si in 0 until segsJson.length()) {
+                        val pairArr = segsJson.optJSONArray(si) ?: continue
+                        if (pairArr.length() >= 2) {
+                            list.add(Pair(pairArr.optLong(0, 0L), pairArr.optLong(1, 0L)))
+                        }
+                    }
+                    list
+                } else null
                 val entry = ArchiveEntryTarget(
                     id = id,
                     archiveUrl = freshUrl,
@@ -1184,7 +1258,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     compressedSize = o.optLong("compressedSize", 0L),
                     uncompressedSize = o.optLong("uncompressedSize", 0L),
                     localHeaderOffset = o.optLong("localHeaderOffset", 0L),
-                    dataStartOffset = o.optLong("dataStartOffset", -1L)
+                    dataStartOffset = o.optLong("dataStartOffset", -1L),
+                    segments = restoredSegs
                 )
                 archiveEntryRegistry[id] = entry
             }
@@ -1210,6 +1285,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     put("uncompressedSize", t.uncompressedSize)
                     put("localHeaderOffset", t.localHeaderOffset)
                     put("dataStartOffset", t.dataStartOffset)
+                    if (!t.segments.isNullOrEmpty()) {
+                        val sArr = JSONArray()
+                        for ((sOff, sLen) in t.segments) {
+                            sArr.put(JSONArray().apply { put(sOff); put(sLen) })
+                        }
+                        put("segments", sArr)
+                    }
                 })
             }
             if (targetsArr.length() > 0) {
@@ -1354,6 +1436,33 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     for (item in sortedRar) outRar.put(item)
                     promise.resolve(outRar.toString())
                     return@run
+                }
+
+                // 1B. Auto-detect Blu-ray / DVD / Data .ISO (UDF / ISO-9660)
+                val lowerUrlPath = zipUrl.substringBefore("?").lowercase(Locale.ROOT)
+                var looksLikeIso = lowerUrlPath.endsWith(".iso")
+                var volDescProbe: ByteArray? = null
+                if (totalArchiveSize >= 36864L) {
+                    val pvdProbe = fetchRemoteByteRange(zipUrl, 32768L, minOf(totalArchiveSize - 1L, 65535L))
+                    volDescProbe = pvdProbe
+                    var off = 0
+                    while (off + 6 <= pvdProbe.size) {
+                        val sig = String(pvdProbe, off + 1, 5, StandardCharsets.US_ASCII)
+                        if (sig == "CD001" || sig == "BEA01" || sig == "NSR02" || sig == "NSR03") {
+                            looksLikeIso = true
+                            break
+                        }
+                        off += 2048
+                    }
+                }
+                if (looksLikeIso) {
+                    val isoItems = parseIsoDiscEntries(zipUrl, totalArchiveSize, port, volDescProbe)
+                    if (isoItems.isNotEmpty()) {
+                        val outIso = JSONArray()
+                        for (item in isoItems) outIso.put(item)
+                        promise.resolve(outIso.toString())
+                        return@run
+                    }
                 }
 
                 // 2. Standard ZIP / ZIP64 Central Directory Tail Reader
@@ -3341,4 +3450,669 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(true)
         }
     }
+
+    // =========================================================================
+    // BLU-RAY / DVD / DATA .ISO STREAMING ENGINE (UDF + ISO-9660 + MPLS + VOB)
+    // =========================================================================
+    private data class IsoFileEntry(
+        val path: String,
+        val name: String,
+        val isDir: Boolean,
+        val size: Long,
+        val extents: List<Pair<Long, Long>>
+    )
+
+    private fun readUInt16BE(b: ByteArray, off: Int): Int {
+        if (off + 2 > b.size) return 0
+        return ((b[off].toInt() and 0xFF) shl 8) or (b[off + 1].toInt() and 0xFF)
+    }
+
+    private fun readUInt32BE(b: ByteArray, off: Int): Long {
+        if (off + 4 > b.size) return 0L
+        return ((b[off].toLong() and 0xFFL) shl 24) or
+            ((b[off + 1].toLong() and 0xFFL) shl 16) or
+            ((b[off + 2].toLong() and 0xFFL) shl 8) or
+            (b[off + 3].toLong() and 0xFFL)
+    }
+
+    private fun decodeUdfDString(b: ByteArray, off: Int, len: Int): String {
+        if (len <= 1 || off + len > b.size) return ""
+        val compId = b[off].toInt() and 0xFF
+        return try {
+            when (compId) {
+                16 -> String(b, off + 1, len - 1, StandardCharsets.UTF_16BE).trimEnd('\u0000')
+                else -> String(b, off + 1, len - 1, StandardCharsets.UTF_8).trimEnd('\u0000')
+            }
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    private fun cleanIsoDisplayTitle(isoUrl: String): String {
+        return try {
+            val rawName = java.net.URLDecoder.decode(
+                isoUrl.substringBefore("?").substringAfterLast('/'),
+                "UTF-8"
+            )
+            val base = rawName.replace(Regex("\\.iso$", RegexOption.IGNORE_CASE), "")
+            if (base.isNotBlank() && base.length >= 2) base else "BluRay Disc"
+        } catch (_: Throwable) {
+            "BluRay Disc"
+        }
+    }
+
+    private fun formatIsoDurationLabel(totalSec: Int): String {
+        if (totalSec <= 0) return ""
+        val h = totalSec / 3600
+        val m = (totalSec % 3600) / 60
+        return if (h > 0) String.format(Locale.US, "%dh%02dm", h, m) else String.format(Locale.US, "%dm", m)
+    }
+
+    private fun parseIsoDiscEntries(
+        isoUrl: String,
+        totalIsoSize: Long,
+        port: Int,
+        volDescProbe: ByteArray?
+    ): List<JSONObject> {
+        val allFiles = ArrayList<IsoFileEntry>()
+
+        try {
+            val udfFiles = parseUdfTree(isoUrl, totalIsoSize)
+            if (udfFiles.isNotEmpty()) {
+                allFiles.addAll(udfFiles)
+            }
+        } catch (_: Throwable) {}
+
+        if (allFiles.isEmpty()) {
+            try {
+                val iso9660Files = parseIso9660Tree(isoUrl, totalIsoSize, volDescProbe)
+                allFiles.addAll(iso9660Files)
+            } catch (_: Throwable) {}
+        }
+
+        if (allFiles.isEmpty()) return emptyList()
+
+        val discTitle = cleanIsoDisplayTitle(isoUrl)
+        val outItems = ArrayList<JSONObject>()
+
+        val m2tsMap = HashMap<String, IsoFileEntry>()
+        val mplsList = ArrayList<IsoFileEntry>()
+        for (f in allFiles) {
+            if (f.isDir || f.size <= 0L || f.extents.isEmpty()) continue
+            val upperPath = f.path.uppercase(Locale.ROOT)
+            val upperName = f.name.uppercase(Locale.ROOT)
+            if (upperPath.contains("BDMV/STREAM/") && upperName.endsWith(".M2TS")) {
+                val clipKey = upperName.substringBeforeLast('.')
+                m2tsMap[clipKey] = f
+            } else if (upperPath.contains("BDMV/PLAYLIST/") && upperName.endsWith(".MPLS") && f.size <= 2L * 1024L * 1024L) {
+                mplsList.add(f)
+            }
+        }
+
+        if (m2tsMap.isNotEmpty()) {
+            data class ResolvedPlaylist(
+                val mplsName: String,
+                val durationSec: Int,
+                val totalBytes: Long,
+                val segments: List<Pair<Long, Long>>,
+                val clipSignature: String
+            )
+
+            val playlists = ArrayList<ResolvedPlaylist>()
+            val seenSignatures = HashSet<String>()
+
+            for (mpls in mplsList.sortedByDescending { it.size }.take(40)) {
+                try {
+                    val mplsBytes = readIsoFileBytes(isoUrl, mpls, 524288)
+                    if (mplsBytes.size < 32) continue
+                    val sig = String(mplsBytes, 0, 8, StandardCharsets.US_ASCII)
+                    if (!sig.startsWith("MPLS0")) continue
+
+                    val playListStart = readUInt32BE(mplsBytes, 8).toInt()
+                    if (playListStart <= 0 || playListStart + 10 > mplsBytes.size) continue
+                    val numPlayItems = readUInt16BE(mplsBytes, playListStart + 6)
+                    if (numPlayItems <= 0 || numPlayItems > 250) continue
+
+                    var p = playListStart + 10
+                    val segs = ArrayList<Pair<Long, Long>>()
+                    val clipNames = ArrayList<String>()
+                    var totalTicks = 0L
+                    var totalBytes = 0L
+                    var valid = true
+
+                    for (idx in 0 until numPlayItems) {
+                        if (p + 22 > mplsBytes.size) { valid = false; break }
+                        val itemLen = readUInt16BE(mplsBytes, p)
+                        if (itemLen < 20 || p + 2 + itemLen > mplsBytes.size) { valid = false; break }
+                        val clipId = String(mplsBytes, p + 2, 5, StandardCharsets.US_ASCII).uppercase(Locale.ROOT)
+                        val inTime = readUInt32BE(mplsBytes, p + 14)
+                        val outTime = readUInt32BE(mplsBytes, p + 18)
+                        if (outTime > inTime) {
+                            totalTicks += (outTime - inTime)
+                        }
+                        val m2tsEntry = m2tsMap[clipId]
+                        if (m2tsEntry == null) {
+                            valid = false
+                            break
+                        }
+                        segs.addAll(m2tsEntry.extents)
+                        clipNames.add(clipId)
+                        totalBytes += m2tsEntry.size
+                        p += 2 + itemLen
+                    }
+
+                    val durSec = (totalTicks / 45000L).toInt()
+                    val clipSig = clipNames.joinToString("+")
+                    if (valid && segs.isNotEmpty() && totalBytes >= 50L * 1024L * 1024L && durSec >= 180 && seenSignatures.add(clipSig)) {
+                        playlists.add(
+                            ResolvedPlaylist(
+                                mplsName = mpls.name,
+                                durationSec = durSec,
+                                totalBytes = totalBytes,
+                                segments = segs,
+                                clipSignature = clipSig
+                            )
+                        )
+                    }
+                } catch (_: Throwable) {}
+            }
+
+            if (playlists.isNotEmpty()) {
+                val epCandidates = playlists.filter { it.durationSec in 1080..4800 }
+                val longFeatures = playlists.filter { it.durationSec > 4800 }
+                val isSeriesDisc = epCandidates.size >= 2 && longFeatures.isEmpty()
+
+                if (isSeriesDisc) {
+                    val orderedEps = epCandidates.sortedBy { it.mplsName }
+                    val seasonMatch = Regex("S(\\d{1,2})", RegexOption.IGNORE_CASE).find(discTitle)
+                    val sNum = seasonMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
+                    val cleanShow = discTitle
+                        .replace(Regex("\\bS\\d{1,2}(?:E\\d{1,2}|D\\d{1,2}|\\s*Disc\\s*\\d+)?\\b", RegexOption.IGNORE_CASE), "")
+                        .replace(Regex("\\b(BluRay|BD50|BD25|UHD|REMUX|1080p|2160p|4K|AVC|HEVC).*$", RegexOption.IGNORE_CASE), "")
+                        .trim()
+                        .ifEmpty { discTitle }
+
+                    orderedEps.forEachIndexed { idx, ep ->
+                        val epCode = String.format(Locale.US, "S%02dE%02d", sNum, idx + 1)
+                        val durTag = formatIsoDurationLabel(ep.durationSec)
+                        val displayName = if (durTag.isNotEmpty()) "$cleanShow $epCode [$durTag].m2ts" else "$cleanShow $epCode.m2ts"
+                        outItems.add(registerIsoStreamTarget(isoUrl, displayName, ep.totalBytes, ep.segments, port, "video/mp2t"))
+                    }
+                    return outItems
+                } else {
+                    val sortedMovies = playlists.sortedByDescending { it.durationSec }
+                    sortedMovies.forEachIndexed { idx, pl ->
+                        val durTag = formatIsoDurationLabel(pl.durationSec)
+                        val featureNum = idx + 1
+                        val label = when {
+                            idx == 0 && durTag.isNotEmpty() -> "$discTitle [Main Movie - $durTag].m2ts"
+                            idx == 0 -> "$discTitle [Main Movie].m2ts"
+                            durTag.isNotEmpty() -> "$discTitle - Feature $featureNum [$durTag].m2ts"
+                            else -> "$discTitle - Feature $featureNum.m2ts"
+                        }
+                        outItems.add(registerIsoStreamTarget(isoUrl, label, pl.totalBytes, pl.segments, port, "video/mp2t"))
+                    }
+                    return outItems
+                }
+            }
+
+            val largeM2ts = m2tsMap.values.filter { it.size >= 100L * 1024L * 1024L }.sortedByDescending { it.size }
+            if (largeM2ts.isNotEmpty()) {
+                largeM2ts.forEachIndexed { idx, f ->
+                    val clipFileName = f.name
+                    val label = if (idx == 0) "$discTitle [Main Stream - $clipFileName].m2ts" else "$discTitle - $clipFileName"
+                    outItems.add(registerIsoStreamTarget(isoUrl, label, f.size, f.extents, port, "video/mp2t"))
+                }
+                return outItems
+            }
+        }
+
+        val vobGroups = HashMap<String, ArrayList<IsoFileEntry>>()
+        for (f in allFiles) {
+            if (f.isDir || f.size <= 0L || f.extents.isEmpty()) continue
+            val upperName = f.name.uppercase(Locale.ROOT)
+            val m = Regex("^VTS_(\\d{2})_([1-9])\\.VOB$").find(upperName)
+            if (m != null) {
+                val titleSet = m.groupValues[1]
+                vobGroups.getOrPut(titleSet) { ArrayList() }.add(f)
+            }
+        }
+        if (vobGroups.isNotEmpty()) {
+            data class DvdTitle(val titleSet: String, val totalBytes: Long, val segs: List<Pair<Long, Long>>)
+            val titles = ArrayList<DvdTitle>()
+            for ((ts, parts) in vobGroups) {
+                val sortedParts = parts.sortedBy { it.name.uppercase(Locale.ROOT) }
+                val segs = ArrayList<Pair<Long, Long>>()
+                var sumBytes = 0L
+                for (p in sortedParts) {
+                    segs.addAll(p.extents)
+                    sumBytes += p.size
+                }
+                if (sumBytes >= 50L * 1024L * 1024L && segs.isNotEmpty()) {
+                    titles.add(DvdTitle(ts, sumBytes, segs))
+                }
+            }
+            if (titles.isNotEmpty()) {
+                val sortedTitles = titles.sortedByDescending { it.totalBytes }
+                sortedTitles.forEachIndexed { idx, dt ->
+                    val tSet = dt.titleSet
+                    val label = if (idx == 0) "$discTitle [DVD Main].vob" else "$discTitle - Title $tSet.vob"
+                    outItems.add(registerIsoStreamTarget(isoUrl, label, dt.totalBytes, dt.segs, port, "video/mpeg"))
+                }
+                return outItems
+            }
+        }
+
+        val directExts = listOf(".mkv", ".mp4", ".avi", ".mov", ".m4v", ".m2ts", ".ts")
+        val directVideos = allFiles.filter {
+            !it.isDir && it.size > 10L * 1024L * 1024L && it.extents.isNotEmpty() &&
+                directExts.any { ext -> it.name.lowercase(Locale.ROOT).endsWith(ext) }
+        }.sortedBy { it.name }
+
+        for (v in directVideos) {
+            val lower = v.name.lowercase(Locale.ROOT)
+            val mime = when {
+                lower.endsWith(".mp4") || lower.endsWith(".m4v") -> "video/mp4"
+                lower.endsWith(".m2ts") || lower.endsWith(".ts") -> "video/mp2t"
+                else -> "video/x-matroska"
+            }
+            outItems.add(registerIsoStreamTarget(isoUrl, v.name, v.size, v.extents, port, mime))
+        }
+
+        return outItems
+    }
+
+    private fun registerIsoStreamTarget(
+        isoUrl: String,
+        displayName: String,
+        totalBytes: Long,
+        segments: List<Pair<Long, Long>>,
+        port: Int,
+        mimeType: String
+    ): JSONObject {
+        val entryId = "ze_" + System.nanoTime() + "_" + archiveEntryCounter.getAndIncrement()
+        val firstOffset = segments.firstOrNull()?.first ?: 0L
+        val target = ArchiveEntryTarget(
+            id = entryId,
+            archiveUrl = isoUrl,
+            fileName = displayName,
+            archiveFormat = "ISO",
+            compressionMethod = 0,
+            compressedSize = totalBytes,
+            uncompressedSize = totalBytes,
+            localHeaderOffset = firstOffset,
+            dataStartOffset = firstOffset,
+            segments = segments
+        )
+        archiveEntryRegistry[entryId] = target
+        val safeName = URLEncoder.encode(displayName, "UTF-8").replace("+", "%20")
+        val streamUrl = "http://127.0.0.1:$port/zip/$entryId/$safeName"
+        return JSONObject().apply {
+            put("id", entryId)
+            put("name", displayName)
+            put("size", totalBytes.toString())
+            put("mimeType", mimeType)
+            put("link", streamUrl)
+            put("isZipEntry", true)
+            put("zipCompression", "STORE")
+        }
+    }
+
+    private fun readIsoFileBytes(isoUrl: String, entry: IsoFileEntry, maxBytes: Int): ByteArray {
+        val toFetch = minOf(entry.size, maxBytes.toLong()).toInt()
+        if (toFetch <= 0 || entry.extents.isEmpty()) return ByteArray(0)
+        val out = java.io.ByteArrayOutputStream(toFetch)
+        var rem = toFetch
+        for ((extOff, extLen) in entry.extents) {
+            if (rem <= 0) break
+            val chunk = minOf(extLen, rem.toLong()).toInt()
+            val bytes = fetchRemoteByteRange(isoUrl, extOff, extOff + chunk - 1L)
+            out.write(bytes)
+            rem -= bytes.size
+        }
+        return out.toByteArray()
+    }
+
+    private fun resolveUdfBlockByte(
+        blockNum: Long,
+        partRef: Int,
+        blockSize: Long,
+        defaultPhysBase: Long,
+        metaBaseByte: Long,
+        metaPartRef: Int,
+        physPartitions: Map<Int, Long>
+    ): Long {
+        return if (partRef == metaPartRef && metaBaseByte >= 0L) {
+            metaBaseByte + blockNum * blockSize
+        } else {
+            val pBase = physPartitions[partRef] ?: defaultPhysBase
+            pBase + blockNum * blockSize
+        }
+    }
+
+    private fun walkUdfDir(
+        isoUrl: String,
+        blockSize: Long,
+        defaultPhysBase: Long,
+        metaBaseByte: Long,
+        metaPartRef: Int,
+        physPartitions: Map<Int, Long>,
+        icbBlock: Long,
+        icbPartRef: Int,
+        parentPath: String,
+        depth: Int,
+        results: MutableList<IsoFileEntry>
+    ) {
+        if (depth > 6) return
+        val feByteOff = resolveUdfBlockByte(icbBlock, icbPartRef, blockSize, defaultPhysBase, metaBaseByte, metaPartRef, physPartitions)
+        val feBuf = fetchRemoteByteRange(isoUrl, feByteOff, feByteOff + blockSize - 1L)
+        val dirExts = parseUdfFileEntryExtents(feBuf, 0, blockSize, defaultPhysBase, metaBaseByte, metaPartRef)
+        if (dirExts.isEmpty()) return
+
+        val dirStream = java.io.ByteArrayOutputStream()
+        var fetched = 0
+        for ((dOff, dLen) in dirExts) {
+            if (fetched >= 524288) break
+            val take = minOf(dLen, (524288 - fetched).toLong()).toInt()
+            if (take <= 0) break
+            val chunk = if (dOff >= feByteOff && dOff + take <= feByteOff + feBuf.size) {
+                feBuf.copyOfRange((dOff - feByteOff).toInt(), (dOff - feByteOff).toInt() + take)
+            } else {
+                fetchRemoteByteRange(isoUrl, dOff, dOff + take - 1L)
+            }
+            dirStream.write(chunk)
+            fetched += chunk.size
+        }
+        val dirBuf = dirStream.toByteArray()
+
+        var p = 0
+        while (p + 38 <= dirBuf.size) {
+            val tid = readUInt16LE(dirBuf, p)
+            if (tid != 257) break
+            val chars = dirBuf[p + 18].toInt() and 0xFF
+            val lFi = dirBuf[p + 19].toInt() and 0xFF
+            val childBlock = readUInt32LE(dirBuf, p + 24)
+            val childPartRef = readUInt16LE(dirBuf, p + 28)
+            val lIu = readUInt16LE(dirBuf, p + 36)
+            val fiStart = p + 38 + lIu
+            val nextP = p + ((38 + lIu + lFi + 3) and 3.inv())
+            if (fiStart + lFi > dirBuf.size) break
+            p = nextP
+
+            val isDeleted = (chars and 0x04) != 0
+            val isParent = (chars and 0x08) != 0
+            if (isDeleted || isParent || lFi <= 1) continue
+
+            val name = decodeUdfDString(dirBuf, fiStart, lFi)
+            if (name.isEmpty() || name == "." || name == "..") continue
+            val isChildDir = (chars and 0x02) != 0
+            val fullPath = if (parentPath.isEmpty()) name else "$parentPath/$name"
+
+            if (isChildDir) {
+                val upper = fullPath.uppercase(Locale.ROOT)
+                if (depth <= 2 || upper.startsWith("BDMV") || upper.startsWith("VIDEO_TS")) {
+                    walkUdfDir(isoUrl, blockSize, defaultPhysBase, metaBaseByte, metaPartRef, physPartitions, childBlock, childPartRef, fullPath, depth + 1, results)
+                }
+            } else {
+                val childFeOff = resolveUdfBlockByte(childBlock, childPartRef, blockSize, defaultPhysBase, metaBaseByte, metaPartRef, physPartitions)
+                val childFeBuf = fetchRemoteByteRange(isoUrl, childFeOff, childFeOff + blockSize - 1L)
+                val infoLen = if (childFeBuf.size >= 64) readInt64LE(childFeBuf, 56) else 0L
+                val fileExts = parseUdfFileEntryExtents(childFeBuf, 0, blockSize, defaultPhysBase, metaBaseByte, metaPartRef)
+                if (infoLen > 0L && fileExts.isNotEmpty()) {
+                    results.add(
+                        IsoFileEntry(
+                            path = fullPath,
+                            name = name,
+                            isDir = false,
+                            size = infoLen,
+                            extents = fileExts
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private fun parseUdfTree(isoUrl: String, totalIsoSize: Long): List<IsoFileEntry> {
+        if (totalIsoSize < 600L * 1024L) return emptyList()
+        var avdp = fetchRemoteByteRange(isoUrl, 524288L, 524799L)
+        if (avdp.size < 32 || readUInt16LE(avdp, 0) != 2) {
+            val lastSec = ((totalIsoSize / 2048L) - 1L) * 2048L
+            if (lastSec > 524288L) {
+                avdp = fetchRemoteByteRange(isoUrl, lastSec, lastSec + 511L)
+            }
+        }
+        if (avdp.size < 32 || readUInt16LE(avdp, 0) != 2) return emptyList()
+
+        val mvdsLen = readUInt32LE(avdp, 16).coerceIn(2048L, 65536L).toInt()
+        val mvdsLoc = readUInt32LE(avdp, 20)
+        if (mvdsLoc <= 0L) return emptyList()
+
+        val mvdsStart = mvdsLoc * 2048L
+        val mvdsBuf = fetchRemoteByteRange(isoUrl, mvdsStart, minOf(totalIsoSize - 1L, mvdsStart + mvdsLen - 1L))
+
+        var blockSize = 2048L
+        val physPartitions = HashMap<Int, Long>()
+        var fsdLen = 0L
+        var fsdBlock = 0L
+        var fsdPartRef = 0
+        var metaPhysPartNum = -1
+        var metaFileBlock = -1L
+        var metaPartRef = -1
+
+        var off = 0
+        while (off + 512 <= mvdsBuf.size) {
+            val tagId = readUInt16LE(mvdsBuf, off)
+            if (tagId == 8 || tagId == 0) break
+            if (tagId == 5) {
+                val partNum = readUInt16LE(mvdsBuf, off + 22)
+                val partStartSec = readUInt32LE(mvdsBuf, off + 188)
+                physPartitions[partNum] = partStartSec * 2048L
+            } else if (tagId == 6) {
+                val bs = readUInt32LE(mvdsBuf, off + 212)
+                if (bs >= 512L) blockSize = bs
+                fsdLen = readUInt32LE(mvdsBuf, off + 248)
+                fsdBlock = readUInt32LE(mvdsBuf, off + 252)
+                fsdPartRef = readUInt16LE(mvdsBuf, off + 256)
+
+                val numPartMaps = readUInt32LE(mvdsBuf, off + 268).toInt()
+                var mp = off + 440
+                for (mIdx in 0 until numPartMaps) {
+                    if (mp + 6 > off + 2048 || mp + 6 > mvdsBuf.size) break
+                    val mType = mvdsBuf[mp].toInt() and 0xFF
+                    val mLen = mvdsBuf[mp + 1].toInt() and 0xFF
+                    if (mLen <= 0 || mp + mLen > mvdsBuf.size) break
+                    if (mType == 2 && mLen >= 48) {
+                        val partIdStr = String(mvdsBuf, mp + 5, 23, StandardCharsets.US_ASCII)
+                        if (partIdStr.contains("Metadata")) {
+                            metaPartRef = mIdx
+                            metaPhysPartNum = readUInt16LE(mvdsBuf, mp + 38)
+                            metaFileBlock = readUInt32LE(mvdsBuf, mp + 40)
+                        }
+                    }
+                    mp += mLen
+                }
+            }
+            off += 2048
+        }
+
+        if (physPartitions.isEmpty() || fsdLen <= 0L) return emptyList()
+        val defaultPhysBase = physPartitions[0] ?: physPartitions.values.first()
+
+        var metaBaseByte = -1L
+        if (metaPartRef >= 0 && metaFileBlock >= 0L) {
+            val mPhysBase = physPartitions[metaPhysPartNum] ?: defaultPhysBase
+            val mFeOffset = mPhysBase + metaFileBlock * blockSize
+            val mFeBuf = fetchRemoteByteRange(isoUrl, mFeOffset, mFeOffset + blockSize - 1L)
+            val mExts = parseUdfFileEntryExtents(mFeBuf, 0, blockSize, mPhysBase, -1L)
+            if (mExts.isNotEmpty()) {
+                metaBaseByte = mExts[0].first
+            }
+        }
+
+        val fsdByteOff = resolveUdfBlockByte(fsdBlock, fsdPartRef, blockSize, defaultPhysBase, metaBaseByte, metaPartRef, physPartitions)
+        val fsdBuf = fetchRemoteByteRange(isoUrl, fsdByteOff, fsdByteOff + blockSize - 1L)
+        if (fsdBuf.size < 416 || readUInt16LE(fsdBuf, 0) != 256) return emptyList()
+
+        val rootIcbBlock = readUInt32LE(fsdBuf, 404)
+        val rootIcbPartRef = readUInt16LE(fsdBuf, 408)
+
+        val results = ArrayList<IsoFileEntry>()
+        walkUdfDir(isoUrl, blockSize, defaultPhysBase, metaBaseByte, metaPartRef, physPartitions, rootIcbBlock, rootIcbPartRef, "", 0, results)
+        return results
+    }
+
+    private fun parseUdfFileEntryExtents(
+        buf: ByteArray,
+        secOff: Int,
+        blockSize: Long,
+        defaultPhysBase: Long,
+        metaBaseByte: Long,
+        metaPartRef: Int = -1
+    ): List<Pair<Long, Long>> {
+        if (secOff + 180 > buf.size) return emptyList()
+        val tagId = readUInt16LE(buf, secOff)
+        if (tagId != 256 && tagId != 261) return emptyList()
+
+        val icbFlags = readUInt16LE(buf, secOff + 18)
+        val allocType = icbFlags and 0x07
+        val infoLen = readInt64LE(buf, secOff + 56)
+
+        val lEa: Int
+        val lAd: Int
+        val adBase: Int
+        if (tagId == 261) {
+            if (secOff + 216 > buf.size) return emptyList()
+            lEa = readUInt32LE(buf, secOff + 208).toInt()
+            lAd = readUInt32LE(buf, secOff + 212).toInt()
+            adBase = secOff + 216 + lEa
+        } else {
+            lEa = readUInt32LE(buf, secOff + 168).toInt()
+            lAd = readUInt32LE(buf, secOff + 172).toInt()
+            adBase = secOff + 176 + lEa
+        }
+        if (adBase < 0 || adBase > buf.size) return emptyList()
+        val adEnd = (adBase + lAd).coerceAtMost(buf.size)
+
+        val out = ArrayList<Pair<Long, Long>>()
+        var remainingInfo = infoLen
+
+        if (allocType == 0) {
+            var ap = adBase
+            while (ap + 8 <= adEnd && remainingInfo > 0L) {
+                val rawLen = readUInt32LE(buf, ap)
+                val extType = (rawLen ushr 30).toInt()
+                val extBytes = rawLen and 0x3FFFFFFFL
+                val extPos = readUInt32LE(buf, ap + 4)
+                ap += 8
+                if (extBytes == 0L) break
+                if (extType == 0) {
+                    val take = minOf(extBytes, remainingInfo)
+                    out.add(Pair(defaultPhysBase + extPos * blockSize, take))
+                    remainingInfo -= take
+                }
+            }
+        } else if (allocType == 1) {
+            var ap = adBase
+            while (ap + 16 <= adEnd && remainingInfo > 0L) {
+                val rawLen = readUInt32LE(buf, ap)
+                val extType = (rawLen ushr 30).toInt()
+                val extBytes = rawLen and 0x3FFFFFFFL
+                val extBlock = readUInt32LE(buf, ap + 4)
+                val pRef = readUInt16LE(buf, ap + 8)
+                ap += 16
+                if (extBytes == 0L) break
+                if (extType == 0) {
+                    val base = if (pRef == metaPartRef && metaBaseByte >= 0L) metaBaseByte else defaultPhysBase
+                    val take = minOf(extBytes, remainingInfo)
+                    out.add(Pair(base + extBlock * blockSize, take))
+                    remainingInfo -= take
+                }
+            }
+        }
+        return out
+    }
+
+    private fun walkIso9660Dir(
+        isoUrl: String,
+        totalIsoSize: Long,
+        dirLba: Long,
+        dirLen: Long,
+        parentPath: String,
+        depth: Int,
+        results: MutableList<IsoFileEntry>
+    ) {
+        if (depth > 5) return
+        val byteStart = dirLba * 2048L
+        val fetchLen = dirLen.coerceIn(2048L, 262144L).toInt()
+        val dirBuf = fetchRemoteByteRange(isoUrl, byteStart, minOf(totalIsoSize - 1L, byteStart + fetchLen - 1L))
+        var p = 0
+        while (p + 34 <= dirBuf.size) {
+            val recLen = dirBuf[p].toInt() and 0xFF
+            if (recLen == 0) {
+                val nextSec = ((p / 2048) + 1) * 2048
+                if (nextSec >= dirBuf.size) break
+                p = nextSec
+                continue
+            }
+            if (p + recLen > dirBuf.size) break
+            val extentLba = readUInt32LE(dirBuf, p + 2)
+            val dataLen = readUInt32LE(dirBuf, p + 10)
+            val flags = dirBuf[p + 25].toInt() and 0xFF
+            val nameLen = dirBuf[p + 32].toInt() and 0xFF
+            if (nameLen > 0 && p + 33 + nameLen <= dirBuf.size) {
+                val rawId = String(dirBuf, p + 33, nameLen, StandardCharsets.UTF_8)
+                val isSpecial = nameLen == 1 && (dirBuf[p + 33].toInt() == 0 || dirBuf[p + 33].toInt() == 1)
+                if (!isSpecial) {
+                    val cleanName = rawId.substringBefore(';').trim()
+                    val fullPath = if (parentPath.isEmpty()) cleanName else "$parentPath/$cleanName"
+                    val isDir = (flags and 0x02) != 0
+                    if (isDir) {
+                        walkIso9660Dir(isoUrl, totalIsoSize, extentLba, dataLen, fullPath, depth + 1, results)
+                    } else if (dataLen > 0L) {
+                        results.add(
+                            IsoFileEntry(
+                                path = fullPath,
+                                name = cleanName,
+                                isDir = false,
+                                size = dataLen,
+                                extents = listOf(Pair(extentLba * 2048L, dataLen))
+                            )
+                        )
+                    }
+                }
+            }
+            p += recLen
+        }
+    }
+
+    private fun parseIso9660Tree(
+        isoUrl: String,
+        totalIsoSize: Long,
+        volDescProbe: ByteArray?
+    ): List<IsoFileEntry> {
+        val pvdBuf = volDescProbe ?: fetchRemoteByteRange(isoUrl, 32768L, minOf(totalIsoSize - 1L, 40959L))
+        var pvdOff = -1
+        var off = 0
+        while (off + 2048 <= pvdBuf.size) {
+            if ((pvdBuf[off].toInt() and 0xFF) == 1 &&
+                String(pvdBuf, off + 1, 5, StandardCharsets.US_ASCII) == "CD001"
+            ) {
+                pvdOff = off
+                break
+            }
+            off += 2048
+        }
+        if (pvdOff < 0) return emptyList()
+
+        val rootRecOff = pvdOff + 156
+        val rootLba = readUInt32LE(pvdBuf, rootRecOff + 2)
+        val rootLen = readUInt32LE(pvdBuf, rootRecOff + 10)
+        if (rootLba <= 0L || rootLen <= 0L) return emptyList()
+
+        val results = ArrayList<IsoFileEntry>()
+        walkIso9660Dir(isoUrl, totalIsoSize, rootLba, rootLen, "", 0, results)
+        return results
+    }
+
 }

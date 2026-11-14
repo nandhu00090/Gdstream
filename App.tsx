@@ -152,7 +152,7 @@ const getVersionTag = (name: string): string => {
 };
 
 const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => {
-  const withoutExt = isFolder ? name : name.replace(/\.(mkv|mp4|avi|mov|webm|m4v|ts|zip|rar)$/i, '');
+  const withoutExt = isFolder ? name : name.replace(/\.(mkv|mp4|avi|mov|webm|m4v|ts|m2ts|vob|zip|rar|iso)$/i, '');
   const normalized = withoutExt
     .replace(/[._]+/g, ' ')
     .replace(/\[.*?\]/g, ' ')
@@ -518,7 +518,7 @@ const App = () => {
       const name = String(f?.name || f?.title || '');
       const parsedRange = extractSeasonRangeFromName(name);
       if (parsedRange) {
-        const isDir = !!f?.mimeType?.includes('folder') || (/\.(zip|rar)$/i.test(name) && !f?.isZipEntry);
+        const isDir = !!f?.mimeType?.includes('folder') || (/\.(zip|rar|iso)$/i.test(name) && !f?.isZipEntry);
         const fInfo = parseMediaFilename(name, isDir);
         const clean = String(fInfo?.searchTitle || fInfo?.cleanTitle || '').trim().toUpperCase();
         if (clean) {
@@ -1403,7 +1403,7 @@ const App = () => {
         if (!item?.name) continue;
         const itemKey = item.name;
         if (fetchedKeysRef.current.has(itemKey)) continue;
-        const isFolder = !!item.mimeType?.includes('folder') || (/\.(zip|rar)$/i.test(String(item.name || '')) && !item.isZipEntry);
+        const isFolder = !!item.mimeType?.includes('folder') || (/\.(zip|rar|iso)$/i.test(String(item.name || '')) && !item.isZipEntry);
         const info = parseMediaFilename(itemKey, isFolder);
         const cacheKey = `meta_v8_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
         pendingItems.push({ itemKey, info, cacheKey });
@@ -1559,7 +1559,7 @@ const App = () => {
   const buildProcessedList = useCallback((rawList: any[], isEpFolder: boolean) => {
     const q = searchQuery.trim().toLowerCase();
     const filtered = rawList.filter((file) => {
-      const isFolder = !!file.mimeType?.includes('folder') || (/\.(zip|rar)$/i.test(String(file.name || '')) && !file.isZipEntry);
+      const isFolder = !!file.mimeType?.includes('folder') || (/\.(zip|rar|iso)$/i.test(String(file.name || '')) && !file.isZipEntry);
       const info = parseMediaFilename(file.name, isFolder);
       const realMi = mediaInfoMap[file.name];
 
@@ -1628,7 +1628,7 @@ const App = () => {
     }
 
     return mergedOrder.map(item => {
-      const isFolder = !!item.mimeType?.includes('folder') || (/\.(zip|rar)$/i.test(String(item.name || '')) && !item.isZipEntry);
+      const isFolder = !!item.mimeType?.includes('folder') || (/\.(zip|rar|iso)$/i.test(String(item.name || '')) && !item.isZipEntry);
       const info = parseMediaFilename(item.name, isFolder);
       if (info.isFolder || info.seasonEpisode || info.episodeNum > 0) return item;
       const key = `${info.cleanTitle.toLowerCase()}|${info.year}`;
@@ -1704,7 +1704,7 @@ const App = () => {
       setFolderFiles([]);
       setSeasonFolders([]);
       setActiveSeason(null);
-      setSeriesParentTitle(info.cleanTitle || zipItem.name.replace(/\.(zip|rar)$/i, ''));
+      setSeriesParentTitle(info.cleanTitle || zipItem.name.replace(/\.(zip|rar|iso)$/i, ''));
       setCurrentPath(virtualZipPath);
       // CRITICAL FIX: Push onto pathStack so isInsideFolder (pathStack.length > 1) becomes true IMMEDIATELY!
       setPathStack(prev => [...prev, virtualZipPath]);
@@ -1728,7 +1728,7 @@ const App = () => {
       setSeriesParentTitle(prevBackup.seriesParentTitle);
       setSeasonFolders(prevBackup.seasonFolders);
       setActiveSeason(prevBackup.activeSeason);
-      Alert.alert('Archive Info', 'Indha .zip / .rar archive-kulla video episodes (.mkv / .mp4) edhuvum illa.');
+      Alert.alert('Archive / Disc Info', 'Indha .zip / .rar / .iso file-kulla playable video streams edhuvum kidaikala.');
     } catch (e: any) {
       zipParentBackupRef.current = null;
       setFolderLoading(false);
@@ -2205,8 +2205,8 @@ const App = () => {
         setSeriesParentTitle('');
         setHomeFiles(incomingFiles);
       } else {
-        const archiveFiles = incomingFiles.filter((f: any) => /\.(zip|rar)$/i.test(String(f?.name || '')));
-        const normalVideos = incomingFiles.filter((f: any) => !f.mimeType?.includes('folder') && !/\.(zip|rar)$/i.test(String(f?.name || '')));
+        const archiveFiles = incomingFiles.filter((f: any) => /\.(zip|rar|iso)$/i.test(String(f?.name || '')));
+        const normalVideos = incomingFiles.filter((f: any) => !f.mimeType?.includes('folder') && !/\.(zip|rar|iso)$/i.test(String(f?.name || '')));
         if (archiveFiles.length === 1 && normalVideos.length === 0 && SecurityVault?.listZipMediaEntries) {
           try {
             const archItem = archiveFiles[0];
@@ -2339,7 +2339,7 @@ const App = () => {
   };
 
   const handlePress = (item: any) => {
-    if (item?.name && /\.(zip|rar)$/i.test(String(item.name)) && !item?.isZipEntry) {
+    if (item?.name && /\.(zip|rar|iso)$/i.test(String(item.name)) && !item?.isZipEntry) {
       openZipArchiveFile(item);
       return;
     }
@@ -2712,7 +2712,7 @@ const App = () => {
   useEffect(() => {
     if (!vaultReady || playMode !== null || !Array.isArray(activeRawFiles) || activeRawFiles.length === 0) return;
     const archives = activeRawFiles.filter(
-      (f: any) => f && !f.isZipEntry && /\.(zip|rar)$/i.test(String(f.name || ''))
+      (f: any) => f && !f.isZipEntry && /\.(zip|rar|iso)$/i.test(String(f.name || ''))
     );
     if (archives.length === 0) return;
 
@@ -3718,7 +3718,7 @@ const App = () => {
   const activeDownloadsCount = downloads.filter(d => d.status === 'downloading').length;
 
   const renderCatalogCard = ({ item, index, isFolderCard = false }: { item: any; index: number; isFolderCard?: boolean }) => {
-    const isFolder = !!item.mimeType?.includes('folder') || (/\.(zip|rar)$/i.test(String(item.name || '')) && !item.isZipEntry);
+    const isFolder = !!item.mimeType?.includes('folder') || (/\.(zip|rar|iso)$/i.test(String(item.name || '')) && !item.isZipEntry);
     const info = parseMediaFilename(item.name, isFolder);
     const meta = metadataMap[item.name];
     const realMi = mediaInfoMap[item.name];
