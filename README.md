@@ -1,97 +1,86 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# GDStream
 
-# Getting Started
+GDStream is a personal Android and Android TV / Fire TV streaming app built to play high-bitrate movies and TV series directly from a Google Drive index.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+Instead of downloading 20GB+ REMUX files or manually extracting multi-episode `.zip` and `.rar` archives just to watch something, GDStream parses file headers on the fly, pulls metadata from TMDB, inspects actual audio/video tracks before playback, and streams directly over HTTP range requests.
 
-## Step 1: Start Metro
+---
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+## Why I Built This
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+Most cloud media players either choke on large `.zip`/`.rar` packs, fail to pass through Dolby Vision / TrueHD Atmos properly, or require running a heavy 24/7 server like Plex or Jellyfin. I wanted a lightweight native Android client that works smoothly on both a phone and an Amazon Fire TV Stick remote, handles raw Drive folders and archives natively, and shows real technical specs before hitting play.
 
-```sh
-# Using npm
-npm start
+---
 
-# OR using Yarn
-yarn start
-```
+## What It Does
 
-## Step 2: Build and run your app
+### 1. Direct `.ZIP` & `.RAR` Streaming (No Extraction Needed)
+* **Remote Header Inspection:** Reads only the Central Directory (ZIP) or block headers (RAR5 / STORE) using HTTP `Range` requests instead of downloading the entire archive.
+* **Local Loopback Proxy (`127.0.0.1`):** Runs a lightweight multi-threaded HTTP proxy inside the app. Both the built-in ExoPlayer and external players (Just Player, VLC, MX Player) stream and seek directly through this local endpoint.
+* **Compressed ZIP MKV Fix:** Neutralizes tail `Cues` and `Tags` seek pointers in the opening bytes of Matroska streams inside `DEFLATE` ZIPs so ExoPlayer starts playback immediately instead of trying to seek to the end of a multi-gigabyte compressed stream.
+* **Instant Re-Opens:** Caches parsed archive file tables on disk (`gdstream_zip_index_v2`) so previously opened archives load in 0ms.
 
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
+### 2. Real MediaInfo Specs Before Playback
+Before you start streaming, GDStream probes the file header and displays:
+* **Video:** Resolution (`4K`, `1080p`, etc.), codec (`HEVC`, `AVC`), HDR profile (`Dolby Vision`, `HDR10`, `SDR`), and frame rate.
+* **File & Runtime:** Exact file size and duration.
+* **Audio Tracks:** Lists every embedded audio stream with channel layout and codec (`Dolby TrueHD with Atmos`, `DD+ 5.1`, `DTS-HD MA`, etc.).
+* **Compact Subtitles:** Groups duplicate language/format tracks (e.g., `Spanish (SRT) ×4`) and collapses long lists with a `+N more` toggle so 40+ subtitle tracks don't clutter the screen.
 
-### Android
+### 3. Smart Series & Multi-Version Library
+* **Owned-Season Badges:** Calculates season tags (`S04`, `S02-S03`) strictly from the folders and files actually present in your Drive—ignoring unreleased or missing seasons on TMDB.
+* **16:9 Episode Cards:** Inside series folders and archives, cards switch to 16:9 scene thumbnails (`still_path`) from TMDB along with actual episode titles, synopses, and a **Next Episode** quick-switch button on the detail screen.
+* **Multi-Version Grouping:** Automatically groups multiple encodes of the same movie (for example, a `4K DV` version and a `1080p WEB-DL` version) under one poster card with an interactive version picker.
 
-```sh
-# Using npm
-npm run android
+### 4. Dual Phone & Fire TV Remote Support
+* **Adaptive Layout:** Renders a 2-column touch layout on phones and a 5-column grid on Android TV / Fire TV.
+* **D-Pad Focus Management:** Uses a custom layer-based focus tracker (`FocusLayerContext`) and focus watchdog so Fire TV remote navigation stays predictable across overlays, modals, and horizontal rows.
 
-# OR using Yarn
-yarn android
-```
+### 5. Playback, Trailers & Offline Downloads
+* **In-App & External Players:** Built on ExoPlayer (`react-native-video`) with audio/subtitle track switching, playback speed, and resume tracking (`Continue Watching`), plus one-tap handoff to external players.
+* **Verified Official Trailers:** Resolves official trailers in-app in a chromeless landscape player while filtering out fan edits, reviews, and shorts.
+* **Watchlist & Downloads:** Includes a local `My List` bookmark system and a background multi-threaded downloader that saves files straight to `Download/GDStream`.
 
-### iOS
+---
 
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
+## How It's Built (Codebase & Stack)
 
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
+The project is written in **TypeScript**, **Kotlin**, and **C++**:
 
-```sh
-bundle install
-```
+* **`App.tsx` (React Native + TypeScript):** Handles the entire UI, filename parser (`parseMediaFilename`), multi-version grouping, owned-season calculation, TMDB metadata & episode still caching, Continue Watching state, and the TV D-Pad focus system.
+* **`android/app/src/main/java/com/gdstream/SecurityVaultModule.kt` (Kotlin):** The native backbone of the app. Runs the `127.0.0.1` archive HTTP range proxy, parses ZIP/RAR structures, probes MediaInfo tracks, verifies YouTube trailer streams, and manages background file downloads.
+* **`android/app/src/main/cpp/` (C++ JNI — `libgdcore.so`):** Native library that keeps endpoint URLs, shield tokens, and session cookies isolated from the JavaScript runtime.
+* **`scripts/patch-rnv.js` (Node.js):** Post-install script that patches `react-native-video`'s `ReactExoplayerView.java` for better Dolby Vision / HDR track selection and subtitle handling, and wires up CMake for `libgdcore.so`.
+* **`AsyncStorage` + Local Disk Cache:** Persists TMDB metadata (`meta_v8`), watch progress, watchlist items, and archive directory indexes locally for fast startup.
 
-Then, and every time you update your native dependencies, run:
+---
 
-```sh
-bundle exec pod install
-```
+## Project Layout
 
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
+    Gdstream/
+    ├── App.tsx                                    # UI, filename parser, TMDB enrichment, player & TV D-Pad focus
+    ├── android/
+    │   └── app/
+    │       ├── src/main/
+    │       │   ├── java/com/gdstream/
+    │       │   │   └── SecurityVaultModule.kt     # Local HTTP proxy, ZIP/RAR parser, MediaInfo & download engine
+    │       │   └── cpp/                           # Native C++ JNI module (libgdcore.so)
+    │       └── build.gradle                       # Android NDK & release signing config
+    ├── scripts/
+    │   └── patch-rnv.js                           # Post-install ExoPlayer DV/HDR & CMake patcher
+    └── .github/workflows/                         # GitHub Actions CI workflow for release APKs
 
-```sh
-# Using npm
-npm run ios
+---
 
-# OR using Yarn
-yarn ios
-```
+## Building
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+### GitHub Actions (Automated)
+Pushing to `main` automatically runs the Gradle release workflow, compiles `arm64-v8a` and `armeabi-v7a` native binaries, signs the APK, and uploads the build.
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
+### Local Build
 
-## Step 3: Modify your app
+    # Install packages and apply native ExoPlayer patches
+    npm install
 
-Now that you have successfully run the app, let's make changes!
-
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
-
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
-
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
-
-## Congratulations! :tada:
-
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+    # Compile release APK
+    cd android && ./gradlew assembleRelease
