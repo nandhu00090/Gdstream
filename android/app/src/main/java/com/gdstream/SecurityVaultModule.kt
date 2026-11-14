@@ -3852,7 +3852,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val feByteOff = resolveUdfBlockByte(icbBlock, icbPartRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
         val feBuf = fetchRemoteByteRange(isoUrl, feByteOff, feByteOff + blockSize - 1L)
         val feTag = if (feBuf.size >= 2) readUInt16LE(feBuf, 0) else -1
-        val dirExts = parseUdfFileEntryExtents(feBuf, 0, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, feByteOff)
+        val dirExts = parseUdfFileEntryExtents(feBuf, 0, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, feByteOff, icbPartRef)
         if (depth == 0) {
             diagNotes.add("rootFeOff=$feByteOff,tag=$feTag,exts=${dirExts.size}")
         }
@@ -3918,7 +3918,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val childFeOff = resolveUdfBlockByte(childBlock, childPartRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
                 val childFeBuf = fetchRemoteByteRange(isoUrl, childFeOff, childFeOff + blockSize - 1L)
                 val infoLen = if (childFeBuf.size >= 64) readInt64LE(childFeBuf, 56) else 0L
-                val fileExts = parseUdfFileEntryExtents(childFeBuf, 0, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, childFeOff)
+                val fileExts = parseUdfFileEntryExtents(childFeBuf, 0, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, childFeOff, childPartRef)
                 if (infoLen > 0L && fileExts.isNotEmpty()) {
                     results.add(IsoFileEntry(fullPath, name, false, infoLen, fileExts))
                 }
@@ -4024,7 +4024,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 if (candBlock < 0L || candBlock == 0xFFFFFFFFL) continue
                 val mFeOffset = mPhysBase + candBlock * blockSize
                 val mFeBuf = fetchRemoteByteRange(isoUrl, mFeOffset, mFeOffset + blockSize - 1L)
-                val mExts = parseUdfFileEntryExtents(mFeBuf, 0, blockSize, mPhysBase, emptyList(), -1, partRefToPhysBase, mFeOffset)
+                val mExts = parseUdfFileEntryExtents(mFeBuf, 0, blockSize, mPhysBase, emptyList(), -1, partRefToPhysBase, mFeOffset, -1)
                 if (mExts.isNotEmpty()) {
                     metaExtents = mExts
                     break
@@ -4059,7 +4059,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         metaExtents: List<Pair<Long, Long>>,
         metaPartRef: Int,
         partRefToPhysBase: Map<Int, Long>,
-        feAbsoluteByteOff: Long
+        feAbsoluteByteOff: Long,
+        currentPartRef: Int = -1
     ): List<Pair<Long, Long>> {
         if (secOff + 180 > buf.size) return emptyList()
         val tagId = readUInt16LE(buf, secOff)
@@ -4100,7 +4101,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 if (extBytes == 0L) break
                 if (extType == 0) {
                     val take = minOf(extBytes, remainingInfo)
-                    out.add(Pair(defaultPhysBase + extPos * blockSize, take))
+                    val physByte = resolveUdfBlockByte(extPos, currentPartRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
+                    out.add(Pair(physByte, take))
                     remainingInfo -= take
                 }
             }
