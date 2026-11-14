@@ -657,14 +657,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             if (archiveProxyPort > 0) return archiveProxyPort
             val server = ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"))
             archiveProxyPort = server.localPort
-            ioExecutor.submit {
+            Thread {
                 while (!server.isClosed) {
                     try {
                         val client = server.accept()
                         ioExecutor.submit { handleArchiveProxyClient(client) }
                     } catch (_: Throwable) {}
                 }
-            }
+            }.apply { isDaemon = true; name = "GDArchiveProxy" }.start()
             return archiveProxyPort
         }
     }
@@ -1074,7 +1074,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val dataStartOffset = offset + headSize.toLong()
 
                     if (!isDir && unpSize > 0L && mediaExtensions.any { lowerName.endsWith(it) }) {
-                        val entryId = "ze_${archiveEntryCounter.getAndIncrement()}"
+                        val entryId = "ze_${System.nanoTime()}_${archiveEntryCounter.getAndIncrement()}"
                         val target = ArchiveEntryTarget(
                             id = entryId,
                             archiveUrl = archiveUrl,
@@ -1125,7 +1125,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     private fun ensureZipDiskCacheLoaded() {
         if (!zipDiskLoaded.compareAndSet(false, true)) return
         try {
-            val file = java.io.File(reactContext.filesDir, "gdstream_zip_index_v1.json")
+            val file = java.io.File(reactContext.filesDir, "gdstream_zip_index_v2.json")
             if (file.exists() && file.length() > 2L) {
                 val rootObj = JSONObject(file.readText(Charsets.UTF_8))
                 val keys = rootObj.keys()
@@ -1144,8 +1144,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 try {
                     val obj = JSONObject()
                     for ((k, v) in zipDiskCache) obj.put(k, v)
-                    val tmp = java.io.File(reactContext.filesDir, "gdstream_zip_index_v1.tmp")
-                    val dest = java.io.File(reactContext.filesDir, "gdstream_zip_index_v1.json")
+                    val tmp = java.io.File(reactContext.filesDir, "gdstream_zip_index_v2.tmp")
+                    val dest = java.io.File(reactContext.filesDir, "gdstream_zip_index_v2.json")
                     tmp.writeText(obj.toString(), Charsets.UTF_8)
                     tmp.renameTo(dest)
                 } catch (_: Throwable) {}
@@ -1310,7 +1310,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val seed = verifyCertificateAndEnv()
                 if (seed != 0x5A3C9E71) {
                     promise.reject("E_SEC", "Security shield active")
-                    return@submit
+                    return@run
                 }
 
                 val baseUrl = nSync(1, seed)

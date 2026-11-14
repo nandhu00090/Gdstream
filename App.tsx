@@ -2620,6 +2620,7 @@ const App = () => {
   };
 
 
+
   useEffect(() => {
     if (!vaultReady || playMode !== null || !Array.isArray(activeRawFiles) || activeRawFiles.length === 0) return;
     const archives = activeRawFiles.filter(
