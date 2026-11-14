@@ -216,6 +216,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         appendDebugLog(tag, msg)
     }
 
+    init {
+        ioExecutor.submit {
+            appendDebugLog("APP_BOOT", "GDStream Native Engine ready (SDK=" + Build.VERSION.SDK_INT + ")")
+        }
+    }
+
     private external fun nSync(slot: Int, sigSeed: Int): String
 
     private fun buildPinnedSystemSslFactory(): SSLSocketFactory {
@@ -885,7 +891,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 return
             }
 
-            if (entry.archiveFormat == "ISO" && !entry.segments.isNullOrEmpty() && entry.segments.size > 1) {
+            if (entry.archiveFormat == "ISO") {
+                val segList = if (!entry.segments.isNullOrEmpty()) {
+                    entry.segments
+                } else {
+                    listOf(Pair(resolveEntryDataStartOffset(entry), totalSize))
+                }
                 val headers = buildString {
                     append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
                     append("Content-Type: $mimeType\r\n")
@@ -900,8 +911,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 out.flush()
 
                 val buf = ByteArray(65536)
+                val maxUpstreamChunk = 4L * 1024L * 1024L // 4 MB upstream slices prevent Worker/Drive 35GB range timeouts!
                 var virtualCursor = 0L
-                for ((segOffset, segLen) in entry.segments) {
+
+                for ((segOffset, segLen) in segList) {
                     val segVirtStart = virtualCursor
                     val segVirtEnd = virtualCursor + segLen - 1L
                     virtualCursor += segLen
@@ -912,35 +925,47 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val overlapEnd = minOf(reqEnd, segVirtEnd)
                     if (overlapStart > overlapEnd) continue
 
-                    val remoteStart = segOffset + (overlapStart - segVirtStart)
-                    val remoteEnd = segOffset + (overlapEnd - segVirtStart)
-                    var segRemaining = overlapEnd - overlapStart + 1L
+                    var curRemote = segOffset + (overlapStart - segVirtStart)
+                    val endRemote = segOffset + (overlapEnd - segVirtStart)
 
-                    val segConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
-                    remoteConnToClean = segConn
-                    val uCode = segConn.responseCode
-                    if (uCode !in 200..299) {
-                        try { segConn.disconnect() } catch (_: Throwable) {}
-                        break
-                    }
-                    val segIn = segConn.inputStream
-                    if (uCode == 200 && remoteStart > 0L) {
-                        var skipLeft = remoteStart
-                        while (skipLeft > 0L) {
-                            val s = segIn.read(buf, 0, minOf(buf.size.toLong(), skipLeft).toInt())
-                            if (s <= 0) break
-                            skipLeft -= s.toLong()
+                    while (curRemote <= endRemote) {
+                        val sliceEnd = minOf(endRemote, curRemote + maxUpstreamChunk - 1L)
+                        var sliceRemaining = sliceEnd - curRemote + 1L
+
+                        val segConn = openRangeConnection(entry.archiveUrl, "bytes=$curRemote-$sliceEnd")
+                        remoteConnToClean = segConn
+                        val uCode = segConn.responseCode
+                        if (uCode !in 200..299) {
+                            appendDebugLog("PROXY_ISO_ERR", "HTTP $uCode for ${entry.fileName} range=$curRemote-$sliceEnd")
+                            try { segConn.disconnect() } catch (_: Throwable) {}
+                            remoteConnToClean = null
+                            out.flush()
+                            return
                         }
+                        val segIn = segConn.inputStream
+                        if (uCode == 200 && curRemote > 0L) {
+                            var skipLeft = curRemote
+                            while (skipLeft > 0L) {
+                                val s = segIn.read(buf, 0, minOf(buf.size.toLong(), skipLeft).toInt())
+                                if (s <= 0) break
+                                skipLeft -= s.toLong()
+                            }
+                        }
+                        while (sliceRemaining > 0L) {
+                            val toRead = minOf(buf.size.toLong(), sliceRemaining).toInt()
+                            val read = segIn.read(buf, 0, toRead)
+                            if (read <= 0) break
+                            out.write(buf, 0, read)
+                            sliceRemaining -= read.toLong()
+                        }
+                        try { segConn.disconnect() } catch (_: Throwable) {}
+                        remoteConnToClean = null
+                        if (sliceRemaining > 0L) {
+                            out.flush()
+                            return
+                        }
+                        curRemote = sliceEnd + 1L
                     }
-                    while (segRemaining > 0L) {
-                        val toRead = minOf(buf.size.toLong(), segRemaining).toInt()
-                        val read = segIn.read(buf, 0, toRead)
-                        if (read <= 0) break
-                        out.write(buf, 0, read)
-                        segRemaining -= read.toLong()
-                    }
-                    try { segConn.disconnect() } catch (_: Throwable) {}
-                    remoteConnToClean = null
                 }
                 out.flush()
                 return
@@ -1316,7 +1341,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val root = JSONObject(cachedBlob)
             val rawJson = root.optString("rawJson", "")
             val targetsArr = root.optJSONArray("targets") ?: return null
-            if (rawJson.isEmpty() || targetsArr.length() == 0) return null
+            if (rawJson.isEmpty() || targetsArr.length() == 0 || rawJson.contains("download.aspx", ignoreCase = true)) return null
 
             val seed = verifyCertificateAndEnv()
             if (seed == 0x5A3C9E71) {

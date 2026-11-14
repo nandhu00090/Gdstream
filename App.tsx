@@ -1724,8 +1724,16 @@ const App = () => {
 
       if (SecurityVault?.listZipMediaEntries) {
         const rawJson = await fetchZipRawJsonFast(zipUrl, sizeHint);
-        const entries = rawJson ? JSON.parse(rawJson) : [];
-        if (Array.isArray(entries) && entries.length > 0) {
+        const rawEntries = rawJson ? JSON.parse(rawJson) : [];
+        const cleanDiscBase = zipItem.name.replace(/\.(iso|zip|rar)$/i, '');
+        const entries = Array.isArray(rawEntries)
+          ? rawEntries.map((ent: any) =>
+              ent?.name && /^download\.aspx/i.test(String(ent.name))
+                ? { ...ent, name: String(ent.name).replace(/^download\.aspx/i, cleanDiscBase) }
+                : ent
+            )
+          : [];
+        if (entries.length > 0) {
           setFolderFiles(entries);
           setFolderLoading(false);
           return;
@@ -3016,6 +3024,10 @@ const App = () => {
             }
           }}
           onEnd={handleVideoEnd}
+          onError={(err: any) => {
+            const errDetail = JSON.stringify(err?.error || err || 'Unknown playback error');
+            SecurityVault?.writeDebugLog?.('EXO_PLAY_ERR', `${selectedFile?.name || ''}: ${errDetail}`);
+          }}
           selectedAudioTrack={isExternalAudioSelected ? { type: 'disabled' } : selectedAudio}
           subtitleStyle={{
             paddingBottom: resizeMode === 'cover' ? 70 : 20,
