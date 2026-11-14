@@ -1991,11 +1991,11 @@ const App = () => {
       }
 
       // Details Page: Let native ScrollView D-Pad move smoothly between Play in App -> External Player -> Download -> Trailer -> Source!
-      // Only guard the top ceiling (detail_back_btn / detail_fav_top_btn) and bottom floor (detail_source_btn)!
+      // Only guard the top ceiling (detail_back_btn) and bottom floor (detail_source_btn)!
       if (currentActiveLayer === 'detail') {
-        if (keyCode === 19 && (sourceId === 'detail_back_btn' || sourceId === 'detail_fav_top_btn')) {
+        if (keyCode === 19 && (sourceId === 'detail_back_btn')) {
           setTimeout(() => focusById(sourceId), 5);
-        } else if (keyCode === 20 && (sourceId === 'detail_back_btn' || sourceId === 'detail_fav_top_btn')) {
+        } else if (keyCode === 20 && (sourceId === 'detail_back_btn')) {
           setTimeout(() => {
             if (versionGroup.length > 1) focusById('detail_ver_0');
             else focusById('detail_play_btn');
@@ -3197,9 +3197,6 @@ const App = () => {
           <View style={styles.detailHeroShade} />
           <FocusableButton focusId="detail_back_btn" style={styles.detailBackTopBtn} onPress={() => { setSelectedFile(null); setVersionGroup([]); }}>
             <Icon name="arrow-back" size={24} color="white" />
-          </FocusableButton>
-          <FocusableButton focusId="detail_fav_top_btn" style={styles.detailFavTopBtn} onPress={() => toggleWatchlist(selectedFile.name)}>
-            <Icon name={isFav ? 'favorite' : 'favorite-border'} size={22} color={isFav ? '#E50914' : 'white'} />
           </FocusableButton>
         </View>
 
