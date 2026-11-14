@@ -477,7 +477,28 @@ const App = () => {
 
   
   const [showSeriesRatingTick, setShowSeriesRatingTick] = React.useState(false);
-  const [seriesMaxSeasonMap, setSeriesMaxSeasonMap] = React.useState<Record<string, number>>({});
+  const [seriesSeasonRangeMap, setSeriesSeasonRangeMap] = React.useState<Record<string, { min: number; max: number }>>({});
+
+  const extractSeasonRangeFromName = useCallback((raw: string): { min: number; max: number } | null => {
+    const rangeMatch = raw.match(/(?:[.\s_-]|\b)S(\d{1,2})\s*[-–]\s*S?(\d{1,2})(?:[.\s_-]|\b)/i)
+      || raw.match(/\bSeason[\s._-]*(\d{1,2})\s*[-–to]+\s*(?:Season[\s._-]*)?(\d{1,2})\b/i);
+    if (rangeMatch) {
+      const a = parseInt(rangeMatch[1], 10);
+      const b = parseInt(rangeMatch[2], 10);
+      if (a > 0 && b > 0) return { min: Math.min(a, b), max: Math.max(a, b) };
+    }
+    const singleMatch = raw.match(/(?:[.\s_-]|\b)S(\d{1,2})(?:[\s._-]*E\d{1,3}|[.\s_-]|\b)/i)
+      || raw.match(/\bSeason[\s._-]*(\d{1,2})\b/i);
+    if (singleMatch) {
+      const s = parseInt(singleMatch[1], 10);
+      if (s > 0) return { min: s, max: s };
+    }
+    const fromHelper = extractSeasonNumberFromFolder(raw);
+    if (fromHelper !== null && fromHelper > 0) {
+      return { min: fromHelper, max: fromHelper };
+    }
+    return null;
+  }, []);
 
   React.useEffect(() => {
     if (IS_TV) return;
@@ -487,82 +508,46 @@ const App = () => {
     return () => clearInterval(timer);
   }, []);
 
-  
-  // Automatically discover total seasons (e.g. S01-S04) for series from both loaded files and TMDb /tv/{id}
+  // Discover actual owned season range (e.g., S04 or S02-S03) strictly from Drive files/folders in memory
   React.useEffect(() => {
-    let cancelled = false;
-    const tmdbKey = vaultRef.current?.tmdbKey || '';
-    if (!tmdbKey) return;
+    const rawList: any[] = Array.isArray(activeRawFiles) ? activeRawFiles : [];
+    if (rawList.length === 0) return;
 
-    const scanSeriesSeasons = async () => {
-      try {
-        // Find all unique series titles from current files/items in memory
-        const rawList: any[] = (typeof files !== 'undefined' && Array.isArray(files)) ? files : [];
-        const localMaxMap: Record<string, number> = {};
-        const seriesTitles = new Set<string>();
-
-        for (const f of rawList) {
-          const name = String(f?.name || f?.title || '');
-          const sMatch = name.match(/(?:[.\s_-]|\b)S(\d{1,2})(?:[\s._-]*E\d{1,3}|\b)/i)
-            || name.match(/\bSeason[\s._-]*(\d{1,2})\b/i);
-          if (sMatch) {
-            const sNum = parseInt(sMatch[1], 10);
-            const cut = sMatch.index || 0;
-            const clean = (cut > 0 ? name.slice(0, cut) : name)
-              .replace(/\b(19\d{2}|20\d{2})\b.*$/, '')
-              .replace(/[._-]+/g, ' ')
-              .replace(/\s+/g, ' ')
-              .trim()
-              .toUpperCase();
-            if (clean) {
-              seriesTitles.add(clean);
-              if (sNum > (localMaxMap[clean] || 0)) {
-                localMaxMap[clean] = sNum;
-              }
-            }
-          }
+    const localRangeMap: Record<string, { min: number; max: number }> = {};
+    for (const f of rawList) {
+      const name = String(f?.name || f?.title || '');
+      const parsedRange = extractSeasonRangeFromName(name);
+      if (parsedRange) {
+        const isDir = !!f?.mimeType?.includes('folder') || (/\.(zip|rar)$/i.test(name) && !f?.isZipEntry);
+        const fInfo = parseMediaFilename(name, isDir);
+        const clean = String(fInfo?.searchTitle || fInfo?.cleanTitle || '').trim().toUpperCase();
+        if (clean) {
+          const existing = localRangeMap[clean];
+          localRangeMap[clean] = existing
+            ? { min: Math.min(existing.min, parsedRange.min), max: Math.max(existing.max, parsedRange.max) }
+            : parsedRange;
         }
+      }
+    }
 
-        if (Object.keys(localMaxMap).length > 0 && !cancelled) {
-          setSeriesMaxSeasonMap(prev => ({ ...prev, ...localMaxMap }));
+    if (Object.keys(localRangeMap).length > 0) {
+      setSeriesSeasonRangeMap(prev => {
+        const merged = { ...prev };
+        for (const [k, rng] of Object.entries(localRangeMap)) {
+          merged[k] = merged[k]
+            ? { min: Math.min(merged[k].min, rng.min), max: Math.max(merged[k].max, rng.max) }
+            : rng;
         }
+        return merged;
+      });
+    }
+  }, [activeRawFiles, extractSeasonRangeFromName]);
 
-        for (const titleKey of Array.from(seriesTitles)) {
-          if (cancelled) break;
-          try {
-            const sUrl = `https://api.themoviedb.org/3/search/tv?api_key=${tmdbKey}&query=${encodeURIComponent(titleKey)}`;
-            const sData = await fetch(sUrl).then(r => r.json());
-            const tvId = sData?.results?.[0]?.id;
-            if (tvId) {
-              const dUrl = `https://api.themoviedb.org/3/tv/${tvId}?api_key=${tmdbKey}`;
-              const dData = await fetch(dUrl).then(r => r.json());
-              const numSeasons = Number(dData?.number_of_seasons || 0);
-              if (numSeasons > 0 && !cancelled) {
-                setSeriesMaxSeasonMap(prev => ({
-                  ...prev,
-                  [titleKey]: Math.max(prev[titleKey] || 1, numSeasons),
-                }));
-              }
-            }
-          } catch (_e) {}
-        }
-      } catch (_err) {}
-    };
-
-    const t = setTimeout(scanSeriesSeasons, 900);
-    return () => {
-      cancelled = true;
-      clearTimeout(t);
-    };
-  }, [typeof files !== 'undefined' ? files?.length : 0]);
-
-  
-  const seriesMetaCacheRef = React.useRef<Record<string, { maxSeasons: number; rating: string }>>({});
+  const seriesMetaCacheRef = React.useRef<Record<string, { minSeason: number; maxSeason: number; rating: string }>>({});
   const seriesPendingRef = React.useRef<Set<string>>(new Set());
   const [, forceSeriesBadgeUpdate] = React.useState(0);
 
   const ensureSeriesMetaLoaded = (itemObj: any, infoObj: any) => {
-    if (IS_TV) return null;
     const searchName = String(infoObj?.searchTitle || infoObj?.cleanTitle || itemObj?.name || '').trim();
     const cleanKey = searchName.toUpperCase();
     if (!cleanKey || cleanKey.length < 2) return null;
@@ -573,51 +558,58 @@ const App = () => {
 
     seriesPendingRef.current.add(cleanKey);
     setTimeout(async () => {
-      let maxS = 1;
+      const foundSeasons: number[] = [];
       let tmdbRating = '';
 
-      // A. If this Homepage item is a Series Folder on Google Drive, inspect its actual season subfolders!
+      const ownRange = extractSeasonRangeFromName(String(itemObj?.name || ''));
+      if (ownRange) {
+        foundSeasons.push(ownRange.min, ownRange.max);
+      }
+
+      // Inspect actual season subfolders/episodes inside this Drive Series Folder
       try {
         if (itemObj?.mimeType?.includes('folder') && itemObj?.name) {
-          const subPath = `/${encodeURIComponent(itemObj.name)}/`;
+          const baseFolderPath = currentPath.startsWith('/0:/') ? currentPath : '/0:/';
+          const subPath = `${baseFolderPath}${encodeURIComponent(itemObj.name)}/`;
           const subFiles = await requestRawDirectory(subPath);
           if (Array.isArray(subFiles) && subFiles.length > 0) {
-            let folderSeasonCount = 0;
             for (const sf of subFiles) {
-              const sNum = extractSeasonNumberFromFolder(String(sf?.name || ''));
-              if (sNum !== null && sNum > 0) {
-                folderSeasonCount = Math.max(folderSeasonCount, sNum);
+              const subRange = extractSeasonRangeFromName(String(sf?.name || ''));
+              if (subRange) {
+                foundSeasons.push(subRange.min, subRange.max);
               }
             }
-            if (folderSeasonCount > maxS) maxS = folderSeasonCount;
           }
         }
       } catch (_e) {}
 
-      // B. Also check TMDb /search/tv -> /tv/{id} for total seasons & overall series rating
+      // Fetch TMDb rating only (never override owned seasons with total released TMDb seasons)
       try {
         const tmdbKey = vaultRef.current?.tmdbKey || '';
-        if (tmdbKey) {
+        if (tmdbKey && !IS_TV) {
           const sUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(searchName)}`;
           const sData = await fetch(sUrl).then(r => r.json());
           const sList: any[] = sData?.results || [];
           const first = sList.find((r: any) => String(r?.name || r?.original_name || '').toLowerCase().trim() === searchName.toLowerCase()) || sList[0];
-          if (first?.id) {
-            const dUrl = `https://api.themoviedb.org/3/tv/${first.id}?api_key=${encodeURIComponent(tmdbKey)}`;
-            const dData = await fetch(dUrl).then(r => r.json());
-            const numSeasons = Number(dData?.number_of_seasons || 0);
-            if (numSeasons > maxS) maxS = numSeasons;
-            const voteAvg = Number(dData?.vote_average || first?.vote_average || 0);
-            if (voteAvg > 0) tmdbRating = voteAvg.toFixed(1);
-          }
+          const voteAvg = Number(first?.vote_average || 0);
+          if (voteAvg > 0) tmdbRating = voteAvg.toFixed(1);
         }
       } catch (_e) {}
 
+      const minS = foundSeasons.length > 0 ? Math.min(...foundSeasons) : 1;
+      const maxS = foundSeasons.length > 0 ? Math.max(...foundSeasons) : 1;
+
       seriesMetaCacheRef.current[cleanKey] = {
-        maxSeasons: maxS,
+        minSeason: minS,
+        maxSeason: maxS,
         rating: tmdbRating,
       };
-      setSeriesMaxSeasonMap(prev => ({ ...prev, [cleanKey]: maxS }));
+      setSeriesSeasonRangeMap(prev => ({
+        ...prev,
+        [cleanKey]: prev[cleanKey]
+          ? { min: Math.min(prev[cleanKey].min, minS), max: Math.max(prev[cleanKey].max, maxS) }
+          : { min: minS, max: maxS },
+      }));
       forceSeriesBadgeUpdate(v => v + 1);
     }, 20);
 
@@ -627,16 +619,30 @@ const App = () => {
   const getHomeSeriesBadgeText = (itemObj: any, infoObj: any, metaObj: any): { text: string; isRating: boolean } => {
     const cached = ensureSeriesMetaLoaded(itemObj, infoObj);
     const cleanKey = String(infoObj?.searchTitle || infoObj?.cleanTitle || '').trim().toUpperCase();
-    const mappedS = (cleanKey && seriesMaxSeasonMap[cleanKey]) ? seriesMaxSeasonMap[cleanKey] : 0;
+    const mappedRange = cleanKey ? seriesSeasonRangeMap[cleanKey] : undefined;
+    const ownRange = extractSeasonRangeFromName(String(itemObj?.name || ''));
 
-    const rawTag = String(infoObj?.seasonEpisode || 'S01');
-    const sMatch = rawTag.match(/S(\d{1,2})/i);
-    const curS = sMatch ? parseInt(sMatch[1], 10) : 1;
-    const totalS = Math.max(cached?.maxSeasons || 0, mappedS, curS);
+    const candidatesMin: number[] = [];
+    const candidatesMax: number[] = [];
+    if (cached && (cached.minSeason > 0 || cached.maxSeason > 0)) {
+      candidatesMin.push(cached.minSeason);
+      candidatesMax.push(cached.maxSeason);
+    }
+    if (mappedRange) {
+      candidatesMin.push(mappedRange.min);
+      candidatesMax.push(mappedRange.max);
+    }
+    if (ownRange) {
+      candidatesMin.push(ownRange.min);
+      candidatesMax.push(ownRange.max);
+    }
 
-    const seasonRangeText = totalS > 1
-      ? `S01-S${String(totalS).padStart(2, '0')}`
-      : `S${String(curS).padStart(2, '0')}`;
+    const minS = candidatesMin.length > 0 ? Math.min(...candidatesMin) : 1;
+    const maxS = candidatesMax.length > 0 ? Math.max(...candidatesMax) : 1;
+
+    const seasonRangeText = maxS > minS
+      ? `S${String(minS).padStart(2, '0')}-S${String(maxS).padStart(2, '0')}`
+      : `S${String(minS).padStart(2, '0')}`;
 
     const ratingVal = metaObj?.rating || cached?.rating || '';
     if (ratingVal && showSeriesRatingTick) {
