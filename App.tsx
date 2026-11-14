@@ -657,6 +657,17 @@ const App = () => {
     epTitle: string | null;
     code: string | null;
   } | null>(null);
+  const [episodeCardsMetaMap, setEpisodeCardsMetaMap] = React.useState<Record<string, {
+    epTitle: string;
+    stillUrl: string | null;
+    runtimeMin: number;
+  }>>({});
+  const fetchedEpCardKeysRef = React.useRef<Set<string>>(new Set());
+  const [subsExpanded, setSubsExpanded] = React.useState(false);
+
+  React.useEffect(() => {
+    setSubsExpanded(false);
+  }, [selectedFile?.name]);
 
   const [trailerState, setTrailerState] = React.useState<{
     loading: boolean;
@@ -1474,6 +1485,77 @@ const App = () => {
     return () => { cancelled = true; };
   }, [activeRawFiles, vaultReady, selectedFile, playMode, fetchSingleMetadata, loadSavedTimesForFiles]);
 
+  React.useEffect(() => {
+    if (!vaultReady || playMode !== null || !isInsideFolder || !Array.isArray(folderFiles) || folderFiles.length === 0) return;
+    const tmdbKey = (vaultRef.current?.tmdbKey || '').trim();
+    if (tmdbKey.length < 20) return;
+
+    const epEntries: Array<{ fileName: string; sNum: number; eNum: number; showTitle: string }> = [];
+    for (const f of folderFiles) {
+      if (!f?.name || f?.mimeType?.includes('folder')) continue;
+      if (fetchedEpCardKeysRef.current.has(f.name)) continue;
+      const p = parseMediaFilename(f.name, false);
+      const m = f.name.match(/(?:[.\s_-]|\b)S(\d{1,2})[\s._-]*E(\d{1,3})\b/i)
+        || (p.seasonEpisode ? p.seasonEpisode.match(/S(\d{1,2})E(\d{1,3})/i) : null);
+      const sNum = m ? parseInt(m[1], 10) : (activeSeason?.seasonNum || p.seasonNum || 1);
+      const eNum = m ? parseInt(m[2], 10) : (p.episodeNum || 0);
+      const showTitle = (seriesParentTitle || p.searchTitle || p.cleanTitle || '').trim();
+      if (eNum > 0 && showTitle) {
+        epEntries.push({ fileName: f.name, sNum, eNum, showTitle });
+      }
+    }
+    if (epEntries.length === 0) return;
+
+    let cancelled = false;
+    const fetchEpisodeStills = async () => {
+      try {
+        const primaryShow = epEntries[0].showTitle;
+        const tvSearchUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(primaryShow)}`;
+        const tvRes = await fetch(tvSearchUrl).then(r => r.json());
+        const tvId = tvRes?.results?.[0]?.id;
+        if (!tvId || cancelled) return;
+
+        const neededSeasons = Array.from(new Set(epEntries.map(e => e.sNum)));
+        const seasonLookup: Record<string, { epTitle: string; stillUrl: string | null; runtimeMin: number }> = {};
+
+        for (const sNum of neededSeasons) {
+          if (cancelled) break;
+          try {
+            const sUrl = `https://api.themoviedb.org/3/tv/${tvId}/season/${sNum}?api_key=${encodeURIComponent(tmdbKey)}`;
+            const sData = await fetch(sUrl).then(r => r.json());
+            const eps: any[] = Array.isArray(sData?.episodes) ? sData.episodes : [];
+            for (const ep of eps) {
+              const epNo = Number(ep?.episode_number || 0);
+              if (epNo > 0) {
+                seasonLookup[`${sNum}_${epNo}`] = {
+                  epTitle: String(ep?.name || '').trim(),
+                  stillUrl: ep?.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : null,
+                  runtimeMin: Number(ep?.runtime || 0),
+                };
+              }
+            }
+          } catch {}
+        }
+
+        if (cancelled) return;
+        const updates: Record<string, { epTitle: string; stillUrl: string | null; runtimeMin: number }> = {};
+        for (const item of epEntries) {
+          fetchedEpCardKeysRef.current.add(item.fileName);
+          const hit = seasonLookup[`${item.sNum}_${item.eNum}`];
+          if (hit && (hit.epTitle || hit.stillUrl)) {
+            updates[item.fileName] = hit;
+          }
+        }
+        if (Object.keys(updates).length > 0 && !cancelled) {
+          setEpisodeCardsMetaMap(prev => ({ ...prev, ...updates }));
+        }
+      } catch {}
+    };
+
+    fetchEpisodeStills();
+    return () => { cancelled = true; };
+  }, [isInsideFolder, folderFiles, seriesParentTitle, activeSeason, vaultReady, playMode]);
+
   const buildProcessedList = useCallback((rawList: any[], isEpFolder: boolean) => {
     const q = searchQuery.trim().toLowerCase();
     const filtered = rawList.filter((file) => {
@@ -1962,16 +2044,16 @@ const App = () => {
             }, 5);
           } else if (isFolder && (sourceId === 'f_back' || sourceId === 'f_season')) {
             setTimeout(() => focusById(sourceId), 5);
-          } else if (!isFolder && sourceId && sourceId.startsWith('chip_')) {
+          } else if (!isFolder && sourceId && (sourceId.startsWith('chip_') || sourceId === 'hdr_sort')) {
             setTimeout(() => focusById('search_btn'), 5);
           } else if (!isFolder && (sourceId === 'search_btn' || sourceId === 'search_clear')) {
-            setTimeout(() => focusById('hdr_sort'), 5);
+            setTimeout(() => focusById('hdr_dl'), 5);
           } else if (!isFolder && sourceId && sourceId.startsWith('hdr_')) {
             setTimeout(() => focusById(sourceId), 5);
           }
         } else if (keyCode === 20) {
           // DOWN ARROW at header/CW boundaries only (Card-to-Card Down moves natively with zero flicker!):
-          if (!isFolder && sourceId && sourceId.startsWith('hdr_')) {
+          if (!isFolder && sourceId && sourceId.startsWith('hdr_') && sourceId !== 'hdr_sort') {
             setTimeout(() => focusById('search_btn'), 5);
           } else if (!isFolder && (sourceId === 'search_btn' || sourceId === 'search_clear')) {
             setTimeout(() => focusById('chip_all'), 5);
@@ -3211,6 +3293,11 @@ const App = () => {
             {meta?.poster ? <Image source={{ uri: meta.poster }} style={styles.detailPosterThumb} resizeMode="cover" /> : null}
             <View style={{ flex: 1 }}>
               <Text style={styles.detailTitle}>{info.cleanTitle}</Text>
+              {!!episodeTmdbMeta?.epTitle && (
+                <Text style={{ color: '#D1D5DB', fontSize: 14, fontWeight: '600', marginTop: 2, marginBottom: 4 }} numberOfLines={2}>
+                  {episodeTmdbMeta.code ? `${episodeTmdbMeta.code} • ` : ''}{episodeTmdbMeta.epTitle}
+                </Text>
+              )}
               <View style={styles.detailMetaRow}>
                 {!!(meta?.year || info.year) && <Text style={styles.detailYearText}>{meta?.year || info.year}</Text>}
                 {!!info.seasonEpisode && <View style={styles.seasonBadge}><Text style={styles.seasonBadgeText}>{info.seasonEpisode}</Text></View>}
@@ -3333,6 +3420,50 @@ const App = () => {
                 </Text>
               </FocusableButton>
             )}
+
+            {(() => {
+              const curEpIdx = playableFolderEpisodes.findIndex((ep: any) => ep.name === selectedFile.name);
+              const nextEpFile = curEpIdx >= 0 && curEpIdx + 1 < playableFolderEpisodes.length
+                ? playableFolderEpisodes[curEpIdx + 1]
+                : null;
+              if (!nextEpFile) return null;
+              const nextInfo = parseMediaFilename(nextEpFile.name, false);
+              const nextEpCard = episodeCardsMetaMap[nextEpFile.name];
+              const nextLabel = nextEpCard?.epTitle
+                ? `${nextInfo.seasonEpisode || `E${nextInfo.episodeNum}`} • ${nextEpCard.epTitle}`
+                : (nextInfo.seasonEpisode ? `${nextInfo.seasonEpisode} • ${nextInfo.cleanTitle}` : nextInfo.cleanTitle);
+              return (
+                <FocusableButton
+                  focusId="detail_next_ep_btn"
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    backgroundColor: '#161B26',
+                    borderWidth: 1,
+                    borderColor: '#2E384D',
+                    borderRadius: 10,
+                    paddingVertical: 11,
+                    paddingHorizontal: 14,
+                    marginTop: 2,
+                  }}
+                  onPress={() => {
+                    setVersionGroup([nextEpFile]);
+                    openFile(nextEpFile);
+                  }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, flex: 1 }}>
+                    <Icon name="skip-next" size={22} color="#F5C518" />
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: '#9CA3AF', fontSize: 10, fontWeight: '800', letterSpacing: 0.6 }}>NEXT EPISODE</Text>
+                      <Text style={{ color: '#FFF', fontSize: 13, fontWeight: '700', marginTop: 1 }} numberOfLines={1}>
+                        {nextLabel}
+                      </Text>
+                    </View>
+                  </View>
+                  <Icon name="chevron-right" size={20} color="#9CA3AF" />
+                </FocusableButton>
+              );
+            })()}
           </View>
 
           {/* Single MediaInfo Card for Currently Selected Version Only */}
@@ -3427,16 +3558,47 @@ const App = () => {
                     </View>
                   </View>
                 )}
-                {vMi.subtitleTracks && vMi.subtitleTracks.length > 0 && (
-                  <View style={styles.miSpecRow}>
-                    <Text style={styles.miSpecLabel}>SUBTITLES ({vMi.subtitleTracks.length})</Text>
-                    <View style={styles.miTrackPillWrap}>
-                      {vMi.subtitleTracks.map((st, idx) => (
-                        <View key={idx} style={styles.miSubPill}><Text style={styles.miSubPillText}>{st.language} ({st.format})</Text></View>
-                      ))}
-                    </View>
+                {vMi.subtitleTracks && vMi.subtitleTracks.length > 0 && (() => {
+              const groupedSubs: Array<{ label: string; count: number }> = [];
+              const subIdxMap = new Map<string, number>();
+              for (const st of vMi.subtitleTracks) {
+                const lbl = `${st.language} (${st.format})`;
+                const existingIdx = subIdxMap.get(lbl);
+                if (existingIdx !== undefined) {
+                  groupedSubs[existingIdx].count += 1;
+                } else {
+                  subIdxMap.set(lbl, groupedSubs.length);
+                  groupedSubs.push({ label: lbl, count: 1 });
+                }
+              }
+              const INITIAL_SUB_LIMIT = 6;
+              const visibleSubs = subsExpanded ? groupedSubs : groupedSubs.slice(0, INITIAL_SUB_LIMIT);
+              const hiddenCount = groupedSubs.length - visibleSubs.length;
+              return (
+                <View style={styles.miSpecRow}>
+                  <Text style={styles.miSpecLabel}>SUBTITLES ({vMi.subtitleTracks.length})</Text>
+                  <View style={styles.miTrackPillWrap}>
+                    {visibleSubs.map((gs, idx) => (
+                      <View key={idx} style={styles.miSubPill}>
+                        <Text style={styles.miSubPillText}>
+                          {gs.count > 1 ? `${gs.label} ×${gs.count}` : gs.label}
+                        </Text>
+                      </View>
+                    ))}
+                    {groupedSubs.length > INITIAL_SUB_LIMIT && (
+                      <FocusableButton
+                        focusId="detail_subs_toggle"
+                        style={[styles.miSubPill, { backgroundColor: '#1E2433', borderColor: '#4B5563' }]}
+                        onPress={() => setSubsExpanded(prev => !prev)}>
+                        <Text style={[styles.miSubPillText, { color: '#F5C518', fontWeight: '800' }]}>
+                          {subsExpanded ? 'Show less' : `+${hiddenCount} more`}
+                        </Text>
+                      </FocusableButton>
+                    )}
                   </View>
-                )}
+                </View>
+              );
+            })()}
               </View>
             ) : !scanningMediaInfo ? (
               <Text style={styles.rawFileName}>{vItem.name}</Text>
@@ -3606,6 +3768,12 @@ const App = () => {
       );
     }
 
+    const epCardMeta = !isFolder ? episodeCardsMetaMap[item.name] : undefined;
+    const isEpisodeStillCard = Boolean(isFolderCard && !isFolder && (info.episodeNum > 0 || !!info.seasonEpisode || !!epCardMeta));
+    const cardImageUri = isEpisodeStillCard
+      ? (epCardMeta?.stillUrl || meta?.backdrop || meta?.poster)
+      : meta?.poster;
+
     return (
       <FocusableButton
         focusId={cardFocusId}
@@ -3615,13 +3783,13 @@ const App = () => {
           recordCardFocus();
           handlePress(item);
         }}>
-        <View style={styles.posterImageContainer}>
+        <View style={[styles.posterImageContainer, isEpisodeStillCard && { aspectRatio: 16 / 9 }]}>
           <View style={styles.posterFallback}>
-            <Icon name={isFolder ? 'folder-special' : 'local-movies'} size={38} color={isFolder ? '#F5C518' : '#E50914'} />
-            <Text style={styles.posterFallbackTitle} numberOfLines={3}>{info.cleanTitle}</Text>
+            <Icon name={isFolder ? 'folder-special' : 'local-movies'} size={isEpisodeStillCard ? 30 : 38} color={isFolder ? '#F5C518' : '#E50914'} />
+            <Text style={styles.posterFallbackTitle} numberOfLines={2}>{epCardMeta?.epTitle || info.cleanTitle}</Text>
           </View>
-          {!!meta?.poster && (
-            <Image source={{ uri: meta.poster }} style={[styles.posterImage, StyleSheet.absoluteFill]} resizeMode="cover" />
+          {!!cardImageUri && (
+            <Image source={{ uri: cardImageUri }} style={[styles.posterImage, StyleSheet.absoluteFill]} resizeMode="cover" />
           )}
 
           <View style={styles.posterTopBadges}>
@@ -3666,7 +3834,9 @@ const App = () => {
 
         <View style={styles.posterCardFooter}>
           <Text style={styles.posterTitle} numberOfLines={1}>
-            {!isFolder && info.episodeNum > 0 ? `Episode ${info.episodeNum} • ${info.cleanTitle}` : info.cleanTitle}
+            {!isFolder && info.episodeNum > 0
+              ? (epCardMeta?.epTitle ? `E${String(info.episodeNum).padStart(2, '0')} • ${epCardMeta.epTitle}` : `Episode ${info.episodeNum} • ${info.cleanTitle}`)
+              : info.cleanTitle}
           </Text>
           <View style={styles.posterSubRow}>
             {savedSec > 3 ? (
@@ -3788,14 +3958,6 @@ const App = () => {
           </View>
 
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-            <FocusableButton
-              focusId="hdr_sort" isHeaderControl={true}
-              style={styles.sortToggleBtn}
-              onPress={() => setSortBy(prev => (prev === 'newest' ? 'az' : 'newest'))}>
-              <Icon name="sort" size={16} color="#E50914" />
-              <Text style={styles.sortToggleText}>{sortBy === 'newest' ? 'Newest' : 'A - Z'}</Text>
-            </FocusableButton>
-
             <FocusableButton focusId="hdr_dl" isHeaderControl={true} style={styles.headerIconBtn} onPress={() => setActiveTab('downloads')}>
               <Icon name="file-download" size={22} color={activeDownloadsCount > 0 ? '#46d369' : 'white'} />
               {downloads.length > 0 && (
@@ -3846,7 +4008,14 @@ const App = () => {
         </View>
 
         <View style={{ marginBottom: 10 }}>
-          <ScrollView focusable={false} horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 14, gap: 8 }}>
+          <ScrollView focusable={false} horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 14, gap: 8, alignItems: 'center' }}>
+            <FocusableButton
+              focusId="hdr_sort" isHeaderControl={true}
+              style={[styles.sortToggleBtn, { paddingVertical: 7, paddingHorizontal: 11 }]}
+              onPress={() => setSortBy(prev => (prev === 'newest' ? 'az' : 'newest'))}>
+              <Icon name="sort" size={15} color="#E50914" />
+              <Text style={styles.sortToggleText}>{sortBy === 'newest' ? 'Newest' : 'A - Z'}</Text>
+            </FocusableButton>
             {FILTER_CATEGORIES.map(cat => {
               const isSelected = activeCategory === cat.id;
               return (
