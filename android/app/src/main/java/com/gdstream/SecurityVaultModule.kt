@@ -3824,12 +3824,17 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         icbPartRef: Int,
         parentPath: String,
         depth: Int,
-        results: MutableList<IsoFileEntry>
+        results: MutableList<IsoFileEntry>,
+        diagNotes: MutableList<String>
     ) {
         if (depth > 6) return
         val feByteOff = resolveUdfBlockByte(icbBlock, icbPartRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
         val feBuf = fetchRemoteByteRange(isoUrl, feByteOff, feByteOff + blockSize - 1L)
+        val feTag = if (feBuf.size >= 2) readUInt16LE(feBuf, 0) else -1
         val dirExts = parseUdfFileEntryExtents(feBuf, 0, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, feByteOff)
+        if (depth == 0) {
+            diagNotes.add("rootFeOff=$feByteOff,tag=$feTag,exts=${dirExts.size}")
+        }
         if (dirExts.isEmpty()) return
 
         val dirStream = ByteArrayOutputStream()
@@ -3847,11 +3852,22 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             fetched += chunk.size
         }
         val dirBuf = dirStream.toByteArray()
+        val bsInt = blockSize.toInt().coerceAtLeast(512)
 
         var p = 0
         while (p + 38 <= dirBuf.size) {
             val tid = readUInt16LE(dirBuf, p)
-            if (tid != 257) break
+            if (tid == 0) {
+                // Sector padding at end of logical block: advance to next block boundary
+                val nextBlock = ((p / bsInt) + 1) * bsInt
+                if (nextBlock >= dirBuf.size) break
+                p = nextBlock
+                continue
+            }
+            if (tid != 257) {
+                if (depth == 0) diagNotes.add("rootBadTid=$tid@p=$p")
+                break
+            }
             val chars = dirBuf[p + 18].toInt() and 0xFF
             val lFi = dirBuf[p + 19].toInt() and 0xFF
             val childBlock = readUInt32LE(dirBuf, p + 24)
@@ -3870,11 +3886,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             if (name.isEmpty() || name == "." || name == "..") continue
             val isChildDir = (chars and 0x02) != 0
             val fullPath = if (parentPath.isEmpty()) name else "$parentPath/$name"
+            if (depth == 0) diagNotes.add("rootChild=$name(dir=$isChildDir)")
 
             if (isChildDir) {
                 val upper = fullPath.uppercase(Locale.ROOT)
-                if (depth <= 2 || upper.startsWith("BDMV") || upper.startsWith("VIDEO_TS")) {
-                    walkUdfDir(isoUrl, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, childBlock, childPartRef, fullPath, depth + 1, results)
+                if (depth <= 2 || upper.contains("BDMV") || upper.contains("VIDEO_TS")) {
+                    walkUdfDir(isoUrl, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, childBlock, childPartRef, fullPath, depth + 1, results, diagNotes)
                 }
             } else {
                 val childFeOff = resolveUdfBlockByte(childBlock, childPartRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
@@ -3889,25 +3906,27 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     }
 
     private fun parseUdfTree(isoUrl: String, totalIsoSize: Long): List<IsoFileEntry> {
-        if (totalIsoSize < 600L * 1024L) return emptyList()
+        if (totalIsoSize < 600L * 1024L) throw IllegalStateException("ISO too small: $totalIsoSize")
         val totalSectors = totalIsoSize / 2048L
-        val candidateAvdpSectors = listOf(256L, totalSectors - 256L, totalSectors - 1L).filter { it > 0L && it < totalSectors }
+        val candidateAvdpSectors = listOf(256L, totalSectors - 256L, totalSectors - 1L, 512L).filter { it > 0L && it < totalSectors }
         var avdp = ByteArray(0)
+        var foundAvdpSec = -1L
         for (sec in candidateAvdpSectors) {
             val probe = fetchRemoteByteRange(isoUrl, sec * 2048L, sec * 2048L + 511L)
             if (probe.size >= 32 && readUInt16LE(probe, 0) == 2) {
                 avdp = probe
+                foundAvdpSec = sec
                 break
             }
         }
-        if (avdp.size < 32 || readUInt16LE(avdp, 0) != 2) return emptyList()
+        if (avdp.size < 32 || readUInt16LE(avdp, 0) != 2) {
+            throw IllegalStateException("No UDF AVDP found (size=$totalIsoSize)")
+        }
 
         val mvdsLen = readUInt32LE(avdp, 16).coerceIn(2048L, 65536L).toInt()
         val mvdsLoc = readUInt32LE(avdp, 20)
-        if (mvdsLoc <= 0L) return emptyList()
-
-        val mvdsStart = mvdsLoc * 2048L
-        val mvdsBuf = fetchRemoteByteRange(isoUrl, mvdsStart, minOf(totalIsoSize - 1L, mvdsStart + mvdsLen - 1L))
+        val rvdsLen = readUInt32LE(avdp, 24).coerceIn(2048L, 65536L).toInt()
+        val rvdsLoc = readUInt32LE(avdp, 28)
 
         var blockSize = 2048L
         val physPartitions = HashMap<Int, Long>()
@@ -3920,49 +3939,58 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         var metaMirrorBlock = -1L
         var metaPartRef = -1
 
-        var off = 0
-        while (off + 512 <= mvdsBuf.size) {
-            val tagId = readUInt16LE(mvdsBuf, off)
-            if (tagId == 8 || tagId == 0) break
-            if (tagId == 5) {
-                val partNum = readUInt16LE(mvdsBuf, off + 22)
-                val partStartSec = readUInt32LE(mvdsBuf, off + 188)
-                physPartitions[partNum] = partStartSec * 2048L
-            } else if (tagId == 6) {
-                val bs = readUInt32LE(mvdsBuf, off + 212)
-                if (bs >= 512L) blockSize = bs
-                fsdLen = readUInt32LE(mvdsBuf, off + 248)
-                fsdBlock = readUInt32LE(mvdsBuf, off + 252)
-                fsdPartRef = readUInt16LE(mvdsBuf, off + 256)
+        for ((vdsLoc, vdsLen) in listOf(Pair(mvdsLoc, mvdsLen), Pair(rvdsLoc, rvdsLen))) {
+            if (vdsLoc <= 0L || vdsLoc >= totalSectors) continue
+            val vdsStart = vdsLoc * 2048L
+            val vdsBuf = fetchRemoteByteRange(isoUrl, vdsStart, minOf(totalIsoSize - 1L, vdsStart + vdsLen - 1L))
+            var off = 0
+            while (off + 512 <= vdsBuf.size) {
+                val tagId = readUInt16LE(vdsBuf, off)
+                if (tagId == 8) break
+                if (tagId == 0) { off += 2048; continue }
+                if (tagId == 5) {
+                    val partNum = readUInt16LE(vdsBuf, off + 22)
+                    val partStartSec = readUInt32LE(vdsBuf, off + 188)
+                    physPartitions[partNum] = partStartSec * 2048L
+                } else if (tagId == 6) {
+                    val bs = readUInt32LE(vdsBuf, off + 212)
+                    if (bs >= 512L) blockSize = bs
+                    fsdLen = readUInt32LE(vdsBuf, off + 248)
+                    fsdBlock = readUInt32LE(vdsBuf, off + 252)
+                    fsdPartRef = readUInt16LE(vdsBuf, off + 256)
 
-                val numPartMaps = readUInt32LE(mvdsBuf, off + 268).toInt()
-                var mp = off + 440
-                for (mIdx in 0 until numPartMaps) {
-                    if (mp + 6 > off + 2048 || mp + 6 > mvdsBuf.size) break
-                    val mType = mvdsBuf[mp].toInt() and 0xFF
-                    val mLen = mvdsBuf[mp + 1].toInt() and 0xFF
-                    if (mLen <= 0 || mp + mLen > mvdsBuf.size) break
-                    if (mType == 1 && mLen >= 6) {
-                        val pNum = readUInt16LE(mvdsBuf, mp + 4)
-                        partRefToPhysBase[mIdx] = physPartitions[pNum] ?: 0L
-                    } else if (mType == 2 && mLen >= 48) {
-                        val partIdStr = String(mvdsBuf, mp + 5, 23, StandardCharsets.US_ASCII)
-                        if (partIdStr.contains("Metadata")) {
-                            metaPartRef = mIdx
-                            metaPhysPartNum = readUInt16LE(mvdsBuf, mp + 38)
-                            metaFileBlock = readUInt32LE(mvdsBuf, mp + 40)
-                            if (mLen >= 52) {
-                                metaMirrorBlock = readUInt32LE(mvdsBuf, mp + 44)
+                    val numPartMaps = readUInt32LE(vdsBuf, off + 268).toInt()
+                    var mp = off + 440
+                    for (mIdx in 0 until numPartMaps) {
+                        if (mp + 6 > off + 2048 || mp + 6 > vdsBuf.size) break
+                        val mType = vdsBuf[mp].toInt() and 0xFF
+                        val mLen = vdsBuf[mp + 1].toInt() and 0xFF
+                        if (mLen <= 0 || mp + mLen > vdsBuf.size) break
+                        if (mType == 1 && mLen >= 6) {
+                            val pNum = readUInt16LE(vdsBuf, mp + 4)
+                            partRefToPhysBase[mIdx] = physPartitions[pNum] ?: 0L
+                        } else if (mType == 2 && mLen >= 48) {
+                            val partIdStr = String(vdsBuf, mp + 5, 23, StandardCharsets.US_ASCII)
+                            if (partIdStr.contains("Metadata")) {
+                                metaPartRef = mIdx
+                                metaPhysPartNum = readUInt16LE(vdsBuf, mp + 38)
+                                metaFileBlock = readUInt32LE(vdsBuf, mp + 40)
+                                if (mLen >= 52) {
+                                    metaMirrorBlock = readUInt32LE(vdsBuf, mp + 44)
+                                }
                             }
                         }
+                        mp += mLen
                     }
-                    mp += mLen
                 }
+                off += 2048
             }
-            off += 2048
+            if (physPartitions.isNotEmpty() && fsdLen > 0L) break
         }
 
-        if (physPartitions.isEmpty() || fsdLen <= 0L) return emptyList()
+        if (physPartitions.isEmpty() || fsdLen <= 0L) {
+            throw IllegalStateException("AVDP@$foundAvdpSec mvds=$mvdsLoc parts=${physPartitions.size} fsdLen=$fsdLen")
+        }
         val defaultPhysBase = physPartitions[0] ?: physPartitions.values.first()
         for ((k, v) in physPartitions) {
             if (!partRefToPhysBase.containsKey(k)) partRefToPhysBase[k] = v
@@ -3985,13 +4013,20 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
         val fsdByteOff = resolveUdfBlockByte(fsdBlock, fsdPartRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
         val fsdBuf = fetchRemoteByteRange(isoUrl, fsdByteOff, fsdByteOff + blockSize - 1L)
-        if (fsdBuf.size < 416 || readUInt16LE(fsdBuf, 0) != 256) return emptyList()
+        val fsdTag = if (fsdBuf.size >= 2) readUInt16LE(fsdBuf, 0) else -1
+        if (fsdBuf.size < 416 || fsdTag != 256) {
+            throw IllegalStateException("Bad FSD tag=$fsdTag off=$fsdByteOff metaExts=${metaExtents.size}")
+        }
 
         val rootIcbBlock = readUInt32LE(fsdBuf, 404)
         val rootIcbPartRef = readUInt16LE(fsdBuf, 408)
 
         val results = ArrayList<IsoFileEntry>()
-        walkUdfDir(isoUrl, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, rootIcbBlock, rootIcbPartRef, "", 0, results)
+        val diagNotes = ArrayList<String>()
+        walkUdfDir(isoUrl, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, rootIcbBlock, rootIcbPartRef, "", 0, results, diagNotes)
+        if (results.isEmpty()) {
+            throw IllegalStateException("UDF walk 0 files [" + diagNotes.take(6).joinToString(";") + "]")
+        }
         return results
     }
 
