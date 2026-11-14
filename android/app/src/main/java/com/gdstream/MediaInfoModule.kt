@@ -993,7 +993,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         return null
     }
 
-    private fun fetchAndParseHeader(urlStr: String): HeaderParseResult {
+    private fun fetchAndParseHeader(urlStr: String, fileNameHint: String = ""): HeaderParseResult {
         val isLocalProxy = urlStr.contains("127.0.0.1") || urlStr.contains("localhost")
         val maxHeaderBytes = if (isLocalProxy) 512 * 1024 else 1024 * 1024 // 1 MB covers EBML Header + Tracks + First Cluster packets
         val tailBytesSize = 64 * 1024    // 64 KB at end of file covers mkvmerge Tags (BPS)
@@ -1015,7 +1015,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             } catch (_: Exception) {}
             val mkvRes = parseMkvHeaderAndClusters(headBuf, tailBuf, len)
             if (mkvRes.tracks.isNotEmpty()) return mkvRes
-            val tsRes = parseMpegTsHeader(headBuf, len, urlStr)
+            val tsRes = parseMpegTsHeader(headBuf, len, if (fileNameHint.isNotEmpty()) fileNameHint else urlStr)
             if (tsRes.tracks.isNotEmpty()) return tsRes
             return mkvRes
         }
@@ -1073,7 +1073,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
 
             val mkvRes = parseMkvHeaderAndClusters(headBytes, tailBytes, totalBytes)
             if (mkvRes.tracks.isNotEmpty()) return mkvRes
-            val tsRes = parseMpegTsHeader(headBytes, totalBytes, urlStr)
+            val tsRes = parseMpegTsHeader(headBytes, totalBytes, if (fileNameHint.isNotEmpty()) fileNameHint else urlStr)
             if (tsRes.tracks.isNotEmpty()) return tsRes
             return mkvRes
         } catch (_: Exception) {
@@ -1087,7 +1087,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
     fun inspectMedia(url: String, fileName: String, promise: Promise) {
         inspectorPool.submit {
             try {
-                val parsed = fetchAndParseHeader(url)
+                val parsed = fetchAndParseHeader(url, fileName)
 
                 var width = 0
                 var height = 0
@@ -1924,7 +1924,16 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                         val descStart = ep + 5
                         val descEnd = minOf(sEnd, descStart + esInfoLen)
 
-                        var langCode = "eng"
+                        val decodedHint = try { java.net.URLDecoder.decode(urlStr, "UTF-8") } catch (_: Throwable) { urlStr }
+                        val hintLang = when {
+                            Regex("\\b(tamil|tam)\\b", RegexOption.IGNORE_CASE).containsMatchIn(decodedHint) -> "tam"
+                            Regex("\\b(telugu|tel)\\b", RegexOption.IGNORE_CASE).containsMatchIn(decodedHint) -> "tel"
+                            Regex("\\b(hindi|hin)\\b", RegexOption.IGNORE_CASE).containsMatchIn(decodedHint) -> "hin"
+                            Regex("\\b(malayalam|mal)\\b", RegexOption.IGNORE_CASE).containsMatchIn(decodedHint) -> "mal"
+                            Regex("\\b(kannada|kan)\\b", RegexOption.IGNORE_CASE).containsMatchIn(decodedHint) -> "kan"
+                            else -> "eng"
+                        }
+                        var langCode = hintLang
                         var regTag = ""
                         var dp = descStart
                         while (dp + 2 <= descEnd) {

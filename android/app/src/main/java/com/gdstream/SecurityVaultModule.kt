@@ -896,7 +896,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val segList = if (!entry.segments.isNullOrEmpty()) {
                     entry.segments
                 } else {
-                    listOf(Pair(resolveEntryDataStartOffset(entry), totalSize))
+                    listOf(Pair(resolveEntryDataStartOffset(entry), entry.compressedSize))
                 }
                 val headers = buildString {
                     append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
@@ -915,48 +915,45 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     appendDebugLog("PROXY_ISO_PLAY", "Streaming ${entry.fileName} bdav=${entry.isBdavM2ts} range=$reqStart-$reqEnd/$totalSize")
                 }
 
+                val rawReqStart: Long
+                val rawReqEnd: Long
+                var dropHeadTsBytes = 0
+                var tsBytesLeftToEmit = contentLength
+
+                if (entry.isBdavM2ts) {
+                    val firstPkt = reqStart / 188L
+                    val lastPkt = reqEnd / 188L
+                    dropHeadTsBytes = (reqStart % 188L).toInt()
+                    rawReqStart = firstPkt * 192L
+                    rawReqEnd = (lastPkt + 1L) * 192L - 1L
+                } else {
+                    rawReqStart = reqStart
+                    rawReqEnd = reqEnd
+                }
+
                 val buf = ByteArray(65536)
+                val pktAccum = ByteArray(192)
+                var pktFill = 0
                 val maxUpstreamChunk = 4L * 1024L * 1024L
-                var virtualCursor = 0L
+                var rawCursor = 0L
 
                 for ((segRawOffset, segRawLen) in segList) {
-                    val segVirtLen = if (entry.isBdavM2ts) (segRawLen / 192L) * 188L else segRawLen
-                    if (segVirtLen <= 0L) continue
-                    val segVirtStart = virtualCursor
-                    val segVirtEnd = virtualCursor + segVirtLen - 1L
-                    virtualCursor += segVirtLen
-                    if (segVirtEnd < reqStart) continue
-                    if (segVirtStart > reqEnd) break
+                    if (segRawLen <= 0L || tsBytesLeftToEmit <= 0L) continue
+                    val segRawStart = rawCursor
+                    val segRawEnd = rawCursor + segRawLen - 1L
+                    rawCursor += segRawLen
+                    if (segRawEnd < rawReqStart) continue
+                    if (segRawStart > rawReqEnd) break
 
-                    val overlapStart = maxOf(reqStart, segVirtStart)
-                    val overlapEnd = minOf(reqEnd, segVirtEnd)
+                    val overlapStart = maxOf(rawReqStart, segRawStart)
+                    val overlapEnd = minOf(rawReqEnd, segRawEnd)
                     if (overlapStart > overlapEnd) continue
 
-                    val relStart = overlapStart - segVirtStart
-                    val relEnd = overlapEnd - segVirtStart
-
-                    var curRemote: Long
-                    val endRemote: Long
-                    var dropHeadTsBytes = 0
-                    var tsBytesLeftToEmit = overlapEnd - overlapStart + 1L
-
-                    if (entry.isBdavM2ts) {
-                        val firstPkt = relStart / 188L
-                        val lastPkt = relEnd / 188L
-                        dropHeadTsBytes = (relStart % 188L).toInt()
-                        curRemote = segRawOffset + firstPkt * 192L
-                        endRemote = segRawOffset + (lastPkt + 1L) * 192L - 1L
-                    } else {
-                        curRemote = segRawOffset + relStart
-                        endRemote = segRawOffset + relEnd
-                    }
-
-                    val pktAccum = ByteArray(192)
-                    var pktFill = 0
+                    var curRemote = segRawOffset + (overlapStart - segRawStart)
+                    val endRemote = segRawOffset + (overlapEnd - segRawStart)
 
                     while (curRemote <= endRemote && tsBytesLeftToEmit > 0L) {
-                        val rawChunkLimit = if (entry.isBdavM2ts) (maxUpstreamChunk / 192L) * 192L else maxUpstreamChunk
-                        val sliceEnd = minOf(endRemote, curRemote + rawChunkLimit - 1L)
+                        val sliceEnd = minOf(endRemote, curRemote + maxUpstreamChunk - 1L)
                         var sliceRemaining = sliceEnd - curRemote + 1L
 
                         val segConn = openRangeConnection(entry.archiveUrl, "bytes=$curRemote-$sliceEnd")
@@ -985,8 +982,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             sliceRemaining -= read.toLong()
 
                             if (!entry.isBdavM2ts) {
-                                out.write(buf, 0, read)
-                                tsBytesLeftToEmit -= read.toLong()
+                                val emitNow = minOf(read.toLong(), tsBytesLeftToEmit).toInt()
+                                out.write(buf, 0, emitNow)
+                                tsBytesLeftToEmit -= emitNow.toLong()
                             } else {
                                 var bPos = 0
                                 while (bPos < read && tsBytesLeftToEmit > 0L) {
@@ -1391,7 +1389,15 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val root = JSONObject(cachedBlob)
             val rawJson = root.optString("rawJson", "")
             val targetsArr = root.optJSONArray("targets") ?: return null
-            if (rawJson.isEmpty() || targetsArr.length() == 0 || rawJson.contains("download.aspx", ignoreCase = true) || rawJson.contains("4465391616")) return null
+            var hasUnstrippedM2ts = false
+            for (ci in 0 until targetsArr.length()) {
+                val co = targetsArr.optJSONObject(ci) ?: continue
+                if (co.optString("archiveFormat") == "ISO" && co.optString("fileName").endsWith(".m2ts", true) && !co.optBoolean("isBdavM2ts", false)) {
+                    hasUnstrippedM2ts = true
+                    break
+                }
+            }
+            if (rawJson.isEmpty() || targetsArr.length() == 0 || rawJson.contains("download.aspx", ignoreCase = true) || hasUnstrippedM2ts) return null
 
             val seed = verifyCertificateAndEnv()
             if (seed == 0x5A3C9E71) {
@@ -3954,7 +3960,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     ): JSONObject {
         val entryId = "ze_" + System.nanoTime() + "_" + archiveEntryCounter.getAndIncrement()
         val firstOffset = segments.firstOrNull()?.first ?: 0L
-        val isBdav = mimeType == "video/mp2t" && segments.isNotEmpty() && segments.all { it.second >= 192L && (it.second % 192L) == 0L }
+        val isBdav = displayName.endsWith(".m2ts", ignoreCase = true) && totalBytes >= 192L
         val exposedBytes = if (isBdav) {
             segments.sumOf { (it.second / 192L) * 188L }
         } else {
