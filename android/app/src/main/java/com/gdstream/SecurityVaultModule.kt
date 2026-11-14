@@ -525,29 +525,39 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     }
 
     private fun openRangeConnectionInternal(urlStr: String, rangeHeader: String?): HttpURLConnection {
-        var currentUrl = if (urlStr.startsWith("/")) {
-            val seed = verifyCertificateAndEnv()
-            val bUrl = if (seed == 0x5A3C9E71) nSync(1, seed) else ""
-            if (bUrl.isNotEmpty()) bUrl.trimEnd('/') + urlStr else urlStr
+        val seed = verifyCertificateAndEnv()
+        val workerBase = if (seed == 0x5A3C9E71) nSync(1, seed) else ""
+        val workerHost = try { if (workerBase.isNotEmpty()) URL(workerBase).host.lowercase(Locale.ROOT) else "" } catch (_: Throwable) { "" }
+
+        var currentUrl = if (urlStr.startsWith("/") && workerBase.isNotEmpty()) {
+            workerBase.trimEnd('/') + urlStr
         } else {
             urlStr
         }
+
         var redirects = 0
-        while (redirects < 5) {
-            val conn = (URL(currentUrl).openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
+        while (redirects < 6) {
+            val targetUrlObj = URL(currentUrl)
+            val targetHost = targetUrlObj.host.lowercase(Locale.ROOT)
+            val isWorkerHost = workerHost.isNotEmpty() && (targetHost == workerHost || targetHost.endsWith("." + workerHost))
+
+            val conn = (targetUrlObj.openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
                 connectTimeout = 15000
-                readTimeout = 25000
+                readTimeout = 30000
                 requestMethod = "GET"
                 instanceFollowRedirects = false
                 useCaches = false
-                setRequestProperty("User-Agent", "GDStream-Native-Engine/3.0")
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36")
+                setRequestProperty("Accept", "*/*")
                 setRequestProperty("Accept-Encoding", "identity")
-                if (cachedShieldToken.isNotEmpty()) {
-                    setRequestProperty("X-GD-Shield", cachedShieldToken)
+                if (isWorkerHost) {
+                    if (cachedShieldToken.isNotEmpty()) {
+                        setRequestProperty("X-GD-Shield", cachedShieldToken)
+                    }
+                    if (sessionCookieHeader.isNotEmpty()) {
+                        setRequestProperty("Cookie", sessionCookieHeader)
+                    }
                 }
-                if (sessionCookieHeader.isNotEmpty()) {
-                setRequestProperty("Cookie", sessionCookieHeader)
-            }
                 if (!rangeHeader.isNullOrEmpty()) {
                     setRequestProperty("Range", rangeHeader)
                 }
@@ -557,18 +567,20 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
             }
             val code = conn.responseCode
-            val setCookies = conn.headerFields["Set-Cookie"] ?: conn.headerFields["set-cookie"]
-            if (!setCookies.isNullOrEmpty()) {
-                val cookieParts = setCookies.mapNotNull { it.substringBefore(";").trim().takeIf { s -> s.isNotEmpty() } }
-                if (cookieParts.isNotEmpty()) {
-                    sessionCookieHeader = cookieParts.joinToString("; ")
+            if (isWorkerHost) {
+                val setCookies = conn.headerFields["Set-Cookie"] ?: conn.headerFields["set-cookie"]
+                if (!setCookies.isNullOrEmpty()) {
+                    val cookieParts = setCookies.mapNotNull { it.substringBefore(";").trim().takeIf { s -> s.isNotEmpty() } }
+                    if (cookieParts.isNotEmpty()) {
+                        sessionCookieHeader = cookieParts.joinToString("; ")
+                    }
                 }
             }
             if (code in 300..399) {
                 val loc = conn.getHeaderField("Location")
                 conn.disconnect()
                 if (loc.isNullOrEmpty()) break
-                currentUrl = URL(URL(currentUrl), loc).toString()
+                currentUrl = URL(targetUrlObj, loc).toString()
                 redirects++
             } else {
                 return conn
@@ -608,9 +620,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     private fun fetchRemoteByteRange(archiveUrl: String, start: Long, endInclusive: Long): ByteArray {
         val len = (endInclusive - start + 1L).toInt()
-        val conn = openRangeConnection(archiveUrl, "bytes=$start-$endInclusive")
+        if (len <= 0) return ByteArray(0)
+        val conn = openRangeConnection(archiveUrl, "bytes=" + start + "-" + endInclusive)
         try {
             val code = conn.responseCode
+            if (code !in 200..299) {
+                throw java.io.IOException("Upstream HTTP " + code + " for range " + start + "-" + endInclusive)
+            }
             val input = conn.inputStream
             return input.use { stream ->
                 if (code == 200 && start > 0L) {
@@ -792,12 +808,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
             val out = BufferedOutputStream(socket.getOutputStream(), 65536)
 
-            val acceptRangesVal = if (entry.compressionMethod == 0) "bytes" else "none"
             if (method == "HEAD") {
                 val headers = buildString {
                     append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
                     append("Content-Type: $mimeType\r\n")
-                    append("Accept-Ranges: $acceptRangesVal\r\n")
+                    append("Accept-Ranges: bytes\r\n")
                     append("Content-Length: $contentLength\r\n")
                     if (isPartial) {
                         append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
@@ -1462,26 +1477,34 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val lowerUrlPath = zipUrl.substringBefore("?").lowercase(Locale.ROOT)
                 var looksLikeIso = lowerUrlPath.endsWith(".iso")
                 var volDescProbe: ByteArray? = null
+                var isoDiagReason = ""
                 if (totalArchiveSize >= 36864L) {
-                    val pvdProbe = fetchRemoteByteRange(zipUrl, 32768L, minOf(totalArchiveSize - 1L, 65535L))
-                    volDescProbe = pvdProbe
-                    var off = 0
-                    while (off + 6 <= pvdProbe.size) {
-                        val sig = String(pvdProbe, off + 1, 5, StandardCharsets.US_ASCII)
-                        if (sig == "CD001" || sig == "BEA01" || sig == "NSR02" || sig == "NSR03") {
-                            looksLikeIso = true
-                            break
+                    try {
+                        val pvdProbe = fetchRemoteByteRange(zipUrl, 32768L, minOf(totalArchiveSize - 1L, 65535L))
+                        volDescProbe = pvdProbe
+                        var off = 0
+                        while (off + 6 <= pvdProbe.size) {
+                            val sig = String(pvdProbe, off + 1, 5, StandardCharsets.US_ASCII)
+                            if (sig == "CD001" || sig == "BEA01" || sig == "NSR02" || sig == "NSR03") {
+                                looksLikeIso = true
+                                break
+                            }
+                            off += 2048
                         }
-                        off += 2048
+                    } catch (probeEx: Throwable) {
+                        isoDiagReason = probeEx.message ?: probeEx.javaClass.simpleName
                     }
                 }
                 if (looksLikeIso) {
-                    val isoItems = parseIsoDiscEntries(zipUrl, totalArchiveSize, port, volDescProbe)
-                    if (isoItems.isNotEmpty()) {
+                    val isoOutcome = parseIsoDiscEntriesWithDiag(zipUrl, totalArchiveSize, port, volDescProbe)
+                    if (isoOutcome.first.isNotEmpty()) {
                         val outIso = JSONArray()
-                        for (item in isoItems) outIso.put(item)
+                        for (item in isoOutcome.first) outIso.put(item)
                         promise.resolve(outIso.toString())
                         return@run
+                    }
+                    if (isoOutcome.second.isNotEmpty()) {
+                        isoDiagReason = isoOutcome.second
                     }
                 }
 
@@ -1503,7 +1526,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
 
                 if (eocdPos < 0) {
-                    promise.reject("E_ZIP", "Archive header not recognized (Not a valid ZIP or RAR file)")
+                    val detail = if (looksLikeIso && isoDiagReason.isNotEmpty()) {
+                        "ISO Disc Error: " + isoDiagReason
+                    } else if (looksLikeIso) {
+                        "ISO Disc Error: No playable BDMV/VIDEO_TS video streams found inside ISO"
+                    } else {
+                        "Archive header not recognized (Not a valid ZIP, RAR, or ISO file)"
+                    }
+                    promise.reject("E_ZIP", detail)
                     return@run
                 }
 
@@ -3472,7 +3502,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     }
 
     // =========================================================================
-    // BLU-RAY / DVD / DATA .ISO STREAMING ENGINE (UDF + ISO-9660 + MPLS + VOB)
+    // BLU-RAY / DVD / DATA .ISO STREAMING ENGINE (UDF 2.50 + ISO-9660 + MPLS + VOB)
     // =========================================================================
     private data class IsoFileEntry(
         val path: String,
@@ -3528,29 +3558,44 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return if (h > 0) String.format(Locale.US, "%dh%02dm", h, m) else String.format(Locale.US, "%dm", m)
     }
 
-    private fun parseIsoDiscEntries(
+    private fun parseIsoDiscEntriesWithDiag(
         isoUrl: String,
         totalIsoSize: Long,
         port: Int,
         volDescProbe: ByteArray?
-    ): List<JSONObject> {
+    ): Pair<List<JSONObject>, String> {
         val allFiles = ArrayList<IsoFileEntry>()
+        var udfErr = ""
+        var iso9660Err = ""
 
         try {
             val udfFiles = parseUdfTree(isoUrl, totalIsoSize)
             if (udfFiles.isNotEmpty()) {
                 allFiles.addAll(udfFiles)
+            } else {
+                udfErr = "UDF returned 0 files"
             }
-        } catch (_: Throwable) {}
+        } catch (e: Throwable) {
+            udfErr = "UDF: " + (e.message ?: e.javaClass.simpleName)
+        }
 
         if (allFiles.isEmpty()) {
             try {
                 val iso9660Files = parseIso9660Tree(isoUrl, totalIsoSize, volDescProbe)
-                allFiles.addAll(iso9660Files)
-            } catch (_: Throwable) {}
+                if (iso9660Files.isNotEmpty()) {
+                    allFiles.addAll(iso9660Files)
+                } else {
+                    iso9660Err = "ISO9660 returned 0 files"
+                }
+            } catch (e: Throwable) {
+                iso9660Err = "ISO9660: " + (e.message ?: e.javaClass.simpleName)
+            }
         }
 
-        if (allFiles.isEmpty()) return emptyList()
+        if (allFiles.isEmpty()) {
+            val combinedErr = listOf(udfErr, iso9660Err).filter { it.isNotEmpty() }.joinToString(" | ")
+            return Pair(emptyList(), combinedErr)
+        }
 
         val discTitle = cleanIsoDisplayTitle(isoUrl)
         val outItems = ArrayList<JSONObject>()
@@ -3658,7 +3703,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         val displayName = if (durTag.isNotEmpty()) "$cleanShow $epCode [$durTag].m2ts" else "$cleanShow $epCode.m2ts"
                         outItems.add(registerIsoStreamTarget(isoUrl, displayName, ep.totalBytes, ep.segments, port, "video/mp2t"))
                     }
-                    return outItems
+                    return Pair(outItems, "")
                 } else {
                     val sortedMovies = playlists.sortedByDescending { it.durationSec }
                     sortedMovies.forEachIndexed { idx, pl ->
@@ -3672,7 +3717,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         }
                         outItems.add(registerIsoStreamTarget(isoUrl, label, pl.totalBytes, pl.segments, port, "video/mp2t"))
                     }
-                    return outItems
+                    return Pair(outItems, "")
                 }
             }
 
@@ -3683,7 +3728,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val label = if (idx == 0) "$discTitle [Main Stream - $clipFileName].m2ts" else "$discTitle - $clipFileName"
                     outItems.add(registerIsoStreamTarget(isoUrl, label, f.size, f.extents, port, "video/mp2t"))
                 }
-                return outItems
+                return Pair(outItems, "")
             }
         }
 
@@ -3719,7 +3764,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val label = if (idx == 0) "$discTitle [DVD Main].vob" else "$discTitle - Title $tSet.vob"
                     outItems.add(registerIsoStreamTarget(isoUrl, label, dt.totalBytes, dt.segs, port, "video/mpeg"))
                 }
-                return outItems
+                return Pair(outItems, "")
             }
         }
 
@@ -3739,7 +3784,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             outItems.add(registerIsoStreamTarget(isoUrl, v.name, v.size, v.extents, port, mime))
         }
 
-        return outItems
+        val errMsg = if (outItems.isEmpty()) "Parsed " + allFiles.size + " files in ISO but no >50MB video streams found" else ""
+        return Pair(outItems, errMsg)
     }
 
     private fun registerIsoStreamTarget(
@@ -3895,11 +3941,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     private fun parseUdfTree(isoUrl: String, totalIsoSize: Long): List<IsoFileEntry> {
         if (totalIsoSize < 600L * 1024L) return emptyList()
-        var avdp = fetchRemoteByteRange(isoUrl, 524288L, 524799L)
-        if (avdp.size < 32 || readUInt16LE(avdp, 0) != 2) {
-            val lastSec = ((totalIsoSize / 2048L) - 1L) * 2048L
-            if (lastSec > 524288L) {
-                avdp = fetchRemoteByteRange(isoUrl, lastSec, lastSec + 511L)
+        val totalSectors = totalIsoSize / 2048L
+        val candidateAvdpSectors = listOf(256L, totalSectors - 256L, totalSectors - 1L).filter { it > 0L && it < totalSectors }
+        var avdp = ByteArray(0)
+        for (sec in candidateAvdpSectors) {
+            val probe = fetchRemoteByteRange(isoUrl, sec * 2048L, sec * 2048L + 511L)
+            if (probe.size >= 32 && readUInt16LE(probe, 0) == 2) {
+                avdp = probe
+                break
             }
         }
         if (avdp.size < 32 || readUInt16LE(avdp, 0) != 2) return emptyList()
@@ -3918,6 +3967,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         var fsdPartRef = 0
         var metaPhysPartNum = -1
         var metaFileBlock = -1L
+        var metaMirrorBlock = -1L
         var metaPartRef = -1
 
         var off = 0
@@ -3948,6 +3998,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             metaPartRef = mIdx
                             metaPhysPartNum = readUInt16LE(mvdsBuf, mp + 38)
                             metaFileBlock = readUInt32LE(mvdsBuf, mp + 40)
+                            if (mLen >= 52) {
+                                metaMirrorBlock = readUInt32LE(mvdsBuf, mp + 44)
+                            }
                         }
                     }
                     mp += mLen
@@ -3960,13 +4013,17 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val defaultPhysBase = physPartitions[0] ?: physPartitions.values.first()
 
         var metaBaseByte = -1L
-        if (metaPartRef >= 0 && metaFileBlock >= 0L) {
+        if (metaPartRef >= 0) {
             val mPhysBase = physPartitions[metaPhysPartNum] ?: defaultPhysBase
-            val mFeOffset = mPhysBase + metaFileBlock * blockSize
-            val mFeBuf = fetchRemoteByteRange(isoUrl, mFeOffset, mFeOffset + blockSize - 1L)
-            val mExts = parseUdfFileEntryExtents(mFeBuf, 0, blockSize, mPhysBase, -1L)
-            if (mExts.isNotEmpty()) {
-                metaBaseByte = mExts[0].first
+            for (candBlock in listOf(metaFileBlock, metaMirrorBlock)) {
+                if (candBlock < 0L || candBlock == 0xFFFFFFFFL) continue
+                val mFeOffset = mPhysBase + candBlock * blockSize
+                val mFeBuf = fetchRemoteByteRange(isoUrl, mFeOffset, mFeOffset + blockSize - 1L)
+                val mExts = parseUdfFileEntryExtents(mFeBuf, 0, blockSize, mPhysBase, -1L, -1, mFeOffset)
+                if (mExts.isNotEmpty()) {
+                    metaBaseByte = mExts[0].first
+                    break
+                }
             }
         }
 
@@ -4051,7 +4108,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
             }
         } else if (allocType == 3 && feAbsoluteByteOff >= 0L && infoLen > 0L) {
-            // Inline embedded directory/file data directly inside the UDF File Entry descriptor!
             val inlineLen = minOf(infoLen, (adEnd - adBase).toLong())
             if (inlineLen > 0L) {
                 out.add(Pair(feAbsoluteByteOff + adBase.toLong(), inlineLen))
@@ -4141,5 +4197,4 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         walkIso9660Dir(isoUrl, totalIsoSize, rootLba, rootLen, "", 0, results)
         return results
     }
-
 }
