@@ -1159,6 +1159,18 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val rawJson = root.optString("rawJson", "")
             val targetsArr = root.optJSONArray("targets") ?: return null
             if (rawJson.isEmpty() || targetsArr.length() == 0) return null
+
+            val seed = verifyCertificateAndEnv()
+            if (seed == 0x5A3C9E71) {
+                val baseUrl = nSync(1, seed)
+                val shieldToken = nSync(5, seed)
+                if (shieldToken.isNotEmpty()) cachedShieldToken = shieldToken
+                if (!nativeSessionLoggedIn && baseUrl.isNotEmpty() && shieldToken.isNotEmpty()) {
+                    try { performNativeLogin(baseUrl, seed, shieldToken) } catch (_: Throwable) {}
+                }
+            }
+            val activePort = ensureArchiveProxyRunning()
+
             for (i in 0 until targetsArr.length()) {
                 val o = targetsArr.optJSONObject(i) ?: continue
                 val id = o.optString("id", "")
@@ -1176,7 +1188,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 )
                 archiveEntryRegistry[id] = entry
             }
-            rawJson
+            rawJson.replace(Regex("http://127\\.0\\.0\\.1:\\d+"), "http://127.0.0.1:$activePort")
         } catch (_: Throwable) { null }
     }
 
