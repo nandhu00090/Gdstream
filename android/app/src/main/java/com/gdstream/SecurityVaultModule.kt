@@ -127,7 +127,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val uncompressedSize: Long,
         val localHeaderOffset: Long,
         @Volatile var dataStartOffset: Long = -1L,
-        val segments: List<Pair<Long, Long>>? = null
+        val segments: List<Pair<Long, Long>>? = null,
+        val isBdavM2ts: Boolean = false
     )
 
     private val verifiedTrailerCache = ConcurrentHashMap<String, VerifiedTrailerInfo>()
@@ -910,14 +911,20 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 out.write(headers.toByteArray(StandardCharsets.US_ASCII))
                 out.flush()
 
+                if (reqStart == 0L) {
+                    appendDebugLog("PROXY_ISO_PLAY", "Streaming ${entry.fileName} bdav=${entry.isBdavM2ts} range=$reqStart-$reqEnd/$totalSize")
+                }
+
                 val buf = ByteArray(65536)
-                val maxUpstreamChunk = 4L * 1024L * 1024L // 4 MB upstream slices prevent Worker/Drive 35GB range timeouts!
+                val maxUpstreamChunk = 4L * 1024L * 1024L
                 var virtualCursor = 0L
 
-                for ((segOffset, segLen) in segList) {
+                for ((segRawOffset, segRawLen) in segList) {
+                    val segVirtLen = if (entry.isBdavM2ts) (segRawLen / 192L) * 188L else segRawLen
+                    if (segVirtLen <= 0L) continue
                     val segVirtStart = virtualCursor
-                    val segVirtEnd = virtualCursor + segLen - 1L
-                    virtualCursor += segLen
+                    val segVirtEnd = virtualCursor + segVirtLen - 1L
+                    virtualCursor += segVirtLen
                     if (segVirtEnd < reqStart) continue
                     if (segVirtStart > reqEnd) break
 
@@ -925,11 +932,31 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val overlapEnd = minOf(reqEnd, segVirtEnd)
                     if (overlapStart > overlapEnd) continue
 
-                    var curRemote = segOffset + (overlapStart - segVirtStart)
-                    val endRemote = segOffset + (overlapEnd - segVirtStart)
+                    val relStart = overlapStart - segVirtStart
+                    val relEnd = overlapEnd - segVirtStart
 
-                    while (curRemote <= endRemote) {
-                        val sliceEnd = minOf(endRemote, curRemote + maxUpstreamChunk - 1L)
+                    var curRemote: Long
+                    val endRemote: Long
+                    var dropHeadTsBytes = 0
+                    var tsBytesLeftToEmit = overlapEnd - overlapStart + 1L
+
+                    if (entry.isBdavM2ts) {
+                        val firstPkt = relStart / 188L
+                        val lastPkt = relEnd / 188L
+                        dropHeadTsBytes = (relStart % 188L).toInt()
+                        curRemote = segRawOffset + firstPkt * 192L
+                        endRemote = segRawOffset + (lastPkt + 1L) * 192L - 1L
+                    } else {
+                        curRemote = segRawOffset + relStart
+                        endRemote = segRawOffset + relEnd
+                    }
+
+                    val pktAccum = ByteArray(192)
+                    var pktFill = 0
+
+                    while (curRemote <= endRemote && tsBytesLeftToEmit > 0L) {
+                        val rawChunkLimit = if (entry.isBdavM2ts) (maxUpstreamChunk / 192L) * 192L else maxUpstreamChunk
+                        val sliceEnd = minOf(endRemote, curRemote + rawChunkLimit - 1L)
                         var sliceRemaining = sliceEnd - curRemote + 1L
 
                         val segConn = openRangeConnection(entry.archiveUrl, "bytes=$curRemote-$sliceEnd")
@@ -951,12 +978,35 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                                 skipLeft -= s.toLong()
                             }
                         }
-                        while (sliceRemaining > 0L) {
+                        while (sliceRemaining > 0L && tsBytesLeftToEmit > 0L) {
                             val toRead = minOf(buf.size.toLong(), sliceRemaining).toInt()
                             val read = segIn.read(buf, 0, toRead)
                             if (read <= 0) break
-                            out.write(buf, 0, read)
                             sliceRemaining -= read.toLong()
+
+                            if (!entry.isBdavM2ts) {
+                                out.write(buf, 0, read)
+                                tsBytesLeftToEmit -= read.toLong()
+                            } else {
+                                var bPos = 0
+                                while (bPos < read && tsBytesLeftToEmit > 0L) {
+                                    val copyLen = minOf(192 - pktFill, read - bPos)
+                                    System.arraycopy(buf, bPos, pktAccum, pktFill, copyLen)
+                                    pktFill += copyLen
+                                    bPos += copyLen
+                                    if (pktFill == 192) {
+                                        pktFill = 0
+                                        val tsOff = 4 + dropHeadTsBytes
+                                        val availTs = 188 - dropHeadTsBytes
+                                        dropHeadTsBytes = 0
+                                        if (availTs > 0) {
+                                            val emitNow = minOf(availTs.toLong(), tsBytesLeftToEmit).toInt()
+                                            out.write(pktAccum, tsOff, emitNow)
+                                            tsBytesLeftToEmit -= emitNow.toLong()
+                                        }
+                                    }
+                                }
+                            }
                         }
                         try { segConn.disconnect() } catch (_: Throwable) {}
                         remoteConnToClean = null
@@ -1341,7 +1391,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val root = JSONObject(cachedBlob)
             val rawJson = root.optString("rawJson", "")
             val targetsArr = root.optJSONArray("targets") ?: return null
-            if (rawJson.isEmpty() || targetsArr.length() == 0 || rawJson.contains("download.aspx", ignoreCase = true)) return null
+            if (rawJson.isEmpty() || targetsArr.length() == 0 || rawJson.contains("download.aspx", ignoreCase = true) || rawJson.contains("4465391616")) return null
 
             val seed = verifyCertificateAndEnv()
             if (seed == 0x5A3C9E71) {
@@ -1379,7 +1429,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     uncompressedSize = o.optLong("uncompressedSize", 0L),
                     localHeaderOffset = o.optLong("localHeaderOffset", 0L),
                     dataStartOffset = o.optLong("dataStartOffset", -1L),
-                    segments = restoredSegs
+                    segments = restoredSegs,
+                    isBdavM2ts = o.optBoolean("isBdavM2ts", false)
                 )
                 archiveEntryRegistry[id] = entry
             }
@@ -1411,6 +1462,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             sArr.put(JSONArray().apply { put(sOff); put(sLen) })
                         }
                         put("segments", sArr)
+                    }
+                    if (t.isBdavM2ts) {
+                        put("isBdavM2ts", true)
                     }
                 })
             }
@@ -3777,7 +3831,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
                     val durSec = (totalTicks / 45000L).toInt()
                     val clipSig = clipNames.joinToString("+")
-                    if (valid && segs.isNotEmpty() && totalBytes >= 50L * 1024L * 1024L && durSec >= 180 && seenSignatures.add(clipSig)) {
+                    val isMenuLoop = clipNames.size > 3 && clipNames.toSet().size == 1
+                    if (valid && !isMenuLoop && segs.isNotEmpty() && totalBytes >= 50L * 1024L * 1024L && durSec >= 180 && seenSignatures.add(clipSig)) {
                         playlists.add(ResolvedPlaylist(mpls.name, durSec, totalBytes, segs, clipSig))
                         appendDebugLog("ISO_MPLS_HIT", "mpls=${mpls.name} dur=${durSec}s bytes=$totalBytes clips=$clipSig")
                     }
@@ -3899,6 +3954,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     ): JSONObject {
         val entryId = "ze_" + System.nanoTime() + "_" + archiveEntryCounter.getAndIncrement()
         val firstOffset = segments.firstOrNull()?.first ?: 0L
+        val isBdav = mimeType == "video/mp2t" && segments.isNotEmpty() && segments.all { it.second >= 192L && (it.second % 192L) == 0L }
+        val exposedBytes = if (isBdav) {
+            segments.sumOf { (it.second / 192L) * 188L }
+        } else {
+            totalBytes
+        }
         val target = ArchiveEntryTarget(
             id = entryId,
             archiveUrl = isoUrl,
@@ -3906,10 +3967,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             archiveFormat = "ISO",
             compressionMethod = 0,
             compressedSize = totalBytes,
-            uncompressedSize = totalBytes,
+            uncompressedSize = exposedBytes,
             localHeaderOffset = firstOffset,
             dataStartOffset = firstOffset,
-            segments = segments
+            segments = segments,
+            isBdavM2ts = isBdav
         )
         archiveEntryRegistry[entryId] = target
         val safeName = URLEncoder.encode(displayName, "UTF-8").replace("+", "%20")
@@ -3917,7 +3979,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return JSONObject().apply {
             put("id", entryId)
             put("name", displayName)
-            put("size", totalBytes.toString())
+            put("size", exposedBytes.toString())
             put("mimeType", mimeType)
             put("link", streamUrl)
             put("isZipEntry", true)
