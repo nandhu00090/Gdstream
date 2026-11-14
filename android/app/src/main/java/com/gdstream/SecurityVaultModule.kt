@@ -363,7 +363,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val seed = verifyCertificateAndEnv()
                 if (seed != 0x5A3C9E71) {
                     promise.reject("E_SEC", "Security shield active")
-                    return@submit
+                    return@run
                 }
 
                 val baseUrl = nSync(1, seed)
@@ -988,7 +988,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val method = ((compInfo ushr 7) and 0x07L).toInt() // 0 = STORE
 
                     if (!isDir && unpackedSize > 0L && mediaExtensions.any { lowerName.endsWith(it) }) {
-                        val entryId = "ze_${archiveEntryCounter.getAndIncrement()}"
+                        val entryId = "ze_${System.nanoTime()}_${archiveEntryCounter.getAndIncrement()}"
                         val target = ArchiveEntryTarget(
                             id = entryId,
                             archiveUrl = archiveUrl,
@@ -1305,7 +1305,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     }
 
     private fun scanZipMediaEntriesUncached(zipUrl: String, fileSizeHint: Double, promise: Promise) {
-        ioExecutor.submit {
+        run {
             try {
                 val seed = verifyCertificateAndEnv()
                 if (seed != 0x5A3C9E71) {
@@ -1327,7 +1327,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
                 if (totalArchiveSize <= 22L) {
                     promise.reject("E_ZIP", "Unable to determine archive file size")
-                    return@submit
+                    return@run
                 }
 
                 val port = ensureArchiveProxyRunning()
@@ -1353,7 +1353,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val outRar = JSONArray()
                     for (item in sortedRar) outRar.put(item)
                     promise.resolve(outRar.toString())
-                    return@submit
+                    return@run
                 }
 
                 // 2. Standard ZIP / ZIP64 Central Directory Tail Reader
@@ -1375,7 +1375,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
                 if (eocdPos < 0) {
                     promise.reject("E_ZIP", "Archive header not recognized (Not a valid ZIP or RAR file)")
-                    return@submit
+                    return@run
                 }
 
                 var cdSize = readUInt32LE(tailBuf, eocdPos + 12)
@@ -1409,7 +1409,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
                 if (cdSize <= 0L || cdSize > 16L * 1024L * 1024L) {
                     promise.reject("E_ZIP", "Invalid ZIP Central Directory size")
-                    return@submit
+                    return@run
                 }
 
                 val cdBytes = if (cdOffset >= tailStart && (cdOffset + cdSize) <= totalArchiveSize) {

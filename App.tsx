@@ -2619,17 +2619,20 @@ const App = () => {
     );
   };
 
+
   useEffect(() => {
-    if (playMode !== null || !Array.isArray(homeFiles) || homeFiles.length === 0) return;
-    const archives = homeFiles.filter(
-      (f: any) => f && !f.isFolder && /\.(zip|rar)$/i.test(String(f.name || ''))
+    if (!vaultReady || playMode !== null || !Array.isArray(activeRawFiles) || activeRawFiles.length === 0) return;
+    const archives = activeRawFiles.filter(
+      (f: any) => f && !f.isZipEntry && /\.(zip|rar)$/i.test(String(f.name || ''))
     );
     if (archives.length === 0) return;
 
     let cancelled = false;
     const timer = setTimeout(() => {
       const queue = archives.filter((a: any) => {
-        const k = a.id || a.name;
+        const sUrl = getStreamUrl(a);
+        const idMatch = sUrl.match(/[?&]id=([a-zA-Z0-9_-]{15,})/) || sUrl.match(/\/d\/([a-zA-Z0-9_-]{15,})/);
+        const k = idMatch ? `gd_${idMatch[1]}` : (a.id || a.name);
         if (zipRawJsonCacheRef.current[k] || zipPrewarmQueuedRef.current.has(k)) return false;
         zipPrewarmQueuedRef.current.add(k);
         return true;
@@ -2641,26 +2644,25 @@ const App = () => {
       const worker = async () => {
         while (!cancelled && cursor < queue.length) {
           const item = queue[cursor++];
-          const k = item.id || item.name;
           try {
             const sUrl = getStreamUrl(item);
             if (sUrl) {
-              await fetchZipRawJsonFast(sUrl, Number(item.size || 0), k);
+              await fetchZipRawJsonFast(sUrl, Number(item.size || 0), item.id || item.name);
             }
           } catch {}
-          await new Promise(r => setTimeout(r, 120));
+          await new Promise(r => setTimeout(r, 150));
         }
       };
 
       worker();
       worker();
-    }, 700);
+    }, 900);
 
     return () => {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [homeFiles, playMode, getStreamUrl, fetchZipRawJsonFast]);
+  }, [activeRawFiles, vaultReady, playMode, getStreamUrl, fetchZipRawJsonFast]);
 
   const renderFloatingMenu = () => {
     if (!activeMenu) return null;
