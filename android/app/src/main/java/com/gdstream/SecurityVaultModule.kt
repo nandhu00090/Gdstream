@@ -363,7 +363,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val seed = verifyCertificateAndEnv()
                 if (seed != 0x5A3C9E71) {
                     promise.reject("E_SEC", "Security shield active")
-                    return@run
+                    return@submit
                 }
 
                 val baseUrl = nSync(1, seed)
