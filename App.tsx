@@ -10,6 +10,7 @@ import axios from 'axios';
 import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { isIsoArchiveUrl, withArchiveTimeout } from './archivePlayback';
 
 const {
   VideoPlayerManager, SubtitleFileModule, DownloadEngine, MediaInfoModule, SecurityVault,
@@ -17,6 +18,12 @@ const {
 
 const IS_TV = Platform.isTV;
 const CW_STORAGE_KEY = 'gdstream_cw_history_v2';
+
+// AsyncStorage v3 returns a record from getMany; callers below consume ordered pairs.
+const readStoragePairs = async (keys: string[]) => {
+  const values = await AsyncStorage.getMany(keys);
+  return keys.map(key => [key, values[key]] as const);
+};
 
 interface ParsedMediaInfo {
   rawName: string;
@@ -877,10 +884,12 @@ const App = () => {
   const fetchZipRawJsonFast = useCallback(async (url: string, sizeHint: number, cacheId?: string) => {
     const idMatch = url.match(/[?&]id=([a-zA-Z0-9_-]{15,})/) || url.match(/\/d\/([a-zA-Z0-9_-]{15,})/);
     const key = idMatch ? `gd_${idMatch[1]}` : (cacheId || `${url.split('?')[0]}|${sizeHint}`);
-    if (zipRawJsonCacheRef.current[key]) {
+    const isIso = isIsoArchiveUrl(url);
+    if (!isIso && zipRawJsonCacheRef.current[key]) {
       return zipRawJsonCacheRef.current[key];
     }
-    const rawJson = await SecurityVault.listZipMediaEntries(url, sizeHint);
+    const request: Promise<string> = SecurityVault.listZipMediaEntries(url, sizeHint);
+    const rawJson = await (isIso ? withArchiveTimeout(request) : request);
     if (typeof rawJson === 'string' && rawJson.startsWith('[') && rawJson.length > 2) {
       zipRawJsonCacheRef.current[key] = rawJson;
     }
@@ -916,6 +925,16 @@ const App = () => {
     return bestUri;
   }, []);
 
+  const getStreamUrl = useCallback((file: any) => {
+    if (!file) return '';
+    if (file.localPath) return file.localPath.startsWith('file://') ? file.localPath : `file://${file.localPath}`;
+    const completedDl = downloads.find(d => d.fileName === file.name && d.status === 'completed' && d.filePath);
+    if (completedDl) return `file://${completedDl.filePath}`;
+    const baseUrl = vaultRef.current.baseUrl;
+    if (file.link) return file.link.startsWith('http') ? file.link : `${baseUrl}${file.link.startsWith('/') ? '' : '/'}${file.link}`;
+    return `${baseUrl}${currentPath}${encodeURIComponent(file.name)}`;
+  }, [downloads, currentPath]);
+
   const requestPreviewAtTime = useCallback((sec: number) => {
     const active = selectedFileRef.current;
     if (!active) return;
@@ -944,68 +963,6 @@ const App = () => {
       .catch(() => {});
   }, [getStreamUrl, findNearestCachedPreview]);
 
-  const seekbarPanResponder = useMemo(() => PanResponder.create({
-    onStartShouldSetPanResponder: () => true,
-    onMoveShouldSetPanResponder: () => true,
-    onPanResponderTerminationRequest: () => false,
-    onPanResponderGrant: evt => {
-      const dur = durationRef.current;
-      if (dur <= 0) return;
-      lastPlayerActivityRef.current = Date.now();
-      isScrubbingRef.current = true;
-      setIsScrubbing(true);
-      lastPreviewBucketRef.current = -1;
-      const calcAndApply = (px: number, barX: number, barW: number) => {
-        if (barW <= 0) return;
-        const ratio = Math.max(0, Math.min(1, (px - barX) / barW));
-        const target = ratio * dur;
-        scrubTimeRef.current = target;
-        setScrubTime(target);
-        requestPreviewAtTime(target);
-      };
-      const pageX = evt.nativeEvent.pageX;
-      lastScrubPageXRef.current = pageX;
-      if (progressBarRef.current?.measureInWindow) {
-        progressBarRef.current.measureInWindow((x: number, _y: number, w: number) => {
-          if (w > 0) progressBarMetrics.current = { pageX: x, width: w };
-          calcAndApply(pageX, progressBarMetrics.current.pageX, progressBarMetrics.current.width);
-        });
-      } else {
-        calcAndApply(pageX, progressBarMetrics.current.pageX, progressBarMetrics.current.width);
-      }
-    },
-    onPanResponderMove: evt => {
-      const dur = durationRef.current;
-      const { pageX: barX, width: barW } = progressBarMetrics.current;
-      if (dur <= 0 || barW <= 0) return;
-      const curPageX = evt.nativeEvent.pageX;
-      if (lastScrubPageXRef.current >= 0 && Math.abs(curPageX - lastScrubPageXRef.current) < 5) return;
-      lastScrubPageXRef.current = curPageX;
-      lastPlayerActivityRef.current = Date.now();
-      const ratio = Math.max(0, Math.min(1, (curPageX - barX) / barW));
-      const target = ratio * dur;
-      scrubTimeRef.current = target;
-      setScrubTime(target);
-      requestPreviewAtTime(target);
-    },
-    onPanResponderRelease: () => {
-      if (isScrubbingRef.current) {
-        seekBothPlayers(scrubTimeRef.current);
-      }
-      isScrubbingRef.current = false;
-      setIsScrubbing(false);
-      setPreviewFrameUri(null);
-      lastPreviewBucketRef.current = -1;
-      lastScrubPageXRef.current = -1;
-      lastPlayerActivityRef.current = Date.now();
-    },
-    onPanResponderTerminate: () => {
-      isScrubbingRef.current = false;
-      setIsScrubbing(false);
-      setPreviewFrameUri(null);
-      lastPreviewBucketRef.current = -1;
-    },
-  }), [requestPreviewAtTime, seekBothPlayers]);
   const videoRef = useRef<any>(null);
   const externalAudioRef = useRef<any>(null);
   const externalAudioTimeRef = useRef(0);
@@ -1213,9 +1170,9 @@ const App = () => {
       const durKeys = items.map(f => `dur_${f.name}`);
       const miKeys = items.map(f => `mediainfo_v8_${f.name}`);
       const [timePairs, durPairs, miPairs] = await Promise.all([
-        AsyncStorage.multiGet(timeKeys),
-        AsyncStorage.multiGet(durKeys),
-        AsyncStorage.multiGet(miKeys),
+        readStoragePairs(timeKeys),
+        readStoragePairs(durKeys),
+        readStoragePairs(miKeys),
       ]);
       let changedTimes = false;
       timePairs.forEach(([k, val]) => {
@@ -1271,8 +1228,28 @@ const App = () => {
     prewarmedUrlRef.current = '';
     try { MediaInfoModule?.releasePreviewExtractor?.(); } catch {}
     setActiveMenu(null);
+    setIsVideoBuffering(false);
     setPlayMode(null);
   }, [selectedFile, persistPlaybackProgress]);
+
+  const isoProgressAtRef = useRef(0);
+  const isIsoPlayback = selectedFile?.archiveFormat === 'ISO';
+  const failIsoPlayback = useCallback((message: string) => {
+    closeInternalPlayer();
+    Alert.alert('Disc playback failed', message);
+  }, [closeInternalPlayer]);
+
+  useEffect(() => {
+    if (!isIsoPlayback || playMode !== 'internal' || isPaused) return;
+    isoProgressAtRef.current = Date.now();
+    const timer = setInterval(() => {
+      if (Date.now() - isoProgressAtRef.current > 90000) {
+        clearInterval(timer);
+        failIsoPlayback('The disc stream stopped responding. Reopen the disc and try again.');
+      }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [isIsoPlayback, playMode, isPaused, playerInstanceKey, failIsoPlayback]);
 
   useEffect(() => {
     const backAction = () => {
@@ -1426,7 +1403,7 @@ const App = () => {
       const uncachedQueue: Array<{ itemKey: string; info: ParsedMediaInfo; cacheKey: string }> = [];
       try {
         const uniqueCacheKeys = Array.from(new Set(pendingItems.map(p => p.cacheKey)));
-        const cachedPairs = await AsyncStorage.multiGet(uniqueCacheKeys);
+        const cachedPairs = await readStoragePairs(uniqueCacheKeys);
         const cacheLookup: Record<string, MediaMetadata> = {};
         for (const [k, v] of cachedPairs) {
           if (v) {
@@ -1673,15 +1650,6 @@ const App = () => {
     });
   }, [displayedFiles, selectedFile, seasonFolders]);
 
-  const getStreamUrl = useCallback((file: any) => {
-    if (!file) return '';
-    if (file.localPath) return file.localPath.startsWith('file://') ? file.localPath : `file://${file.localPath}`;
-    const completedDl = downloads.find(d => d.fileName === file.name && d.status === 'completed' && d.filePath);
-    if (completedDl) return `file://${completedDl.filePath}`;
-    const baseUrl = vaultRef.current.baseUrl;
-    if (file.link) return file.link.startsWith('http') ? file.link : `${baseUrl}${file.link.startsWith('/') ? '' : '/'}${file.link}`;
-    return `${baseUrl}${currentPath}${encodeURIComponent(file.name)}`;
-  }, [downloads, currentPath]);
 
   const zipParentBackupRef = React.useRef<{
     pathStack: string[];
@@ -1692,7 +1660,10 @@ const App = () => {
     activeSeason: any;
   } | null>(null);
 
+  const archiveOpenRequestRef = useRef(0);
+
   const openZipArchiveFile = async (zipItem: any, basePathOverride?: string) => {
+    const requestId = ++archiveOpenRequestRef.current;
     lastFolderCardIdRef.current = 'fcard_0';
     const effectiveBasePath = basePathOverride || (currentPath.startsWith('/0:/') ? currentPath : '/0:/');
     const prevBackup = {
@@ -1706,7 +1677,6 @@ const App = () => {
 
     try {
       const info = parseMediaFilename(zipItem.name, false);
-      const baseUrl = vaultRef.current.baseUrl;
       const rawZipUrl = getStreamUrl(zipItem);
       const zipUrl = zipItem?.name ? `${rawZipUrl.split("#")[0]}#name=${encodeURIComponent(zipItem.name)}` : rawZipUrl;
       const sizeHint = Number(zipItem.size || 0);
@@ -1724,6 +1694,7 @@ const App = () => {
 
       if (SecurityVault?.listZipMediaEntries) {
         const rawJson = await fetchZipRawJsonFast(zipUrl, sizeHint);
+        if (requestId !== archiveOpenRequestRef.current) return;
         const rawEntries = rawJson ? JSON.parse(rawJson) : [];
         const cleanDiscBase = zipItem.name.replace(/\.(iso|zip|rar)$/i, '');
         const entries = Array.isArray(rawEntries)
@@ -1751,6 +1722,7 @@ const App = () => {
       setActiveSeason(prevBackup.activeSeason);
       Alert.alert('Archive / Disc Info', 'Indha .zip / .rar / .iso file-kulla playable video streams edhuvum kidaikala.');
     } catch (e: any) {
+      if (requestId !== archiveOpenRequestRef.current) return;
       zipParentBackupRef.current = null;
       setFolderLoading(false);
       setPathStack(prevBackup.pathStack);
@@ -1836,6 +1808,69 @@ const App = () => {
       lastAudioSyncMs.current = Date.now();
     }
   }, [isExternalAudioSelected, audioDelay, selectedFile, persistPlaybackProgress]);
+
+  const seekbarPanResponder = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: () => true,
+    onPanResponderTerminationRequest: () => false,
+    onPanResponderGrant: evt => {
+      const dur = durationRef.current;
+      if (dur <= 0) return;
+      lastPlayerActivityRef.current = Date.now();
+      isScrubbingRef.current = true;
+      setIsScrubbing(true);
+      lastPreviewBucketRef.current = -1;
+      const calcAndApply = (px: number, barX: number, barW: number) => {
+        if (barW <= 0) return;
+        const ratio = Math.max(0, Math.min(1, (px - barX) / barW));
+        const target = ratio * dur;
+        scrubTimeRef.current = target;
+        setScrubTime(target);
+        requestPreviewAtTime(target);
+      };
+      const pageX = evt.nativeEvent.pageX;
+      lastScrubPageXRef.current = pageX;
+      if (progressBarRef.current?.measureInWindow) {
+        progressBarRef.current.measureInWindow((x: number, _y: number, w: number) => {
+          if (w > 0) progressBarMetrics.current = { pageX: x, width: w };
+          calcAndApply(pageX, progressBarMetrics.current.pageX, progressBarMetrics.current.width);
+        });
+      } else {
+        calcAndApply(pageX, progressBarMetrics.current.pageX, progressBarMetrics.current.width);
+      }
+    },
+    onPanResponderMove: evt => {
+      const dur = durationRef.current;
+      const { pageX: barX, width: barW } = progressBarMetrics.current;
+      if (dur <= 0 || barW <= 0) return;
+      const curPageX = evt.nativeEvent.pageX;
+      if (lastScrubPageXRef.current >= 0 && Math.abs(curPageX - lastScrubPageXRef.current) < 5) return;
+      lastScrubPageXRef.current = curPageX;
+      lastPlayerActivityRef.current = Date.now();
+      const ratio = Math.max(0, Math.min(1, (curPageX - barX) / barW));
+      const target = ratio * dur;
+      scrubTimeRef.current = target;
+      setScrubTime(target);
+      requestPreviewAtTime(target);
+    },
+    onPanResponderRelease: () => {
+      if (isScrubbingRef.current) {
+        seekBothPlayers(scrubTimeRef.current);
+      }
+      isScrubbingRef.current = false;
+      setIsScrubbing(false);
+      setPreviewFrameUri(null);
+      lastPreviewBucketRef.current = -1;
+      lastScrubPageXRef.current = -1;
+      lastPlayerActivityRef.current = Date.now();
+    },
+    onPanResponderTerminate: () => {
+      isScrubbingRef.current = false;
+      setIsScrubbing(false);
+      setPreviewFrameUri(null);
+      lastPreviewBucketRef.current = -1;
+    },
+  }), [requestPreviewAtTime, seekBothPlayers]);
 
   const triggerStepSeek = useCallback((isForward: boolean) => {
     clearTimeout(multiTapTimer.current);
@@ -2235,7 +2270,8 @@ const App = () => {
             const archUrl = archItem.link
               ? (archItem.link.startsWith('http') ? archItem.link : `${baseUrl}${archItem.link.startsWith('/') ? '' : '/'}${archItem.link}`)
               : `${baseUrl}${path}${encodeURIComponent(archItem.name)}`;
-            const rawJson = await fetchZipRawJsonFast(archUrl, Number(archItem.size || 0));
+            const namedArchiveUrl = `${archUrl.split('#')[0]}#name=${encodeURIComponent(archItem.name)}`;
+            const rawJson = await fetchZipRawJsonFast(namedArchiveUrl, Number(archItem.size || 0));
             const entries = rawJson ? JSON.parse(rawJson) : [];
             if (Array.isArray(entries) && entries.length > 0) {
               const rawFolderTitle = decodeURIComponent(path.split('/').filter(Boolean).pop() || '');
@@ -2307,6 +2343,8 @@ const App = () => {
     setShowControls(true);
     lastPlayerActivityRef.current = Date.now();
     setPlayerInstanceKey(k => k + 1);
+    setIsPaused(false);
+    setIsVideoBuffering(true);
     setPlayMode('internal');
     try { VideoPlayerManager?.setPreferredHdrMode?.(mode); } catch {}
   };
@@ -2390,6 +2428,7 @@ const App = () => {
 
   // Instant Back from Series to Homepage: Home FlatList stays mounted at exact scroll position!
   const goBack = () => {
+    archiveOpenRequestRef.current++;
     if (zipParentBackupRef.current) {
       const prev = zipParentBackupRef.current;
       zipParentBackupRef.current = null;
@@ -2761,7 +2800,7 @@ const App = () => {
               await fetchZipRawJsonFast(sUrl, Number(item.size || 0), item.id || item.name);
             }
           } catch {}
-          await new Promise(r => setTimeout(r, 150));
+          await new Promise<void>(r => setTimeout(r, 150));
         }
       };
 
@@ -2999,6 +3038,7 @@ const App = () => {
             if (list && list.length) setTextTracks(list);
           }}
           onProgress={(p: any) => {
+            if (p.currentTime !== currentTimeRef.current) isoProgressAtRef.current = Date.now();
             currentTimeRef.current = p.currentTime;
             if (showControls || isExternalSubtitleSelected) {
               setCurrentTime(p.currentTime);
@@ -3027,6 +3067,9 @@ const App = () => {
           onError={(err: any) => {
             const errDetail = JSON.stringify(err?.error || err || 'Unknown playback error');
             SecurityVault?.writeDebugLog?.('EXO_PLAY_ERR', `${selectedFile?.name || ''}: ${errDetail}`);
+            if (isIsoPlayback) {
+              failIsoPlayback('The disc could not be played. Reopen it to retry, or check that its audio and video formats are supported.');
+            }
           }}
           selectedAudioTrack={isExternalAudioSelected ? { type: 'disabled' } : selectedAudio}
           subtitleStyle={{
@@ -4077,7 +4120,7 @@ const App = () => {
                 windowSize={7}
                 keyboardShouldPersistTaps="handled"
                 removeClippedSubviews={false}
-                ListHeaderComponent={!isInsideFolder ? renderContinueWatchingHeader() : null}
+                ListHeaderComponent={!isInsideFolder ? renderContinueWatchingHeader() ?? undefined : undefined}
                 refreshControl={
                   !IS_TV ? <RefreshControl refreshing={refreshing && !isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" /> : undefined
                 }
@@ -4122,7 +4165,7 @@ const App = () => {
                   windowSize={7}
                   keyboardShouldPersistTaps="handled"
                   removeClippedSubviews={false}
-                  ListHeaderComponent={renderContinueWatchingHeader()}
+                  ListHeaderComponent={renderContinueWatchingHeader() ?? undefined}
                   refreshControl={
                     !IS_TV ? <RefreshControl refreshing={refreshing && isInsideFolder} onRefresh={handleRefresh} tintColor="#E50914" colors={['#E50914']} progressBackgroundColor="#181C24" /> : undefined
                   }
