@@ -98,10 +98,66 @@ class ArchiveProxyTest {
         assertArrayEquals(payload.copyOfRange(17, 2001), serve("ZIP", 8, payload, compressed))
     }
 
+    @Test fun isoProxyDeliversMultipleChunksPastTheFirstKeyframeAt42GbPhysicalOffset() {
+        val module = SecurityVaultModule(mock(ReactApplicationContext::class.java))
+        val pool = Executors.newCachedThreadPool()
+        val base = 42_000_000_000L
+        val payload = ByteArray(3 * 1024 * 1024) { (it % 251).toByte() }
+        ServerSocket(0).use { origin ->
+            ServerSocket(0).use { local ->
+                try {
+                    origin.soTimeout = 5000
+                    val requests = ArrayList<HttpByteRange>()
+                    val upstreamJob = pool.submit {
+                        repeat(3) {
+                            origin.accept().use { socket ->
+                                val reader = socket.getInputStream().bufferedReader()
+                                val headers = ArrayList<String>()
+                                while (true) { val line = reader.readLine() ?: break; if (line.isEmpty()) break; headers.add(line) }
+                                assertTrue(headers.any { it.equals("Connection: close", true) })
+                                val range = HttpByteRange.parse(headers.first { it.startsWith("Range:", true) }.substringAfter(':').trim(), base + payload.size)
+                                assertTrue(range.length <= 2 * 1024 * 1024)
+                                requests.add(range)
+                                socket.getOutputStream().apply {
+                                    write("HTTP/1.1 206 Partial Content\r\nContent-Length: ${range.length}\r\nContent-Range: bytes ${range.start}-${range.end}/${base + payload.size}\r\nConnection: close\r\n\r\n".toByteArray())
+                                    write(payload, (range.start - base).toInt(), range.length.toInt())
+                                    flush()
+                                }
+                            }
+                        }
+                    }
+                    @Suppress("UNCHECKED_CAST")
+                    val registry = field(module, "archiveEntryRegistry") as ConcurrentHashMap<String, SecurityVaultModule.ArchiveEntryTarget>
+                    registry["disc"] = SecurityVaultModule.ArchiveEntryTarget("disc",
+                        "http://127.0.0.1:${origin.localPort}/download.aspx?expiry=1&mac=fixture", "feature.ts", "ISO", 0,
+                        payload.size.toLong(), payload.size.toLong(), 0, segments = listOf(base to payload.size.toLong()))
+                    val handler = SecurityVaultModule::class.java.getDeclaredMethod("handleArchiveProxyClient", Socket::class.java).apply { isAccessible = true }
+                    val proxy = pool.submit { handler.invoke(module, local.accept()) }
+                    val response = Socket("127.0.0.1", local.localPort).use { client ->
+                        client.soTimeout = 5000
+                        client.getOutputStream().write("GET /zip/disc/feature.ts HTTP/1.1\r\nHost: localhost\r\nRange: bytes=0-\r\n\r\n".toByteArray())
+                        client.getInputStream().readBytes()
+                    }
+                    proxy.get(5, TimeUnit.SECONDS)
+                    upstreamJob.get(5, TimeUnit.SECONDS)
+                    val split = response.toString(Charsets.ISO_8859_1).indexOf("\r\n\r\n")
+                    val headers = response.copyOfRange(0, split).toString(Charsets.US_ASCII)
+                    assertTrue(headers.startsWith("HTTP/1.1 206 Partial Content"))
+                    assertTrue(headers.contains("Content-Range: bytes 0-${payload.size - 1}/${payload.size}"))
+                    assertArrayEquals(payload, response.copyOfRange(split + 4, response.size))
+                    assertEquals(base, requests.first().start)
+                    assertEquals(base + payload.size - 1, requests.last().end)
+                } finally {
+                    pool.shutdownNow()
+                    (field(module, "ioExecutor") as ExecutorService).shutdownNow()
+                }
+            }
+        }
+    }
+
     @Test fun isoCacheInvalidationAndRestorationKeepProxyIdsAndLengthsConsistent() {
         val module = SecurityVaultModule(mock(ReactApplicationContext::class.java))
         try {
-            SecurityVaultModule::class.java.getDeclaredField("archiveProxyPort").apply { isAccessible = true }.setInt(module, 45678)
             val restore = SecurityVaultModule::class.java.getDeclaredMethod("restoreArchiveFromDisk", String::class.java, String::class.java)
                 .apply { isAccessible = true }
             val target = JSONObject().put("id", "disc").put("fileName", "Movie.m2ts").put("archiveFormat", "ISO")
@@ -112,7 +168,9 @@ class ArchiveProxyTest {
             assertNull(restore.invoke(module, cache.toString(), "https://example/disc.iso"))
             cache.put("isoIndexVersion", 4)
             val restored = JSONArray(restore.invoke(module, cache.toString(), "https://example/disc.iso?fresh=1") as String).getJSONObject(0)
-            assertEquals("http://127.0.0.1:45678/zip/disc/Movie.m2ts", restored.getString("link"))
+            val activePort = field(module, "archiveProxyPort") as Int
+            assertTrue(activePort > 0)
+            assertEquals("http://127.0.0.1:$activePort/zip/disc/Movie.m2ts", restored.getString("link"))
             assertEquals("ISO", restored.getString("archiveFormat"))
             @Suppress("UNCHECKED_CAST")
             val registry = field(module, "archiveEntryRegistry") as ConcurrentHashMap<String, SecurityVaultModule.ArchiveEntryTarget>
@@ -123,7 +181,10 @@ class ArchiveProxyTest {
             target.put("archiveFormat", "ZIP").put("isBdavM2ts", false)
             cache.remove("isoIndexVersion")
             assertNotNull(restore.invoke(module, cache.toString(), "https://example/archive.zip"))
-        } finally { (field(module, "ioExecutor") as ExecutorService).shutdownNow() }
+        } finally {
+            (field(module, "archiveProxyServer") as ServerSocket).close()
+            (field(module, "ioExecutor") as ExecutorService).shutdownNow()
+        }
     }
 
     @Test fun pmtRewriteIsIdenticalWhenSeekingWithoutAnEarlierPat() {

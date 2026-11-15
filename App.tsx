@@ -10,7 +10,7 @@ import axios from 'axios';
 import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration } from './archivePlayback';
+import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration, archiveSourceUrl } from './archivePlayback';
 
 const {
   VideoPlayerManager, SubtitleFileModule, DownloadEngine, MediaInfoModule, SecurityVault,
@@ -1102,8 +1102,8 @@ const App = () => {
     });
 
     const appStateSub = AppState.addEventListener('change', nextState => {
-      if (nextState === 'active') {
-        VideoPlayerManager?.stopExternalStreamBridge?.();
+      if (nextState === 'active' || nextState === 'background') {
+        VideoPlayerManager?.setArchiveBridgeAppForeground?.(nextState === 'active');
       }
       const activeFile = selectedFileRef.current;
       if ((nextState === 'background' || nextState === 'inactive') && activeFile?.name && currentTimeRef.current > 3) {
@@ -1677,7 +1677,7 @@ const App = () => {
 
     try {
       const info = parseMediaFilename(zipItem.name, false);
-      const rawZipUrl = getStreamUrl(zipItem);
+      const rawZipUrl = archiveSourceUrl(String(zipItem.name || ''), vaultRef.current.baseUrl, effectiveBasePath, getStreamUrl(zipItem));
       const zipUrl = zipItem?.name ? `${rawZipUrl.split("#")[0]}#name=${encodeURIComponent(zipItem.name)}` : rawZipUrl;
       const sizeHint = Number(zipItem.size || 0);
       const virtualZipPath = `${effectiveBasePath}${encodeURIComponent(zipItem.name)}/`;
@@ -2267,9 +2267,10 @@ const App = () => {
         if (archiveFiles.length === 1 && normalVideos.length === 0 && SecurityVault?.listZipMediaEntries) {
           try {
             const archItem = archiveFiles[0];
-            const archUrl = archItem.link
+            const listedUrl = archItem.link
               ? (archItem.link.startsWith('http') ? archItem.link : `${baseUrl}${archItem.link.startsWith('/') ? '' : '/'}${archItem.link}`)
               : `${baseUrl}${path}${encodeURIComponent(archItem.name)}`;
+            const archUrl = archiveSourceUrl(archItem.name, baseUrl, path, listedUrl);
             const namedArchiveUrl = `${archUrl.split('#')[0]}#name=${encodeURIComponent(archItem.name)}`;
             const rawJson = await fetchZipRawJsonFast(namedArchiveUrl, Number(archItem.size || 0));
             const entries = rawJson ? JSON.parse(rawJson) : [];
