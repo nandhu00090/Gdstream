@@ -3,10 +3,13 @@ package com.gdstream
 import java.io.EOFException
 import java.io.IOException
 import java.io.OutputStream
-import java.net.HttpURLConnection
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+
+internal class IsoClientDisconnected(cause: IOException) : IOException("Client closed proxy response", cause)
+internal class IsoProxyReadException(val start: Long, val count: Int, cause: Throwable) :
+    IOException("ISO proxy read failed: virtual bytes=$start-${start + count - 1L}", cause)
 
 internal data class HttpByteRange(val start: Long, val end: Long, val partial: Boolean) {
     val length: Long get() = end - start + 1
@@ -87,6 +90,21 @@ internal class IsoVirtualFile(
         return result
     }
 
+    fun physicalRanges(start: Long, length: Int): String {
+        val rawStart = if (bdav) (start / 188L) * 192L else start
+        val rawEnd = if (bdav) ((start + length - 1) / 188L + 1) * 192L else start + length
+        var cursor = 0L
+        return extents.mapNotNull { (offset, size) ->
+            val from = maxOf(cursor, rawStart)
+            val until = minOf(cursor + size, rawEnd)
+            val mapped = if (from < until) {
+                if (offset < 0) "zero:${until - from}" else "${offset + from - cursor}-${offset + until - cursor - 1}"
+            } else null
+            cursor += size
+            mapped
+        }.joinToString(",")
+    }
+
     /** Preflight the first chunk before committing 200/206; later failures close a truncated body. */
     fun serve(
         method: String,
@@ -96,15 +114,25 @@ internal class IsoVirtualFile(
         executor: ExecutorService,
         read: (Long, Int) -> ByteArray
     ) {
+        fun write(bytes: ByteArray) {
+            try { out.write(bytes) } catch (e: IOException) { throw IsoClientDisconnected(e) }
+        }
+        fun flush() {
+            try { out.flush() } catch (e: IOException) { throw IsoClientDisconnected(e) }
+        }
         fun error(status: String, extra: String = "") {
-            out.write("HTTP/1.1 $status\r\n${extra}Content-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
-            out.flush()
+            try {
+                write("HTTP/1.1 $status\r\n${extra}Content-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                flush()
+            } catch (_: IsoClientDisconnected) { }
         }
         if (method != "GET" && method != "HEAD") { error("405 Method Not Allowed", "Allow: GET, HEAD\r\n"); return }
         val range = try { HttpByteRange.parse(if (method == "HEAD") null else rangeHeader, size) } catch (_: IOException) {
             error("416 Range Not Satisfiable", "Content-Range: bytes */$size\r\n")
             return
         }
+        var pendingStart = 0L
+        var pendingCount = 0
         var sentHeaders = false
         var pending: Future<ByteArray>? = null
         try {
@@ -116,12 +144,14 @@ internal class IsoVirtualFile(
                 val limit = if (cursor == range.start) 188 * 2788 else 188 * 22310
                 val count = minOf(limit.toLong(), range.end - cursor + 1).toInt()
                 cursor += count
+                pendingStart = start
+                pendingCount = count
                 return executor.submit<ByteArray> {
                     read(start, count).also { if (it.size != count) throw EOFException("Short ISO proxy read") }
                 }
             }
             pending = fetchNext()
-            var chunk = pending?.get(45, TimeUnit.SECONDS)
+            var chunk = pending?.get(120, TimeUnit.SECONDS)
             val headers = buildString {
                 append(if (range.partial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
                 append("Content-Type: $mimeType\r\nAccept-Ranges: bytes\r\nContent-Length: ${range.length}\r\n")
@@ -129,57 +159,22 @@ internal class IsoVirtualFile(
                 append("Connection: close\r\n\r\n")
             }
             sentHeaders = true
-            out.write(headers.toByteArray(Charsets.US_ASCII))
+            write(headers.toByteArray(Charsets.US_ASCII))
             while (chunk != null) {
                 pending = fetchNext()
-                out.write(chunk)
-                out.flush()
-                chunk = pending?.get(45, TimeUnit.SECONDS)
+                write(chunk)
+                flush()
+                chunk = pending?.get(120, TimeUnit.SECONDS)
             }
-            out.flush()
+            flush()
+        } catch (_: IsoClientDisconnected) {
+            // A probe/seek was abandoned. Only local writes are classified as client disconnects.
+            return
         } catch (e: Exception) {
-            if (!sentHeaders) error("502 Bad Gateway")
-            throw IOException("ISO proxy read failed", e)
+            if (!sentHeaders) try { error("502 Bad Gateway") } catch (_: IsoClientDisconnected) { }
+            throw IsoProxyReadException(pendingStart, pendingCount, e)
         } finally {
             pending?.cancel(true)
-        }
-    }
-}
-
-/** ISO seeks must never silently download and discard tens of GB when a server ignores Range. */
-internal object IsoRangeReader {
-    fun read(conn: HttpURLConnection, start: Long, end: Long): ByteArray {
-        try {
-            require(start >= 0 && end >= start && end - start < Int.MAX_VALUE)
-            val code = conn.responseCode
-            if (code != 206) throw IOException("ISO requires HTTP 206 for bytes=$start-$end (got $code)")
-            val match = Regex("bytes (\\d+)-(\\d+)/(\\d+)", RegexOption.IGNORE_CASE)
-                .matchEntire(conn.getHeaderField("Content-Range")?.trim() ?: "")
-                ?: throw IOException("Missing or invalid ISO Content-Range")
-            val actualStart = match.groupValues[1].toLongOrNull()
-            val actualEnd = match.groupValues[2].toLongOrNull()
-            val total = match.groupValues[3].toLongOrNull()
-            if (actualStart != start || actualEnd != end || total == null || total <= end) {
-                throw IOException("Mismatched ISO Content-Range for bytes=$start-$end")
-            }
-            val length = (end - start + 1).toInt()
-            val contentLength = conn.getHeaderField("Content-Length")?.toLongOrNull()
-            if (contentLength != null && contentLength != length.toLong()) throw IOException("Mismatched ISO Content-Length")
-            val encoding = conn.getHeaderField("Content-Encoding")
-            if (encoding != null && !encoding.equals("identity", true)) throw IOException("Encoded ISO range response")
-            return conn.inputStream.use { input ->
-                val result = ByteArray(length)
-                var p = 0
-                while (p < length) {
-                    if (Thread.currentThread().isInterrupted) throw IOException("ISO read cancelled")
-                    val count = input.read(result, p, length - p)
-                    if (count <= 0) throw EOFException("Truncated ISO HTTP range: $p/$length bytes")
-                    p += count
-                }
-                result
-            }
-        } finally {
-            conn.disconnect()
         }
     }
 }

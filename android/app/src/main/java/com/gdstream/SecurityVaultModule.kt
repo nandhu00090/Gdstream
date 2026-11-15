@@ -595,55 +595,31 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun openRangeConnectionInternal(urlStr: String, rangeHeader: String?): HttpURLConnection {
-        var currentUrl = urlStr
-        var redirects = 0
-        while (redirects < 5) {
-            val conn = (URL(currentUrl).openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
-                connectTimeout = 15000
-                readTimeout = 25000
-                requestMethod = "GET"
-                instanceFollowRedirects = false
-                useCaches = false
-                setRequestProperty("User-Agent", "GDStream-Native-Engine/3.0")
-                setRequestProperty("Accept-Encoding", "identity")
-                if (cachedShieldToken.isNotEmpty()) {
-                    setRequestProperty("X-GD-Shield", cachedShieldToken)
+    private val rangeConnections by lazy {
+        RangeConnections(
+            headers = { mapOf("User-Agent" to "GDStream-Native-Engine/3.0", "Cookie" to sessionCookieHeader, "X-GD-Shield" to cachedShieldToken) },
+            configure = { conn ->
+                if (conn is HttpsURLConnection) {
+                    conn.sslSocketFactory = buildPinnedSystemSslFactory()
+                    conn.hostnameVerifier = HttpsURLConnection.getDefaultHostnameVerifier()
                 }
-                if (sessionCookieHeader.isNotEmpty()) {
-                setRequestProperty("Cookie", sessionCookieHeader)
-            }
-                if (!rangeHeader.isNullOrEmpty()) {
-                    setRequestProperty("Range", rangeHeader)
-                }
-                if (this is HttpsURLConnection) {
-                    sslSocketFactory = buildPinnedSystemSslFactory()
-                    hostnameVerifier = HttpsURLConnection.getDefaultHostnameVerifier()
+            },
+            receiveCookies = { updated ->
+                synchronized(this) {
+                    val merged = sessionCookieHeader.split(';').map { it.trim() }.filter { '=' in it }
+                        .associate { it.substringBefore('=') to it.substringAfter('=') }.toMutableMap()
+                    updated.forEach {
+                        val pair = it.substringBefore(';')
+                        if ('=' in pair) merged[pair.substringBefore('=').trim()] = pair.substringAfter('=')
+                    }
+                    sessionCookieHeader = merged.entries.joinToString("; ") { "${it.key}=${it.value}" }
                 }
             }
-            val code = try { conn.responseCode } catch (e: java.io.IOException) {
-                conn.disconnect()
-                throw e
-            }
-            val setCookies = conn.headerFields["Set-Cookie"] ?: conn.headerFields["set-cookie"]
-            if (!setCookies.isNullOrEmpty()) {
-                val cookieParts = setCookies.mapNotNull { it.substringBefore(";").trim().takeIf { s -> s.isNotEmpty() } }
-                if (cookieParts.isNotEmpty()) {
-                    sessionCookieHeader = cookieParts.joinToString("; ")
-                }
-            }
-            if (code in 300..399) {
-                val loc = conn.getHeaderField("Location")
-                conn.disconnect()
-                if (loc.isNullOrEmpty()) break
-                currentUrl = URL(URL(currentUrl), loc).toString()
-                redirects++
-            } else {
-                return conn
-            }
-        }
-        throw IllegalStateException("Too many redirects for archive stream")
+        )
     }
+
+    private fun openRangeConnectionInternal(urlStr: String, rangeHeader: String?): HttpURLConnection =
+        rangeConnections.open(urlStr, rangeHeader)
 
     private fun openRangeConnection(urlStr: String, rangeHeader: String?): HttpURLConnection {
         ensureVaultSessionReady()
@@ -722,7 +698,21 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     }
 
     private fun fetchIsoByteRange(isoUrl: String, start: Long, endInclusive: Long): ByteArray =
-        IsoRangeReader.read(openRangeConnection(isoUrl.substringBefore('#'), "bytes=$start-$endInclusive"), start, endInclusive)
+        IsoRangeReader.readFully(isoUrl, start, endInclusive,
+            open = { from, to ->
+                ensureVaultSessionReady()
+                var conn = rangeConnections.open(isoUrl, "bytes=$from-$to", 10000, 20000)
+                if (conn.responseCode == 401 || conn.responseCode == 403) {
+                    appendDebugLog("ISO_UPSTREAM_ERR", isoFailureDetails(IsoRangeException(from, to, conn.responseCode,
+                        conn.url.toString(), 1, java.io.IOException("Session rejected; refreshing once"))))
+                    conn.disconnect()
+                    nativeSessionLoggedIn = false
+                    ensureVaultSessionReady()
+                    conn = rangeConnections.open(isoUrl, "bytes=$from-$to", 10000, 20000)
+                }
+                conn
+            },
+            onFailure = { error -> appendDebugLog("ISO_UPSTREAM_ERR", isoFailureDetails(error)) })
 
     private fun detectRemoteFileSize(archiveUrl: String): Long {
         val conn = openRangeConnection(archiveUrl, "bytes=0-1")
@@ -811,10 +801,15 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     private fun handleArchiveProxyClient(socket: Socket) {
         var remoteConnToClean: HttpURLConnection? = null
         var inflaterToClean: Inflater? = null
+        var requestDetails = "unparsed request"
+        var isoFile: IsoVirtualFile? = null
         try {
             socket.soTimeout = 30000
             val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII))
-            val requestLine = reader.readLine() ?: return
+            fun readClientLine(): String? = try { reader.readLine() } catch (e: java.io.IOException) {
+                throw IsoClientDisconnected(e)
+            }
+            val requestLine = readClientLine() ?: return
             val parts = requestLine.split(" ")
             if (parts.size < 2) return
             val method = parts[0].uppercase(Locale.ROOT)
@@ -822,7 +817,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
             var rangeHeader: String? = null
             while (true) {
-                val line = reader.readLine() ?: break
+                val line = readClientLine() ?: break
                 if (line.isEmpty()) break
                 if (line.startsWith("Range:", ignoreCase = true)) {
                     rangeHeader = line.substringAfter(":").trim()
@@ -841,6 +836,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 return
             }
 
+            requestDetails = "method=$method id=${segments[1]} requestedRange=${rangeHeader ?: "full"}"
             val entryId = segments[1]
             val entry = archiveEntryRegistry[entryId]
             if (entry == null) {
@@ -864,6 +860,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val out = BufferedOutputStream(socket.getOutputStream(), 65536)
             if (entry.archiveFormat == "ISO") {
                 val file = IsoVirtualFile(entry.segments ?: throw java.io.IOException("Missing ISO extent map"), entry.isBdavM2ts)
+                isoFile = file
                 if (file.rawSize != entry.compressedSize || file.size != totalSize) {
                     throw java.io.IOException("Inconsistent ISO stream length")
                 }
@@ -1028,8 +1025,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 outStream.write("HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\n\r\n".toByteArray())
                 outStream.flush()
             }
+        } catch (_: IsoClientDisconnected) {
+            // Client aborted while sending its request, before an upstream read began.
         } catch (e: Exception) {
-            appendDebugLog("ARCHIVE_PROXY_ERR", e.message ?: e.javaClass.simpleName)
+            val mapping = if (e is IsoProxyReadException && e.count > 0) isoFile?.physicalRanges(e.start, e.count) else null
+            val upstream = generateSequence<Throwable>(e) { it.cause }.take(12).filterIsInstance<IsoRangeException>().firstOrNull()
+            appendDebugLog("ARCHIVE_PROXY_ERR", "$requestDetails mappedPhysical=${mapping ?: "unavailable"} upstreamHTTP=${upstream?.status ?: "unavailable"} ${isoFailureDetails(e)}")
         } finally {
             // Close local client socket FIRST so MediaInfo & ExoPlayer never wait on upstream teardown!
             try { socket.close() } catch (_: Throwable) {}
@@ -1274,7 +1275,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val hasIso = (0 until targetsArr.length()).any {
                 targetsArr.optJSONObject(it)?.optString("archiveFormat") == "ISO"
             }
-            if (hasIso && root.optInt("isoIndexVersion", 0) != 3) return null
+            if (hasIso && root.optInt("isoIndexVersion", 0) != 4) return null
             var hasUnstrippedM2ts = false
             for (ci in 0 until targetsArr.length()) {
                 val co = targetsArr.optJSONObject(ci) ?: continue
@@ -1378,7 +1379,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val root = JSONObject().apply {
                     put("rawJson", rawJson)
                     put("targets", targetsArr)
-                    put("isoIndexVersion", 3)
+                    put("isoIndexVersion", 4)
                 }
                 zipDiskCache[cacheKey] = root.toString()
                 saveZipDiskCacheAsync()
@@ -3697,7 +3698,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         volDescProbe: ByteArray?
     ): Pair<List<JSONObject>, String> {
         val t0 = System.currentTimeMillis()
-        appendDebugLog("ISO_START", "Opening ISO size=$totalIsoSize url=${isoUrl.substringAfterLast('/')}")
+        appendDebugLog("ISO_START", "Opening ISO size=$totalIsoSize url=${safeStreamUrl(isoUrl)}")
         val allFiles = ArrayList<IsoFileEntry>()
         var udfErr = ""
         var isoErr = ""
@@ -3790,10 +3791,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     if (numPlayItems <= 0 || numPlayItems > 250) continue
 
                     var p = playListStart + 10
-                    val segs = ArrayList<Pair<Long, Long>>()
-                    val clipNames = ArrayList<String>()
-                    var totalTicks = 0L
-                    var totalBytes = 0L
+                    val clips = ArrayList<BluRayPlaylist.Clip>()
                     var valid = true
 
                     for (idx in 0 until numPlayItems) {
@@ -3803,17 +3801,22 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         val clipId = String(mplsBytes, p + 2, 5, StandardCharsets.US_ASCII).uppercase(Locale.ROOT)
                         val inTime = readUInt32BE(mplsBytes, p + 14)
                         val outTime = readUInt32BE(mplsBytes, p + 18)
-                        if (outTime > inTime) totalTicks += (outTime - inTime)
+                        if (outTime <= inTime) { valid = false; break }
                         val m2tsEntry = m2tsMap[clipId]
                         if (m2tsEntry == null) { valid = false; break }
-                        segs.addAll(m2tsEntry.extents)
-                        clipNames.add(clipId)
-                        totalBytes += m2tsEntry.size
+                        clips.add(BluRayPlaylist.Clip(clipId, outTime - inTime, m2tsEntry.size, m2tsEntry.extents))
                         p += 2 + itemLen
                     }
 
-                    val durSec = (totalTicks / 45000L).toInt()
+                    val selected = BluRayPlaylist.playbackClips(clips)
+                    val clipNames = selected.map { it.id }
+                    val segs = selected.flatMap { it.extents }
+                    val totalBytes = selected.fold(0L) { total, clip -> Math.addExact(total, clip.size) }
+                    val durSec = (selected.sumOf { it.ticks } / 45000L).toInt()
                     val clipSig = clipNames.joinToString("+")
+                    if (selected.size != clips.size) {
+                        appendDebugLog("ISO_MPLS_FEATURE", "mpls=${mpls.name} originalClips=${clips.joinToString("+") { it.id }} originalDuration=${clips.sumOf { it.ticks } / 45000L}s selected=$clipSig duration=${durSec}s bytes=$totalBytes")
+                    }
                     val isMenuLoop = clipNames.size > 3 && clipNames.toSet().size == 1
                     if (valid && !isMenuLoop && segs.isNotEmpty() && totalBytes >= 50L * 1024L * 1024L && durSec >= 180 && seenSignatures.add(clipSig)) {
                         playlists.add(ResolvedPlaylist(mpls.name, durSec, totalBytes, segs, clipSig))
@@ -3841,7 +3844,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         val epCode = String.format(Locale.US, "S%02dE%02d", sNum, idx + 1)
                         val durTag = formatIsoDurationLabel(ep.durationSec)
                         val displayName = if (durTag.isNotEmpty()) "$cleanShow $epCode [$durTag].m2ts" else "$cleanShow $epCode.m2ts"
-                        outItems.add(registerIsoStreamTarget(isoUrl, displayName, ep.totalBytes, ep.segments, port, "video/mp2t"))
+                        outItems.add(registerIsoStreamTarget(isoUrl, displayName, ep.totalBytes, ep.segments, port, "video/mp2t", ep.durationSec))
                     }
                     appendDebugLog("ISO_DONE_SERIES", "Resolved ${outItems.size} episodes in ${System.currentTimeMillis() - t0}ms")
                     return Pair(outItems, "")
@@ -3856,7 +3859,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             durTag.isNotEmpty() -> "$discTitle - Feature $featureNum [$durTag].m2ts"
                             else -> "$discTitle - Feature $featureNum.m2ts"
                         }
-                        outItems.add(registerIsoStreamTarget(isoUrl, label, pl.totalBytes, pl.segments, port, "video/mp2t"))
+                        outItems.add(registerIsoStreamTarget(isoUrl, label, pl.totalBytes, pl.segments, port, "video/mp2t", pl.durationSec))
                     }
                     appendDebugLog("ISO_DONE_MOVIE", "Resolved ${outItems.size} features in ${System.currentTimeMillis() - t0}ms")
                     return Pair(outItems, "")
@@ -3933,7 +3936,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         totalBytes: Long,
         segments: List<Pair<Long, Long>>,
         port: Int,
-        mimeType: String
+        mimeType: String,
+        durationSec: Int = 0
     ): JSONObject {
         val entryId = "ze_" + System.nanoTime() + "_" + archiveEntryCounter.getAndIncrement()
         val firstOffset = segments.firstOrNull()?.first ?: 0L
@@ -3966,6 +3970,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             put("isZipEntry", true)
             put("zipCompression", "STORE")
             put("archiveFormat", "ISO")
+            if (durationSec > 0) put("durationSec", durationSec)
         }
     }
 

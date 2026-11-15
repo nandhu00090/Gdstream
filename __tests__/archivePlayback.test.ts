@@ -1,4 +1,13 @@
-import { isIsoArchiveUrl, withArchiveTimeout } from '../archivePlayback';
+import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration } from '../archivePlayback';
+
+test('selected feature duration overrides disclaimer probes and stale cached runtime', () => {
+  const feature = { archiveFormat: 'ISO', durationSec: 9995 };
+  expect(playbackDuration(feature, 14, 14)).toBe(9995);
+  expect(playbackDuration(feature, -14)).toBe(9995);
+  expect(playbackDuration(feature, NaN)).toBe(9995);
+  expect(playbackDuration({ archiveFormat: 'ZIP' }, 3600, 14)).toBe(3600);
+  expect(playbackDuration(undefined, -14)).toBe(0);
+});
 
 describe('ISO archive opening', () => {
   afterEach(() => jest.useRealTimers());

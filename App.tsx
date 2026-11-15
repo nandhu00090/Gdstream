@@ -10,7 +10,7 @@ import axios from 'axios';
 import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { isIsoArchiveUrl, withArchiveTimeout } from './archivePlayback';
+import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration } from './archivePlayback';
 
 const {
   VideoPlayerManager, SubtitleFileModule, DownloadEngine, MediaInfoModule, SecurityVault,
@@ -1243,7 +1243,7 @@ const App = () => {
     if (!isIsoPlayback || playMode !== 'internal' || isPaused) return;
     isoProgressAtRef.current = Date.now();
     const timer = setInterval(() => {
-      if (Date.now() - isoProgressAtRef.current > 90000) {
+      if (Date.now() - isoProgressAtRef.current > 150000) {
         clearInterval(timer);
         failIsoPlayback('The disc stream stopped responding. Reopen the disc and try again.');
       }
@@ -2324,9 +2324,10 @@ const App = () => {
     setSelectedAudio(undefined);
     setSelectedText({ type: 'disabled' });
     setCurrentTime(0);
-    setDuration(0);
+    const knownDuration = playbackDuration(file, 0);
+    setDuration(knownDuration);
     currentTimeRef.current = 0;
-    durationRef.current = 0;
+    durationRef.current = knownDuration;
     setResizeMode('contain');
     setSubtitleDelay(0);
     setAudioDelay(0);
@@ -2460,8 +2461,8 @@ const App = () => {
 
   const openInExternalPlayer = async (targetFile = selectedFile) => {
     const url = getStreamUrl(targetFile);
-    try { await VideoPlayerManager.playVideo(url); } catch {
-      Alert.alert('Error', 'Player illai!');
+    try { await VideoPlayerManager.playVideo(url); } catch (error) {
+      Alert.alert('External player error', error instanceof Error ? error.message : 'Could not open the player.');
     }
   };
 
@@ -2577,7 +2578,7 @@ const App = () => {
   }), []);
 
   const handleVideoLoad = async (meta: any) => {
-    const loadedDur = meta?.duration > 0 ? meta.duration : (savedDurationsRef.current[selectedFile?.name] || 0);
+    const loadedDur = playbackDuration(selectedFile, Number(meta?.duration), savedDurationsRef.current[selectedFile?.name] || 0);
     if (loadedDur > 0) {
       setDuration(loadedDur);
       durationRef.current = loadedDur;
@@ -3044,8 +3045,9 @@ const App = () => {
               setCurrentTime(p.currentTime);
             }
             if (p.seekableDuration > 0 && durationRef.current <= 0) {
-              durationRef.current = p.seekableDuration;
-              setDuration(p.seekableDuration);
+              const effectiveDuration = playbackDuration(selectedFile, p.seekableDuration);
+              durationRef.current = effectiveDuration;
+              setDuration(effectiveDuration);
             }
             const sec = Math.floor(p.currentTime);
             if (hasRestoredResumeRef.current && sec > 3 && sec % 2 === 0 && lastSavedSec.current !== sec) {
@@ -3315,7 +3317,7 @@ const App = () => {
     const meta = metadataMap[selectedFile.name];
     const realMi = mediaInfoMap[selectedFile.name];
     const savedSec = savedTimesMap[selectedFile.name] || 0;
-    const totalDur = savedDurationsMap[selectedFile.name] || realMi?.durationSec || 0;
+    const totalDur = playbackDuration(selectedFile, realMi?.durationSec || 0, savedDurationsMap[selectedFile.name]);
     const resumePct = totalDur > 0 && savedSec > 0 ? Math.min(98, Math.max(3, (savedSec / totalDur) * 100)) : 45;
     const bannerImage = meta?.backdrop || meta?.poster;
     const dlTask = downloads.find(d => d.fileName === selectedFile.name);
