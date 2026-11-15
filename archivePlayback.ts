@@ -19,3 +19,11 @@ export async function withArchiveTimeout<T>(request: Promise<T>, timeoutMs = 120
     clearTimeout(timer);
   }
 }
+
+/** Prefer the selected MPLS timeline over a stale 14-second probe or persisted duration. */
+export function playbackDuration(file: { archiveFormat?: string; durationSec?: number } | null | undefined, reported: number, cached = 0): number {
+  const known = Number(file?.durationSec);
+  if (file?.archiveFormat === 'ISO' && Number.isFinite(known) && known > 0) return known;
+  if (Number.isFinite(reported) && reported > 0) return reported;
+  return Number.isFinite(cached) && cached > 0 ? cached : 0;
+}

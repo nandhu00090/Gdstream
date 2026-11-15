@@ -297,7 +297,8 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
     @ReactMethod
     fun playVideo(url: String, promise: Promise) {
         try {
-            if (url.contains("127.0.0.1") || url.contains("localhost")) {
+            val playableUri = resolvePlayableUri(url)
+            if (playableUri.host == "127.0.0.1" || playableUri.host == "localhost") {
                 DownloadForegroundService.updateService(
                     reactApplicationContext,
                     "GDStream Archive Bridge",
@@ -305,9 +306,9 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
                     0
                 )
             }
-            val playableUri = resolvePlayableUri(url)
+            val mimeType = externalVideoMimeType(playableUri.path.orEmpty())
             val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(playableUri, "video/*")
+                setDataAndType(playableUri, mimeType)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             val chooser = Intent.createChooser(intent, "Choose Player 🍿").apply {
@@ -316,7 +317,8 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
             reactApplicationContext.startActivity(chooser)
             promise.resolve(true)
         } catch (e: Exception) {
-            promise.reject("ERROR", "No player found")
+            try { stopExternalStreamBridge() } catch (cleanup: Exception) { e.addSuppressed(cleanup) }
+            promise.reject("E_EXTERNAL_PLAYER", "${e.javaClass.simpleName}: ${e.message ?: "Could not open player"}", e)
         }
     }
 
@@ -463,4 +465,13 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
         }
     }
 
+}
+
+// The ISO proxy emits 188-byte MPEG-TS even though the display filename ends in .m2ts.
+internal fun externalVideoMimeType(path: String): String = when (path.substringAfterLast('.').lowercase(java.util.Locale.ROOT)) {
+    "m2ts", "ts" -> "video/mp2t"
+    "mp4", "m4v" -> "video/mp4"
+    "mkv" -> "video/x-matroska"
+    "webm" -> "video/webm"
+    else -> "video/*"
 }
