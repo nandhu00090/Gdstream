@@ -117,7 +117,15 @@ internal class IsoVirtualFile(
     ) {
         session.log("ISO_PROXY_REQUEST", "method=$method requestedRange=${rangeHeader ?: "full"} size=$size")
         fun write(bytes: ByteArray) {
-            try { out.write(bytes) } catch (e: IOException) { throw IsoClientDisconnected(e) }
+            try {
+                var offset = 0
+                while (offset < bytes.size) {
+                    session.checkActive()
+                    val count = minOf(64 * 1024, bytes.size - offset)
+                    out.write(bytes, offset, count)
+                    offset += count
+                }
+            } catch (e: IOException) { throw IsoClientDisconnected(e) }
         }
         fun flush() {
             try { out.flush() } catch (e: IOException) { throw IsoClientDisconnected(e) }
@@ -137,7 +145,8 @@ internal class IsoVirtualFile(
         var pendingStart = 0L
         var pendingCount = 0
         var sentHeaders = false
-        var pending: Future<ByteArray>? = null
+        data class Pending(val start: Long, val count: Int, val future: Future<ByteArray>)
+        val queued = java.util.ArrayDeque<Pending>()
         try {
             var cursor = range.start
             fun awaitChunk(future: Future<ByteArray>?): ByteArray? {
@@ -150,23 +159,31 @@ internal class IsoVirtualFile(
                     }
                 }
             }
-            fun fetchNext(): Future<ByteArray>? {
-                if (cursor > range.end || method == "HEAD") return null
-                val start = cursor
-                // Packet-aligned chunks avoid repeatedly reading a packet at chunk boundaries.
-                val limit = if (cursor == range.start) 188 * 2788 else 188 * 10922
-                val count = minOf(limit.toLong(), range.end - cursor + 1).toInt()
-                cursor += count
-                pendingStart = start
-                pendingCount = count
-                session.log("ISO_PROXY_MAP", "virtual=$start-${start + count - 1} physical=${physicalRanges(start, count)}")
-                return executor.submit<ByteArray> {
+            fun prefetch() {
+                // One current chunk plus three sequential chunks, bounded to about 8 MiB per stream.
+                while (queued.size < 4 && cursor <= range.end && method != "HEAD") {
                     session.checkActive()
-                    read(start, count).also { if (it.size != count) throw EOFException("Short ISO proxy read") }
+                    val start = cursor
+                    val limit = if (cursor == range.start) 188 * 2788 else 188 * 10922
+                    val count = minOf(limit.toLong(), range.end - cursor + 1).toInt()
+                    cursor += count
+                    session.log("ISO_PROXY_MAP", "virtual=$start-${start + count - 1} physical=${physicalRanges(start, count)}")
+                    queued.add(Pending(start, count, executor.submit<ByteArray> {
+                        session.checkActive()
+                        read(start, count).also { if (it.size != count) throw EOFException("Short ISO proxy read") }
+                    }))
                 }
             }
-            pending = fetchNext()
-            var chunk = awaitChunk(pending)
+            fun nextChunk(): ByteArray? {
+                val next = queued.peekFirst() ?: return null
+                pendingStart = next.start
+                pendingCount = next.count
+                val data = awaitChunk(next.future)
+                queued.removeFirst()
+                return data
+            }
+            prefetch()
+            var chunk = nextChunk()
             val headers = buildString {
                 append(if (range.partial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
                 append("Content-Type: $mimeType\r\nAccept-Ranges: bytes\r\nContent-Length: ${range.length}\r\n")
@@ -178,12 +195,12 @@ internal class IsoVirtualFile(
             write(headers.toByteArray(Charsets.US_ASCII))
             var delivered = 0L
             while (chunk != null) {
-                pending = fetchNext()
                 write(chunk)
                 flush()
                 delivered += chunk.size
-                session.log("ISO_PROXY_PROGRESS", "sent=$delivered/${range.length} virtual=${range.start}-${range.end}")
-                chunk = awaitChunk(pending)
+                session.log("ISO_PROXY_CHUNK_COMPLETE", "sent=$delivered/${range.length} virtual=${range.start}-${range.end}")
+                prefetch()
+                chunk = nextChunk()
             }
             flush()
         } catch (error: IsoClientDisconnected) {
@@ -195,7 +212,8 @@ internal class IsoVirtualFile(
             throw IsoProxyReadException(pendingStart, pendingCount, e)
         } finally {
             session.cancel()
-            pending?.cancel(true)
+            queued.forEach { it.future.cancel(true) }
+            queued.clear()
         }
     }
 }

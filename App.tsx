@@ -10,6 +10,7 @@ import axios from 'axios';
 import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { usePlaybackSource } from './playbackSession';
 import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration, archiveSourceUrl } from './archivePlayback';
 
 const {
@@ -935,6 +936,10 @@ const App = () => {
     return `${baseUrl}${currentPath}${encodeURIComponent(file.name)}`;
   }, [downloads, currentPath]);
 
+  const playbackIdentity = playMode === 'internal'
+    ? `${selectedFile?.id || selectedFile?.name || ''}:${playerInstanceKey}` : null;
+  const playbackSource = usePlaybackSource(getStreamUrl(selectedFile), playbackIdentity);
+
   const requestPreviewAtTime = useCallback((sec: number) => {
     const active = selectedFileRef.current;
     if (!active) return;
@@ -1212,7 +1217,9 @@ const App = () => {
     } catch {}
   }, [restoreAllSavedWatchHistory]);
 
-  const closeInternalPlayer = useCallback(() => {
+  const closeInternalPlayer = useCallback((cancelProxy: unknown = true) => {
+    setIsPaused(true);
+    if (cancelProxy !== false) SecurityVault?.stopArchivePlayback?.(playbackSource.uri);
     if (selectedFile?.name && currentTimeRef.current > 3) {
       persistPlaybackProgress(selectedFile.name, currentTimeRef.current, durationRef.current);
     }
@@ -1230,7 +1237,7 @@ const App = () => {
     setActiveMenu(null);
     setIsVideoBuffering(false);
     setPlayMode(null);
-  }, [selectedFile, persistPlaybackProgress]);
+  }, [selectedFile, persistPlaybackProgress, playbackSource.uri]);
 
   const isoProgressAtRef = useRef(0);
   const isIsoPlayback = selectedFile?.archiveFormat === 'ISO';
@@ -2339,7 +2346,9 @@ const App = () => {
     setSelectedFile(file);
   };
 
-  const startPlaybackWithMode = (mode: 'dv' | 'hdr' | 'sdr') => {
+  const startPlaybackWithMode = async (mode: 'dv' | 'hdr' | 'sdr') => {
+    try { await SecurityVault?.prepareArchivePlayback?.(getStreamUrl(selectedFile)); } catch { return; }
+    hasRestoredResumeRef.current = false;
     setShowHdrChoiceModal(false);
     setActiveHdrMode(mode);
     setShowControls(true);
@@ -2369,6 +2378,7 @@ const App = () => {
     if (currentTimeRef.current > 3 && selectedFile?.name) {
       persistPlaybackProgress(selectedFile.name, currentTimeRef.current, durationRef.current);
     }
+    hasRestoredResumeRef.current = false;
     setActiveHdrMode(nextMode);
     try { await VideoPlayerManager?.setPreferredHdrMode?.(nextMode); } catch {}
     setPlayerInstanceKey(k => k + 1);
@@ -2462,7 +2472,13 @@ const App = () => {
 
   const openInExternalPlayer = async (targetFile = selectedFile) => {
     const url = getStreamUrl(targetFile);
-    try { await VideoPlayerManager.playVideo(url); } catch (error) {
+    closeInternalPlayer(false);
+    // Commit the paused/unmounted native view before handing the proxy to the external app.
+    await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    try {
+      await SecurityVault?.stopArchivePlayback?.(playbackSource.uri);
+      await VideoPlayerManager.playVideo(url);
+    } catch (error) {
       Alert.alert('External player error', error instanceof Error ? error.message : 'Could not open the player.');
     }
   };
@@ -2583,7 +2599,7 @@ const App = () => {
     if (loadedDur > 0) {
       setDuration(loadedDur);
       durationRef.current = loadedDur;
-      if (selectedFile && MediaInfoModule?.prewarmTimelinePreviews) {
+      if (!isIsoPlayback && selectedFile && MediaInfoModule?.prewarmTimelinePreviews) {
         const sUrl = getStreamUrl(selectedFile);
         if (sUrl && prewarmedUrlRef.current !== sUrl) {
           prewarmedUrlRef.current = sUrl;
@@ -2613,12 +2629,14 @@ const App = () => {
     }
     if (meta.audioTracks) {
       setAudioTracks(meta.audioTracks);
-      if (!selectedAudio && meta.audioTracks.length > 0) {
+      if (!isIsoPlayback && !selectedAudio && meta.audioTracks.length > 0) {
         const selectedIdx = meta.audioTracks.findIndex((t: any) => t.selected);
         setSelectedAudio({ type: 'index', value: String(selectedIdx >= 0 ? selectedIdx : 0) });
       }
     }
     if (meta.textTracks) setTextTracks(meta.textTracks);
+    if (hasRestoredResumeRef.current) return;
+    hasRestoredResumeRef.current = true;
     try {
       let savedTime = savedTimesRef.current[selectedFile?.name] || 0;
       if (savedTime <= 3 && selectedFile?.name) {
@@ -2630,11 +2648,7 @@ const App = () => {
         setCurrentTime(savedTime);
         currentTimeRef.current = savedTime;
       }
-    } catch {} finally {
-      setTimeout(() => {
-        hasRestoredResumeRef.current = true;
-      }, 650);
-    }
+    } catch {}
   };
 
   const nextEpisodeFile = useMemo(() => {
@@ -3011,9 +3025,9 @@ const App = () => {
       <View style={styles.playerWrapper}>
         <StatusBar hidden={true} />
         <Video
-          key={`${selectedFile.link || selectedFile.name}-${playerInstanceKey}-${activeHdrMode}`}
+          key={playbackIdentity}
           ref={videoRef}
-          source={{ uri: getStreamUrl(selectedFile) }}
+          source={playbackSource}
           style={styles.videoPlayer}
           resizeMode={resizeMode}
           paused={isPaused}
@@ -3023,12 +3037,6 @@ const App = () => {
           rate={playbackRate}
           focusable={false}
           progressUpdateInterval={500}
-          bufferConfig={{
-            minBufferMs: 20000,
-            maxBufferMs: 50000,
-            bufferForPlaybackMs: 2500,
-            bufferForPlaybackAfterRebufferMs: 5000,
-          }}
           onLoad={handleVideoLoad}
           onBuffer={(b: any) => setIsVideoBuffering(!!b?.isBuffering)}
           onAudioTracks={(data: any) => {

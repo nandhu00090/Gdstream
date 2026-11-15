@@ -109,7 +109,7 @@ class ArchiveProxyTest {
                     origin.soTimeout = 5000
                     val requests = ArrayList<HttpByteRange>()
                     val upstreamJob = pool.submit {
-                        repeat(3) {
+                        repeat(2) {
                             origin.accept().use { socket ->
                                 val reader = socket.getInputStream().bufferedReader()
                                 val headers = ArrayList<String>()
@@ -145,14 +145,49 @@ class ArchiveProxyTest {
                     assertTrue(headers.startsWith("HTTP/1.1 206 Partial Content"))
                     assertTrue(headers.contains("Content-Range: bytes 0-${payload.size - 1}/${payload.size}"))
                     assertArrayEquals(payload, response.copyOfRange(split + 4, response.size))
-                    assertEquals(base, requests.first().start)
-                    assertEquals(base + payload.size - 1, requests.last().end)
+                    assertEquals(base, requests.minOf { it.start })
+                    assertEquals(base + payload.size - 1, requests.maxOf { it.end })
                 } finally {
                     pool.shutdownNow()
                     (field(module, "ioExecutor") as ExecutorService).shutdownNow()
                 }
             }
         }
+    }
+
+    @Test fun subtitleProbesAndWrongFilenamesReturn404WithoutOpeningTheIso() {
+        val module = SecurityVaultModule(mock(ReactApplicationContext::class.java))
+        val pool = Executors.newCachedThreadPool()
+        ArchiveProxyStreams.registry.resume()
+        try {
+            val name = "Movie + Tamil.m2ts"
+            @Suppress("UNCHECKED_CAST")
+            val registry = field(module, "archiveEntryRegistry") as ConcurrentHashMap<String, SecurityVaultModule.ArchiveEntryTarget>
+            registry["disc"] = SecurityVaultModule.ArchiveEntryTarget("disc", "http://127.0.0.1:1/must-not-open", name,
+                "ISO", 0, 41_400_000_000L, 41_400_000_000L, 0, segments = listOf(1L to 41_400_000_000L))
+            val handler = SecurityVaultModule::class.java.getDeclaredMethod("handleArchiveProxyClient", Socket::class.java).apply { isAccessible = true }
+            ServerSocket(0).use { local ->
+                for (filename in listOf("Movie.srt", "Movie.eng.srt", "Movie.ssa", "Movie.ass", "Movie.vtt", "Other.m2ts", "%invalid")) {
+                    val work = pool.submit { handler.invoke(module, local.accept()) }
+                    val response = Socket("127.0.0.1", local.localPort).use { client ->
+                        client.soTimeout = 1000
+                        client.getOutputStream().write("GET /zip/disc/$filename HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray())
+                        client.getInputStream().readBytes().toString(Charsets.US_ASCII)
+                    }
+                    work.get(1, TimeUnit.SECONDS)
+                    assertTrue(response.startsWith("HTTP/1.1 404 Not Found"))
+                    assertTrue(response.endsWith("Content-Length: 0\r\n\r\n"))
+                }
+                val work = pool.submit { handler.invoke(module, local.accept()) }
+                val response = Socket("127.0.0.1", local.localPort).use { client ->
+                    client.soTimeout = 1000
+                    client.getOutputStream().write("HEAD /zip/disc/Movie%20%2B%20Tamil.m2ts HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray())
+                    client.getInputStream().readBytes().toString(Charsets.US_ASCII)
+                }
+                work.get(1, TimeUnit.SECONDS)
+                assertTrue(response.startsWith("HTTP/1.1 200 OK"))
+            }
+        } finally { pool.shutdownNow(); (field(module, "ioExecutor") as ExecutorService).shutdownNow() }
     }
 
     @Test fun isoCacheInvalidationAndRestorationKeepProxyIdsAndLengthsConsistent() {

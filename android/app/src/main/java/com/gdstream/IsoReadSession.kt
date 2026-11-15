@@ -19,6 +19,7 @@ internal class IsoReadSession {
     private val lock = Any()
     private val connections = LinkedHashSet<HttpURLConnection>()
     private val leases = LinkedHashSet<Permit>()
+    private val cancellations = LinkedHashMap<Any, () -> Unit>()
 
     internal class Permit(private val release: () -> Unit) : AutoCloseable {
         private val closed = AtomicBoolean()
@@ -38,7 +39,6 @@ internal class IsoReadSession {
         permit = Permit {
             semaphore.release()
             synchronized(lock) { leases.remove(permit) }
-            log("ISO_UPSTREAM_RELEASE", "availablePermits=${semaphore.availablePermits()}")
         }
         synchronized(lock) {
             if (!isCancelled) { leases.add(permit); return permit }
@@ -64,16 +64,28 @@ internal class IsoReadSession {
         }
     }
 
+    fun onCancel(action: () -> Unit): AutoCloseable {
+        val key = Any()
+        val invokeNow = synchronized(lock) {
+            if (isCancelled) true else { cancellations[key] = action; false }
+        }
+        if (invokeNow) action()
+        return AutoCloseable { synchronized(lock) { cancellations.remove(key) }; Unit }
+    }
+
     fun cancel(reason: String = "response finished") {
         val resources = synchronized(lock) {
             if (isCancelled) return
             isCancelled = true
-            Pair(leases.toList(), connections.toList()).also { leases.clear(); connections.clear() }
+            Triple(leases.toList(), connections.toList(), cancellations.values.toList()).also {
+                leases.clear(); connections.clear(); cancellations.clear()
+            }
         }
         log("ISO_REQUEST_CLOSE", reason)
         // Release independently of HttpURLConnection teardown, which can contend with a blocked read.
         // Worker finally blocks also close these leases; each lease releases exactly once.
         resources.first.forEach { it.close() }
+        resources.third.forEach { it() }
         resources.second.forEach { disconnect(it) }
     }
 }

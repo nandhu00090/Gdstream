@@ -21,13 +21,17 @@ internal class DebugLogStore(private val file: File) {
     data class Snapshot(val text: String, val generation: Long)
     @Synchronized fun append(tag: String, message: String) {
         file.parentFile?.mkdirs()
-        if (file.length() > 2 * 1024 * 1024) {
-            val previous = file.readText().takeLast(1024 * 1024).substringAfter('\n')
-            file.writeText(previous)
+        val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
+        // Bound individual messages too; use byte lengths so non-ASCII names cannot exceed 2 MiB.
+        val line = "[$timestamp] [$tag] ${message.take(16 * 1024)}\n".toByteArray(Charsets.UTF_8)
+        if (file.length() + line.size > 2 * 1024 * 1024) {
+            val old = file.readBytes()
+            var from = (old.size - 1024 * 1024).coerceAtLeast(0)
+            while (from < old.size && old[from] != 10.toByte()) from++
+            file.writeBytes(old.copyOfRange(minOf(from + 1, old.size), old.size))
             generation++
         }
-        val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
-        file.appendText("[$timestamp] [$tag] $message\n")
+        file.appendBytes(line)
     }
     @Synchronized fun snapshot(): String = if (file.exists()) file.readText() else ""
     @Synchronized fun capture(): Snapshot = Snapshot(snapshot(), generation)
@@ -91,6 +95,7 @@ internal object DebugLogger {
     }
 
     @Synchronized fun log(tag: String, message: String) {
+        if (tag == "ISO_UPSTREAM_PROGRESS") return // Ignore old bridge/plugin per-read progress calls too.
         val active = store ?: return
         try {
             active.append(tag, message)

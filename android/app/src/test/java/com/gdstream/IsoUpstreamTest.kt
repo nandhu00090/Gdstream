@@ -71,9 +71,9 @@ class IsoUpstreamTest {
         }
     }
 
-    @Test fun parallelProbesNeverExceedTwoUpstreamReads() {
+    @Test fun parallelProbesNeverExceedFourUpstreamReads() {
         val pool = Executors.newFixedThreadPool(8)
-        val entered = CountDownLatch(2)
+        val entered = CountDownLatch(4)
         val release = CountDownLatch(1)
         val active = AtomicInteger()
         val peak = AtomicInteger()
@@ -95,10 +95,10 @@ class IsoUpstreamTest {
                 }
             }
             assertTrue(entered.await(5, TimeUnit.SECONDS))
-            assertEquals(2, peak.get())
+            assertEquals(4, peak.get())
             release.countDown()
             jobs.forEach { assertEquals(4, it.get(5, TimeUnit.SECONDS).size) }
-            assertEquals(2, peak.get()); assertEquals(0, active.get())
+            assertEquals(4, peak.get()); assertEquals(0, active.get())
         } finally { release.countDown(); pool.shutdownNow() }
     }
 
@@ -187,20 +187,32 @@ class IsoUpstreamTest {
         assertTrue(connections.all { it.closed })
     }
 
-    @Test fun abortedClientSocketsDisconnectBlockedReadsAndImmediatelyReleaseBothPermits() {
+    @Test fun abortedClientSocketsDisconnectBlockedReadsAndImmediatelyReleaseAllFourPermits() {
+        assertCancelledProbes { clients -> clients.forEach { it.close() } }
+    }
+
+    @Test fun serviceShutdownClosesProxySocketsAndReleasesAllFourUpstreamPermits() {
+        try { assertCancelledProbes { SecurityVaultModule.stopArchiveStreams("Recents or idle timeout") } }
+        finally { ArchiveProxyStreams.registry.resume() }
+    }
+
+    private fun assertCancelledProbes(abort: (List<java.net.Socket>) -> Unit) {
         val pool = Executors.newCachedThreadPool()
-        val entered = CountDownLatch(2)
-        val disconnected = CountDownLatch(2)
-        val sessions = List(2) { IsoReadSession() }
+        val entered = CountDownLatch(4)
+        val disconnected = CountDownLatch(4)
+        val sessions = List(4) { IsoReadSession() }
         val clients = ArrayList<java.net.Socket>()
         val accepted = ArrayList<java.net.Socket>()
         val watches = ArrayList<IsoClientWatch>()
         val connections = ArrayList<Connection>()
+        val registrations = ArrayList<AutoCloseable>()
+        ArchiveProxyStreams.registry.resume()
         ServerSocket(0).use { listener ->
             try {
                 val jobs = sessions.map { session ->
                     clients.add(java.net.Socket("127.0.0.1", listener.localPort))
                     val socket = listener.accept().also { accepted.add(it) }
+                    registrations.add(ArchiveProxyStreams.registry.register("cancel-test-${session.id}", true) { reason -> socket.close(); session.cancel(reason) })
                     watches.add(IsoClientWatch(socket, session, pool))
                     val unblock = CountDownLatch(1)
                     val connection = object : Connection(206, "bytes $start-${start + 3}/50000000000", ByteArray(4)) {
@@ -225,8 +237,8 @@ class IsoUpstreamTest {
                     }
                 }
                 assertTrue(entered.await(5, TimeUnit.SECONDS))
-                clients.forEach { it.close() } // No Future.cancel: actual client EOF triggers cancellation.
-                assertTrue("Both upstream sockets must disconnect promptly", disconnected.await(1, TimeUnit.SECONDS))
+                abort(clients) // Actual socket EOF or the service's production shutdown entry point.
+                assertTrue("All upstream sockets must disconnect promptly", disconnected.await(1, TimeUnit.SECONDS))
                 jobs.forEach { it.get(1, TimeUnit.SECONDS) }
                 sessions.forEach { it.cancel("duplicate cancellation must not double-release") }
                 val next = pool.submit<ByteArray> {
@@ -235,11 +247,12 @@ class IsoUpstreamTest {
                 }
                 assertArrayEquals(byteArrayOf(1, 2, 3, 4), next.get(1, TimeUnit.SECONDS))
                 assertTrue(connections.all { it.closed })
-                // Also proves cancelled workers did not double-release and raise the two-request limit.
-                parallelProbesNeverExceedTwoUpstreamReads()
+                // Also proves cancelled workers did not double-release and raise the four-request limit.
+                parallelProbesNeverExceedFourUpstreamReads()
             } finally {
                 sessions.forEach { it.cancel("test cleanup") }
                 watches.forEach { it.close() }
+                registrations.forEach { it.close() }
                 clients.forEach { it.close() }; accepted.forEach { it.close() }
                 pool.shutdownNow()
             }
@@ -275,8 +288,8 @@ class IsoUpstreamTest {
                     open = { _, _ -> Connection(403, null, ByteArray(0)) })
             }
             val text = store.snapshot()
-            for (tag in listOf("ISO_PROXY_REQUEST", "ISO_PROXY_MAP", "ISO_PROXY_STATUS", "ISO_PROXY_PROGRESS",
-                "ISO_UPSTREAM_RANGE", "ISO_UPSTREAM_STATUS", "ISO_UPSTREAM_PROGRESS", "ISO_UPSTREAM_ERR")) {
+            for (tag in listOf("ISO_PROXY_REQUEST", "ISO_PROXY_MAP", "ISO_PROXY_STATUS", "ISO_PROXY_CHUNK_COMPLETE",
+                "ISO_UPSTREAM_RANGE", "ISO_UPSTREAM_STATUS", "ISO_UPSTREAM_COMPLETE", "ISO_UPSTREAM_ERR")) {
                 assertTrue("Missing $tag in persisted log", text.contains("[$tag]"))
             }
             assertTrue(text.contains("physical=${start + 1}-${start + 3}"))
@@ -284,7 +297,7 @@ class IsoUpstreamTest {
             assertTrue(text.contains("java.io.IOException: Expected HTTP 206, got 403"))
             assertFalse(text.contains("mac=secret"))
             assertTrue(mirrored.await(3, TimeUnit.SECONDS))
-            assertTrue(exported.contains("ISO_PROXY_PROGRESS"))
+            assertTrue(exported.contains("ISO_PROXY_CHUNK_COMPLETE"))
             assertTrue(exported.contains("APP_BOOT"))
             assertTrue("Playback must append after the earlier APP_BOOT export", appended)
             DebugLogStore(file).append("APP_BOOT", "reopened")

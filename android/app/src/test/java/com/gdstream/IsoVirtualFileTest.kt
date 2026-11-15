@@ -146,6 +146,32 @@ class IsoVirtualFileTest {
         } finally { executor.shutdownNow() }
     }
 
+    @Test fun prefetchesThreeChunksAheadBeforeFirstReadCompletesAndWritesInOrder() {
+        val workers = Executors.newCachedThreadPool()
+        val entered = java.util.concurrent.CountDownLatch(4)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val starts = java.util.concurrent.ConcurrentSkipListSet<Long>()
+        val length = 7 * 1024 * 1024
+        val file = IsoVirtualFile(listOf(42_000_000_000L to length.toLong()), false)
+        val out = ByteArrayOutputStream()
+        try {
+            val task = workers.submit {
+                file.serve("GET", "bytes=0-", "video/mp2t", out, workers) { start, count ->
+                    starts.add(start)
+                    entered.countDown()
+                    assertTrue(release.await(3, java.util.concurrent.TimeUnit.SECONDS))
+                    ByteArray(count) { ((start + it) % 251).toByte() }
+                }
+            }
+            assertTrue("Current chunk plus three look-ahead reads must overlap", entered.await(3, java.util.concurrent.TimeUnit.SECONDS))
+            assertEquals(4, starts.size)
+            assertEquals(0, out.size())
+            release.countDown()
+            task.get(5, java.util.concurrent.TimeUnit.SECONDS)
+            assertArrayEquals(ByteArray(length) { (it % 251).toByte() }, response(out.toByteArray()).body)
+        } finally { release.countDown(); workers.shutdownNow() }
+    }
+
     private class Connection(val status: Int, val range: String?, val data: ByteArray) : HttpURLConnection(URL("http://localhost/image.iso")) {
         var closed = false
         var bodyRead = false
