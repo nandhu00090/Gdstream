@@ -27,3 +27,13 @@ export function playbackDuration(file: { archiveFormat?: string; durationSec?: n
   if (Number.isFinite(reported) && reported > 0) return reported;
   return Number.isFinite(cached) && cached > 0 ? cached : 0;
 }
+
+/** Use the authenticated library path to obtain a fresh redirect for EACH ISO range request.
+ * Directory listings (and their disk cache) can contain already expired download.aspx links.
+ * Keep local files and ZIP/RAR link selection unchanged.
+ */
+export function archiveSourceUrl(name: string, baseUrl: string, parentPath: string, fallback: string): string {
+  if (!/\.iso$/i.test(name) || !/^https?:\/\//i.test(baseUrl) ||
+      !/^\/\d+:\//.test(parentPath) || /^(file|content):/i.test(fallback)) return fallback;
+  return `${baseUrl.replace(/\/$/, '')}${parentPath.replace(/\/$/, '')}/${encodeURIComponent(name)}`;
+}

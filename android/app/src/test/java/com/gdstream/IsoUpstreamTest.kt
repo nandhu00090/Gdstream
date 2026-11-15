@@ -86,8 +86,9 @@ class IsoUpstreamTest {
                         entered.countDown()
                         assertTrue(release.await(5, TimeUnit.SECONDS))
                         object : Connection(206, "bytes $from-$to/50000000000", ByteArray(4)) {
-                            override fun getInputStream(): InputStream = object : ByteArrayInputStream(ByteArray(4)) {
-                                override fun close() { active.decrementAndGet(); super.close() }
+                            override fun disconnect() {
+                                if (!closed) active.decrementAndGet()
+                                super.disconnect()
                             }
                         }
                     })
@@ -123,8 +124,9 @@ class IsoUpstreamTest {
             try {
                 val connections = RangeConnections({ mapOf("Cookie" to "session=keep", "X-GD-Shield" to "shield", "User-Agent" to "GDStream-Test") })
                 repeat(2) {
+                    val session = IsoReadSession()
                     val result = IsoRangeReader.readFully("http://127.0.0.1:${server.localPort}/download.aspx?token=original%2F+value#name=Disc.iso", start, start + 3,
-                        open = { from, to -> connections.open("http://127.0.0.1:${server.localPort}/download.aspx?token=original%2F+value#name=Disc.iso", "bytes=$from-$to") })
+                        open = { from, to -> connections.open("http://127.0.0.1:${server.localPort}/download.aspx?token=original%2F+value#name=Disc.iso", "bytes=$from-$to", session = session) }, session = session)
                     assertEquals("DATA", result.toString(Charsets.US_ASCII))
                 }
                 job.get(5, TimeUnit.SECONDS)
@@ -134,7 +136,8 @@ class IsoUpstreamTest {
                 requests.forEach {
                     assertTrue(it.contains("Range: bytes=$start-${start + 3}"))
                     assertTrue(it.contains("User-Agent: GDStream-Test"))
-                    assertTrue(it.contains("Connection: Keep-Alive", true))
+                    assertTrue(it.contains("Connection: close", true))
+                    assertTrue(it.contains("Cache-Control: no-cache", true))
                     assertTrue(it.contains("session=keep"))
                     assertTrue(it.contains("X-GD-Shield: shield"))
                 }
@@ -159,6 +162,133 @@ class IsoUpstreamTest {
             assertEquals("$start-${start + 191},${start + 500}-${start + 691}", file.physicalRanges(error.start, error.count))
             assertTrue(isoFailureDetails(error).contains("HTTP 206"))
             assertTrue(isoFailureDetails(error).contains("java.net.SocketException: ECONNRESET"))
+        } finally { pool.shutdownNow() }
+    }
+
+    @Test fun largePhysicalReadsAreSplitIntoBoundedWindowsAndNeverDrainInputOnClose() {
+        val requested = ArrayList<Pair<Long, Long>>()
+        val connections = ArrayList<Connection>()
+        val length = IsoRangeReader.WINDOW_BYTES * 2 + 17
+        val data = IsoRangeReader.readFully("http://origin/download.aspx?expiry=1&mac=secret", start, start + length - 1,
+            open = { from, to ->
+                requested.add(from to to)
+                object : Connection(206, "bytes $from-$to/50000000000", ByteArray((to - from + 1).toInt()) { 7 }) {
+                    override fun getInputStream(): InputStream = object : ByteArrayInputStream(body) {
+                        override fun close() { fail("InputStream.close would drain the origin response") }
+                    }
+                }.also { connections.add(it) }
+            })
+        assertEquals(length, data.size)
+        assertTrue(data.all { it == 7.toByte() })
+        assertEquals(3, requested.size)
+        assertEquals(start, requested.first().first)
+        assertEquals(start + length - 1, requested.last().second)
+        assertTrue(requested.all { (from, to) -> to - from + 1 <= 2 * 1024 * 1024 })
+        assertTrue(connections.all { it.closed })
+    }
+
+    @Test fun abortedClientSocketsDisconnectBlockedReadsAndImmediatelyReleaseBothPermits() {
+        val pool = Executors.newCachedThreadPool()
+        val entered = CountDownLatch(2)
+        val disconnected = CountDownLatch(2)
+        val sessions = List(2) { IsoReadSession() }
+        val clients = ArrayList<java.net.Socket>()
+        val accepted = ArrayList<java.net.Socket>()
+        val watches = ArrayList<IsoClientWatch>()
+        val connections = ArrayList<Connection>()
+        ServerSocket(0).use { listener ->
+            try {
+                val jobs = sessions.map { session ->
+                    clients.add(java.net.Socket("127.0.0.1", listener.localPort))
+                    val socket = listener.accept().also { accepted.add(it) }
+                    watches.add(IsoClientWatch(socket, session, pool))
+                    val unblock = CountDownLatch(1)
+                    val connection = object : Connection(206, "bytes $start-${start + 3}/50000000000", ByteArray(4)) {
+                        override fun disconnect() {
+                            if (!closed) { super.disconnect(); disconnected.countDown(); unblock.countDown() }
+                        }
+                        override fun getInputStream(): InputStream = object : InputStream() {
+                            override fun read(): Int {
+                                entered.countDown()
+                                // Model Android socket reads that ignore worker interruption.
+                                while (unblock.count > 0) try { unblock.await() } catch (_: InterruptedException) { }
+                                throw SocketException("Socket closed by disconnect")
+                            }
+                            override fun close() { fail("Must disconnect, never drain InputStream") }
+                        }
+                    }.also { connections.add(it) }
+                    pool.submit {
+                        assertThrows(java.io.InterruptedIOException::class.java) {
+                            IsoRangeReader.readFully("http://origin/download.aspx", start, start + 3,
+                                open = { _, _ -> connection }, session = session)
+                        }
+                    }
+                }
+                assertTrue(entered.await(5, TimeUnit.SECONDS))
+                clients.forEach { it.close() } // No Future.cancel: actual client EOF triggers cancellation.
+                assertTrue("Both upstream sockets must disconnect promptly", disconnected.await(1, TimeUnit.SECONDS))
+                jobs.forEach { it.get(1, TimeUnit.SECONDS) }
+                sessions.forEach { it.cancel("duplicate cancellation must not double-release") }
+                val next = pool.submit<ByteArray> {
+                    IsoRangeReader.readFully("http://origin/download.aspx", start, start + 3,
+                        open = { from, to -> Connection(206, "bytes $from-$to/50000000000", byteArrayOf(1, 2, 3, 4)) })
+                }
+                assertArrayEquals(byteArrayOf(1, 2, 3, 4), next.get(1, TimeUnit.SECONDS))
+                assertTrue(connections.all { it.closed })
+                // Also proves cancelled workers did not double-release and raise the two-request limit.
+                parallelProbesNeverExceedTwoUpstreamReads()
+            } finally {
+                sessions.forEach { it.cancel("test cleanup") }
+                watches.forEach { it.close() }
+                clients.forEach { it.close() }; accepted.forEach { it.close() }
+                pool.shutdownNow()
+            }
+        }
+    }
+
+    @Test fun proxyAndUpstreamDiagnosticsReachThePersistentLogAndExport() {
+        val file = java.io.File.createTempFile("gdstream-debug-", ".log.txt").apply { deleteOnExit() }
+        val store = DebugLogStore(file)
+        val bootExported = CountDownLatch(1)
+        val mirrored = CountDownLatch(1)
+        var exported = ""
+        var appended = false
+        DebugLogger.attach(store) { text, append ->
+            exported = if (append) exported + text else text
+            if ("APP_BOOT" in text) bootExported.countDown()
+            if ("ISO_UPSTREAM_ERR" in text) { appended = append; mirrored.countDown() }
+        }
+        DebugLogger.log("APP_BOOT", "before playback")
+        assertTrue(bootExported.await(3, TimeUnit.SECONDS))
+        val pool = Executors.newCachedThreadPool()
+        try {
+            val virtual = IsoVirtualFile(listOf(start to 8L), false)
+            val session = IsoReadSession()
+            virtual.serve("GET", "bytes=1-3", "video/mp2t", ByteArrayOutputStream(), pool, session) { offset, count ->
+                virtual.readRaw(offset, count) { from, to ->
+                    IsoRangeReader.readFully("http://origin/download.aspx?expiry=1&mac=secret", from, to,
+                        open = { a, b -> Connection(206, "bytes $a-$b/50000000000", ByteArray(count)) }, session = session)
+                }
+            }
+            assertThrows(IsoRangeException::class.java) {
+                IsoRangeReader.readFully("http://origin/download.aspx?mac=secret", start, start + 3,
+                    open = { _, _ -> Connection(403, null, ByteArray(0)) })
+            }
+            val text = store.snapshot()
+            for (tag in listOf("ISO_PROXY_REQUEST", "ISO_PROXY_MAP", "ISO_PROXY_STATUS", "ISO_PROXY_PROGRESS",
+                "ISO_UPSTREAM_RANGE", "ISO_UPSTREAM_STATUS", "ISO_UPSTREAM_PROGRESS", "ISO_UPSTREAM_ERR")) {
+                assertTrue("Missing $tag in persisted log", text.contains("[$tag]"))
+            }
+            assertTrue(text.contains("physical=${start + 1}-${start + 3}"))
+            assertTrue(text.contains("HTTP 403"))
+            assertTrue(text.contains("java.io.IOException: Expected HTTP 206, got 403"))
+            assertFalse(text.contains("mac=secret"))
+            assertTrue(mirrored.await(3, TimeUnit.SECONDS))
+            assertTrue(exported.contains("ISO_PROXY_PROGRESS"))
+            assertTrue(exported.contains("APP_BOOT"))
+            assertTrue("Playback must append after the earlier APP_BOOT export", appended)
+            DebugLogStore(file).append("APP_BOOT", "reopened")
+            assertTrue(DebugLogStore(file).snapshot().contains("ISO_UPSTREAM_ERR"))
         } finally { pool.shutdownNow() }
     }
 }

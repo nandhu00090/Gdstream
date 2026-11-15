@@ -299,12 +299,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
         try {
             val playableUri = resolvePlayableUri(url)
             if (playableUri.host == "127.0.0.1" || playableUri.host == "localhost") {
-                DownloadForegroundService.updateService(
-                    reactApplicationContext,
-                    "GDStream Archive Bridge",
-                    "Streaming video to external player...",
-                    0
-                )
+                ArchiveStreamService.start(reactApplicationContext)
             }
             val mimeType = externalVideoMimeType(playableUri.path.orEmpty())
             val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -317,6 +312,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
             reactApplicationContext.startActivity(chooser)
             promise.resolve(true)
         } catch (e: Exception) {
+            DebugLogger.log("ARCHIVE_EXTERNAL_ERR", isoFailureDetails(e))
             try { stopExternalStreamBridge() } catch (cleanup: Exception) { e.addSuppressed(cleanup) }
             promise.reject("E_EXTERNAL_PLAYER", "${e.javaClass.simpleName}: ${e.message ?: "Could not open player"}", e)
         }
@@ -324,9 +320,12 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
 
     @ReactMethod
     fun stopExternalStreamBridge() {
-        if (DownloadEngineModule.activeDownloadCount <= 0) {
-            DownloadForegroundService.stopService(reactApplicationContext)
-        }
+        ArchiveStreamService.setAppForeground(true)
+    }
+
+    @ReactMethod
+    fun setArchiveBridgeAppForeground(foreground: Boolean) {
+        ArchiveStreamService.setAppForeground(foreground)
     }
 
     @ReactMethod

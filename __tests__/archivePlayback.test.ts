@@ -1,4 +1,4 @@
-import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration } from '../archivePlayback';
+import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration, archiveSourceUrl } from '../archivePlayback';
 
 test('selected feature duration overrides disclaimer probes and stale cached runtime', () => {
   const feature = { archiveFormat: 'ISO', durationSec: 9995 };
@@ -37,4 +37,18 @@ describe('ISO archive opening', () => {
     await expect(withArchiveTimeout(Promise.reject(new Error('Bad FSD')))).rejects.toThrow('Bad FSD');
     expect(jest.getTimerCount()).toBe(0);
   });
+});
+
+
+test('ISO reopening replaces cached signed links with a stable library source', () => {
+  const expired = 'https://origin/download.aspx?expiry=1&mac=old%2Bsignature';
+  const source = archiveSourceUrl('Aadhavan (2009).iso', 'https://library/', '/0:/Tamil/', expired);
+  expect(source).toBe('https://library/0:/Tamil/Aadhavan%20(2009).iso');
+  expect(isIsoArchiveUrl(source)).toBe(true);
+  expect(archiveSourceUrl('disc.iso', 'https://library', '/0:/Tamil/', 'file:///disc.iso')).toBe('file:///disc.iso');
+  expect(archiveSourceUrl('disc.iso', 'https://library', '/0:/Tamil/', 'content://disc')).toBe('content://disc');
+  expect(archiveSourceUrl('disc.iso', 'https://library', 'unknown', expired)).toBe(expired);
+  for (const name of ['movie.zip', 'movie.rar', '00006.m2ts']) {
+    expect(archiveSourceUrl(name, 'https://library', '/0:/Tamil/', expired)).toBe(expired);
+  }
 });

@@ -112,8 +112,10 @@ internal class IsoVirtualFile(
         mimeType: String,
         out: OutputStream,
         executor: ExecutorService,
+        session: IsoReadSession = IsoReadSession(),
         read: (Long, Int) -> ByteArray
     ) {
+        session.log("ISO_PROXY_REQUEST", "method=$method requestedRange=${rangeHeader ?: "full"} size=$size")
         fun write(bytes: ByteArray) {
             try { out.write(bytes) } catch (e: IOException) { throw IsoClientDisconnected(e) }
         }
@@ -121,6 +123,7 @@ internal class IsoVirtualFile(
             try { out.flush() } catch (e: IOException) { throw IsoClientDisconnected(e) }
         }
         fun error(status: String, extra: String = "") {
+            session.log("ISO_PROXY_STATUS", "HTTP=$status requestedRange=${rangeHeader ?: "full"}")
             try {
                 write("HTTP/1.1 $status\r\n${extra}Content-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
                 flush()
@@ -137,43 +140,61 @@ internal class IsoVirtualFile(
         var pending: Future<ByteArray>? = null
         try {
             var cursor = range.start
+            fun awaitChunk(future: Future<ByteArray>?): ByteArray? {
+                if (future == null) return null
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(120)
+                while (true) {
+                    session.checkActive()
+                    try { return future.get(250, TimeUnit.MILLISECONDS) } catch (timeout: java.util.concurrent.TimeoutException) {
+                        if (System.nanoTime() >= deadline) throw timeout
+                    }
+                }
+            }
             fun fetchNext(): Future<ByteArray>? {
                 if (cursor > range.end || method == "HEAD") return null
                 val start = cursor
                 // Packet-aligned chunks avoid repeatedly reading a packet at chunk boundaries.
-                val limit = if (cursor == range.start) 188 * 2788 else 188 * 22310
+                val limit = if (cursor == range.start) 188 * 2788 else 188 * 10922
                 val count = minOf(limit.toLong(), range.end - cursor + 1).toInt()
                 cursor += count
                 pendingStart = start
                 pendingCount = count
+                session.log("ISO_PROXY_MAP", "virtual=$start-${start + count - 1} physical=${physicalRanges(start, count)}")
                 return executor.submit<ByteArray> {
+                    session.checkActive()
                     read(start, count).also { if (it.size != count) throw EOFException("Short ISO proxy read") }
                 }
             }
             pending = fetchNext()
-            var chunk = pending?.get(120, TimeUnit.SECONDS)
+            var chunk = awaitChunk(pending)
             val headers = buildString {
                 append(if (range.partial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
                 append("Content-Type: $mimeType\r\nAccept-Ranges: bytes\r\nContent-Length: ${range.length}\r\n")
                 if (range.partial) append("Content-Range: bytes ${range.start}-${range.end}/$size\r\n")
                 append("Connection: close\r\n\r\n")
             }
+            session.log("ISO_PROXY_STATUS", "HTTP=${if (range.partial) 206 else 200} virtual=${range.start}-${range.end} length=${range.length}")
             sentHeaders = true
             write(headers.toByteArray(Charsets.US_ASCII))
+            var delivered = 0L
             while (chunk != null) {
                 pending = fetchNext()
                 write(chunk)
                 flush()
-                chunk = pending?.get(120, TimeUnit.SECONDS)
+                delivered += chunk.size
+                session.log("ISO_PROXY_PROGRESS", "sent=$delivered/${range.length} virtual=${range.start}-${range.end}")
+                chunk = awaitChunk(pending)
             }
             flush()
-        } catch (_: IsoClientDisconnected) {
-            // A probe/seek was abandoned. Only local writes are classified as client disconnects.
+        } catch (error: IsoClientDisconnected) {
+            session.cancel("client write: ${isoFailureDetails(error)}")
             return
         } catch (e: Exception) {
+            if (session.isCancelled) return
             if (!sentHeaders) try { error("502 Bad Gateway") } catch (_: IsoClientDisconnected) { }
             throw IsoProxyReadException(pendingStart, pendingCount, e)
         } finally {
+            session.cancel()
             pending?.cancel(true)
         }
     }
