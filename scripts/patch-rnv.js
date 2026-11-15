@@ -156,10 +156,30 @@ for (const file of targets) {
     }
 
     
+        // Auto-recover if audio decoder fails (e.g., DTS-only Blu-ray disc on device without DTS codec)
+    if (!content.includes('GD_AUDIO_FALLBACK')) {
+      content = content.replace(
+        'eventEmitter.onVideoError.invoke(errorString, e, errorCode);',
+        `// GD_AUDIO_FALLBACK: If audio codec (like DTS-HD) is unsupported on this device, disable audio renderer and continue video!
+        if (e.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED && e.getMessage() != null && e.getMessage().contains("Audio")) {
+            int audioIdx = getTrackRendererIndex(C.TRACK_TYPE_AUDIO);
+            if (audioIdx != C.INDEX_UNSET && trackSelector != null && !trackSelector.getParameters().getRendererDisabled(audioIdx)) {
+                disableTrack(audioIdx);
+                playerNeedsSource = true;
+                updateResumePosition();
+                initializePlayer();
+                setPlayWhenReady(true);
+                return;
+            }
+        }
+        eventEmitter.onVideoError.invoke(errorString, e, errorCode);`
+      );
+    }
+
     // Ensure DefaultTrackSelector always allows multichannel & non-AAC audio tracks to be decoded into PCM
     content = content.replace(
       '.setMaxVideoBitrate(maxBitRate == 0 ? Integer.MAX_VALUE : maxBitRate));',
-      '.setExceedAudioConstraintsIfNecessary(true).setExceedRendererCapabilitiesIfNecessary(true).setExceedVideoConstraintsIfNecessary(true).setMaxVideoBitrate(maxBitRate == 0 ? Integer.MAX_VALUE : maxBitRate));'
+      '.setExceedAudioConstraintsIfNecessary(true).setExceedRendererCapabilitiesIfNecessary(false).setExceedVideoConstraintsIfNecessary(true).setMaxVideoBitrate(maxBitRate == 0 ? Integer.MAX_VALUE : maxBitRate));'
     );
 
     

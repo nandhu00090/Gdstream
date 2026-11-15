@@ -179,8 +179,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val resolver = reactContext.contentResolver
                     val collection = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
                     val relPath = android.os.Environment.DIRECTORY_DOWNLOADS + "/GDStream"
-                    val sel = "${android.provider.MediaStore.MediaColumns.DISPLAY_NAME}=? AND ${android.provider.MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
-                    val selArgs = arrayOf("gdstream_debug.log", "%GDStream%")
+                    val sel = "${android.provider.MediaStore.MediaColumns.DISPLAY_NAME} LIKE ? AND ${android.provider.MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
+                    val selArgs = arrayOf("gdstream_debug.log%", "%GDStream%")
                     var targetUri: android.net.Uri? = null
                     resolver.query(collection, arrayOf(android.provider.BaseColumns._ID), sel, selArgs, null)?.use { c ->
                         if (c.moveToFirst()) {
@@ -931,15 +931,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     rawReqEnd = reqEnd
                 }
 
-                val buf = ByteArray(65536)
-                val pktAccum = ByteArray(192)
-                var pktFill = 0
+                // Build exact list of remote byte slices needed for this request
+                val remoteSlices = ArrayList<Pair<Long, Long>>()
                 var rawCursor = 0L
                 var chunkIndex = 0
-                var detectedPmtPid = -1
-
                 for ((segRawOffset, segRawLen) in segList) {
-                    if (segRawLen <= 0L || tsBytesLeftToEmit <= 0L) continue
+                    if (segRawLen <= 0L) continue
                     val segRawStart = rawCursor
                     val segRawEnd = rawCursor + segRawLen - 1L
                     rawCursor += segRawLen
@@ -952,80 +949,83 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
                     var curRemote = segRawOffset + (overlapStart - segRawStart)
                     val endRemote = segRawOffset + (overlapEnd - segRawStart)
-
-                    while (curRemote <= endRemote && tsBytesLeftToEmit > 0L) {
-                        // Progressive chunk ramp-up: 512KB first for instant player probe, scaling up to 4MB
+                    while (curRemote <= endRemote) {
                         val targetChunk = when (chunkIndex) {
                             0 -> 512L * 1024L
-                            1 -> 1024L * 1024L
-                            2 -> 2L * 1024L * 1024L
+                            1 -> 1536L * 1024L
                             else -> 4L * 1024L * 1024L
                         }
                         chunkIndex++
                         val rawChunkLimit = if (entry.isBdavM2ts) (targetChunk / 192L) * 192L else targetChunk
                         val sliceEnd = minOf(endRemote, curRemote + rawChunkLimit - 1L)
-                        var sliceRemaining = sliceEnd - curRemote + 1L
-
-                        val segConn = openRangeConnection(entry.archiveUrl, "bytes=$curRemote-$sliceEnd")
-                        remoteConnToClean = segConn
-                        val uCode = segConn.responseCode
-                        if (uCode !in 200..299) {
-                            appendDebugLog("PROXY_ISO_ERR", "HTTP $uCode for ${entry.fileName} range=$curRemote-$sliceEnd")
-                            try { segConn.disconnect() } catch (_: Throwable) {}
-                            remoteConnToClean = null
-                            out.flush()
-                            return
-                        }
-                        val segIn = segConn.inputStream
-                        if (uCode == 200 && curRemote > 0L) {
-                            var skipLeft = curRemote
-                            while (skipLeft > 0L) {
-                                val s = segIn.read(buf, 0, minOf(buf.size.toLong(), skipLeft).toInt())
-                                if (s <= 0) break
-                                skipLeft -= s.toLong()
-                            }
-                        }
-                        while (sliceRemaining > 0L && tsBytesLeftToEmit > 0L) {
-                            val toRead = minOf(buf.size.toLong(), sliceRemaining).toInt()
-                            val read = segIn.read(buf, 0, toRead)
-                            if (read <= 0) break
-                            sliceRemaining -= read.toLong()
-
-                            if (!entry.isBdavM2ts) {
-                                val emitNow = minOf(read.toLong(), tsBytesLeftToEmit).toInt()
-                                out.write(buf, 0, emitNow)
-                                tsBytesLeftToEmit -= emitNow.toLong()
-                            } else {
-                                var bPos = 0
-                                while (bPos < read && tsBytesLeftToEmit > 0L) {
-                                    val copyLen = minOf(192 - pktFill, read - bPos)
-                                    System.arraycopy(buf, bPos, pktAccum, pktFill, copyLen)
-                                    pktFill += copyLen
-                                    bPos += copyLen
-                                    if (pktFill == 192) {
-                                        pktFill = 0
-                                        detectedPmtPid = patchBluRayPmtForTs(pktAccum, 4, detectedPmtPid)
-                                        val tsOff = 4 + dropHeadTsBytes
-                                        val availTs = 188 - dropHeadTsBytes
-                                        dropHeadTsBytes = 0
-                                        if (availTs > 0) {
-                                            val emitNow = minOf(availTs.toLong(), tsBytesLeftToEmit).toInt()
-                                            out.write(pktAccum, tsOff, emitNow)
-                                            tsBytesLeftToEmit -= emitNow.toLong()
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        try { segConn.disconnect() } catch (_: Throwable) {}
-                        remoteConnToClean = null
-                        if (sliceRemaining > 0L) {
-                            out.flush()
-                            return
-                        }
+                        remoteSlices.add(Pair(curRemote, sliceEnd))
                         curRemote = sliceEnd + 1L
                     }
                 }
+
+                fun fetchSliceAsync(sStart: Long, sEnd: Long): java.util.concurrent.Future<ByteArray?> {
+                    return ioExecutor.submit<ByteArray?> {
+                        try {
+                            fetchRemoteByteRange(entry.archiveUrl, sStart, sEnd)
+                        } catch (e: Throwable) {
+                            appendDebugLog("PROXY_ISO_ERR", "Range $sStart-$sEnd failed: ${e.message}")
+                            null
+                        }
+                    }
+                }
+
+                val pktAccum = ByteArray(192)
+                var pktFill = 0
+                var detectedPmtPid = -1
+
+                var nextFuture: java.util.concurrent.Future<ByteArray?>? =
+                    if (remoteSlices.isNotEmpty()) fetchSliceAsync(remoteSlices[0].first, remoteSlices[0].second) else null
+
+                for (i in remoteSlices.indices) {
+                    if (tsBytesLeftToEmit <= 0L) break
+                    val currentFuture = nextFuture ?: break
+                    // Start downloading slice i+1 in parallel while slice i is written to the player!
+                    nextFuture = if (i + 1 < remoteSlices.size) {
+                        fetchSliceAsync(remoteSlices[i + 1].first, remoteSlices[i + 1].second)
+                    } else {
+                        null
+                    }
+
+                    val chunkBytes = currentFuture.get()
+                    if (chunkBytes == null || chunkBytes.isEmpty()) {
+                        nextFuture?.cancel(true)
+                        break
+                    }
+
+                    if (!entry.isBdavM2ts) {
+                        val emitNow = minOf(chunkBytes.size.toLong(), tsBytesLeftToEmit).toInt()
+                        out.write(chunkBytes, 0, emitNow)
+                        tsBytesLeftToEmit -= emitNow.toLong()
+                    } else {
+                        var bPos = 0
+                        val read = chunkBytes.size
+                        while (bPos < read && tsBytesLeftToEmit > 0L) {
+                            val copyLen = minOf(192 - pktFill, read - bPos)
+                            System.arraycopy(chunkBytes, bPos, pktAccum, pktFill, copyLen)
+                            pktFill += copyLen
+                            bPos += copyLen
+                            if (pktFill == 192) {
+                                pktFill = 0
+                                detectedPmtPid = patchBluRayPmtForTs(pktAccum, 4, detectedPmtPid)
+                                val tsOff = 4 + dropHeadTsBytes
+                                val availTs = 188 - dropHeadTsBytes
+                                dropHeadTsBytes = 0
+                                if (availTs > 0) {
+                                    val emitNow = minOf(availTs.toLong(), tsBytesLeftToEmit).toInt()
+                                    out.write(pktAccum, tsOff, emitNow)
+                                    tsBytesLeftToEmit -= emitNow.toLong()
+                                }
+                            }
+                        }
+                    }
+                    out.flush()
+                }
+                nextFuture?.cancel(true)
                 out.flush()
                 return
             }
