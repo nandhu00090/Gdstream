@@ -1451,7 +1451,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 )
                 archiveEntryRegistry[id] = entry
             }
-            rawJson.replace(Regex("http://127\\.0\\.0\\.1:\\d+"), "http://127.0.0.1:$activePort")
+            rawJson.replace(Regex("127\\.0\\.0\\.1:\\d+"), "127.0.0.1:$activePort")
         } catch (_: Throwable) { null }
     }
 
