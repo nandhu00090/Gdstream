@@ -934,8 +934,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val buf = ByteArray(65536)
                 val pktAccum = ByteArray(192)
                 var pktFill = 0
-                val maxUpstreamChunk = 4L * 1024L * 1024L
                 var rawCursor = 0L
+                var chunkIndex = 0
+                var detectedPmtPid = -1
 
                 for ((segRawOffset, segRawLen) in segList) {
                     if (segRawLen <= 0L || tsBytesLeftToEmit <= 0L) continue
@@ -953,7 +954,16 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val endRemote = segRawOffset + (overlapEnd - segRawStart)
 
                     while (curRemote <= endRemote && tsBytesLeftToEmit > 0L) {
-                        val sliceEnd = minOf(endRemote, curRemote + maxUpstreamChunk - 1L)
+                        // Progressive chunk ramp-up: 512KB first for instant player probe, scaling up to 4MB
+                        val targetChunk = when (chunkIndex) {
+                            0 -> 512L * 1024L
+                            1 -> 1024L * 1024L
+                            2 -> 2L * 1024L * 1024L
+                            else -> 4L * 1024L * 1024L
+                        }
+                        chunkIndex++
+                        val rawChunkLimit = if (entry.isBdavM2ts) (targetChunk / 192L) * 192L else targetChunk
+                        val sliceEnd = minOf(endRemote, curRemote + rawChunkLimit - 1L)
                         var sliceRemaining = sliceEnd - curRemote + 1L
 
                         val segConn = openRangeConnection(entry.archiveUrl, "bytes=$curRemote-$sliceEnd")
@@ -994,6 +1004,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                                     bPos += copyLen
                                     if (pktFill == 192) {
                                         pktFill = 0
+                                        detectedPmtPid = patchBluRayPmtForTs(pktAccum, 4, detectedPmtPid)
                                         val tsOff = 4 + dropHeadTsBytes
                                         val availTs = 188 - dropHeadTsBytes
                                         dropHeadTsBytes = 0
@@ -3644,6 +3655,84 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             resetAutoHideTimer()
             promise.resolve(true)
         }
+    }
+
+    private fun computeMpeg2Crc32(data: ByteArray, offset: Int, length: Int): Int {
+        var crc = -1
+        for (i in 0 until length) {
+            val b = data[offset + i].toInt() and 0xFF
+            crc = crc xor (b shl 24)
+            for (bit in 0 until 8) {
+                crc = if ((crc and Int.MIN_VALUE) != 0) {
+                    (crc shl 1) xor 0x04C11DB7
+                } else {
+                    crc shl 1
+                }
+            }
+        }
+        return crc
+    }
+
+    // Rewrites Blu-ray DTS-HD MA stream_type (0x86) to standard TS_STREAM_TYPE_DTS_HD (0x8A) in PMT packets
+    // so ExoPlayer never mistakes DTS-HD audio for SCTE-35 splice metadata.
+    private fun patchBluRayPmtForTs(pkt: ByteArray, tsStart: Int, currentPmtPid: Int): Int {
+        if (tsStart + 188 > pkt.size || (pkt[tsStart].toInt() and 0xFF) != 0x47) return currentPmtPid
+        val pusi = (pkt[tsStart + 1].toInt() and 0x40) != 0
+        if (!pusi) return currentPmtPid
+        val pid = ((pkt[tsStart + 1].toInt() and 0x1F) shl 8) or (pkt[tsStart + 2].toInt() and 0xFF)
+        val afc = (pkt[tsStart + 3].toInt() and 0x30) ushr 4
+        if (afc == 0 || afc == 2) return currentPmtPid
+        var payOff = tsStart + 4
+        if (afc == 3) {
+            if (payOff >= tsStart + 188) return currentPmtPid
+            payOff += 1 + (pkt[payOff].toInt() and 0xFF)
+        }
+        if (payOff >= tsStart + 188) return currentPmtPid
+        val ptrField = pkt[payOff].toInt() and 0xFF
+        val secStart = payOff + 1 + ptrField
+        val pktEnd = tsStart + 188
+
+        if (pid == 0 && secStart + 12 <= pktEnd && (pkt[secStart].toInt() and 0xFF) == 0x00) {
+            val secLen = ((pkt[secStart + 1].toInt() and 0x0F) shl 8) or (pkt[secStart + 2].toInt() and 0xFF)
+            var sp = secStart + 8
+            val sEnd = minOf(pktEnd - 4, secStart + 3 + secLen - 4)
+            while (sp + 4 <= sEnd) {
+                val progNum = ((pkt[sp].toInt() and 0xFF) shl 8) or (pkt[sp + 1].toInt() and 0xFF)
+                val pPid = ((pkt[sp + 2].toInt() and 0x1F) shl 8) or (pkt[sp + 3].toInt() and 0xFF)
+                if (progNum != 0 && pPid > 0) return pPid
+                sp += 4
+            }
+        } else if ((pid == currentPmtPid || (currentPmtPid < 0 && pid == 0x0100)) &&
+            secStart + 16 <= pktEnd &&
+            (pkt[secStart].toInt() and 0xFF) == 0x02
+        ) {
+            val secLen = ((pkt[secStart + 1].toInt() and 0x0F) shl 8) or (pkt[secStart + 2].toInt() and 0xFF)
+            val secTotalEnd = secStart + 3 + secLen
+            if (secLen >= 13 && secTotalEnd <= pktEnd) {
+                val progInfoLen = ((pkt[secStart + 10].toInt() and 0x0F) shl 8) or (pkt[secStart + 11].toInt() and 0xFF)
+                var ep = secStart + 12 + progInfoLen
+                val crcPos = secTotalEnd - 4
+                var modified = false
+                while (ep + 5 <= crcPos) {
+                    val st = pkt[ep].toInt() and 0xFF
+                    if (st == 0x86) {
+                        pkt[ep] = 0x8A.toByte()
+                        modified = true
+                    }
+                    val esInfoLen = ((pkt[ep + 3].toInt() and 0x0F) shl 8) or (pkt[ep + 4].toInt() and 0xFF)
+                    ep += 5 + esInfoLen
+                }
+                if (modified) {
+                    val newCrc = computeMpeg2Crc32(pkt, secStart, crcPos - secStart)
+                    pkt[crcPos] = ((newCrc ushr 24) and 0xFF).toByte()
+                    pkt[crcPos + 1] = ((newCrc ushr 16) and 0xFF).toByte()
+                    pkt[crcPos + 2] = ((newCrc ushr 8) and 0xFF).toByte()
+                    pkt[crcPos + 3] = (newCrc and 0xFF).toByte()
+                }
+            }
+            return pid
+        }
+        return currentPmtPid
     }
 
     // =========================================================================
