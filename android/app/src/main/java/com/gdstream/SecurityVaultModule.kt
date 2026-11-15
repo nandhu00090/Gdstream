@@ -621,7 +621,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     hostnameVerifier = HttpsURLConnection.getDefaultHostnameVerifier()
                 }
             }
-            val code = conn.responseCode
+            val code = try { conn.responseCode } catch (e: java.io.IOException) {
+                conn.disconnect()
+                throw e
+            }
             val setCookies = conn.headerFields["Set-Cookie"] ?: conn.headerFields["set-cookie"]
             if (!setCookies.isNullOrEmpty()) {
                 val cookieParts = setCookies.mapNotNull { it.substringBefore(";").trim().takeIf { s -> s.isNotEmpty() } }
@@ -717,6 +720,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             conn.disconnect()
         }
     }
+
+    private fun fetchIsoByteRange(isoUrl: String, start: Long, endInclusive: Long): ByteArray =
+        IsoRangeReader.read(openRangeConnection(isoUrl.substringBefore('#'), "bytes=$start-$endInclusive"), start, endInclusive)
 
     private fun detectRemoteFileSize(archiveUrl: String): Long {
         val conn = openRangeConnection(archiveUrl, "bytes=0-1")
@@ -823,7 +829,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
             }
 
-            val segments = path.split("/").filter { it.isNotEmpty() }
+            val segments = path.substringBefore('?').split("/").filter { it.isNotEmpty() }
             if (segments.size >= 2 && segments[0] == "yt") {
                 handleYoutubeProxyClient(socket, segments[1], method, rangeHeader)
                 return
@@ -855,213 +861,41 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 else -> "video/x-matroska"
             }
 
-            var reqStart = 0L
-            var reqEnd = totalSize - 1L
-            var isPartial = false
-
-            if (!rangeHeader.isNullOrEmpty() && rangeHeader.startsWith("bytes=")) {
-                isPartial = true
-                val spec = rangeHeader.removePrefix("bytes=").substringBefore(",").trim()
-                val dashIdx = spec.indexOf('-')
-                if (dashIdx >= 0) {
-                    val sPart = spec.substring(0, dashIdx).trim()
-                    val ePart = spec.substring(dashIdx + 1).trim()
-                    if (sPart.isNotEmpty()) {
-                        reqStart = sPart.toLongOrNull() ?: 0L
-                        if (ePart.isNotEmpty()) {
-                            reqEnd = ePart.toLongOrNull() ?: (totalSize - 1L)
-                        }
-                    } else if (ePart.isNotEmpty()) {
-                        val suffixLen = ePart.toLongOrNull() ?: 0L
-                        reqStart = (totalSize - suffixLen).coerceAtLeast(0L)
-                    }
-                }
-            }
-
-            reqStart = reqStart.coerceIn(0L, (totalSize - 1L).coerceAtLeast(0L))
-            reqEnd = reqEnd.coerceIn(reqStart, (totalSize - 1L).coerceAtLeast(0L))
-            val contentLength = reqEnd - reqStart + 1L
-
             val out = BufferedOutputStream(socket.getOutputStream(), 65536)
-
-            if (method == "HEAD") {
-                val headers = buildString {
-                    append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
-                    append("Content-Type: $mimeType\r\n")
-                    append("Accept-Ranges: bytes\r\n")
-                    append("Content-Length: $contentLength\r\n")
-                    if (isPartial) {
-                        append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
-                    }
-                    append("Connection: close\r\n\r\n")
+            if (entry.archiveFormat == "ISO") {
+                val file = IsoVirtualFile(entry.segments ?: throw java.io.IOException("Missing ISO extent map"), entry.isBdavM2ts)
+                if (file.rawSize != entry.compressedSize || file.size != totalSize) {
+                    throw java.io.IOException("Inconsistent ISO stream length")
                 }
-                out.write(headers.toByteArray(StandardCharsets.US_ASCII))
-                out.flush()
+                file.serve(method, rangeHeader, mimeType, out, ioExecutor) { start, length ->
+                    // Cache by VIRTUAL position: physical extents can be fragmented or repeated in a playlist.
+                    val cachedHead = isoHeadProbeCache[entry.id]
+                    if (cachedHead != null && start <= cachedHead.size.toLong() - length) {
+                        cachedHead.copyOfRange(start.toInt(), start.toInt() + length)
+                    } else {
+                        val data = file.read(start, length,
+                            { remoteStart, remoteEnd -> fetchIsoByteRange(entry.archiveUrl, remoteStart, remoteEnd) },
+                            { packet, tsStart -> patchBluRayPmtForTs(packet, tsStart, -1) })
+                        if (start == 0L && length <= 524288) isoHeadProbeCache[entry.id] = data
+                        data
+                    }
+                }
                 return
             }
 
-            if (entry.archiveFormat == "ISO") {
-                val segList = if (!entry.segments.isNullOrEmpty()) {
-                    entry.segments
-                } else {
-                    listOf(Pair(resolveEntryDataStartOffset(entry), entry.compressedSize))
-                }
-                val headers = buildString {
-                    append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
-                    append("Content-Type: $mimeType\r\n")
-                    append("Accept-Ranges: bytes\r\n")
-                    append("Content-Length: $contentLength\r\n")
-                    if (isPartial) {
-                        append("Content-Range: bytes $reqStart-$reqEnd/$totalSize\r\n")
-                    }
-                    append("Connection: close\r\n\r\n")
-                }
-                out.write(headers.toByteArray(StandardCharsets.US_ASCII))
+            val range = try {
+                HttpByteRange.parse(if (method == "HEAD") null else rangeHeader, totalSize)
+            } catch (_: java.io.IOException) {
+                out.write("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$totalSize\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
                 out.flush()
-
-                if (reqStart == 0L) {
-                    appendDebugLog("PROXY_ISO_PLAY", "Streaming ${entry.fileName} bdav=${entry.isBdavM2ts} range=$reqStart-$reqEnd/$totalSize")
-                }
-
-                val rawReqStart: Long
-                val rawReqEnd: Long
-                var dropHeadTsBytes = 0
-                var tsBytesLeftToEmit = contentLength
-
-                if (entry.isBdavM2ts) {
-                    val firstPkt = reqStart / 188L
-                    val lastPkt = reqEnd / 188L
-                    dropHeadTsBytes = (reqStart % 188L).toInt()
-                    rawReqStart = firstPkt * 192L
-                    rawReqEnd = (lastPkt + 1L) * 192L - 1L
-                } else {
-                    rawReqStart = reqStart
-                    rawReqEnd = reqEnd
-                }
-
-                // Build exact list of remote byte slices needed for this request
-                val remoteSlices = ArrayList<Pair<Long, Long>>()
-                var rawCursor = 0L
-                var chunkIndex = 0
-                for ((segRawOffset, segRawLen) in segList) {
-                    if (segRawLen <= 0L) continue
-                    val segRawStart = rawCursor
-                    val segRawEnd = rawCursor + segRawLen - 1L
-                    rawCursor += segRawLen
-                    if (segRawEnd < rawReqStart) continue
-                    if (segRawStart > rawReqEnd) break
-
-                    val overlapStart = maxOf(rawReqStart, segRawStart)
-                    val overlapEnd = minOf(rawReqEnd, segRawEnd)
-                    if (overlapStart > overlapEnd) continue
-
-                    var curRemote = segRawOffset + (overlapStart - segRawStart)
-                    val endRemote = segRawOffset + (overlapEnd - segRawStart)
-                    while (curRemote <= endRemote) {
-                        val targetChunk = when (chunkIndex) {
-                            0 -> 512L * 1024L
-                            1 -> 1536L * 1024L
-                            else -> 4L * 1024L * 1024L
-                        }
-                        chunkIndex++
-                        val rawChunkLimit = if (entry.isBdavM2ts) (targetChunk / 192L) * 192L else targetChunk
-                        val sliceEnd = minOf(endRemote, curRemote + rawChunkLimit - 1L)
-                        remoteSlices.add(Pair(curRemote, sliceEnd))
-                        curRemote = sliceEnd + 1L
-                    }
-                }
-
-                val headCacheLimit = 4L * 1024L * 1024L
-                val firstSegRawStart = segList.firstOrNull()?.first ?: 0L
-
-                fun fetchSliceAsync(sStart: Long, sEnd: Long): java.util.concurrent.Future<ByteArray?> {
-                    return ioExecutor.submit<ByteArray?> {
-                        // Serve opening 4MB probe slices from RAM so 12 parallel player probe connections never flood Worker/DNS
-                        val relFromDiscStart = sStart - firstSegRawStart
-                        val relEndFromDiscStart = sEnd - firstSegRawStart
-                        if (relFromDiscStart >= 0L && relEndFromDiscStart < headCacheLimit) {
-                            val cachedHead = isoHeadProbeCache[entry.id]
-                            if (cachedHead != null && relEndFromDiscStart.toInt() < cachedHead.size) {
-                                return@submit cachedHead.copyOfRange(relFromDiscStart.toInt(), relEndFromDiscStart.toInt() + 1)
-                            }
-                        }
-
-                        var attempt = 0
-                        while (attempt < 6) {
-                            try {
-                                val data = fetchRemoteByteRange(entry.archiveUrl, sStart, sEnd)
-                                if (data.isNotEmpty()) {
-                                    // Populate 4MB head cache on first successful read of opening segment
-                                    if (sStart == firstSegRawStart && isoHeadProbeCache[entry.id] == null && data.size >= 512 * 1024) {
-                                        isoHeadProbeCache[entry.id] = data
-                                    }
-                                    return@submit data
-                                }
-                            } catch (e: Throwable) {
-                                attempt++
-                                if (attempt >= 6) {
-                                    appendDebugLog("PROXY_ISO_ERR", "Range $sStart-$sEnd failed after 6 tries: ${e.message}")
-                                    return@submit null
-                                }
-                                try { Thread.sleep(250L * attempt) } catch (_: InterruptedException) { return@submit null }
-                            }
-                        }
-                        null
-                    }
-                }
-
-                val pktAccum = ByteArray(192)
-                var pktFill = 0
-                var detectedPmtPid = -1
-
-                var nextFuture: java.util.concurrent.Future<ByteArray?>? =
-                    if (remoteSlices.isNotEmpty()) fetchSliceAsync(remoteSlices[0].first, remoteSlices[0].second) else null
-
-                for (i in remoteSlices.indices) {
-                    if (tsBytesLeftToEmit <= 0L) break
-                    val currentFuture = nextFuture ?: break
-                    // Start downloading slice i+1 in parallel while slice i is written to the player!
-                    nextFuture = if (i + 1 < remoteSlices.size) {
-                        fetchSliceAsync(remoteSlices[i + 1].first, remoteSlices[i + 1].second)
-                    } else {
-                        null
-                    }
-
-                    val chunkBytes = currentFuture.get()
-                    if (chunkBytes == null || chunkBytes.isEmpty()) {
-                        nextFuture?.cancel(true)
-                        break
-                    }
-
-                    if (!entry.isBdavM2ts) {
-                        val emitNow = minOf(chunkBytes.size.toLong(), tsBytesLeftToEmit).toInt()
-                        out.write(chunkBytes, 0, emitNow)
-                        tsBytesLeftToEmit -= emitNow.toLong()
-                    } else {
-                        var bPos = 0
-                        val read = chunkBytes.size
-                        while (bPos < read && tsBytesLeftToEmit > 0L) {
-                            val copyLen = minOf(192 - pktFill, read - bPos)
-                            System.arraycopy(chunkBytes, bPos, pktAccum, pktFill, copyLen)
-                            pktFill += copyLen
-                            bPos += copyLen
-                            if (pktFill == 192) {
-                                pktFill = 0
-                                detectedPmtPid = patchBluRayPmtForTs(pktAccum, 4, detectedPmtPid)
-                                val tsOff = 4 + dropHeadTsBytes
-                                val availTs = 188 - dropHeadTsBytes
-                                dropHeadTsBytes = 0
-                                if (availTs > 0) {
-                                    val emitNow = minOf(availTs.toLong(), tsBytesLeftToEmit).toInt()
-                                    out.write(pktAccum, tsOff, emitNow)
-                                    tsBytesLeftToEmit -= emitNow.toLong()
-                                }
-                            }
-                        }
-                    }
-                    out.flush()
-                }
-                nextFuture?.cancel(true)
+                return
+            }
+            val reqStart = range.start
+            val reqEnd = range.end
+            val contentLength = range.length
+            val isPartial = range.partial
+            if (method == "HEAD") {
+                out.write("HTTP/1.1 200 OK\r\nContent-Type: $mimeType\r\nAccept-Ranges: bytes\r\nContent-Length: $totalSize\r\nConnection: close\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
                 out.flush()
                 return
             }
@@ -1194,7 +1028,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 outStream.write("HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\n\r\n".toByteArray())
                 outStream.flush()
             }
-        } catch (_: Throwable) {
+        } catch (e: Exception) {
+            appendDebugLog("ARCHIVE_PROXY_ERR", e.message ?: e.javaClass.simpleName)
         } finally {
             // Close local client socket FIRST so MediaInfo & ExoPlayer never wait on upstream teardown!
             try { socket.close() } catch (_: Throwable) {}
@@ -1436,6 +1271,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val root = JSONObject(cachedBlob)
             val rawJson = root.optString("rawJson", "")
             val targetsArr = root.optJSONArray("targets") ?: return null
+            val hasIso = (0 until targetsArr.length()).any {
+                targetsArr.optJSONObject(it)?.optString("archiveFormat") == "ISO"
+            }
+            if (hasIso && root.optInt("isoIndexVersion", 0) != 3) return null
             var hasUnstrippedM2ts = false
             for (ci in 0 until targetsArr.length()) {
                 val co = targetsArr.optJSONObject(ci) ?: continue
@@ -1457,6 +1296,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             }
             val activePort = ensureArchiveProxyRunning()
 
+            val restoredTargets = HashMap<String, ArchiveEntryTarget>()
             for (i in 0 until targetsArr.length()) {
                 val o = targetsArr.optJSONObject(i) ?: continue
                 val id = o.optString("id", "")
@@ -1485,9 +1325,22 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     segments = restoredSegs,
                     isBdavM2ts = o.optBoolean("isBdavM2ts", false)
                 )
-                archiveEntryRegistry[id] = entry
+                if (entry.archiveFormat == "ISO") {
+                    val file = IsoVirtualFile(restoredSegs ?: return null, entry.isBdavM2ts)
+                    if (file.rawSize != entry.compressedSize || file.size != entry.uncompressedSize) return null
+                }
+                restoredTargets[id] = entry
             }
-            rawJson.replace(Regex("127\\.0\\.0\\.1:\\d+"), "127.0.0.1:$activePort")
+            val items = JSONArray(rawJson)
+            for (i in 0 until items.length()) {
+                val item = items.getJSONObject(i)
+                val target = restoredTargets[item.getString("id")] ?: return null
+                val safeName = URLEncoder.encode(target.fileName, "UTF-8").replace("+", "%20")
+                item.put("link", "http://127.0.0.1:$activePort/zip/${target.id}/$safeName")
+                if (target.archiveFormat == "ISO") item.put("archiveFormat", "ISO")
+            }
+            archiveEntryRegistry.putAll(restoredTargets)
+            items.toString()
         } catch (_: Throwable) { null }
     }
 
@@ -1525,6 +1378,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val root = JSONObject().apply {
                     put("rawJson", rawJson)
                     put("targets", targetsArr)
+                    put("isoIndexVersion", 3)
                 }
                 zipDiskCache[cacheKey] = root.toString()
                 saveZipDiskCacheAsync()
@@ -1667,12 +1521,19 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
                 // 1B. Blu-ray / DVD / Data .ISO (UDF 2.50 + ISO-9660 + MPLS + VOB)
                 val lowerUrlPath = zipUrl.substringBefore("#").substringBefore("?").lowercase(Locale.ROOT)
-                var looksLikeIso = lowerUrlPath.endsWith(".iso")
+                val hintedName = try {
+                    java.net.URLDecoder.decode(zipUrl.substringAfter("#name=", ""), "UTF-8")
+                } catch (_: IllegalArgumentException) { "" }
+                var looksLikeIso = lowerUrlPath.endsWith(".iso") || hintedName.endsWith(".iso", true)
                 var volDescProbe: ByteArray? = null
                 var isoDiagReason = ""
                 if (totalArchiveSize >= 36864L) {
                     try {
-                        val pvdProbe = fetchRemoteByteRange(zipUrl, 32768L, minOf(totalArchiveSize - 1L, 65535L))
+                        val pvdProbe = if (looksLikeIso) {
+                            fetchIsoByteRange(zipUrl, 32768L, minOf(totalArchiveSize - 1L, 65535L))
+                        } else {
+                            fetchRemoteByteRange(zipUrl, 32768L, minOf(totalArchiveSize - 1L, 65535L))
+                        }
                         volDescProbe = pvdProbe
                         var off = 0
                         while (off + 6 <= pvdProbe.size) {
@@ -1698,6 +1559,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     if (isoOutcome.second.isNotEmpty()) {
                         isoDiagReason = isoOutcome.second
                     }
+                    // Do not fall through to a ZIP tail probe on a known ISO. A server ignoring
+                    // Range would otherwise make the legacy ZIP reader discard the whole BD50.
+                    promise.reject("E_ISO", "ISO Disc Error: " + isoDiagReason.ifEmpty { "No playable video streams found" })
+                    return@run
                 }
 
                 // 2. Standard ZIP / ZIP64 Central Directory Tail Reader
@@ -3738,13 +3603,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 if (progNum != 0 && pPid > 0) return pPid
                 sp += 4
             }
-        } else if ((pid == currentPmtPid || (currentPmtPid < 0 && pid == 0x0100)) &&
-            secStart + 16 <= pktEnd &&
-            (pkt[secStart].toInt() and 0xFF) == 0x02
+        } else if (pid != 0 && secStart + 16 <= pktEnd &&
+            (pkt[secStart].toInt() and 0xFF) == 0x02 &&
+            (pkt[secStart + 1].toInt() and 0xF0) == 0xB0
         ) {
             val secLen = ((pkt[secStart + 1].toInt() and 0x0F) shl 8) or (pkt[secStart + 2].toInt() and 0xFF)
             val secTotalEnd = secStart + 3 + secLen
-            if (secLen >= 13 && secTotalEnd <= pktEnd) {
+            if (secLen >= 13 && secTotalEnd <= pktEnd && computeMpeg2Crc32(pkt, secStart, 3 + secLen) == 0) {
                 val progInfoLen = ((pkt[secStart + 10].toInt() and 0x0F) shl 8) or (pkt[secStart + 11].toInt() and 0xFF)
                 var ep = secStart + 12 + progInfoLen
                 val crcPos = secTotalEnd - 4
@@ -3793,19 +3658,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             ((b[off + 1].toLong() and 0xFFL) shl 16) or
             ((b[off + 2].toLong() and 0xFFL) shl 8) or
             (b[off + 3].toLong() and 0xFFL)
-    }
-
-    private fun decodeUdfDString(b: ByteArray, off: Int, len: Int): String {
-        if (len <= 1 || off + len > b.size) return ""
-        val compId = b[off].toInt() and 0xFF
-        return try {
-            when (compId) {
-                16 -> String(b, off + 1, len - 1, StandardCharsets.UTF_16BE).trimEnd('\u0000')
-                else -> String(b, off + 1, len - 1, StandardCharsets.UTF_8).trimEnd('\u0000')
-            }
-        } catch (_: Throwable) {
-            ""
-        }
     }
 
     private fun cleanIsoDisplayTitle(isoUrl: String): String {
@@ -4086,11 +3938,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val entryId = "ze_" + System.nanoTime() + "_" + archiveEntryCounter.getAndIncrement()
         val firstOffset = segments.firstOrNull()?.first ?: 0L
         val isBdav = displayName.endsWith(".m2ts", ignoreCase = true) && totalBytes >= 192L
-        val exposedBytes = if (isBdav) {
-            segments.sumOf { (it.second / 192L) * 188L }
-        } else {
-            totalBytes
-        }
+        val virtualFile = IsoVirtualFile(segments, isBdav)
+        require(virtualFile.rawSize == totalBytes && virtualFile.size > 0) { "Incomplete ISO stream extent map" }
+        val exposedBytes = virtualFile.size
         val target = ArchiveEntryTarget(
             id = entryId,
             archiveUrl = isoUrl,
@@ -4115,391 +3965,20 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             put("link", streamUrl)
             put("isZipEntry", true)
             put("zipCompression", "STORE")
+            put("archiveFormat", "ISO")
         }
     }
 
-    private fun readIsoFileBytes(isoUrl: String, entry: IsoFileEntry, maxBytes: Int): ByteArray {
-        val toFetch = minOf(entry.size, maxBytes.toLong()).toInt()
-        if (toFetch <= 0 || entry.extents.isEmpty()) return ByteArray(0)
-        val out = ByteArrayOutputStream(toFetch)
-        var rem = toFetch
-        for ((extOff, extLen) in entry.extents) {
-            if (rem <= 0) break
-            val chunk = minOf(extLen, rem.toLong()).toInt()
-            val bytes = fetchRemoteByteRange(isoUrl, extOff, extOff + chunk - 1L)
-            out.write(bytes)
-            rem -= bytes.size
+    private fun readIsoFileBytes(isoUrl: String, entry: IsoFileEntry, maxBytes: Int): ByteArray =
+        IsoVirtualFile(entry.extents, false).readRaw(0, minOf(entry.size, maxBytes.toLong()).toInt()) { start, end ->
+            fetchIsoByteRange(isoUrl, start, end)
         }
-        return out.toByteArray()
-    }
 
-    private fun resolveUdfBlockByte(
-        blockNum: Long,
-        partRef: Int,
-        blockSize: Long,
-        defaultPhysBase: Long,
-        metaExtents: List<Pair<Long, Long>>,
-        metaPartRef: Int,
-        partRefToPhysBase: Map<Int, Long>
-    ): Long {
-        if (partRef == metaPartRef && metaExtents.isNotEmpty()) {
-            var byteInMeta = blockNum * blockSize
-            for ((extStart, extLen) in metaExtents) {
-                if (byteInMeta < extLen) return extStart + byteInMeta
-                byteInMeta -= extLen
+    private fun parseUdfTree(isoUrl: String, totalIsoSize: Long): List<IsoFileEntry> =
+        UdfReader(totalIsoSize, { start, end -> fetchIsoByteRange(isoUrl, start, end) }, ioExecutor)
+            .readTree().map { file ->
+                IsoFileEntry(file.path, file.path.substringAfterLast('/'), false, file.size, file.extents)
             }
-            return metaExtents[0].first + blockNum * blockSize
-        }
-        val pBase = partRefToPhysBase[partRef] ?: defaultPhysBase
-        return pBase + blockNum * blockSize
-    }
-
-    private fun shouldRecurseUdfDir(fullPathUpper: String, depth: Int): Boolean {
-        if (depth == 0) {
-            return fullPathUpper == "BDMV" || fullPathUpper == "VIDEO_TS"
-        }
-        if (depth == 1) {
-            return fullPathUpper == "BDMV/PLAYLIST" || fullPathUpper == "BDMV/STREAM"
-        }
-        return false
-    }
-
-    private fun isRelevantUdfMediaFile(nameUpper: String): Boolean {
-        return nameUpper.endsWith(".MPLS") ||
-            nameUpper.endsWith(".M2TS") ||
-            nameUpper.endsWith(".VOB") ||
-            nameUpper.endsWith(".MKV") ||
-            nameUpper.endsWith(".MP4") ||
-            nameUpper.endsWith(".AVI") ||
-            nameUpper.endsWith(".MOV") ||
-            nameUpper.endsWith(".M4V") ||
-            nameUpper.endsWith(".TS")
-    }
-
-    private fun walkUdfDir(
-        isoUrl: String,
-        blockSize: Long,
-        defaultPhysBase: Long,
-        metaExtents: List<Pair<Long, Long>>,
-        metaPartRef: Int,
-        partRefToPhysBase: Map<Int, Long>,
-        icbBlock: Long,
-        icbPartRef: Int,
-        parentPath: String,
-        depth: Int,
-        results: MutableList<IsoFileEntry>,
-        diagNotes: MutableList<String>
-    ) {
-        if (depth > 3) return
-        val feByteOff = resolveUdfBlockByte(icbBlock, icbPartRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
-        val feBuf = fetchRemoteByteRange(isoUrl, feByteOff, feByteOff + blockSize - 1L)
-        val feTag = if (feBuf.size >= 2) readUInt16LE(feBuf, 0) else -1
-        val dirExts = parseUdfFileEntryExtents(feBuf, 0, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, feByteOff, icbPartRef)
-        if (depth == 0) {
-            diagNotes.add("rootFeOff=$feByteOff,tag=$feTag,exts=${dirExts.size}")
-        }
-        if (dirExts.isEmpty()) return
-
-        val dirStream = ByteArrayOutputStream()
-        var fetched = 0
-        for ((dOff, dLen) in dirExts) {
-            if (fetched >= 524288) break
-            val take = minOf(dLen, (524288 - fetched).toLong()).toInt()
-            if (take <= 0) break
-            val chunk = if (dOff >= feByteOff && dOff + take <= feByteOff + feBuf.size) {
-                feBuf.copyOfRange((dOff - feByteOff).toInt(), (dOff - feByteOff).toInt() + take)
-            } else {
-                fetchRemoteByteRange(isoUrl, dOff, dOff + take - 1L)
-            }
-            dirStream.write(chunk)
-            fetched += chunk.size
-        }
-        val dirBuf = dirStream.toByteArray()
-        val bsInt = blockSize.toInt().coerceAtLeast(512)
-
-        data class PendingChildFile(val fullPath: String, val name: String, val block: Long, val partRef: Int)
-        val pendingFiles = ArrayList<PendingChildFile>()
-
-        var p = 0
-        while (p + 38 <= dirBuf.size) {
-            val tid = readUInt16LE(dirBuf, p)
-            if (tid == 0) {
-                val nextBlock = ((p / bsInt) + 1) * bsInt
-                if (nextBlock >= dirBuf.size) break
-                p = nextBlock
-                continue
-            }
-            if (tid != 257) {
-                if (depth == 0) diagNotes.add("rootBadTid=$tid@p=$p")
-                break
-            }
-            val chars = dirBuf[p + 18].toInt() and 0xFF
-            val lFi = dirBuf[p + 19].toInt() and 0xFF
-            val childBlock = readUInt32LE(dirBuf, p + 24)
-            val childPartRef = readUInt16LE(dirBuf, p + 28)
-            val lIu = readUInt16LE(dirBuf, p + 36)
-            val fiStart = p + 38 + lIu
-            val nextP = p + ((38 + lIu + lFi + 3) and 3.inv())
-            if (fiStart + lFi > dirBuf.size) break
-            p = nextP
-
-            val isDeleted = (chars and 0x04) != 0
-            val isParent = (chars and 0x08) != 0
-            if (isDeleted || isParent || lFi <= 1) continue
-
-            val name = decodeUdfDString(dirBuf, fiStart, lFi)
-            if (name.isEmpty() || name == "." || name == "..") continue
-            val isChildDir = (chars and 0x02) != 0
-            val fullPath = if (parentPath.isEmpty()) name else "$parentPath/$name"
-            val upperFull = fullPath.uppercase(Locale.ROOT)
-            val upperName = name.uppercase(Locale.ROOT)
-
-            if (depth == 0) diagNotes.add("rootChild=$name(dir=$isChildDir)")
-
-            if (isChildDir) {
-                if (shouldRecurseUdfDir(upperFull, depth)) {
-                    walkUdfDir(isoUrl, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, childBlock, childPartRef, fullPath, depth + 1, results, diagNotes)
-                }
-            } else if (isRelevantUdfMediaFile(upperName)) {
-                pendingFiles.add(PendingChildFile(fullPath, name, childBlock, childPartRef))
-            }
-        }
-
-        // Fetch all relevant child File Entries in parallel batches of 8 for sub-second speed!
-        if (pendingFiles.isNotEmpty()) {
-            val batchSize = 8
-            var idx = 0
-            while (idx < pendingFiles.size) {
-                val endIdx = minOf(pendingFiles.size, idx + batchSize)
-                val slice = pendingFiles.subList(idx, endIdx)
-                val futures = slice.map { pf ->
-                    ioExecutor.submit<IsoFileEntry?> {
-                        try {
-                            val childFeOff = resolveUdfBlockByte(pf.block, pf.partRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
-                            val childFeBuf = fetchRemoteByteRange(isoUrl, childFeOff, childFeOff + blockSize - 1L)
-                            val infoLen = if (childFeBuf.size >= 64) readInt64LE(childFeBuf, 56) else 0L
-                            val fileExts = parseUdfFileEntryExtents(childFeBuf, 0, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, childFeOff, pf.partRef)
-                            if (infoLen > 0L && fileExts.isNotEmpty()) {
-                                IsoFileEntry(pf.fullPath, pf.name, false, infoLen, fileExts)
-                            } else null
-                        } catch (_: Throwable) {
-                            null
-                        }
-                    }
-                }
-                for (f in futures) {
-                    val item = try { f.get() } catch (_: Throwable) { null }
-                    if (item != null) results.add(item)
-                }
-                idx = endIdx
-            }
-        }
-    }
-
-    private fun parseUdfTree(isoUrl: String, totalIsoSize: Long): List<IsoFileEntry> {
-        if (totalIsoSize < 600L * 1024L) throw IllegalStateException("ISO too small: $totalIsoSize")
-        val totalSectors = totalIsoSize / 2048L
-        val candidateAvdpSectors = listOf(256L, totalSectors - 256L, totalSectors - 1L, 512L).filter { it > 0L && it < totalSectors }
-        var avdp = ByteArray(0)
-        var foundAvdpSec = -1L
-        for (sec in candidateAvdpSectors) {
-            val probe = fetchRemoteByteRange(isoUrl, sec * 2048L, sec * 2048L + 511L)
-            if (probe.size >= 32 && readUInt16LE(probe, 0) == 2) {
-                avdp = probe
-                foundAvdpSec = sec
-                break
-            }
-        }
-        if (avdp.size < 32 || readUInt16LE(avdp, 0) != 2) {
-            throw IllegalStateException("No UDF AVDP found (size=$totalIsoSize)")
-        }
-
-        val mvdsLen = readUInt32LE(avdp, 16).coerceIn(2048L, 65536L).toInt()
-        val mvdsLoc = readUInt32LE(avdp, 20)
-        val rvdsLen = readUInt32LE(avdp, 24).coerceIn(2048L, 65536L).toInt()
-        val rvdsLoc = readUInt32LE(avdp, 28)
-
-        var blockSize = 2048L
-        val physPartitions = HashMap<Int, Long>()
-        val partRefToPhysBase = HashMap<Int, Long>()
-        var fsdLen = 0L
-        var fsdBlock = 0L
-        var fsdPartRef = 0
-        var metaPhysPartNum = -1
-        var metaFileBlock = -1L
-        var metaMirrorBlock = -1L
-        var metaPartRef = -1
-
-        for ((vdsLoc, vdsLen) in listOf(Pair(mvdsLoc, mvdsLen), Pair(rvdsLoc, rvdsLen))) {
-            if (vdsLoc <= 0L || vdsLoc >= totalSectors) continue
-            val vdsStart = vdsLoc * 2048L
-            val vdsBuf = fetchRemoteByteRange(isoUrl, vdsStart, minOf(totalIsoSize - 1L, vdsStart + vdsLen - 1L))
-            var off = 0
-            while (off + 512 <= vdsBuf.size) {
-                val tagId = readUInt16LE(vdsBuf, off)
-                if (tagId == 8) break
-                if (tagId == 0) { off += 2048; continue }
-                if (tagId == 5) {
-                    val partNum = readUInt16LE(vdsBuf, off + 22)
-                    val partStartSec = readUInt32LE(vdsBuf, off + 188)
-                    physPartitions[partNum] = partStartSec * 2048L
-                } else if (tagId == 6) {
-                    val bs = readUInt32LE(vdsBuf, off + 212)
-                    if (bs >= 512L) blockSize = bs
-                    fsdLen = readUInt32LE(vdsBuf, off + 248)
-                    fsdBlock = readUInt32LE(vdsBuf, off + 252)
-                    fsdPartRef = readUInt16LE(vdsBuf, off + 256)
-
-                    val numPartMaps = readUInt32LE(vdsBuf, off + 268).toInt()
-                    var mp = off + 440
-                    for (mIdx in 0 until numPartMaps) {
-                        if (mp + 6 > off + 2048 || mp + 6 > vdsBuf.size) break
-                        val mType = vdsBuf[mp].toInt() and 0xFF
-                        val mLen = vdsBuf[mp + 1].toInt() and 0xFF
-                        if (mLen <= 0 || mp + mLen > vdsBuf.size) break
-                        if (mType == 1 && mLen >= 6) {
-                            val pNum = readUInt16LE(vdsBuf, mp + 4)
-                            partRefToPhysBase[mIdx] = physPartitions[pNum] ?: 0L
-                        } else if (mType == 2 && mLen >= 48) {
-                            val partIdStr = String(vdsBuf, mp + 5, 23, StandardCharsets.US_ASCII)
-                            if (partIdStr.contains("Metadata")) {
-                                metaPartRef = mIdx
-                                metaPhysPartNum = readUInt16LE(vdsBuf, mp + 38)
-                                metaFileBlock = readUInt32LE(vdsBuf, mp + 40)
-                                if (mLen >= 52) {
-                                    metaMirrorBlock = readUInt32LE(vdsBuf, mp + 44)
-                                }
-                            }
-                        }
-                        mp += mLen
-                    }
-                }
-                off += 2048
-            }
-            if (physPartitions.isNotEmpty() && fsdLen > 0L) break
-        }
-
-        if (physPartitions.isEmpty() || fsdLen <= 0L) {
-            throw IllegalStateException("AVDP@$foundAvdpSec mvds=$mvdsLoc parts=${physPartitions.size} fsdLen=$fsdLen")
-        }
-        val defaultPhysBase = physPartitions[0] ?: physPartitions.values.first()
-        for ((k, v) in physPartitions) {
-            if (!partRefToPhysBase.containsKey(k)) partRefToPhysBase[k] = v
-        }
-
-        var metaExtents: List<Pair<Long, Long>> = emptyList()
-        if (metaPartRef >= 0) {
-            val mPhysBase = physPartitions[metaPhysPartNum] ?: defaultPhysBase
-            for (candBlock in listOf(metaFileBlock, metaMirrorBlock)) {
-                if (candBlock < 0L || candBlock == 0xFFFFFFFFL) continue
-                val mFeOffset = mPhysBase + candBlock * blockSize
-                val mFeBuf = fetchRemoteByteRange(isoUrl, mFeOffset, mFeOffset + blockSize - 1L)
-                val mExts = parseUdfFileEntryExtents(mFeBuf, 0, blockSize, mPhysBase, emptyList(), -1, partRefToPhysBase, mFeOffset, -1)
-                if (mExts.isNotEmpty()) {
-                    metaExtents = mExts
-                    break
-                }
-            }
-        }
-
-        val fsdByteOff = resolveUdfBlockByte(fsdBlock, fsdPartRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
-        val fsdBuf = fetchRemoteByteRange(isoUrl, fsdByteOff, fsdByteOff + blockSize - 1L)
-        val fsdTag = if (fsdBuf.size >= 2) readUInt16LE(fsdBuf, 0) else -1
-        if (fsdBuf.size < 416 || fsdTag != 256) {
-            throw IllegalStateException("Bad FSD tag=$fsdTag off=$fsdByteOff metaExts=${metaExtents.size}")
-        }
-
-        val rootIcbBlock = readUInt32LE(fsdBuf, 404)
-        val rootIcbPartRef = readUInt16LE(fsdBuf, 408)
-
-        val results = ArrayList<IsoFileEntry>()
-        val diagNotes = ArrayList<String>()
-        walkUdfDir(isoUrl, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase, rootIcbBlock, rootIcbPartRef, "", 0, results, diagNotes)
-        if (results.isEmpty()) {
-            throw IllegalStateException("UDF walk 0 files [" + diagNotes.take(6).joinToString(";") + "]")
-        }
-        return results
-    }
-
-    private fun parseUdfFileEntryExtents(
-        buf: ByteArray,
-        secOff: Int,
-        blockSize: Long,
-        defaultPhysBase: Long,
-        metaExtents: List<Pair<Long, Long>>,
-        metaPartRef: Int,
-        partRefToPhysBase: Map<Int, Long>,
-        feAbsoluteByteOff: Long,
-        currentPartRef: Int = -1
-    ): List<Pair<Long, Long>> {
-        if (secOff + 180 > buf.size) return emptyList()
-        val tagId = readUInt16LE(buf, secOff)
-        if (tagId != 261 && tagId != 266) return emptyList()
-
-        val icbFlags = readUInt16LE(buf, secOff + 34)
-        val allocType = icbFlags and 0x07
-        val infoLen = readInt64LE(buf, secOff + 56)
-
-        val lEa: Int
-        val lAd: Int
-        val adBase: Int
-        if (tagId == 266) {
-            if (secOff + 216 > buf.size) return emptyList()
-            lEa = readUInt32LE(buf, secOff + 208).toInt()
-            lAd = readUInt32LE(buf, secOff + 212).toInt()
-            adBase = secOff + 216 + lEa
-        } else {
-            lEa = readUInt32LE(buf, secOff + 168).toInt()
-            lAd = readUInt32LE(buf, secOff + 172).toInt()
-            adBase = secOff + 176 + lEa
-        }
-        if (adBase < 0 || adBase > buf.size) return emptyList()
-        val adEnd = (adBase + lAd).coerceAtMost(buf.size)
-
-        val out = ArrayList<Pair<Long, Long>>()
-        var remainingInfo = infoLen
-
-        if (allocType == 0) {
-            var ap = adBase
-            while (ap + 8 <= adEnd && remainingInfo > 0L) {
-                val rawLen = readUInt32LE(buf, ap)
-                val extType = (rawLen ushr 30).toInt()
-                val extBytes = rawLen and 0x3FFFFFFFL
-                val extPos = readUInt32LE(buf, ap + 4)
-                ap += 8
-                if (extBytes == 0L) break
-                if (extType == 0) {
-                    val take = minOf(extBytes, remainingInfo)
-                    val physByte = resolveUdfBlockByte(extPos, currentPartRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
-                    out.add(Pair(physByte, take))
-                    remainingInfo -= take
-                }
-            }
-        } else if (allocType == 1) {
-            var ap = adBase
-            while (ap + 16 <= adEnd && remainingInfo > 0L) {
-                val rawLen = readUInt32LE(buf, ap)
-                val extType = (rawLen ushr 30).toInt()
-                val extBytes = rawLen and 0x3FFFFFFFL
-                val extBlock = readUInt32LE(buf, ap + 4)
-                val pRef = readUInt16LE(buf, ap + 8)
-                ap += 16
-                if (extBytes == 0L) break
-                if (extType == 0) {
-                    val take = minOf(extBytes, remainingInfo)
-                    val physByte = resolveUdfBlockByte(extBlock, pRef, blockSize, defaultPhysBase, metaExtents, metaPartRef, partRefToPhysBase)
-                    out.add(Pair(physByte, take))
-                    remainingInfo -= take
-                }
-            }
-        } else if (allocType == 3 && feAbsoluteByteOff >= 0L && infoLen > 0L) {
-            val inlineLen = minOf(infoLen, (adEnd - adBase).toLong())
-            if (inlineLen > 0L) {
-                out.add(Pair(feAbsoluteByteOff + adBase.toLong(), inlineLen))
-            }
-        }
-        return out
-    }
 
     private fun walkIso9660Dir(
         isoUrl: String,
@@ -4513,7 +3992,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         if (depth > 5) return
         val byteStart = dirLba * 2048L
         val fetchLen = dirLen.coerceIn(2048L, 262144L).toInt()
-        val dirBuf = fetchRemoteByteRange(isoUrl, byteStart, minOf(totalIsoSize - 1L, byteStart + fetchLen - 1L))
+        val dirBuf = fetchIsoByteRange(isoUrl, byteStart, minOf(totalIsoSize - 1L, byteStart + fetchLen - 1L))
         var p = 0
         while (p + 34 <= dirBuf.size) {
             val recLen = dirBuf[p].toInt() and 0xFF
@@ -4551,7 +4030,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         totalIsoSize: Long,
         volDescProbe: ByteArray?
     ): List<IsoFileEntry> {
-        val pvdBuf = volDescProbe ?: fetchRemoteByteRange(isoUrl, 32768L, minOf(totalIsoSize - 1L, 40959L))
+        val pvdBuf = volDescProbe ?: fetchIsoByteRange(isoUrl, 32768L, minOf(totalIsoSize - 1L, 40959L))
         var pvdOff = -1
         var off = 0
         while (off + 2048 <= pvdBuf.size) {
