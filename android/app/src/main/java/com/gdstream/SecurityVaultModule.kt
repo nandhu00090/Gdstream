@@ -94,6 +94,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     @Volatile
     private var cachedShieldToken: String = ""
 
+    @Volatile
+    private var cachedSslFactory: SSLSocketFactory? = null
+
+    private val isoHeadProbeCache = ConcurrentHashMap<String, ByteArray>()
+
     data class DirectTrailerStream(
         val label: String,
         val height: Int,
@@ -226,6 +231,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     private external fun nSync(slot: Int, sigSeed: Int): String
 
     private fun buildPinnedSystemSslFactory(): SSLSocketFactory {
+        cachedSslFactory?.let { return it }
         val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
         tmf.init(null as KeyStore?)
         val defaultTm = tmf.trustManagers.firstOrNull { it is X509TrustManager } as? X509TrustManager
@@ -275,7 +281,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
         val sslContext = SSLContext.getInstance("TLS")
         sslContext.init(null, arrayOf<TrustManager>(strictTm), SecureRandom())
-        return sslContext.socketFactory
+        val factory = sslContext.socketFactory
+        cachedSslFactory = factory
+        return factory
     }
 
     private fun isSnifferPackageInstalled(): Boolean {
@@ -963,14 +971,42 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 }
 
+                val headCacheLimit = 4L * 1024L * 1024L
+                val firstSegRawStart = segList.firstOrNull()?.first ?: 0L
+
                 fun fetchSliceAsync(sStart: Long, sEnd: Long): java.util.concurrent.Future<ByteArray?> {
                     return ioExecutor.submit<ByteArray?> {
-                        try {
-                            fetchRemoteByteRange(entry.archiveUrl, sStart, sEnd)
-                        } catch (e: Throwable) {
-                            appendDebugLog("PROXY_ISO_ERR", "Range $sStart-$sEnd failed: ${e.message}")
-                            null
+                        // Serve opening 4MB probe slices from RAM so 12 parallel player probe connections never flood Worker/DNS
+                        val relFromDiscStart = sStart - firstSegRawStart
+                        val relEndFromDiscStart = sEnd - firstSegRawStart
+                        if (relFromDiscStart >= 0L && relEndFromDiscStart < headCacheLimit) {
+                            val cachedHead = isoHeadProbeCache[entry.id]
+                            if (cachedHead != null && relEndFromDiscStart.toInt() < cachedHead.size) {
+                                return@submit cachedHead.copyOfRange(relFromDiscStart.toInt(), relEndFromDiscStart.toInt() + 1)
+                            }
                         }
+
+                        var attempt = 0
+                        while (attempt < 6) {
+                            try {
+                                val data = fetchRemoteByteRange(entry.archiveUrl, sStart, sEnd)
+                                if (data.isNotEmpty()) {
+                                    // Populate 4MB head cache on first successful read of opening segment
+                                    if (sStart == firstSegRawStart && isoHeadProbeCache[entry.id] == null && data.size >= 512 * 1024) {
+                                        isoHeadProbeCache[entry.id] = data
+                                    }
+                                    return@submit data
+                                }
+                            } catch (e: Throwable) {
+                                attempt++
+                                if (attempt >= 6) {
+                                    appendDebugLog("PROXY_ISO_ERR", "Range $sStart-$sEnd failed after 6 tries: ${e.message}")
+                                    return@submit null
+                                }
+                                try { Thread.sleep(250L * attempt) } catch (_: InterruptedException) { return@submit null }
+                            }
+                        }
+                        null
                     }
                 }
 
