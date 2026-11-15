@@ -201,7 +201,7 @@ class ArchiveProxyTest {
             val item = JSONObject().put("id", "disc").put("name", "Movie.m2ts").put("link", "http://127.0.0.1:1111/zip/obsolete/Movie.m2ts")
             val cache = JSONObject().put("rawJson", JSONArray().put(item).toString()).put("targets", JSONArray().put(target))
             assertNull(restore.invoke(module, cache.toString(), "https://example/disc.iso"))
-            cache.put("isoIndexVersion", 4)
+            cache.put("isoIndexVersion", 5)
             val restored = JSONArray(restore.invoke(module, cache.toString(), "https://example/disc.iso?fresh=1") as String).getJSONObject(0)
             val activePort = field(module, "archiveProxyPort") as Int
             assertTrue(activePort > 0)
@@ -222,33 +222,44 @@ class ArchiveProxyTest {
         }
     }
 
-    @Test fun pmtRewriteIsIdenticalWhenSeekingWithoutAnEarlierPat() {
+    @Test fun externalHeadOptionsAndSubtitleProbesPreserveActiveIsoWithoutOriginReads() {
+        val log = java.io.File.createTempFile("gdstream-handshake", ".log")
+        DebugLogger.attach(DebugLogStore(log))
         val module = SecurityVaultModule(mock(ReactApplicationContext::class.java))
+        val pool = Executors.newSingleThreadExecutor()
+        val rawSize = 220_000_000L * 192
+        val exposedSize = 220_000_000L * 188
+        val target = SecurityVaultModule.ArchiveEntryTarget("handshake", "http://127.0.0.1:1/never-fetch", "movie.m2ts", "ISO",
+            0, rawSize, exposedSize, 0, 0, listOf(0L to rawSize), true)
+        @Suppress("UNCHECKED_CAST")
+        val entries = field(module, "archiveEntryRegistry") as ConcurrentHashMap<String, SecurityVaultModule.ArchiveEntryTarget>
+        entries[target.id] = target
+        ArchiveProxyStreams.registry.resume()
+        var cancelled = false
+        val active = ArchiveProxyStreams.registry.register(target.id, true) { cancelled = true }
         try {
-            fun crc(bytes: ByteArray): Int {
-                var value = -1
-                for (b in bytes) {
-                    value = value xor ((b.toInt() and 255) shl 24)
-                    repeat(8) { value = (value shl 1) xor (if (value < 0) 0x04c11db7 else 0) }
+            ServerSocket(0).use { server ->
+                val handler = SecurityVaultModule::class.java.getDeclaredMethod("handleArchiveProxyClient", Socket::class.java).apply { isAccessible = true }
+                for ((method, name, status) in listOf(Triple("HEAD", "movie.m2ts", 200), Triple("OPTIONS", "movie.m2ts", 200), Triple("GET", "movie.eng.srt", 404))) {
+                    val job = pool.submit { handler.invoke(module, server.accept()) }
+                    val result = Socket("127.0.0.1", server.localPort).use { client ->
+                        client.soTimeout = 5000
+                        client.getOutputStream().write("$method /zip/handshake/$name HTTP/1.1\r\nUser-Agent: VLC/3.6 test\r\nRange: bytes=0-\r\n\r\n".toByteArray())
+                        client.getInputStream().readBytes().toString(Charsets.US_ASCII)
+                    }
+                    job.get(5, TimeUnit.SECONDS)
+                    assertTrue(result.startsWith("HTTP/1.1 $status "))
+                    assertTrue(result.endsWith("\r\n\r\n"))
+                    assertTrue(result.contains("Content-Length: ${if (method == "HEAD") exposedSize else 0}\r\n"))
+                    if (status != 404) assertTrue(result.contains("Accept-Ranges: bytes"))
+                    assertFalse(cancelled)
+                    assertSame(target, entries[target.id])
                 }
-                return value
             }
-            val section = byteArrayOf(2, 0xb0.toByte(), 18, 0, 1, 0xc1.toByte(), 0, 0,
-                0xe1.toByte(), 1, 0xf0.toByte(), 0, 0x86.toByte(), 0xe1.toByte(), 0, 0xf0.toByte(), 0)
-            val checksum = crc(section)
-            val packet = ByteArray(192) { 0xff.toByte() }
-            packet[4] = 0x47; packet[5] = 0x50; packet[6] = 1; packet[7] = 0x10; packet[8] = 0
-            section.copyInto(packet, 9)
-            repeat(4) { packet[9 + section.size + it] = (checksum ushr (24 - 8 * it)).toByte() }
-            val patch = SecurityVaultModule::class.java.getDeclaredMethod("patchBluRayPmtForTs", ByteArray::class.java,
-                Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).apply { isAccessible = true }
-            val seek = packet.copyOf()
-            val sequential = packet.copyOf()
-            patch.invoke(module, seek, 4, -1)
-            patch.invoke(module, sequential, 4, 0x1001)
-            assertArrayEquals(sequential, seek)
-            assertEquals(0x8a, seek[21].toInt() and 255)
-            assertEquals(0, crc(seek.copyOfRange(9, 30)))
-        } finally { (field(module, "ioExecutor") as ExecutorService).shutdownNow() }
+            assertTrue(log.readText().contains("userAgent=VLC/3.6 test"))
+        } finally {
+            active.close(); pool.shutdownNow(); (field(module, "ioExecutor") as ExecutorService).shutdownNow(); log.delete()
+        }
     }
+
 }

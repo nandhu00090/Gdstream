@@ -1,0 +1,13 @@
+GDStream bundles Jellyfin's AndroidX Media3 FFmpeg decoder 1.8.0+1 (GPL-3.0).
+Copyright holders: Jellyfin contributors, The Android Open Source Project,
+and FFmpeg contributors; see the original source files for individual notices.
+
+Corresponding decoder source and build scripts (including pinned submodules):
+https://github.com/jellyfin/jellyfin-androidx-media/tree/v1.8.0%2B1
+Commit: 84ef4b7201a9e1edfc699c31acbc505511a4af1f
+Clone with submodules to reproduce the upstream decoder build.
+
+Artifact and Java/JNI source archive:
+https://repo.maven.apache.org/maven2/org/jellyfin/media3/media3-ffmpeg-decoder/1.8.0+1/
+
+Full GPL-3.0 license: Jellyfin-FFmpeg-GPL-3.0.txt in this directory.

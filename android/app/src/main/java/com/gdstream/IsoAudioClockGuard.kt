@@ -24,9 +24,10 @@ internal class IsoAudioClockGuard(private val player: ExoPlayer) : AutoCloseable
     private fun key(group: Tracks.Group, index: Int) = "${group.mediaTrackGroup.id}:$index:${group.getTrackFormat(index).sampleMimeType}"
     private fun selectAudio(rejectSelected: Boolean): Boolean {
         val groups = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
-        if (rejectSelected) selectedKey?.let { policy.reject(it) }
-        if (rejectSelected) groups.forEach { group ->
-            for (i in 0 until group.length) if (group.isTrackSelected(i)) policy.reject(key(group, i))
+        if (rejectSelected) {
+            val selected = groups.flatMap { group -> (0 until group.length)
+                .filter { group.isTrackSelected(it) }.map { key(group, it) } }
+            if (selected.isEmpty()) selectedKey?.let { policy.reject(it) } else selected.forEach { policy.reject(it) }
         }
         val candidates = groups.flatMap { group -> (0 until group.length).map { index ->
             IsoAudioCandidate(key(group, index), group.getTrackFormat(index).sampleMimeType, group.isTrackSupported(index))
@@ -51,7 +52,11 @@ internal class IsoAudioClockGuard(private val player: ExoPlayer) : AutoCloseable
     }
 
     override fun onTracksChanged(tracks: Tracks) {
-        if (!configured && tracks.groups.any { it.type == C.TRACK_TYPE_VIDEO }) {
+        if (audioDisabled && tracks.groups.any { it.type == C.TRACK_TYPE_AUDIO && it.isSelected }) {
+            audioDisabled = false
+            clock.reset()
+        }
+        if (!configured && tracks.groups.any { it.type == C.TRACK_TYPE_AUDIO }) {
             configured = true
             selectAudio(false)
         }

@@ -8,6 +8,7 @@ class ArchiveBridgeLifetimeTest {
         var clock = 0L
         val bridge = ArchiveBridgeLifetime { clock }
         bridge.launched()
+        bridge.transferred(188)
         clock = 14_999
         assertFalse(bridge.canStop())
         bridge.transferred(0)
@@ -20,6 +21,26 @@ class ArchiveBridgeLifetimeTest {
         assertTrue(bridge.canStop())
         bridge.launched()
         assertFalse(bridge.canStop())
+    }
+
+    @Test fun chooserGetsGraceButHeadAndOptionsCannotExtendIt() {
+        var clock = 0L
+        val bridge = ArchiveBridgeLifetime { clock }
+        bridge.launched()
+        val head = "HTTP/1.1 200 OK\r\nContent-Length: 41000000000\r\n\r\n".toByteArray()
+        val counter = HttpBodyCounter()
+        bridge.transferred(counter.bodyBytes(head, 0, head.size).toLong())
+        clock = 60_000
+        assertFalse(bridge.canStop())
+        clock = 120_000
+        assertTrue(bridge.canStop())
+        bridge.launched()
+        val combined = head + ByteArray(188)
+        val body = HttpBodyCounter()
+        assertEquals(0, body.bodyBytes(combined, 0, 20))
+        bridge.transferred(body.bodyBytes(combined, 20, combined.size - 20).toLong())
+        clock += 15_000
+        assertTrue(bridge.canStop())
     }
 
     @Test fun fullReloadSupersedesOnlyTheSameStreamAndShutdownCancelsAllWork() {

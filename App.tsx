@@ -857,6 +857,9 @@ const App = () => {
   useEffect(() => { selectedFileRef.current = selectedFile; }, [selectedFile]);
   const [versionGroup, setVersionGroup] = useState<any[]>([]);
   const [playMode, setPlayMode] = useState<string | null>(null);
+  useEffect(() => {
+    if (!selectedFile && playMode === 'external') setPlayMode(null);
+  }, [selectedFile, playMode]);
   const [resizeMode, setResizeMode] = useState<'contain' | 'cover'>('contain');
   const [showControls, setShowControls] = useState(true);
   const [isLocked, setIsLocked] = useState(false);
@@ -1776,6 +1779,7 @@ const App = () => {
           }
         } catch {}
 
+        if (cancelled) break; // The chooser handoff may have happened during the cache lookup.
         if (!MediaInfoModule?.inspectMedia) continue;
         if (fName === selectedFile.name) setScanningMediaInfo(true);
         try {
@@ -2473,12 +2477,14 @@ const App = () => {
   const openInExternalPlayer = async (targetFile = selectedFile) => {
     const url = getStreamUrl(targetFile);
     closeInternalPlayer(false);
+    setPlayMode('external'); // Suppress metadata probes while the external player owns the stream.
     // Commit the paused/unmounted native view before handing the proxy to the external app.
     await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
     try {
       await SecurityVault?.stopArchivePlayback?.(playbackSource.uri);
       await VideoPlayerManager.playVideo(url);
     } catch (error) {
+      setPlayMode(null);
       Alert.alert('External player error', error instanceof Error ? error.message : 'Could not open the player.');
     }
   };
@@ -2979,7 +2985,7 @@ const App = () => {
             {tracks.map((track, index) => {
               const indexStr = String(index);
               const isSelected = isAudio
-                ? selectedAudio?.type === 'index' && String(selectedAudio?.value) === indexStr
+                ? (selectedAudio?.type === 'index' ? String(selectedAudio.value) === indexStr : !selectedAudio && !!track.selected)
                 : selectedText?.type === 'index' && String(selectedText?.value) === indexStr;
               return (
                 <FocusableButton
@@ -3321,7 +3327,7 @@ const App = () => {
 
   // 🔥 2. MOVIE / EPISODE DETAIL OVERLAY (Keeps Catalog FlatLists mounted underneath!) 🔥
   const renderDetailOverlay = () => {
-    if (!selectedFile || playMode !== null) return null;
+    if (!selectedFile || (playMode !== null && playMode !== 'external')) return null;
     const info = parseMediaFilename(selectedFile.name, false);
     const meta = metadataMap[selectedFile.name];
     const realMi = mediaInfoMap[selectedFile.name];

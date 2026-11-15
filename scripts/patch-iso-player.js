@@ -5,7 +5,7 @@ function patchIsoPlayer(content) {
     'if (e.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED && e.getMessage()',
     'if (gdIsoPolicy == null && e.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED && e.getMessage()',
   );
-  if (content.includes('GD_ISO_PLAYER_POLICY_V1')) return content;
+  if (content.includes('GD_ISO_PLAYER_POLICY_V1')) return patchIsoAudioCatalog(patchBluRayFactory(content));
   const replace = (anchor, replacement) => {
     if (!content.includes(anchor)) throw new Error(`react-native-video ISO patch anchor missing: ${anchor}`);
     content = content.replace(anchor, replacement);
@@ -40,6 +40,63 @@ function patchIsoPlayer(content) {
   replace('    public void onPlayerError(@NonNull PlaybackException e) {', '    public void onPlayerError(@NonNull PlaybackException e) {\n        if (recoverIsoAudio(e)) return;');
   // RNVLoadControl subclasses DefaultLoadControl. Set its default as well as the stable JS source config.
   replace(': DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS ,', ': 1500 , // ISO fast startup; explicit source config still takes precedence');
-  return content;
+  return patchIsoAudioCatalog(patchBluRayFactory(content));
 }
 module.exports = { patchIsoPlayer };
+
+// ProgressiveMediaSource creates its own extractors; changing DefaultMediaSourceFactory is insufficient.
+function patchBluRayFactory(content) {
+  if (content.includes('GD_BLURAY_EXTRACTORS_V1')) return content;
+  const anchor = '    private void initializePlayerSource(Source runningSource) {';
+  if (!content.includes(anchor)) throw new Error('Blu-ray extractor hook missing');
+  content = content.replace(anchor, `    // GD_BLURAY_EXTRACTORS_V1
+    private androidx.media3.extractor.ExtractorsFactory gdArchiveExtractors(Uri uri) {
+        try {
+            return (androidx.media3.extractor.ExtractorsFactory) Class.forName("com.gdstream.VideoPlayerModule")
+                    .getMethod("archiveExtractors", String.class).invoke(null, uri.toString());
+        } catch (Exception error) {
+            DebugLog.e(TAG, "Blu-ray extractor factory: " + error);
+            return new androidx.media3.extractor.DefaultExtractorsFactory();
+        }
+    }
+
+` + anchor);
+  const replacements = [
+    ['new ProgressiveMediaSource.Factory(assetDataSourceFactory)', 'new ProgressiveMediaSource.Factory(assetDataSourceFactory, gdArchiveExtractors(uri))'],
+    ['new ProgressiveMediaSource.Factory(\n                            mediaDataSourceFactory\n                    )', 'new ProgressiveMediaSource.Factory(\n                            mediaDataSourceFactory, gdArchiveExtractors(uri)\n                    )'],
+    ['new ProgressiveMediaSource.Factory(\n                            RNVSimpleCache.INSTANCE.getCacheFactory(buildHttpDataSourceFactory(true))\n                    )', 'new ProgressiveMediaSource.Factory(\n                            RNVSimpleCache.INSTANCE.getCacheFactory(buildHttpDataSourceFactory(true)), gdArchiveExtractors(uri)\n                    )'],
+  ];
+  for (const [from, to] of replacements) {
+    if (!content.includes(from)) throw new Error('Blu-ray ProgressiveMediaSource anchor missing: ' + from);
+    content = content.replace(from, to);
+  }
+  return content;
+}
+
+function patchIsoAudioCatalog(content) {
+  if (content.includes('GD_AUDIO_CATALOG_V1')) return content;
+  const insert = (anchor, extra) => {
+    if (!content.includes(anchor)) throw new Error('ISO audio catalog anchor missing: ' + anchor);
+    content = content.replace(anchor, anchor + extra);
+  };
+  const listing = `
+        // GD_AUDIO_CATALOG_V1: FFmpeg and raw PCM are mapped to different renderers.
+        if (player != null) {
+            try {
+                return (ArrayList<Track>) Class.forName("com.gdstream.VideoPlayerModule")
+                        .getMethod("audioTrackCatalog", Object.class).invoke(null, player);
+            } catch (Exception error) { DebugLog.e(TAG, "ISO audio catalog: " + error); }
+        }`;
+  insert('    private ArrayList<Track> getAudioTrackInfo() {', listing);
+  insert('    private ArrayList<Track> getBasicAudioTrackInfo() {', listing);
+  insert('    public void setSelectedTrack(int trackType, String type, String value) {', `
+        if (player != null && trackType == C.TRACK_TYPE_AUDIO) {
+            try {
+                boolean handled = Boolean.TRUE.equals(Class.forName("com.gdstream.VideoPlayerModule")
+                        .getMethod("selectAudioTrackFromCatalog", Object.class, String.class, String.class, boolean.class)
+                        .invoke(null, player, type, value, gdIsoPolicy != null));
+                if (handled) return;
+            } catch (Exception error) { DebugLog.e(TAG, "ISO audio selection: " + error); }
+        }`);
+  return content;
+}

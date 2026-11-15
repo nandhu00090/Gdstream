@@ -1,7 +1,7 @@
 package com.gdstream
 
 internal object BluRayPlaylist {
-    data class Clip(val id: String, val ticks: Long, val size: Long, val extents: List<Pair<Long, Long>>)
+    data class Clip(val id: String, val ticks: Long, val size: Long, val extents: List<Pair<Long, Long>>, val inTicks: Long = 0)
 
     /** Independent M2TS clips can reset PCR/PTS and PIDs. Avoid splicing a warning into a feature. */
     fun playbackClips(clips: List<Clip>): List<Clip> {

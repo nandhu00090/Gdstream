@@ -56,10 +56,30 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
 
         @androidx.annotation.Keep
         @JvmStatic
+        fun audioTrackCatalog(rawPlayer: Any): java.util.ArrayList<com.brentvatne.common.api.Track> =
+            AudioTrackCatalog.list((rawPlayer as androidx.media3.exoplayer.ExoPlayer).currentTracks)
+
+        @androidx.annotation.Keep
+        @JvmStatic
+        fun selectAudioTrackFromCatalog(rawPlayer: Any, type: String?, value: String?, preserveDefault: Boolean): Boolean =
+            AudioTrackCatalog.select(rawPlayer as androidx.media3.exoplayer.ExoPlayer, type, value, preserveDefault)
+
+        @androidx.annotation.Keep
+        @JvmStatic
+        fun archiveExtractors(url: String?): androidx.media3.extractor.ExtractorsFactory {
+            if (url == null || !SecurityVaultModule.isIsoStream(url) ||
+                !url.substringBefore('?').endsWith(".m2ts", true)) return androidx.media3.extractor.DefaultExtractorsFactory()
+            val profile = SecurityVaultModule.bluRayProfile(url)
+            return androidx.media3.extractor.ExtractorsFactory { arrayOf(BluRayTsExtractor(profile)) }
+        }
+
+        @androidx.annotation.Keep
+        @JvmStatic
         fun attachArchivePlayer(rawPlayer: Any, url: String?): AutoCloseable? {
             val player = rawPlayer as? androidx.media3.exoplayer.ExoPlayer ?: return null
             if (url == null || !SecurityVaultModule.isIsoStream(url) ||
                 !url.substringBefore('?').endsWith(".m2ts", true) && !url.substringBefore('?').endsWith(".ts", true)) return null
+            DebugLogger.log("ISO_FFMPEG_READY", "available=${androidx.media3.decoder.ffmpeg.FfmpegLibrary.isAvailable()} dtsHd=${androidx.media3.decoder.ffmpeg.FfmpegLibrary.supportsFormat(androidx.media3.common.MimeTypes.AUDIO_DTS_HD)} version=${androidx.media3.decoder.ffmpeg.FfmpegLibrary.getVersion()}")
             return IsoAudioClockGuard(player)
         }
 
@@ -319,6 +339,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
                 ArchiveStreamService.start(reactApplicationContext)
             }
             val mimeType = externalVideoMimeType(playableUri.path.orEmpty())
+            DebugLogger.log("EXTERNAL_PLAYER_LAUNCH", "uri=${safeStreamUrl(url)} mime=$mimeType registeredIso=${SecurityVaultModule.isIsoStream(url)}; preserving proxy registration")
             val intent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(playableUri, mimeType)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)

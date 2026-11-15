@@ -284,7 +284,7 @@ internal class UdfReader(
             val fullPath = if (path.isEmpty()) name else "$path/$name"
             val upper = fullPath.uppercase(java.util.Locale.ROOT)
             if (flags and 2 != 0) {
-                if (upper in listOf("BDMV", "BDMV/STREAM", "BDMV/PLAYLIST", "VIDEO_TS")) {
+                if (upper in listOf("BDMV", "BDMV/STREAM", "BDMV/PLAYLIST", "BDMV/CLIPINF", "VIDEO_TS")) {
                     walk(childBlock, childRef, fullPath, files, visited)
                 }
             } else if (MEDIA_EXTENSIONS.any { upper.endsWith(it) }) {
@@ -318,6 +318,6 @@ internal class UdfReader(
     companion object {
         private const val SECTOR_SIZE = 2048L
         private const val MAX_METADATA = 8L * 1024 * 1024
-        private val MEDIA_EXTENSIONS = listOf(".MPLS", ".M2TS", ".VOB", ".MKV", ".MP4", ".AVI", ".MOV", ".M4V", ".TS")
+        private val MEDIA_EXTENSIONS = listOf(".CLPI", ".MPLS", ".M2TS", ".VOB", ".MKV", ".MP4", ".AVI", ".MOV", ".M4V", ".TS")
     }
 }

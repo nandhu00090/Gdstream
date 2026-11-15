@@ -38,7 +38,7 @@ class ArchiveStreamService : Service() {
     private var wifiLock: WifiManager.WifiLock? = null
     private val checkIdle = object : Runnable {
         override fun run() {
-            if (lifetime.canStop()) shutdown("no proxy bytes transferred for 15 seconds") else handler.postDelayed(this, 1000)
+            if (lifetime.canStop()) shutdown("external handshake / media inactivity deadline expired") else handler.postDelayed(this, 1000)
         }
     }
 
