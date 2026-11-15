@@ -1,12 +1,12 @@
 const fs = require('fs');
 const path = require('path');
+const { patchIsoPlayer } = require('./patch-iso-player');
 
 const targets = [
   path.join(
     __dirname,
     '../node_modules/react-native-video/android/src/main/java/com/brentvatne/exoplayer/ReactExoplayerView.java',
   ),
-  path.join(__dirname, '../rnv-inspect/ReactExoplayerView.java'),
 ];
 
 const oldTrackSnippet = `                    for (int groupIndex = 0; groupIndex < groups.length; groupIndex++) {
@@ -137,7 +137,7 @@ for (const file of targets) {
     }
 
     content = content.replace(
-      /DefaultRenderersFactory renderersFactory =[\s\S]*?\.forceEnableMediaCodecAsynchronousQueueing\(\);/,
+      /^[ \t]*DefaultRenderersFactory renderersFactory =[\s\S]*?\.forceEnableMediaCodecAsynchronousQueueing\(\);/m,
       renderersReplacement,
     );
 
@@ -177,7 +177,7 @@ for (const file of targets) {
     }
 
     // Ensure DefaultTrackSelector always allows multichannel & non-AAC audio tracks to be decoded into PCM
-    content = content.replace(
+    if (!content.includes('.setExceedAudioConstraintsIfNecessary(true)')) content = content.replace(
       '.setMaxVideoBitrate(maxBitRate == 0 ? Integer.MAX_VALUE : maxBitRate));',
       '.setExceedAudioConstraintsIfNecessary(true).setExceedRendererCapabilitiesIfNecessary(false).setExceedVideoConstraintsIfNecessary(true).setMaxVideoBitrate(maxBitRate == 0 ? Integer.MAX_VALUE : maxBitRate));'
     );
@@ -195,6 +195,7 @@ for (const file of targets) {
       );
     }
 
+    content = patchIsoPlayer(content);
     fs.writeFileSync(file, content, 'utf8');
     console.log('Patched Dolby Vision / HDR selector & Subtitles in:', file);
   }

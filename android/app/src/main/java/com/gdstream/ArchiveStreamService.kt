@@ -28,11 +28,9 @@ class ArchiveStreamService : Service() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent) else context.startService(intent)
         }
         fun setAppForeground(value: Boolean) {
-            lifetime.foreground(value)
             DebugLogger.log("ARCHIVE_BRIDGE_ACTIVITY", "appForeground=$value; active streams retain bridge")
         }
-        fun clientOpened() = lifetime.opened()
-        fun clientClosed() = lifetime.closed()
+        fun bytesTransferred(bytes: Long) = lifetime.transferred(bytes)
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -40,7 +38,7 @@ class ArchiveStreamService : Service() {
     private var wifiLock: WifiManager.WifiLock? = null
     private val checkIdle = object : Runnable {
         override fun run() {
-            if (lifetime.canStop()) stopSelf() else handler.postDelayed(this, 5000)
+            if (lifetime.canStop()) shutdown("no proxy bytes transferred for 15 seconds") else handler.postDelayed(this, 1000)
         }
     }
 
@@ -71,7 +69,7 @@ class ArchiveStreamService : Service() {
             @Suppress("DEPRECATION")
             wifiLock = (applicationContext.getSystemService(WIFI_SERVICE) as WifiManager)
                 .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "GDStream::ArchiveWifi").apply { acquire() }
-            handler.postDelayed(checkIdle, 5000)
+            handler.postDelayed(checkIdle, 1000)
             DebugLogger.log("ARCHIVE_BRIDGE_READY", "Foreground service and playback locks active")
         } catch (error: Exception) {
             DebugLogger.log("ARCHIVE_BRIDGE_ERR", isoFailureDetails(error))
@@ -80,12 +78,23 @@ class ArchiveStreamService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == "STOP") stopSelf()
+        if (intent?.action == "STOP") shutdown("notification Stop")
         // A restarted process cannot resurrect its old loopback registrations; do not advertise one.
         return START_NOT_STICKY
     }
 
+    private fun shutdown(reason: String) {
+        SecurityVaultModule.stopArchiveStreams(reason)
+        stopSelf()
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        shutdown("GDStream removed from Recents")
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
+        SecurityVaultModule.stopArchiveStreams("playback service destroyed")
         handler.removeCallbacks(checkIdle)
         try { if (wifiLock?.isHeld == true) wifiLock?.release() } finally {
             if (wakeLock?.isHeld == true) wakeLock?.release()

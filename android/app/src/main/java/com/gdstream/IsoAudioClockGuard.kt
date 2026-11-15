@@ -1,0 +1,103 @@
+package com.gdstream
+
+import android.os.Handler
+import androidx.media3.common.C
+import androidx.media3.common.Player
+import androidx.media3.common.Tracks
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.ExoPlaybackException
+import androidx.media3.common.PlaybackException
+import androidx.media3.exoplayer.analytics.AnalyticsListener
+
+/** Attached only to localhost ISO transport streams; video uses its own clock if audio cannot run. */
+internal class IsoAudioClockGuard(private val player: ExoPlayer) : AutoCloseable, Player.Listener, AnalyticsListener {
+    private val policy = IsoAudioPolicy()
+    private val handler = Handler(player.applicationLooper)
+    private var configured = false
+    private var closed = false
+    private var firstFrame = false
+    private var audioDisabled = false
+    private var selectedKey: String? = null
+    private val clock = IsoClockProgress { android.os.SystemClock.elapsedRealtime() }
+
+    private fun key(group: Tracks.Group, index: Int) = "${group.mediaTrackGroup.id}:$index:${group.getTrackFormat(index).sampleMimeType}"
+    private fun selectAudio(rejectSelected: Boolean): Boolean {
+        val groups = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+        if (rejectSelected) selectedKey?.let { policy.reject(it) }
+        if (rejectSelected) groups.forEach { group ->
+            for (i in 0 until group.length) if (group.isTrackSelected(i)) policy.reject(key(group, i))
+        }
+        val candidates = groups.flatMap { group -> (0 until group.length).map { index ->
+            IsoAudioCandidate(key(group, index), group.getTrackFormat(index).sampleMimeType, group.isTrackSupported(index))
+        } }
+        val chosen = policy.choose(candidates)
+        val params = player.trackSelectionParameters.buildUpon().clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+        if (chosen == null) {
+            if (audioDisabled) return false
+            audioDisabled = true
+            player.trackSelectionParameters = params.setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true).build()
+            DebugLogger.log("ISO_AUDIO_FALLBACK", "No playable audio remains; disabled audio renderer so video clock can advance")
+        } else {
+            for (group in groups) for (i in 0 until group.length) if (key(group, i) == chosen.key) {
+                selectedKey = chosen.key
+                player.trackSelectionParameters = params.setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+                    .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, i)).build()
+                DebugLogger.log("ISO_AUDIO_SELECT", "track=${chosen.key} supported=true")
+            }
+        }
+        clock.reset()
+        return true
+    }
+
+    override fun onTracksChanged(tracks: Tracks) {
+        if (!configured && tracks.groups.any { it.type == C.TRACK_TYPE_VIDEO }) {
+            configured = true
+            selectAudio(false)
+        }
+    }
+
+    override fun onRenderedFirstFrame(eventTime: AnalyticsListener.EventTime, output: Any, renderTimeMs: Long) {
+        firstFrame = true
+        clock.reset()
+    }
+
+    fun recover(error: PlaybackException): Boolean {
+        val renderer = error as? ExoPlaybackException ?: return false
+        val audio = renderer.type == ExoPlaybackException.TYPE_RENDERER &&
+            (renderer.rendererFormat?.sampleMimeType?.startsWith("audio/") == true ||
+                (renderer.rendererIndex in 0 until player.rendererCount && player.getRendererType(renderer.rendererIndex) == C.TRACK_TYPE_AUDIO))
+        if (!audio || audioDisabled) return false
+        DebugLogger.log("ISO_AUDIO_ERR", isoFailureDetails(error))
+        if (!selectAudio(true)) return false
+        player.prepare() // Reuse the existing MediaSource/player; no recursive source reload.
+        return true
+    }
+
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (closed) return
+            val position = player.currentPosition
+            // READY means renderers can play even if the duration estimator reports zero for TS.
+            val buffered = if (player.playbackState == Player.STATE_READY) maxOf(1500L, player.totalBufferedDuration) else player.totalBufferedDuration
+            if (clock.stalled(position, buffered, player.playWhenReady, firstFrame) &&
+                !audioDisabled && configured) {
+                DebugLogger.log("ISO_AUDIO_CLOCK", "Video frame rendered but position=$position unchanged with bufferedMs=${player.totalBufferedDuration}; trying next supported audio track")
+                selectAudio(true)
+            }
+            handler.postDelayed(this, 500)
+        }
+    }
+
+    init {
+        player.addListener(this)
+        player.addAnalyticsListener(this)
+        handler.postDelayed(watchdog, 500)
+    }
+    override fun close() {
+        closed = true
+        handler.removeCallbacks(watchdog)
+        player.removeListener(this)
+        player.removeAnalyticsListener(this)
+    }
+}

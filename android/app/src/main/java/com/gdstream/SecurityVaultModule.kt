@@ -97,7 +97,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     @Volatile
     private var cachedSslFactory: SSLSocketFactory? = null
 
-    private val isoHeadProbeCache = ConcurrentHashMap<String, ByteArray>()
+    private val isoChunkCache = IsoChunkCache()
 
     data class DirectTrailerStream(
         val label: String,
@@ -157,6 +157,16 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     private val archiveProxyLock = Any()
 
     companion object {
+        @Volatile private var clearIsoChunks: (() -> Unit)? = null
+        @Volatile private var archiveFormat: ((String) -> String?)? = null
+        internal fun isIsoStream(url: String): Boolean =
+            ArchiveProxyStreams.streamId(url)?.let { archiveFormat?.invoke(it) } == "ISO"
+        internal fun stopArchiveStreams(reason: String) {
+            ArchiveProxyStreams.registry.stopAll(reason)
+            IsoRangeReader.cancelAll(reason)
+            clearIsoChunks?.invoke()
+            DebugLogger.log("ARCHIVE_PROXY_STOP_ALL", reason)
+        }
         init {
             try {
                 System.loadLibrary("gdcore")
@@ -176,9 +186,25 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     init {
         DebugLogger.initialize(reactContext)
+        clearIsoChunks = { isoChunkCache.clear() }
+        archiveFormat = { id -> archiveEntryRegistry[id]?.archiveFormat }
         ioExecutor.submit {
             appendDebugLog("APP_BOOT", "GDStream Native Engine ready (SDK=" + Build.VERSION.SDK_INT + ")")
         }
+    }
+
+    @ReactMethod
+    fun prepareArchivePlayback(url: String, promise: Promise) {
+        ioExecutor.submit {
+            ArchiveProxyStreams.prepare(url)
+            promise.resolve(true)
+        }
+    }
+
+    @ReactMethod
+    fun stopArchivePlayback(url: String, promise: Promise) {
+        ArchiveProxyStreams.stop(url)
+        promise.resolve(true)
     }
 
     private external fun nSync(slot: Int, sigSeed: Int): String
@@ -654,6 +680,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                                   session: IsoReadSession = IsoReadSession()): ByteArray =
         IsoRangeReader.readFully(isoUrl, start, endInclusive,
             open = { from, to ->
+                ArchiveProxyStreams.registry.checkActive()
                 session.checkActive()
                 ensureVaultSessionReady()
                 session.checkActive()
@@ -762,14 +789,24 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    private fun proxyOutput(socket: Socket): java.io.OutputStream = object : java.io.OutputStream() {
+        private val output = socket.getOutputStream()
+        override fun write(value: Int) { output.write(value); ArchiveStreamService.bytesTransferred(1) }
+        override fun write(bytes: ByteArray, offset: Int, length: Int) {
+            output.write(bytes, offset, length)
+            ArchiveStreamService.bytesTransferred(length.toLong())
+        }
+        override fun flush() = output.flush()
+    }
+
     private fun handleArchiveProxyClient(socket: Socket) {
-        var remoteConnToClean: HttpURLConnection? = null
+        val remoteConnToClean = java.util.concurrent.atomic.AtomicReference<HttpURLConnection?>()
         var inflaterToClean: Inflater? = null
         var requestDetails = "unparsed request"
         var isoFile: IsoVirtualFile? = null
         var isoSession: IsoReadSession? = null
         var clientWatch: IsoClientWatch? = null
-        ArchiveStreamService.clientOpened()
+        var registration: AutoCloseable? = null
         try {
             socket.soTimeout = 30000
             val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII))
@@ -794,11 +831,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             appendDebugLog("ARCHIVE_PROXY_REQUEST", "method=$method path=${path.substringBefore('?')} range=${rangeHeader ?: "full"}")
             val segments = path.substringBefore('?').split("/").filter { it.isNotEmpty() }
             if (segments.size >= 2 && segments[0] == "yt") {
+                registration = ArchiveProxyStreams.registry.register("yt:${segments[1]}", false) {
+                    try { socket.close() } catch (_: java.io.IOException) { }
+                }
                 handleYoutubeProxyClient(socket, segments[1], method, rangeHeader)
                 return
             }
             if (segments.size < 2 || segments[0] != "zip") {
-                val out = socket.getOutputStream()
+                val out = proxyOutput(socket)
                 out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
                 out.flush()
                 return
@@ -807,14 +847,26 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             requestDetails = "method=$method id=${segments[1]} requestedRange=${rangeHeader ?: "full"}"
             val entryId = segments[1]
             val entry = archiveEntryRegistry[entryId]
-            if (entry == null) {
-                appendDebugLog("ARCHIVE_PROXY_STATUS", "$requestDetails HTTP=404 missing stream registration")
-                val out = socket.getOutputStream()
+            if (entry == null || segments.size != 3 || !archiveFilenameMatches(segments.getOrNull(2), entry.fileName)) {
+                appendDebugLog("ARCHIVE_PROXY_STATUS", "$requestDetails HTTP=404 filename or stream registration mismatch")
+                val out = proxyOutput(socket)
                 out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
                 out.flush()
                 return
             }
 
+            val session = IsoReadSession()
+            isoSession = session
+            val full = method == "GET" && try {
+                val requested = HttpByteRange.parse(rangeHeader, entry.uncompressedSize)
+                requested.start == 0L && requested.end == entry.uncompressedSize - 1
+            } catch (_: java.io.IOException) { false }
+            registration = ArchiveProxyStreams.registry.register(entry.id, full) { reason ->
+                try { socket.close() } catch (_: java.io.IOException) { }
+                session.cancel(reason)
+                remoteConnToClean.get()?.disconnect()
+            }
+            session.checkActive()
             val totalSize = entry.uncompressedSize
             val mimeType = when {
                 entry.fileName.endsWith(".mp4", ignoreCase = true) ||
@@ -826,10 +878,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 else -> "video/x-matroska"
             }
 
-            val out = BufferedOutputStream(socket.getOutputStream(), 65536)
+            val out = BufferedOutputStream(proxyOutput(socket), 65536)
             if (entry.archiveFormat == "ISO") {
-                val session = IsoReadSession()
-                isoSession = session
                 clientWatch = IsoClientWatch(socket, session, ioExecutor)
                 session.log("ISO_PROXY_SOURCE", "$requestDetails url=${safeStreamUrl(entry.archiveUrl)}")
                 val file = IsoVirtualFile(entry.segments ?: throw java.io.IOException("Missing ISO extent map"), entry.isBdavM2ts)
@@ -838,19 +888,19 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     throw java.io.IOException("Inconsistent ISO stream length")
                 }
                 file.serve(method, rangeHeader, mimeType, out, ioExecutor, session) { start, length ->
-                    // Cache by VIRTUAL position: physical extents can be fragmented or repeated in a playlist.
-                    val cachedHead = isoHeadProbeCache[entry.id]
-                    if (cachedHead != null && start <= cachedHead.size.toLong() - length) {
-                        session.log("ISO_PROXY_CACHE_HIT", "virtual=$start-${start + length - 1}")
-                        cachedHead.copyOfRange(start.toInt(), start.toInt() + length)
-                    } else {
-                        val data = file.read(start, length,
-                            { remoteStart, remoteEnd -> fetchIsoByteRange(entry.archiveUrl, remoteStart, remoteEnd, session) },
-                            { packet, tsStart -> patchBluRayPmtForTs(packet, tsStart, -1) })
-                        if (start == 0L && length <= 524288) isoHeadProbeCache[entry.id] = data
-                        data
-                    }
+                    file.read(start, length,
+                        { remoteStart, remoteEnd ->
+                            val extent = entry.segments!!.first { (offset, length) ->
+                                offset >= 0 && remoteStart >= offset && remoteEnd < offset + length
+                            }
+                            isoChunkCache.read(entry.archiveUrl, remoteStart, remoteEnd,
+                                extent.first, extent.first + extent.second - 1, session) { from, to, sharedSession ->
+                                fetchIsoByteRange(entry.archiveUrl, from, to, sharedSession)
+                            }
+                        },
+                        { packet, tsStart -> patchBluRayPmtForTs(packet, tsStart, -1) })
                 }
+
                 return
             }
 
@@ -878,7 +928,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val remoteStart = dataStart + reqStart
                 val remoteEnd = dataStart + reqEnd
                 val remoteConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
-                remoteConnToClean = remoteConn
+                remoteConnToClean.set(remoteConn)
                 val upstreamCode = remoteConn.responseCode
                 if (upstreamCode !in 200..299) {
                     out.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
@@ -938,7 +988,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val remoteStart = dataStart
                 val remoteEnd = dataStart + maxCompFetch - 1L
                 val remoteConn = openRangeConnection(entry.archiveUrl, "bytes=$remoteStart-$remoteEnd")
-                remoteConnToClean = remoteConn
+                remoteConnToClean.set(remoteConn)
                 val upstreamCode = remoteConn.responseCode
                 if (upstreamCode !in 200..299) {
                     out.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
@@ -995,13 +1045,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
                 out.flush()
             } else {
-                val outStream = socket.getOutputStream()
+                val outStream = proxyOutput(socket)
                 outStream.write("HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\n\r\n".toByteArray())
                 outStream.flush()
             }
         } catch (_: IsoClientDisconnected) {
             // Client aborted while sending its request, before an upstream read began.
         } catch (e: Exception) {
+            if (isoSession?.isCancelled == true) return
             val mapping = if (e is IsoProxyReadException && e.count > 0) isoFile?.physicalRanges(e.start, e.count) else null
             val upstream = generateSequence<Throwable>(e) { it.cause }.take(12).filterIsInstance<IsoRangeException>().firstOrNull()
             appendDebugLog("ARCHIVE_PROXY_ERR", "$requestDetails mappedPhysical=${mapping ?: "unavailable"} upstreamHTTP=${upstream?.status ?: "unavailable"} ${isoFailureDetails(e)}")
@@ -1010,8 +1061,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             // Finish the local response before upstream cleanup can contend with an HTTP reader.
             try { socket.close() } catch (_: Throwable) {}
             isoSession?.cancel()
-            ArchiveStreamService.clientClosed()
-            val connRef = remoteConnToClean
+            registration?.close()
+            val connRef = remoteConnToClean.get()
             val infRef = inflaterToClean
             if (connRef != null || infRef != null) {
                 ioExecutor.submit {
@@ -1370,6 +1421,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun listZipMediaEntries(zipUrl: String, fileSizeHint: Double, promise: Promise) {
+        ArchiveProxyStreams.registry.resume()
         ioExecutor.submit {
             ensureZipDiskCacheLoaded()
             val cacheKey = extractArchiveCacheKey(zipUrl, fileSizeHint)
@@ -2019,7 +2071,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     private fun handleYoutubeProxyClient(socket: Socket, ytId: String, method: String, rangeHeader: String?) {
         val target = youtubeStreamRegistry[ytId]
         if (target == null || target.totalSize <= 0L) {
-            val out = socket.getOutputStream()
+            val out = proxyOutput(socket)
             out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())
             out.flush()
             return
@@ -2053,7 +2105,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         reqEnd = reqEnd.coerceIn(reqStart, (totalSize - 1L).coerceAtLeast(0L))
         val contentLength = reqEnd - reqStart + 1L
 
-        val out = BufferedOutputStream(socket.getOutputStream(), 65536)
+        val out = BufferedOutputStream(proxyOutput(socket), 65536)
         val headers = buildString {
             append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
             append("Content-Type: video/mp4\r\n")

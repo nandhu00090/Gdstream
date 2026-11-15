@@ -54,6 +54,22 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
         private var loudnessEnhancer: LoudnessEnhancer? = null
         private var enhancerSessionId: Int = -1
 
+        @androidx.annotation.Keep
+        @JvmStatic
+        fun attachArchivePlayer(rawPlayer: Any, url: String?): AutoCloseable? {
+            val player = rawPlayer as? androidx.media3.exoplayer.ExoPlayer ?: return null
+            if (url == null || !SecurityVaultModule.isIsoStream(url) ||
+                !url.substringBefore('?').endsWith(".m2ts", true) && !url.substringBefore('?').endsWith(".ts", true)) return null
+            return IsoAudioClockGuard(player)
+        }
+
+        @androidx.annotation.Keep
+        @JvmStatic
+        fun recoverArchiveAudio(controller: Any?, error: Any): Boolean {
+            val failure = error as? androidx.media3.common.PlaybackException ?: return false
+            return (controller as? IsoAudioClockGuard)?.recover(failure) ?: false
+        }
+
         @JvmStatic
         fun attachAudioSession(sessionId: Int) {
             if (sessionId <= 0) return
@@ -299,6 +315,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
         try {
             val playableUri = resolvePlayableUri(url)
             if (playableUri.host == "127.0.0.1" || playableUri.host == "localhost") {
+                ArchiveProxyStreams.prepare(url)
                 ArchiveStreamService.start(reactApplicationContext)
             }
             val mimeType = externalVideoMimeType(playableUri.path.orEmpty())
