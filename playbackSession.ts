@@ -2,9 +2,9 @@ import { useRef } from 'react';
 
 export const PLAYBACK_BUFFER_CONFIG = Object.freeze({
   minBufferMs: 15000,
-  maxBufferMs: 50000,
-  bufferForPlaybackMs: 1500,
-  bufferForPlaybackAfterRebufferMs: 3000,
+  maxBufferMs: 45000,
+  bufferForPlaybackMs: 2000,
+  bufferForPlaybackAfterRebufferMs: 4000,
 });
 
 /** Metadata, UI updates and completed-download notifications cannot change a playing source. */

@@ -130,7 +130,7 @@ class IsoVirtualFileTest {
     @Test fun failuresBeforeHeadersReturn502AndLaterFailuresDoNotAppendAnotherStatus() {
         val executor = Executors.newCachedThreadPool()
         try {
-            val file = IsoVirtualFile(listOf(0L to 1000000L), false)
+            val file = IsoVirtualFile(listOf(0L to (IsoRangeReader.WINDOW_BYTES * 2L)), false)
             for (failFirst in listOf(true, false)) {
                 val out = ByteArrayOutputStream()
                 assertThrows(IOException::class.java) {
@@ -141,7 +141,7 @@ class IsoVirtualFileTest {
                 }
                 val reply = response(out.toByteArray())
                 assertTrue(reply.headers.startsWith(if (failFirst) "HTTP/1.1 502 " else "HTTP/1.1 206 "))
-                assertEquals(if (failFirst) 0 else 188 * 2788, reply.body.size)
+                assertEquals(if (failFirst) 0 else IsoRangeReader.WINDOW_BYTES, reply.body.size)
             }
         } finally { executor.shutdownNow() }
     }
@@ -151,7 +151,7 @@ class IsoVirtualFileTest {
         val entered = java.util.concurrent.CountDownLatch(4)
         val release = java.util.concurrent.CountDownLatch(1)
         val starts = java.util.concurrent.ConcurrentSkipListSet<Long>()
-        val length = 7 * 1024 * 1024
+        val length = 4 * IsoRangeReader.WINDOW_BYTES + 17
         val file = IsoVirtualFile(listOf(42_000_000_000L to length.toLong()), false)
         val out = ByteArrayOutputStream()
         try {

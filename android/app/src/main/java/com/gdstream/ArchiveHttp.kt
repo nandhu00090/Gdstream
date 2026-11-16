@@ -3,10 +3,10 @@ package com.gdstream
 import java.io.OutputStream
 
 /** OPTIONS is metadata only; it must never prefetch media or supersede an active GET. */
-internal fun writeArchiveOptions(method: String, out: OutputStream): Boolean {
+internal fun writeArchiveOptions(method: String, out: OutputStream, keepAlive: Boolean = false): Boolean {
     if (method != "OPTIONS") return false
     out.write(("HTTP/1.1 200 OK\r\nAllow: GET, HEAD, OPTIONS\r\n" +
-        "Accept-Ranges: bytes\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").toByteArray(Charsets.US_ASCII))
+        "Accept-Ranges: bytes\r\nContent-Length: 0\r\nConnection: ${if (keepAlive) "keep-alive" else "close"}\r\n\r\n").toByteArray(Charsets.US_ASCII))
     out.flush()
     DebugLogger.log("ARCHIVE_PROXY_STATUS", "method=OPTIONS HTTP=200 length=0")
     return true

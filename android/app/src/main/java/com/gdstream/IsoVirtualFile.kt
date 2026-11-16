@@ -114,7 +114,7 @@ internal class IsoVirtualFile(
         executor: ExecutorService,
         session: IsoReadSession = IsoReadSession(),
         read: (Long, Int) -> ByteArray
-    ) {
+    ): Boolean {
         session.log("ISO_PROXY_REQUEST", "method=$method requestedRange=${rangeHeader ?: "full"} size=$size")
         fun write(bytes: ByteArray) {
             try {
@@ -137,11 +137,11 @@ internal class IsoVirtualFile(
                 flush()
             } catch (_: IsoClientDisconnected) { }
         }
-        if (writeArchiveOptions(method, out)) return
-        if (method != "GET" && method != "HEAD") { error("405 Method Not Allowed", "Allow: GET, HEAD, OPTIONS\r\n"); return }
+        if (writeArchiveOptions(method, out, true)) return true
+        if (method != "GET" && method != "HEAD") { error("405 Method Not Allowed", "Allow: GET, HEAD, OPTIONS\r\n"); return false }
         val range = try { HttpByteRange.parse(if (method == "HEAD") null else rangeHeader, size) } catch (_: IOException) {
             error("416 Range Not Satisfiable", "Content-Range: bytes */$size\r\n")
-            return
+            return false
         }
         var pendingStart = 0L
         var pendingCount = 0
@@ -161,11 +161,11 @@ internal class IsoVirtualFile(
                 }
             }
             fun prefetch() {
-                // One current chunk plus three sequential chunks, bounded to about 8 MiB per stream.
+                // Four sequential 8 MiB raw windows ahead of the chunk currently being delivered.
                 while (queued.size < 4 && cursor <= range.end && method != "HEAD") {
                     session.checkActive()
                     val start = cursor
-                    val limit = if (cursor == range.start) 188 * 2788 else 188 * 10922
+                    val limit = if (bdav) (IsoRangeReader.WINDOW_BYTES / 192) * 188 else IsoRangeReader.WINDOW_BYTES
                     val count = minOf(limit.toLong(), range.end - cursor + 1).toInt()
                     cursor += count
                     session.log("ISO_PROXY_MAP", "virtual=$start-${start + count - 1} physical=${physicalRanges(start, count)}")
@@ -189,13 +189,14 @@ internal class IsoVirtualFile(
                 append(if (range.partial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
                 append("Content-Type: $mimeType\r\nAccept-Ranges: bytes\r\nContent-Length: ${range.length}\r\n")
                 if (range.partial) append("Content-Range: bytes ${range.start}-${range.end}/$size\r\n")
-                append("Connection: close\r\n\r\n")
+                append("Connection: keep-alive\r\nKeep-Alive: timeout=120\r\n\r\n")
             }
             session.log("ISO_PROXY_STATUS", "HTTP=${if (range.partial) 206 else 200} virtual=${range.start}-${range.end} length=${range.length}")
             sentHeaders = true
             write(headers.toByteArray(Charsets.US_ASCII))
             var delivered = 0L
             while (chunk != null) {
+                prefetch()
                 write(chunk)
                 flush()
                 delivered += chunk.size
@@ -204,11 +205,12 @@ internal class IsoVirtualFile(
                 chunk = nextChunk()
             }
             flush()
+            return true
         } catch (error: IsoClientDisconnected) {
             session.cancel("client write: ${isoFailureDetails(error)}")
-            return
+            return false
         } catch (e: Exception) {
-            if (session.isCancelled) return
+            if (session.isCancelled) return false
             if (!sentHeaders) try { error("502 Bad Gateway") } catch (_: IsoClientDisconnected) { }
             throw IsoProxyReadException(pendingStart, pendingCount, e)
         } finally {

@@ -71,9 +71,9 @@ class IsoUpstreamTest {
         }
     }
 
-    @Test fun parallelProbesNeverExceedFourUpstreamReads() {
+    @Test fun parallelProbesNeverExceedSixUpstreamReads() {
         val pool = Executors.newFixedThreadPool(8)
-        val entered = CountDownLatch(4)
+        val entered = CountDownLatch(6)
         val release = CountDownLatch(1)
         val active = AtomicInteger()
         val peak = AtomicInteger()
@@ -95,10 +95,10 @@ class IsoUpstreamTest {
                 }
             }
             assertTrue(entered.await(5, TimeUnit.SECONDS))
-            assertEquals(4, peak.get())
+            assertEquals(6, peak.get())
             release.countDown()
             jobs.forEach { assertEquals(4, it.get(5, TimeUnit.SECONDS).size) }
-            assertEquals(4, peak.get()); assertEquals(0, active.get())
+            assertEquals(6, peak.get()); assertEquals(0, active.get())
         } finally { release.countDown(); pool.shutdownNow() }
     }
 
@@ -183,11 +183,11 @@ class IsoUpstreamTest {
         assertEquals(3, requested.size)
         assertEquals(start, requested.first().first)
         assertEquals(start + length - 1, requested.last().second)
-        assertTrue(requested.all { (from, to) -> to - from + 1 <= 2 * 1024 * 1024 })
+        assertTrue(requested.all { (from, to) -> to - from + 1 <= 8 * 1024 * 1024 })
         assertTrue(connections.all { it.closed })
     }
 
-    @Test fun abortedClientSocketsDisconnectBlockedReadsAndImmediatelyReleaseAllFourPermits() {
+    @Test fun abortedClientSocketsDisconnectBlockedReadsAndImmediatelyReleaseAllSixPermits() {
         assertCancelledProbes { clients -> clients.forEach { it.close() } }
     }
 
@@ -198,9 +198,9 @@ class IsoUpstreamTest {
 
     private fun assertCancelledProbes(abort: (List<java.net.Socket>) -> Unit) {
         val pool = Executors.newCachedThreadPool()
-        val entered = CountDownLatch(4)
-        val disconnected = CountDownLatch(4)
-        val sessions = List(4) { IsoReadSession() }
+        val entered = CountDownLatch(6)
+        val disconnected = CountDownLatch(6)
+        val sessions = List(6) { IsoReadSession() }
         val clients = ArrayList<java.net.Socket>()
         val accepted = ArrayList<java.net.Socket>()
         val watches = ArrayList<IsoClientWatch>()
@@ -247,8 +247,8 @@ class IsoUpstreamTest {
                 }
                 assertArrayEquals(byteArrayOf(1, 2, 3, 4), next.get(1, TimeUnit.SECONDS))
                 assertTrue(connections.all { it.closed })
-                // Also proves cancelled workers did not double-release and raise the four-request limit.
-                parallelProbesNeverExceedFourUpstreamReads()
+                // Also proves cancelled workers did not double-release and raise the six-request limit.
+                parallelProbesNeverExceedSixUpstreamReads()
             } finally {
                 sessions.forEach { it.cancel("test cleanup") }
                 watches.forEach { it.close() }
@@ -301,7 +301,7 @@ class IsoUpstreamTest {
             assertTrue(exported.contains("APP_BOOT"))
             assertTrue("Playback must append after the earlier APP_BOOT export", appended)
             DebugLogStore(file).append("APP_BOOT", "reopened")
-            assertTrue(DebugLogStore(file).snapshot().contains("ISO_UPSTREAM_ERR"))
+            assertFalse(DebugLogStore(file).snapshot().contains("ISO_UPSTREAM_ERR"))
         } finally { pool.shutdownNow() }
     }
 }

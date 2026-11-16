@@ -28,7 +28,8 @@ external mode to suppress fresh metadata scans. HEAD returns the exact full
 virtual Content-Length and no body; OPTIONS returns 200 with Allow, Accept-Ranges
 and Content-Length: 0 without reading the origin. Subtitle filename mismatches
 remain 404. The service allows 120 seconds for the chooser/initial handshake;
-once media bytes flow, 15 seconds without media shuts it down. Header-only
+the same 120-second deadline applies after media bytes flow. Idle shutdown retains
+registrations and permits a later probe to reconnect. Header-only
 probes do not extend either deadline. Recents/Stop cleanup remains unchanged.
 
 ## Automated checks
@@ -68,3 +69,14 @@ Use the original BD50 ISO and export `gdstream_debug.log.txt` after:
 
 Actual BD50 audio output, seek latency, and third-party application behavior
 require this Android device check; they cannot be measured by the sandbox tests.
+
+
+PR #6 throughput settings: upstream windows are 8 MiB with six permits, a 64 MiB
+LRU and four queued sequential windows ahead of delivery. Player buffer times
+are 15000/45000/2000/4000 ms (minimum/maximum/start/rebuffer). ISO media responses
+support persistent HTTP connections with exact lengths and keep-alive headers;
+abort monitoring preserves the next request byte. External intents include the
+movie title and video/mp2t MIME. APP_BOOT clears the session log and invalidates
+the exported-file append cursor; subsequent size rotation keeps the newest lines.
+These settings amortize origin TTFB; actual sustained bitrate and device memory
+use still require testing on the original BD50 stream.

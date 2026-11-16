@@ -90,24 +90,29 @@ internal class IsoReadSession {
     }
 }
 
-/** GET/HEAD use Connection: close. Watch abandoned probes even while waiting for their first byte. */
-internal class IsoClientWatch(socket: Socket, session: IsoReadSession, executor: ExecutorService) : AutoCloseable {
+/** Peek without consuming a subsequent keep-alive request. Stop before handing input to the parser. */
+internal class IsoClientWatch(socket: Socket, session: IsoReadSession, executor: ExecutorService,
+                              private val input: java.io.PushbackInputStream = java.io.PushbackInputStream(socket.getInputStream())) : AutoCloseable {
     private val finished = AtomicBoolean()
     private val job = executor.submit {
         try {
-            socket.soTimeout = 1000
-            val input = socket.getInputStream()
+            socket.soTimeout = 250
             while (!finished.get()) {
                 try {
-                    if (input.read() < 0) {
+                    val next = input.read()
+                    if (next < 0) {
                         if (!finished.get()) session.cancel("client closed socket")
-                        break
-                    }
-                } catch (_: SocketTimeoutException) { /* Recheck completion without polling the origin. */ }
+                    } else input.unread(next)
+                    break
+                } catch (_: SocketTimeoutException) { }
             }
         } catch (error: java.io.IOException) {
             if (!finished.get()) session.cancel("client socket: ${isoFailureDetails(error)}")
         }
     }
-    override fun close() { finished.set(true); job.cancel(true) }
+    override fun close() {
+        finished.set(true)
+        // Interrupt alone does not unblock SocketInputStream. Join after its bounded read timeout.
+        try { job.get(1, TimeUnit.SECONDS) } catch (_: Exception) { job.cancel(true) }
+    }
 }

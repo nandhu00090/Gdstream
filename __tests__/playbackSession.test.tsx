@@ -14,7 +14,7 @@ it('keeps the native source identical through metadata/UI updates and changes it
   await act(async () => { renderer.update(<Probe uri="http://localhost/disc.m2ts?metadata=changed" identity="disc:1" />); });
   expect(source!).toBe(original);
   expect(source!.bufferConfig).toBe(PLAYBACK_BUFFER_CONFIG);
-  expect(source!.bufferConfig.bufferForPlaybackMs).toBe(1500);
+  expect(source!.bufferConfig.bufferForPlaybackMs).toBe(2000);
   await act(async () => { renderer.update(<Probe uri="http://localhost/episode2.m2ts" identity="episode2:1" />); });
   expect(source!).not.toBe(original);
   expect(source!.uri).toBe('http://localhost/episode2.m2ts');
