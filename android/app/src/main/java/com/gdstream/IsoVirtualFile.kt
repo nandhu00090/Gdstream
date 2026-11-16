@@ -137,7 +137,8 @@ internal class IsoVirtualFile(
                 flush()
             } catch (_: IsoClientDisconnected) { }
         }
-        if (method != "GET" && method != "HEAD") { error("405 Method Not Allowed", "Allow: GET, HEAD\r\n"); return }
+        if (writeArchiveOptions(method, out)) return
+        if (method != "GET" && method != "HEAD") { error("405 Method Not Allowed", "Allow: GET, HEAD, OPTIONS\r\n"); return }
         val range = try { HttpByteRange.parse(if (method == "HEAD") null else rangeHeader, size) } catch (_: IOException) {
             error("416 Range Not Satisfiable", "Content-Range: bytes */$size\r\n")
             return

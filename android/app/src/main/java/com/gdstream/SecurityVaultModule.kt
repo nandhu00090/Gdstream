@@ -133,7 +133,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val localHeaderOffset: Long,
         @Volatile var dataStartOffset: Long = -1L,
         val segments: List<Pair<Long, Long>>? = null,
-        val isBdavM2ts: Boolean = false
+        val isBdavM2ts: Boolean = false,
+        val bluRay: BluRayProfile? = null
     )
 
     private val verifiedTrailerCache = ConcurrentHashMap<String, VerifiedTrailerInfo>()
@@ -158,6 +159,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     companion object {
         @Volatile private var clearIsoChunks: (() -> Unit)? = null
+        @Volatile private var bluRayProfile: ((String) -> BluRayProfile?)? = null
+        internal fun bluRayProfile(url: String): BluRayProfile? = ArchiveProxyStreams.streamId(url)?.let { bluRayProfile?.invoke(it) }
         @Volatile private var archiveFormat: ((String) -> String?)? = null
         internal fun isIsoStream(url: String): Boolean =
             ArchiveProxyStreams.streamId(url)?.let { archiveFormat?.invoke(it) } == "ISO"
@@ -188,6 +191,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         DebugLogger.initialize(reactContext)
         clearIsoChunks = { isoChunkCache.clear() }
         archiveFormat = { id -> archiveEntryRegistry[id]?.archiveFormat }
+        bluRayProfile = { id -> archiveEntryRegistry[id]?.bluRay }
         ioExecutor.submit {
             appendDebugLog("APP_BOOT", "GDStream Native Engine ready (SDK=" + Build.VERSION.SDK_INT + ")")
         }
@@ -791,10 +795,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     private fun proxyOutput(socket: Socket): java.io.OutputStream = object : java.io.OutputStream() {
         private val output = socket.getOutputStream()
-        override fun write(value: Int) { output.write(value); ArchiveStreamService.bytesTransferred(1) }
+        private val counter = HttpBodyCounter()
+        override fun write(value: Int) = write(byteArrayOf(value.toByte()), 0, 1)
         override fun write(bytes: ByteArray, offset: Int, length: Int) {
             output.write(bytes, offset, length)
-            ArchiveStreamService.bytesTransferred(length.toLong())
+            ArchiveStreamService.bytesTransferred(counter.bodyBytes(bytes, offset, length).toLong())
         }
         override fun flush() = output.flush()
     }
@@ -820,15 +825,17 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val path = parts[1]
 
             var rangeHeader: String? = null
+            var userAgent = "(absent)"
             while (true) {
                 val line = readClientLine() ?: break
                 if (line.isEmpty()) break
+                if (line.startsWith("User-Agent:", ignoreCase = true)) userAgent = line.substringAfter(":").trim().take(512)
                 if (line.startsWith("Range:", ignoreCase = true)) {
                     rangeHeader = line.substringAfter(":").trim()
                 }
             }
 
-            appendDebugLog("ARCHIVE_PROXY_REQUEST", "method=$method path=${path.substringBefore('?')} range=${rangeHeader ?: "full"}")
+            appendDebugLog("ARCHIVE_PROXY_REQUEST", "method=$method path=${path.substringBefore('?')} range=${rangeHeader ?: "full"} userAgent=$userAgent")
             val segments = path.substringBefore('?').split("/").filter { it.isNotEmpty() }
             if (segments.size >= 2 && segments[0] == "yt") {
                 registration = ArchiveProxyStreams.registry.register("yt:${segments[1]}", false) {
@@ -844,7 +851,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 return
             }
 
-            requestDetails = "method=$method id=${segments[1]} requestedRange=${rangeHeader ?: "full"}"
+            requestDetails = "method=$method id=${segments[1]} requestedRange=${rangeHeader ?: "full"} userAgent=$userAgent"
             val entryId = segments[1]
             val entry = archiveEntryRegistry[entryId]
             if (entry == null || segments.size != 3 || !archiveFilenameMatches(segments.getOrNull(2), entry.fileName)) {
@@ -898,12 +905,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                                 fetchIsoByteRange(entry.archiveUrl, from, to, sharedSession)
                             }
                         },
-                        { packet, tsStart -> patchBluRayPmtForTs(packet, tsStart, -1) })
+                        { _, _ -> /* Preserve HDMV PMT stream types for VLC/MX and our Blu-ray extractor. */ })
                 }
 
                 return
             }
 
+            if (writeArchiveOptions(method, out)) return
             val range = try {
                 HttpByteRange.parse(if (method == "HEAD") null else rangeHeader, totalSize)
             } catch (_: java.io.IOException) {
@@ -1303,7 +1311,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val hasIso = (0 until targetsArr.length()).any {
                 targetsArr.optJSONObject(it)?.optString("archiveFormat") == "ISO"
             }
-            if (hasIso && root.optInt("isoIndexVersion", 0) != 4) return null
+            if (hasIso && root.optInt("isoIndexVersion", 0) != 5) return null
             var hasUnstrippedM2ts = false
             for (ci in 0 until targetsArr.length()) {
                 val co = targetsArr.optJSONObject(ci) ?: continue
@@ -1352,11 +1360,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     localHeaderOffset = o.optLong("localHeaderOffset", 0L),
                     dataStartOffset = o.optLong("dataStartOffset", -1L),
                     segments = restoredSegs,
-                    isBdavM2ts = o.optBoolean("isBdavM2ts", false)
+                    isBdavM2ts = o.optBoolean("isBdavM2ts", false),
+                    bluRay = BluRayProfile.fromJson(o.optJSONObject("bluRay"))
                 )
                 if (entry.archiveFormat == "ISO") {
                     val file = IsoVirtualFile(restoredSegs ?: return null, entry.isBdavM2ts)
                     if (file.rawSize != entry.compressedSize || file.size != entry.uncompressedSize) return null
+                    if (entry.bluRay?.points?.any { it.position >= file.size || it.timeUs >= entry.bluRay.durationUs } == true) return null
                 }
                 restoredTargets[id] = entry
             }
@@ -1402,6 +1412,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         }
                         put("segments", sArr)
                     }
+                    t.bluRay?.let { put("bluRay", it.toJson()) }
                     if (t.isBdavM2ts) {
                         put("isBdavM2ts", true)
                     }
@@ -1411,7 +1422,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val root = JSONObject().apply {
                     put("rawJson", rawJson)
                     put("targets", targetsArr)
-                    put("isoIndexVersion", 4)
+                    put("isoIndexVersion", 5)
                 }
                 zipDiskCache[cacheKey] = root.toString()
                 saveZipDiskCacheAsync()
@@ -3592,84 +3603,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun computeMpeg2Crc32(data: ByteArray, offset: Int, length: Int): Int {
-        var crc = -1
-        for (i in 0 until length) {
-            val b = data[offset + i].toInt() and 0xFF
-            crc = crc xor (b shl 24)
-            for (bit in 0 until 8) {
-                crc = if ((crc and Int.MIN_VALUE) != 0) {
-                    (crc shl 1) xor 0x04C11DB7
-                } else {
-                    crc shl 1
-                }
-            }
-        }
-        return crc
-    }
-
-    // Rewrites Blu-ray DTS-HD MA stream_type (0x86) to standard TS_STREAM_TYPE_DTS_HD (0x8A) in PMT packets
-    // so ExoPlayer never mistakes DTS-HD audio for SCTE-35 splice metadata.
-    private fun patchBluRayPmtForTs(pkt: ByteArray, tsStart: Int, currentPmtPid: Int): Int {
-        if (tsStart + 188 > pkt.size || (pkt[tsStart].toInt() and 0xFF) != 0x47) return currentPmtPid
-        val pusi = (pkt[tsStart + 1].toInt() and 0x40) != 0
-        if (!pusi) return currentPmtPid
-        val pid = ((pkt[tsStart + 1].toInt() and 0x1F) shl 8) or (pkt[tsStart + 2].toInt() and 0xFF)
-        val afc = (pkt[tsStart + 3].toInt() and 0x30) ushr 4
-        if (afc == 0 || afc == 2) return currentPmtPid
-        var payOff = tsStart + 4
-        if (afc == 3) {
-            if (payOff >= tsStart + 188) return currentPmtPid
-            payOff += 1 + (pkt[payOff].toInt() and 0xFF)
-        }
-        if (payOff >= tsStart + 188) return currentPmtPid
-        val ptrField = pkt[payOff].toInt() and 0xFF
-        val secStart = payOff + 1 + ptrField
-        val pktEnd = tsStart + 188
-
-        if (pid == 0 && secStart + 12 <= pktEnd && (pkt[secStart].toInt() and 0xFF) == 0x00) {
-            val secLen = ((pkt[secStart + 1].toInt() and 0x0F) shl 8) or (pkt[secStart + 2].toInt() and 0xFF)
-            var sp = secStart + 8
-            val sEnd = minOf(pktEnd - 4, secStart + 3 + secLen - 4)
-            while (sp + 4 <= sEnd) {
-                val progNum = ((pkt[sp].toInt() and 0xFF) shl 8) or (pkt[sp + 1].toInt() and 0xFF)
-                val pPid = ((pkt[sp + 2].toInt() and 0x1F) shl 8) or (pkt[sp + 3].toInt() and 0xFF)
-                if (progNum != 0 && pPid > 0) return pPid
-                sp += 4
-            }
-        } else if (pid != 0 && secStart + 16 <= pktEnd &&
-            (pkt[secStart].toInt() and 0xFF) == 0x02 &&
-            (pkt[secStart + 1].toInt() and 0xF0) == 0xB0
-        ) {
-            val secLen = ((pkt[secStart + 1].toInt() and 0x0F) shl 8) or (pkt[secStart + 2].toInt() and 0xFF)
-            val secTotalEnd = secStart + 3 + secLen
-            if (secLen >= 13 && secTotalEnd <= pktEnd && computeMpeg2Crc32(pkt, secStart, 3 + secLen) == 0) {
-                val progInfoLen = ((pkt[secStart + 10].toInt() and 0x0F) shl 8) or (pkt[secStart + 11].toInt() and 0xFF)
-                var ep = secStart + 12 + progInfoLen
-                val crcPos = secTotalEnd - 4
-                var modified = false
-                while (ep + 5 <= crcPos) {
-                    val st = pkt[ep].toInt() and 0xFF
-                    if (st == 0x86) {
-                        pkt[ep] = 0x8A.toByte()
-                        modified = true
-                    }
-                    val esInfoLen = ((pkt[ep + 3].toInt() and 0x0F) shl 8) or (pkt[ep + 4].toInt() and 0xFF)
-                    ep += 5 + esInfoLen
-                }
-                if (modified) {
-                    val newCrc = computeMpeg2Crc32(pkt, secStart, crcPos - secStart)
-                    pkt[crcPos] = ((newCrc ushr 24) and 0xFF).toByte()
-                    pkt[crcPos + 1] = ((newCrc ushr 16) and 0xFF).toByte()
-                    pkt[crcPos + 2] = ((newCrc ushr 8) and 0xFF).toByte()
-                    pkt[crcPos + 3] = (newCrc and 0xFF).toByte()
-                }
-            }
-            return pid
-        }
-        return currentPmtPid
-    }
-
     // =========================================================================
     // 📀 BLU-RAY / DVD / DATA .ISO STREAMING ENGINE (FAST PARALLEL UDF 2.50)
     // =========================================================================
@@ -3775,6 +3708,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
         val m2tsMap = HashMap<String, IsoFileEntry>()
         val mplsList = ArrayList<IsoFileEntry>()
+        val clpiMap = HashMap<String, IsoFileEntry>()
         for (f in allFiles) {
             if (f.isDir || f.size <= 0L || f.extents.isEmpty()) continue
             val upperPath = f.path.uppercase(Locale.ROOT)
@@ -3783,9 +3717,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 m2tsMap[upperName.substringBeforeLast('.')] = f
             } else if (upperPath.contains("BDMV/PLAYLIST/") && upperName.endsWith(".MPLS") && f.size <= 2L * 1024L * 1024L) {
                 mplsList.add(f)
+            } else if (upperPath.contains("BDMV/CLIPINF/") && upperName.endsWith(".CLPI") && f.size <= 8L * 1024L * 1024L) {
+                clpiMap[upperName.substringBeforeLast('.')] = f
             }
         }
-        appendDebugLog("ISO_BDMV_SCAN", "m2tsCount=${m2tsMap.size}, mplsCount=${mplsList.size}")
+        appendDebugLog("ISO_BDMV_SCAN", "m2tsCount=${m2tsMap.size}, mplsCount=${mplsList.size}, clpiCount=${clpiMap.size}")
 
         if (m2tsMap.isNotEmpty()) {
             data class ResolvedPlaylist(
@@ -3793,7 +3729,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val durationSec: Int,
                 val totalBytes: Long,
                 val segments: List<Pair<Long, Long>>,
-                val clipSignature: String
+                val clipSignature: String,
+                val clips: List<BluRayPlaylist.Clip>
             )
 
             val playlists = ArrayList<ResolvedPlaylist>()
@@ -3837,7 +3774,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         if (outTime <= inTime) { valid = false; break }
                         val m2tsEntry = m2tsMap[clipId]
                         if (m2tsEntry == null) { valid = false; break }
-                        clips.add(BluRayPlaylist.Clip(clipId, outTime - inTime, m2tsEntry.size, m2tsEntry.extents))
+                        clips.add(BluRayPlaylist.Clip(clipId, outTime - inTime, m2tsEntry.size, m2tsEntry.extents, inTime))
                         p += 2 + itemLen
                     }
 
@@ -3852,10 +3789,30 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                     val isMenuLoop = clipNames.size > 3 && clipNames.toSet().size == 1
                     if (valid && !isMenuLoop && segs.isNotEmpty() && totalBytes >= 50L * 1024L * 1024L && durSec >= 180 && seenSignatures.add(clipSig)) {
-                        playlists.add(ResolvedPlaylist(mpls.name, durSec, totalBytes, segs, clipSig))
+                        playlists.add(ResolvedPlaylist(mpls.name, durSec, totalBytes, segs, clipSig, selected))
                         appendDebugLog("ISO_MPLS_HIT", "mpls=${mpls.name} dur=${durSec}s bytes=$totalBytes clips=$clipSig")
                     }
                 } catch (_: Throwable) {}
+            }
+
+            val profiles = HashMap<String, BluRayProfile?>()
+            fun profile(playlist: ResolvedPlaylist): BluRayProfile? {
+                // A single clip has one timestamp epoch. Never apply one clip's map to spliced clips.
+                val clip = playlist.clips.singleOrNull() ?: return null
+                val key = "${clip.id}:${clip.inTicks}:${clip.ticks}"
+                if (profiles.containsKey(key)) return profiles[key]
+                val info = clpiMap[clip.id]
+                val parsed = if (info == null) null else try {
+                    BluRayClipInfo.parse(readIsoFileBytes(isoUrl, info, 8 * 1024 * 1024), clip.inTicks, clip.ticks, clip.size).also {
+                        appendDebugLog("ISO_CLPI_OK", "clip=${clip.id} points=${it.points.size} durationUs=${it.durationUs} audio=${it.audio}")
+                    }
+                } catch (error: Exception) {
+                    appendDebugLog("ISO_CLPI_ERR", "clip=${clip.id} ${isoFailureDetails(error)}; retaining PCR seek fallback")
+                    null
+                }
+                if (info == null) appendDebugLog("ISO_CLPI_MISSING", "clip=${clip.id}; retaining PCR seek fallback")
+                profiles[key] = parsed
+                return parsed
             }
 
             if (playlists.isNotEmpty()) {
@@ -3877,7 +3834,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         val epCode = String.format(Locale.US, "S%02dE%02d", sNum, idx + 1)
                         val durTag = formatIsoDurationLabel(ep.durationSec)
                         val displayName = if (durTag.isNotEmpty()) "$cleanShow $epCode [$durTag].m2ts" else "$cleanShow $epCode.m2ts"
-                        outItems.add(registerIsoStreamTarget(isoUrl, displayName, ep.totalBytes, ep.segments, port, "video/mp2t", ep.durationSec))
+                        outItems.add(registerIsoStreamTarget(isoUrl, displayName, ep.totalBytes, ep.segments, port, "video/mp2t", ep.durationSec, profile(ep)))
                     }
                     appendDebugLog("ISO_DONE_SERIES", "Resolved ${outItems.size} episodes in ${System.currentTimeMillis() - t0}ms")
                     return Pair(outItems, "")
@@ -3892,7 +3849,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             durTag.isNotEmpty() -> "$discTitle - Feature $featureNum [$durTag].m2ts"
                             else -> "$discTitle - Feature $featureNum.m2ts"
                         }
-                        outItems.add(registerIsoStreamTarget(isoUrl, label, pl.totalBytes, pl.segments, port, "video/mp2t", pl.durationSec))
+                        outItems.add(registerIsoStreamTarget(isoUrl, label, pl.totalBytes, pl.segments, port, "video/mp2t", pl.durationSec, profile(pl)))
                     }
                     appendDebugLog("ISO_DONE_MOVIE", "Resolved ${outItems.size} features in ${System.currentTimeMillis() - t0}ms")
                     return Pair(outItems, "")
@@ -3970,7 +3927,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         segments: List<Pair<Long, Long>>,
         port: Int,
         mimeType: String,
-        durationSec: Int = 0
+        durationSec: Int = 0,
+        bluRay: BluRayProfile? = null
     ): JSONObject {
         val entryId = "ze_" + System.nanoTime() + "_" + archiveEntryCounter.getAndIncrement()
         val firstOffset = segments.firstOrNull()?.first ?: 0L
@@ -3989,7 +3947,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             localHeaderOffset = firstOffset,
             dataStartOffset = firstOffset,
             segments = segments,
-            isBdavM2ts = isBdav
+            isBdavM2ts = isBdav,
+            bluRay = bluRay
         )
         archiveEntryRegistry[entryId] = target
         val safeName = URLEncoder.encode(displayName, "UTF-8").replace("+", "%20")
