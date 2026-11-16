@@ -113,6 +113,7 @@ internal class IsoVirtualFile(
         out: OutputStream,
         executor: ExecutorService,
         session: IsoReadSession = IsoReadSession(),
+        durationUs: Long = 0,
         read: (Long, Int) -> ByteArray
     ): Boolean {
         session.log("ISO_PROXY_REQUEST", "method=$method requestedRange=${rangeHeader ?: "full"} size=$size")
@@ -188,6 +189,11 @@ internal class IsoVirtualFile(
             val headers = buildString {
                 append(if (range.partial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
                 append("Content-Type: $mimeType\r\nAccept-Ranges: bytes\r\nContent-Length: ${range.length}\r\n")
+                append("transferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: DLNA.ORG_OP=01;DLNA.ORG_CI=0\r\n")
+                if (durationUs > 0) {
+                    val seconds = java.math.BigDecimal.valueOf(durationUs, 6).stripTrailingZeros().toPlainString()
+                    append("X-Content-Duration: $seconds\r\nContent-Duration: $seconds\r\n")
+                }
                 if (range.partial) append("Content-Range: bytes ${range.start}-${range.end}/$size\r\n")
                 append("Connection: keep-alive\r\nKeep-Alive: timeout=120\r\n\r\n")
             }

@@ -80,3 +80,23 @@ movie title and video/mp2t MIME. APP_BOOT clears the session log and invalidates
 the exported-file append cursor; subsequent size rotation keeps the newest lines.
 These settings amortize origin TTFB; actual sustained bitrate and device memory
 use still require testing on the original BD50 stream.
+
+PR #8 catalogs one largest-by-bytes feature per ISO. All MPLS candidates are
+inspected in batches of six; short-intro filtering is retained. If playlists
+are unavailable, the largest raw M2TS (or DVD title/data-disc video) is used.
+ISO cache schema 6 invalidates old multi-feature catalog entries.
+
+MediaInfo accompanies the selected entry and comes from CLPI ProgramInfo,
+MPLS STN descriptors, and the UDF logical volume label. It includes stream
+languages, video format/rate, and HDR/DV evidence. A 2160p HEVC base plus the
+1080p HEVC enhancement PID 0x1015, MPLS DV indication, HEVC dynamic-range flags,
+or explicit disc-label tags identify DV; an unrelated secondary 1080p video
+does not. The existing display-format chooser consumes these flags before
+playback. This metadata change does not add a new Dolby Vision decoder.
+Unknown channels/languages are not guessed as 5.1/English.
+
+ISO GET/HEAD responses advertise full presentation duration in seconds through
+X-Content-Duration and Content-Duration when known, and DLNA Streaming/OP=01/CI=0.
+Byte ranges and Content-Length remain in the exposed 188-byte TS address space.
+OP=01 advertises byte seeking, not DLNA TimeSeekRange support; VLC/MX time-seek
+behavior and display-format rendering still need device validation.

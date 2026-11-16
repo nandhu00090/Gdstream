@@ -7,7 +7,7 @@ import org.json.JSONObject
 data class BluRayPoint(val timeUs: Long, val position: Long)
 data class BluRayAudio(val pid: Int, val type: Int, val language: String) {
     val label: String get() {
-        val name = java.util.Locale.forLanguageTag(language).getDisplayLanguage(java.util.Locale.ENGLISH).ifBlank { language }
+        val name = bluRayLanguage(language)
         val codec = when (type) {
             0x80 -> "LPCM"
             0x82 -> "DTS"
@@ -18,8 +18,11 @@ data class BluRayAudio(val pid: Int, val type: Int, val language: String) {
         return "$name $codec"
     }
 }
-data class BluRayProfile(val durationUs: Long, val points: List<BluRayPoint>, val audio: List<BluRayAudio>) {
+data class BluRayProfile(val durationUs: Long, val points: List<BluRayPoint>, val audio: List<BluRayAudio>,
+    val streams: List<BluRayStream> = emptyList(), val discLabel: String = "", val dolbyVision: Boolean = false) {
     fun toJson() = JSONObject().put("durationUs", durationUs)
+        .put("streams", JSONArray().apply { streams.forEach { put(it.json()) } })
+        .put("discLabel", discLabel).put("dolbyVision", dolbyVision)
         .put("points", JSONArray().apply { points.forEach { put(JSONArray().put(it.timeUs).put(it.position)) } })
         .put("audio", JSONArray().apply { audio.forEach { put(JSONArray().put(it.pid).put(it.type).put(it.language)) } })
     companion object {
@@ -33,7 +36,8 @@ data class BluRayProfile(val durationUs: Long, val points: List<BluRayPoint>, va
             require(points.zipWithNext().all { (a, b) -> b.timeUs > a.timeUs && b.position > a.position })
             return BluRayProfile(json.getLong("durationUs"), points, (0 until a.length()).map {
                 a.getJSONArray(it).let { BluRayAudio(it.getInt(0), it.getInt(1), it.getString(2)) }
-            })
+            }, json.optJSONArray("streams")?.let { arr -> (0 until arr.length()).map { BluRayStream.fromJson(arr.getJSONArray(it)) } }.orEmpty(),
+                json.optString("discLabel", ""), json.optBoolean("dolbyVision", false))
         }
     }
 }
@@ -48,6 +52,26 @@ internal object BluRayClipInfo {
             return value
         }
     }
+    /** Raw-stream fallback: take the presentation interval from the CLPI STC sequence. */
+    fun parseRaw(data: ByteArray, rawSize: Long): BluRayProfile {
+        fun u32(p: Int): Long {
+            require(p >= 0 && p.toLong() + 4 <= data.size) { "Truncated CLPI sequence" }
+            return (0..3).fold(0L) { n, i -> (n shl 8) or (data[p + i].toLong() and 255) }
+        }
+        val start = u32(8)
+        if (start == 0L) return parse(data, 0, 1, rawSize).copy(durationUs = 0, points = emptyList())
+        require(start <= data.size - 26)
+        val p = start.toInt()
+        require(u32(p) >= 22 && start + 4 + u32(p) <= data.size)
+        val inTicks = u32(p + 18)
+        val outTicks = u32(p + 22)
+        require(outTicks > inTicks)
+        val profile = parse(data, inTicks, outTicks - inTicks, rawSize)
+        // Multiple clock epochs need a splice timeline; do not advertise a misleading duration.
+        return if (data[p + 5].toInt() == 1 && data[p + 10].toInt() == 1) profile
+            else profile.copy(durationUs = 0, points = emptyList())
+    }
+
     fun parse(data: ByteArray, inTicks: Long, durationTicks: Long, rawSize: Long): BluRayProfile {
         require(inTicks >= 0 && durationTicks > 0 && rawSize >= 192)
         require(data.size >= 32 && String(data, 0, 4, Charsets.US_ASCII) == "HDMV") { "Invalid CLPI header" }
@@ -66,21 +90,23 @@ internal object BluRayClipInfo {
             return start.toInt() to end.toInt()
         }
         val audio = ArrayList<BluRayAudio>()
+        val streams = ArrayList<BluRayStream>()
         val videoPids = HashSet<Int>()
         section(12)?.let { (start, end) ->
             require(start + 6 <= end)
             var p = start + 6
             repeat(uint(start + 5, 1).toInt()) {
                 require(p + 8 <= end)
-                val streams = uint(p + 6, 1).toInt()
+                val streamCount = uint(p + 6, 1).toInt()
                 p += 8
-                repeat(streams) {
+                repeat(streamCount) {
                     require(p + 4 <= end)
                     val pid = uint(p, 2).toInt()
                     val length = uint(p + 2, 1).toInt()
                     val coding = p + 3
                     require(length > 0 && coding + length <= end)
                     val type = uint(coding, 1).toInt()
+                    streams.add(BluRayStream.descriptor(pid, data.copyOfRange(coding, coding + length), true))
                     if (type in listOf(0x01, 0x02, 0x1b, 0x24, 0xea)) videoPids.add(pid)
                     if (type in listOf(0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0xa1, 0xa2)) {
                         require(length >= 5)
@@ -96,17 +122,17 @@ internal object BluRayClipInfo {
         // STC epochs cannot share that clip's zero-based clock without an explicit splice layer.
         section(8)?.let { (start, end) ->
             require(start + 6 <= end)
-            if (uint(start + 5, 1) != 1L) return BluRayProfile(durationUs, points, audio)
+            if (uint(start + 5, 1) != 1L) return BluRayProfile(durationUs, points, audio, streams)
             val atc = start + 6
             require(atc + 6 <= end)
-            if (uint(atc + 4, 1) != 1L) return BluRayProfile(durationUs, points, audio)
+            if (uint(atc + 4, 1) != 1L) return BluRayProfile(durationUs, points, audio, streams)
             val stc = atc + 6
             require(stc + 14 <= end)
-            if (kotlin.math.abs(uint(stc + 6, 4) - inTicks) > 256) return BluRayProfile(durationUs, points, audio)
+            if (kotlin.math.abs(uint(stc + 6, 4) - inTicks) > 256) return BluRayProfile(durationUs, points, audio, streams)
         }
-        val cpi = section(16) ?: return BluRayProfile(durationUs, points, audio)
+        val cpi = section(16) ?: return BluRayProfile(durationUs, points, audio, streams)
         val (start, end) = cpi
-        if (end == start + 4) return BluRayProfile(durationUs, points, audio)
+        if (end == start + 4) return BluRayProfile(durationUs, points, audio, streams)
         require(start + 8 <= end)
         val epBase = start + 6
         val table = Bits(data, (start + 8) * 8, end)
@@ -121,7 +147,7 @@ internal object BluRayClipInfo {
             Entry(pid, type, coarse, fine, at.toInt())
         }
         val entry = entries.firstOrNull { it.pid in videoPids } ?: entries.firstOrNull { it.type == 1 }
-            ?: return BluRayProfile(durationUs, points, audio)
+            ?: return BluRayProfile(durationUs, points, audio, streams)
         val fineStart = entry.at.toLong() + uint(entry.at, 4)
         require(entry.at.toLong() + 4 + entry.coarse * 8L <= fineStart && fineStart + entry.fine * 4L <= end)
         val coarseBits = Bits(data, (entry.at + 4) * 8, end)
@@ -145,6 +171,6 @@ internal object BluRayClipInfo {
             }
         }
         if (points.isNotEmpty() && points.first().timeUs > 0 && points.first().position > 0) points.add(0, BluRayPoint(0, 0))
-        return BluRayProfile(durationUs, points, audio.distinctBy { it.pid })
+        return BluRayProfile(durationUs, points, audio.distinctBy { it.pid }, streams.distinctBy { it.pid })
     }
 }

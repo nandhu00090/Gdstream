@@ -1085,6 +1085,10 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun inspectMedia(url: String, fileName: String, promise: Promise) {
+        SecurityVaultModule.isoMediaInfo(url)?.let {
+            promise.resolve(Arguments.makeNativeMap(it))
+            return
+        }
         inspectorPool.submit {
             try {
                 val parsed = fetchAndParseHeader(url, fileName)

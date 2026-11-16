@@ -1560,7 +1560,7 @@ const App = () => {
     const filtered = rawList.filter((file) => {
       const isFolder = isSeriesContainerItem(file);
       const info = parseMediaFilename(file.name, isFolder);
-      const realMi = mediaInfoMap[file.name];
+      const realMi: RealMediaInfo | undefined = file.mediaInfo ?? mediaInfoMap[file.name];
 
       if (q) {
         const titleLower = info.cleanTitle.toLowerCase();
@@ -1756,6 +1756,10 @@ const App = () => {
       for (const fileObj of targets) {
         if (cancelled || !fileObj?.name) break;
         const fName = fileObj.name;
+        if (fileObj.archiveFormat === 'ISO' && fileObj.mediaInfo) {
+          if (mediaInfoMap[fName] !== fileObj.mediaInfo) setMediaInfoMap(prev => ({ ...prev, [fName]: fileObj.mediaInfo }));
+          continue;
+        }
         if (mediaInfoMap[fName] && (mediaInfoMap[fName].width > 0 || (mediaInfoMap[fName].audioTracks && mediaInfoMap[fName].audioTracks.length > 0))) {
           if (mediaInfoMap[fName].durationSec > 0) {
             savedDurationsRef.current[fName] = mediaInfoMap[fName].durationSec;
@@ -2367,7 +2371,7 @@ const App = () => {
   const handlePlayInAppPress = (fileToPlay = selectedFile) => {
     if (!fileToPlay) return;
     const info = parseMediaFilename(fileToPlay.name, false);
-    const realMi = mediaInfoMap[fileToPlay.name];
+    const realMi: RealMediaInfo | undefined = fileToPlay.mediaInfo ?? mediaInfoMap[fileToPlay.name];
     const effectiveHasDV = realMi ? realMi.hasDV : info.hasDV;
     const effectiveHasHDR = realMi ? realMi.hasHDR : info.hasHDR;
 
@@ -3021,7 +3025,7 @@ const App = () => {
     const thumbPixelX = (progressPercent / 100) * safeBarWidth;
     const previewLeftPx = Math.max(0, Math.min(safeBarWidth - previewBoxWidth, thumbPixelX - previewBoxWidth / 2));
     const playerInfo = parseMediaFilename(selectedFile.name, false);
-    const realMi = mediaInfoMap[selectedFile.name];
+    const realMi: RealMediaInfo | undefined = selectedFile.mediaInfo ?? mediaInfoMap[selectedFile.name];
     const effectiveHasDV = realMi ? realMi.hasDV : playerInfo.hasDV;
     const effectiveHasHDR = realMi ? realMi.hasHDR : playerInfo.hasHDR;
     const canSwitchDvHdr = effectiveHasDV && effectiveHasHDR;
@@ -3330,7 +3334,7 @@ const App = () => {
     if (!selectedFile || (playMode !== null && playMode !== 'external')) return null;
     const info = parseMediaFilename(selectedFile.name, false);
     const meta = metadataMap[selectedFile.name];
-    const realMi = mediaInfoMap[selectedFile.name];
+    const realMi: RealMediaInfo | undefined = selectedFile.mediaInfo ?? mediaInfoMap[selectedFile.name];
     const savedSec = savedTimesMap[selectedFile.name] || 0;
     const totalDur = playbackDuration(selectedFile, realMi?.durationSec || 0, savedDurationsMap[selectedFile.name]);
     const resumePct = totalDur > 0 && savedSec > 0 ? Math.min(98, Math.max(3, (savedSec / totalDur) * 100)) : 45;
@@ -3807,7 +3811,7 @@ const App = () => {
     const isFolder = isSeriesContainerItem(item);
     const info = parseMediaFilename(item.name, isFolder);
     const meta = metadataMap[item.name];
-    const realMi = mediaInfoMap[item.name];
+    const realMi: RealMediaInfo | undefined = item.mediaInfo ?? mediaInfoMap[item.name];
     const activeVerForCard = item._versions?.find((v: any) => (savedTimesMap[v.name] || 0) > 3) || item;
     const savedSec = savedTimesMap[activeVerForCard.name] || 0;
     const totalDur = savedDurationsMap[activeVerForCard.name] || mediaInfoMap[activeVerForCard.name]?.durationSec || 0;
