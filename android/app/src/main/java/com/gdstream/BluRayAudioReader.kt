@@ -29,7 +29,8 @@ internal abstract class BluRayAudioReader(private val tracks: List<BluRayAudio>,
         track = tracks.firstOrNull { it.pid == idGenerator.trackId }
         output = extractorOutput.track(idGenerator.trackId, C.TRACK_TYPE_AUDIO)
     }
-    override fun seek() { length = 0; absoluteStart = 0; timestamps.clear(); timeUs = C.TIME_UNSET }
+    protected open fun resetFrameState() {}
+    override fun seek() { resetFrameState(); length = 0; absoluteStart = 0; timestamps.clear(); timeUs = C.TIME_UNSET }
     override fun packetStarted(pesTimeUs: Long, flags: Int) {
         if (pesTimeUs != C.TIME_UNSET) timestamps.addLast((absoluteStart + length) to pesTimeUs)
     }
@@ -74,9 +75,12 @@ internal class HdmvPcmReader(tracks: List<BluRayAudio>, language: String?) : Blu
     override fun frame(data: ByteArray, length: Int, end: Boolean): Frame? {
         if (length < 4) return null
         val bytes = ((data[0].toInt() and 255) shl 8) or (data[1].toInt() and 255)
-        require(bytes > 0) { "Empty HDMV LPCM frame" }
+        val layout = try { HdmvPcm.layout(data) } catch (_: Exception) {
+            return Frame(1, ByteArray(0), Format.Builder().build(), 0)
+        }
+        if (bytes == 0 || bytes % layout.frameBytes != 0)
+            return Frame(1, ByteArray(0), Format.Builder().build(), 0)
         if (length < bytes + 4) return null
-        val layout = HdmvPcm.layout(data)
         val decoded = HdmvPcm.decode(data.copyOfRange(4, bytes + 4), layout)
         val format = Format.Builder().setSampleMimeType(MimeTypes.AUDIO_RAW).setChannelCount(layout.channels.size)
             .setSampleRate(layout.rate).setPcmEncoding(if (layout.bytesPerSample == 2) C.ENCODING_PCM_16BIT else C.ENCODING_PCM_24BIT).build()
@@ -88,6 +92,7 @@ internal class HdmvPcmReader(tracks: List<BluRayAudio>, language: String?) : Blu
 internal class BluRayDtsReader(private val hd: Boolean, tracks: List<BluRayAudio>, language: String?) : BluRayAudioReader(tracks, language) {
     private var knownFormat: Format? = null
     private var knownDuration = 0L
+    override fun resetFrameState() { knownFormat = null; knownDuration = 0L }
     private fun type(data: ByteArray, at: Int): Int {
         var sync = 0
         repeat(4) { sync = (sync shl 8) or (data[at + it].toInt() and 255) }
@@ -100,7 +105,16 @@ internal class BluRayDtsReader(private val hd: Boolean, tracks: List<BluRayAudio
         if (length - at < size) return null
         return DtsUtil.parseDtsHdHeader(data.copyOfRange(at, at + size))
     }
-    override fun frame(data: ByteArray, length: Int, end: Boolean): Frame? {
+    override fun frame(data: ByteArray, length: Int, end: Boolean): Frame? = try {
+        parseFrame(data, length, end)
+    } catch (_: IllegalArgumentException) {
+        resetFrameState()
+        Frame(1, ByteArray(0), Format.Builder().build(), 0)
+    } catch (_: java.io.IOException) {
+        resetFrameState()
+        Frame(1, ByteArray(0), Format.Builder().build(), 0)
+    }
+    private fun parseFrame(data: ByteArray, length: Int, end: Boolean): Frame? {
         if (length < 4) return null
         val type = type(data, 0)
         if (type == DtsUtil.FRAME_TYPE_UNKNOWN) return Frame(1, ByteArray(0), Format.Builder().build(), 0)
@@ -140,5 +154,53 @@ internal class BluRayDtsReader(private val hd: Boolean, tracks: List<BluRayAudio
         knownFormat = format
         knownDuration = duration
         return Frame(size, data.copyOf(size), format, duration)
+    }
+}
+
+/** TrueHD access units interleaved with independent AC-3 syncframes on the HDMV PID.
+ * Skip the AC-3 companion before handing lossless access units to FFmpeg. After a seek,
+ * minor syncs are unusable until a new major sync supplies the decoder configuration.
+ */
+internal class BluRayTrueHdReader(tracks: List<BluRayAudio>, language: String?) : BluRayAudioReader(tracks, language) {
+    private var format: Format? = null
+    private var duration = 0L
+    override fun resetFrameState() { format = null; duration = 0L }
+    override fun frame(data: ByteArray, length: Int, end: Boolean): Frame? {
+        fun skip(n: Int) = Frame(n, ByteArray(0), Format.Builder().build(), 0)
+        if (length < 10) return null
+        if (data[0] == 0x0b.toByte() && data[1] == 0x77.toByte()) {
+            val size = androidx.media3.extractor.Ac3Util.parseAc3SyncframeSize(data)
+            if (size <= 0) return skip(1)
+            return if (length < size) null else skip(size)
+        }
+        val major = data[4] == 0xf8.toByte() && data[5] == 0x72.toByte() &&
+            data[6] == 0x6f.toByte() && data[7] == 0xba.toByte()
+        if (format == null && !major) {
+            // Search in one pass after byte seeks; retaining nine bytes handles split sync words.
+            val next = (1 until length - 9).firstOrNull { at ->
+                data[at + 4] == 0xf8.toByte() && data[at + 5] == 0x72.toByte() &&
+                    data[at + 6] == 0x6f.toByte() && data[at + 7] == 0xba.toByte()
+            }
+            return skip(next ?: (length - 9))
+        }
+        val size = (((data[0].toInt() and 15) shl 8) or (data[1].toInt() and 255)) * 2
+        if (size < 10) { resetFrameState(); return skip(1) }
+        if (length < size) return null
+        if (major) {
+            if (size < 32) { resetFrameState(); return skip(1) }
+            val rateCode = (data[8].toInt() ushr 4) and 15
+            if ((rateCode and 7) > 2) { resetFrameState(); return skip(1) }
+            val rate = (if (rateCode and 8 != 0) 44100 else 48000) shl (rateCode and 7)
+            val map2 = ((data[10].toInt() and 31) shl 8) or (data[11].toInt() and 255)
+            val map1 = ((data[9].toInt() and 15) shl 1) or ((data[10].toInt() ushr 7) and 1)
+            val map = if (map2 != 0) map2 else map1
+            val counts = intArrayOf(2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1)
+            val channels = counts.indices.sumOf { if (map and (1 shl it) != 0) counts[it] else 0 }
+            if (channels == 0) { resetFrameState(); return skip(size) }
+            format = Format.Builder().setSampleMimeType(MimeTypes.AUDIO_TRUEHD)
+                .setSampleRate(rate).setChannelCount(channels).build()
+            duration = (40L shl (rateCode and 7)) * 1_000_000 / rate
+        }
+        return Frame(size, data.copyOf(size), format!!, duration)
     }
 }

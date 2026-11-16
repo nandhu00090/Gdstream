@@ -19,6 +19,7 @@ internal class IsoAudioClockGuard(private val player: ExoPlayer) : AutoCloseable
     private var firstFrame = false
     private var audioDisabled = false
     private var selectedKey: String? = null
+    private var retriedDiscontinuity = false
     private val clock = IsoClockProgress { android.os.SystemClock.elapsedRealtime() }
 
     private fun key(group: Tracks.Group, index: Int) = "${group.mediaTrackGroup.id}:$index:${group.getTrackFormat(index).sampleMimeType}"
@@ -51,6 +52,16 @@ internal class IsoAudioClockGuard(private val player: ExoPlayer) : AutoCloseable
         return true
     }
 
+    override fun onPositionDiscontinuity(oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) {
+        clock.reset()
+        if (reason == Player.DISCONTINUITY_REASON_SEEK) retriedDiscontinuity = false
+    }
+
+    override fun onAudioSinkError(eventTime: AnalyticsListener.EventTime, audioSinkError: Exception) {
+        // The sink handles nonfatal timestamp jumps itself; give the new clock time to settle.
+        if (audioSinkError is androidx.media3.exoplayer.audio.AudioSink.UnexpectedDiscontinuityException) clock.reset()
+    }
+
     override fun onTracksChanged(tracks: Tracks) {
         if (audioDisabled && tracks.groups.any { it.type == C.TRACK_TYPE_AUDIO && it.isSelected }) {
             audioDisabled = false
@@ -74,6 +85,14 @@ internal class IsoAudioClockGuard(private val player: ExoPlayer) : AutoCloseable
                 (renderer.rendererIndex in 0 until player.rendererCount && player.getRendererType(renderer.rendererIndex) == C.TRACK_TYPE_AUDIO))
         if (!audio || audioDisabled) return false
         DebugLogger.log("ISO_AUDIO_ERR", isoFailureDetails(error))
+        val timestampJump = generateSequence<Throwable>(error) { it.cause }
+            .any { it is androidx.media3.exoplayer.audio.AudioSink.UnexpectedDiscontinuityException }
+        if (timestampJump && !retriedDiscontinuity) {
+            retriedDiscontinuity = true
+            clock.reset()
+            player.prepare()
+            return true
+        }
         if (!selectAudio(true)) return false
         player.prepare() // Reuse the existing MediaSource/player; no recursive source reload.
         return true

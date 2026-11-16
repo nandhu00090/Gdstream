@@ -10,6 +10,8 @@ data class BluRayAudio(val pid: Int, val type: Int, val language: String) {
         val name = bluRayLanguage(language)
         val codec = when (type) {
             0x80 -> "LPCM"
+            0x81 -> "AC-3"
+            0x83 -> "TrueHD"
             0x82 -> "DTS"
             0x85 -> "DTS-HD"
             0x86 -> "DTS-HD MA"

@@ -68,7 +68,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
         @JvmStatic
         fun archiveExtractors(url: String?): androidx.media3.extractor.ExtractorsFactory {
             if (url == null || !SecurityVaultModule.isIsoStream(url) ||
-                !url.substringBefore('?').endsWith(".m2ts", true)) return androidx.media3.extractor.DefaultExtractorsFactory()
+                (!url.substringBefore('?').endsWith(".m2ts", true) && !url.substringBefore('?').endsWith(".ts", true))) return androidx.media3.extractor.DefaultExtractorsFactory()
             val profile = SecurityVaultModule.bluRayProfile(url)
             return androidx.media3.extractor.ExtractorsFactory { arrayOf(BluRayTsExtractor(profile)) }
         }

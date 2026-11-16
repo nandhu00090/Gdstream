@@ -931,8 +931,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 if (file.rawSize != entry.compressedSize || file.size != totalSize) {
                     throw java.io.IOException("Inconsistent ISO stream length")
                 }
+                val externalTs = entry.isBdavM2ts && segments.last().substringBefore('?').endsWith(".ts", true) &&
+                    !userAgent.contains("GDStream", ignoreCase = true)
                 val complete = file.serve(method, rangeHeader, "video/MP2T".takeIf { entry.isBdavM2ts } ?: mimeType, out, ioExecutor, session, entry.bluRay?.durationUs ?: 0L) { start, length ->
-                    file.read(start, length,
+                    val windowStart = if (externalTs) ((start / 188 - 32).coerceAtLeast(0)) * 188 else start
+                    val windowEnd = if (externalTs) minOf(file.size, ((start + length + 187) / 188 + 32) * 188) else start + length
+                    val bytes = file.read(windowStart, (windowEnd - windowStart).toInt(),
                         { remoteStart, remoteEnd ->
                             val extent = entry.segments!!.first { (offset, length) ->
                                 offset >= 0 && remoteStart >= offset && remoteEnd < offset + length
@@ -942,7 +946,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                                 fetchIsoByteRange(entry.archiveUrl, from, to, sharedSession)
                             }
                         },
-                        { _, _ -> /* Preserve HDMV PMT stream types for VLC/MX and our Blu-ray extractor. */ })
+                        { _, _ -> })
+                    if (externalTs) ExternalTsPmt.patch(bytes)
+                    bytes.copyOfRange((start - windowStart).toInt(), (start - windowStart).toInt() + length)
                 }
                 connection.reusable = complete && !closeRequested
                 return
