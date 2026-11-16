@@ -331,22 +331,22 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
     }
 
     @ReactMethod
-    fun playVideo(url: String, promise: Promise) {
+    fun playVideo(url: String, chooserTitle: String, promise: Promise) {
         try {
-            val playableUri = resolvePlayableUri(url)
+            val playableUri = resolvePlayableUri(SecurityVaultModule.externalPlayerUrl(url))
             if (playableUri.host == "127.0.0.1" || playableUri.host == "localhost") {
                 ArchiveProxyStreams.prepare(url)
                 ArchiveStreamService.start(reactApplicationContext)
             }
             val mimeType = externalVideoMimeType(playableUri.path.orEmpty())
-            DebugLogger.log("EXTERNAL_PLAYER_LAUNCH", "uri=${safeStreamUrl(url)} mime=$mimeType registeredIso=${SecurityVaultModule.isIsoStream(url)}; preserving proxy registration")
+            DebugLogger.log("EXTERNAL_PLAYER_LAUNCH", "uri=${safeStreamUrl(playableUri.toString())} mime=$mimeType registeredIso=${SecurityVaultModule.isIsoStream(url)}; preserving proxy registration")
             val intent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(playableUri, mimeType)
                 putExtra(Intent.EXTRA_TITLE, playableUri.lastPathSegment ?: "GDStream")
                 putExtra("title", playableUri.lastPathSegment ?: "GDStream")
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            val chooser = Intent.createChooser(intent, "Choose Player 🍿").apply {
+            val chooser = Intent.createChooser(intent, chooserTitle).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             reactApplicationContext.startActivity(chooser)

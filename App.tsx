@@ -2482,7 +2482,7 @@ const App = () => {
     await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
     try {
       await SecurityVault?.stopArchivePlayback?.(playbackSource.uri);
-      await VideoPlayerManager.playVideo(url);
+      await VideoPlayerManager.playVideo(url, 'Open with External Player (VLC / MX / MPV recommended for Blu-ray)');
     } catch (error) {
       setPlayMode(null);
       Alert.alert('External player error', error instanceof Error ? error.message : 'Could not open the player.');
