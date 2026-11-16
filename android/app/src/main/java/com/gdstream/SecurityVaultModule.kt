@@ -161,6 +161,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         @Volatile private var clearIsoChunks: (() -> Unit)? = null
         @Volatile private var bluRayProfile: ((String) -> BluRayProfile?)? = null
         internal fun bluRayProfile(url: String): BluRayProfile? = ArchiveProxyStreams.streamId(url)?.let { bluRayProfile?.invoke(it) }
+        @Volatile private var isoMediaInfo: ((String) -> Map<String, Any>?)? = null
+        internal fun isoMediaInfo(url: String): Map<String, Any>? = isoMediaInfo?.invoke(url)
         @Volatile private var externalIsoUrl: ((String) -> String)? = null
         internal fun externalPlayerUrl(url: String): String = externalIsoUrl?.invoke(url) ?: url
         @Volatile private var archiveFormat: ((String) -> String?)? = null
@@ -199,6 +201,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             if (entry == null) url else externalIsoTsUrl(url, entry.fileName, entry.archiveFormat == "ISO" && entry.isBdavM2ts)
         }
         bluRayProfile = { id -> archiveEntryRegistry[id]?.bluRay }
+        isoMediaInfo = { url -> ArchiveProxyStreams.streamId(url)?.let { archiveEntryRegistry[it] }?.let { entry ->
+            entry.bluRay?.mediaInfo(entry.uncompressedSize)
+        } }
         ioExecutor.submit {
             appendDebugLog("APP_BOOT", "GDStream Native Engine ready (SDK=" + Build.VERSION.SDK_INT + ")")
         }
@@ -926,7 +931,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 if (file.rawSize != entry.compressedSize || file.size != totalSize) {
                     throw java.io.IOException("Inconsistent ISO stream length")
                 }
-                val complete = file.serve(method, rangeHeader, "video/MP2T".takeIf { entry.isBdavM2ts } ?: mimeType, out, ioExecutor, session) { start, length ->
+                val complete = file.serve(method, rangeHeader, "video/MP2T".takeIf { entry.isBdavM2ts } ?: mimeType, out, ioExecutor, session, entry.bluRay?.durationUs ?: 0L) { start, length ->
                     file.read(start, length,
                         { remoteStart, remoteEnd ->
                             val extent = entry.segments!!.first { (offset, length) ->
@@ -1343,7 +1348,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val hasIso = (0 until targetsArr.length()).any {
                 targetsArr.optJSONObject(it)?.optString("archiveFormat") == "ISO"
             }
-            if (hasIso && root.optInt("isoIndexVersion", 0) != 5) return null
+            if (hasIso && root.optInt("isoIndexVersion", 0) != 6) return null
             var hasUnstrippedM2ts = false
             for (ci in 0 until targetsArr.length()) {
                 val co = targetsArr.optJSONObject(ci) ?: continue
@@ -1454,7 +1459,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val root = JSONObject().apply {
                     put("rawJson", rawJson)
                     put("targets", targetsArr)
-                    put("isoIndexVersion", 5)
+                    put("isoIndexVersion", 6)
                 }
                 zipDiskCache[cacheKey] = root.toString()
                 saveZipDiskCacheAsync()
@@ -3698,11 +3703,15 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val t0 = System.currentTimeMillis()
         appendDebugLog("ISO_START", "Opening ISO size=$totalIsoSize url=${safeStreamUrl(isoUrl)}")
         val allFiles = ArrayList<IsoFileEntry>()
+        var discLabel = ""
         var udfErr = ""
         var isoErr = ""
 
         try {
-            val udfFiles = parseUdfTree(isoUrl, totalIsoSize)
+            val reader = UdfReader(totalIsoSize, { start, end -> fetchIsoByteRange(isoUrl, start, end) }, ioExecutor)
+            val udfFiles = reader.readTree().map { IsoFileEntry(it.path, it.path.substringAfterLast('/'), false, it.size, it.extents) }
+            discLabel = reader.volumeLabel
+            appendDebugLog("ISO_VOLUME_LABEL", discLabel)
             if (udfFiles.isNotEmpty()) {
                 allFiles.addAll(udfFiles)
                 appendDebugLog("ISO_UDF_OK", "Parsed ${udfFiles.size} media/playlist entries in ${System.currentTimeMillis() - t0}ms")
@@ -3762,139 +3771,122 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val totalBytes: Long,
                 val segments: List<Pair<Long, Long>>,
                 val clipSignature: String,
-                val clips: List<BluRayPlaylist.Clip>
+                val clips: List<BluRayPlaylist.Clip>,
+                val specs: BluRayMplsSpecs.Result
             )
 
             val playlists = ArrayList<ResolvedPlaylist>()
             val seenSignatures = HashSet<String>()
 
-            // Fetch top 25 MPLS playlist files in parallel for instant parsing
-            val topMpls = mplsList.sortedByDescending { it.size }.take(25)
-            val mplsFutures = topMpls.map { mpls ->
-                ioExecutor.submit<Pair<IsoFileEntry, ByteArray>> {
+            // Inspect every playlist, with bounded concurrency; file size is not feature size.
+            for (batch in mplsList.sortedBy { it.name }.chunked(6)) {
+                val mplsFutures = batch.map { mpls ->
+                    ioExecutor.submit<Pair<IsoFileEntry, ByteArray>> {
+                        try {
+                            Pair(mpls, readIsoFileBytes(isoUrl, mpls, 2 * 1024 * 1024))
+                        } catch (_: Throwable) {
+                            Pair(mpls, ByteArray(0))
+                        }
+                    }
+                }
+
+                for (fut in mplsFutures) {
                     try {
-                        Pair(mpls, readIsoFileBytes(isoUrl, mpls, 262144))
-                    } catch (_: Throwable) {
-                        Pair(mpls, ByteArray(0))
-                    }
+                        val (mpls, mplsBytes) = fut.get()
+                        if (mplsBytes.size < 32) continue
+                        val sig = String(mplsBytes, 0, 8, StandardCharsets.US_ASCII)
+                        if (!sig.startsWith("MPLS0")) continue
+
+                        val playListStart = readUInt32BE(mplsBytes, 8).toInt()
+                        if (playListStart <= 0 || playListStart + 10 > mplsBytes.size) continue
+                        val numPlayItems = readUInt16BE(mplsBytes, playListStart + 6)
+                        if (numPlayItems <= 0 || numPlayItems > 250) continue
+
+                        var p = playListStart + 10
+                        val clips = ArrayList<BluRayPlaylist.Clip>()
+                        val clipSpecs = HashMap<String, BluRayMplsSpecs.Result>()
+                        var valid = true
+
+                        for (idx in 0 until numPlayItems) {
+                            if (p + 22 > mplsBytes.size) { valid = false; break }
+                            val itemLen = readUInt16BE(mplsBytes, p)
+                            if (itemLen < 20 || p + 2 + itemLen > mplsBytes.size) { valid = false; break }
+                            val clipId = String(mplsBytes, p + 2, 5, StandardCharsets.US_ASCII).uppercase(Locale.ROOT)
+                            val inTime = readUInt32BE(mplsBytes, p + 14)
+                            val outTime = readUInt32BE(mplsBytes, p + 18)
+                            if (outTime <= inTime) { valid = false; break }
+                            val m2tsEntry = m2tsMap[clipId]
+                            if (m2tsEntry == null) { valid = false; break }
+                            clips.add(BluRayPlaylist.Clip(clipId, outTime - inTime, m2tsEntry.size, m2tsEntry.extents, inTime))
+                            try {
+                                val specs = BluRayMplsSpecs.parseItem(mplsBytes, p, p + 2 + itemLen)
+                                clipSpecs[clipId] = specs
+                            } catch (error: Exception) { appendDebugLog("ISO_MPLS_SPECS", "${mpls.name}: ${error.message}") }
+                            p += 2 + itemLen
+                        }
+
+                        val selected = BluRayPlaylist.playbackClips(clips)
+                        val selectedSpecs = selected.mapNotNull { clipSpecs[it.id] }
+                        val clipNames = selected.map { it.id }
+                        val segs = selected.flatMap { it.extents }
+                        val totalBytes = selected.fold(0L) { total, clip -> Math.addExact(total, clip.size) }
+                        val durSec = (selected.sumOf { it.ticks } / 45000L).toInt()
+                        val clipSig = clipNames.joinToString("+")
+                        if (selected.size != clips.size) {
+                            appendDebugLog("ISO_MPLS_FEATURE", "mpls=${mpls.name} originalClips=${clips.joinToString("+") { it.id }} originalDuration=${clips.sumOf { it.ticks } / 45000L}s selected=$clipSig duration=${durSec}s bytes=$totalBytes")
+                        }
+                        val isMenuLoop = clipNames.size > 3 && clipNames.toSet().size == 1
+                        if (valid && !isMenuLoop && segs.isNotEmpty() && totalBytes >= 50L * 1024L * 1024L && durSec >= 180 && seenSignatures.add(clipSig)) {
+                            playlists.add(ResolvedPlaylist(mpls.name, durSec, totalBytes, segs, clipSig, selected, BluRayMplsSpecs.Result(mergeBluRayStreams(selectedSpecs.flatMap { it.streams }), selectedSpecs.any { it.dolbyVision })))
+                            appendDebugLog("ISO_MPLS_HIT", "mpls=${mpls.name} dur=${durSec}s bytes=$totalBytes clips=$clipSig")
+                        }
+                    } catch (_: Throwable) {}
                 }
+
             }
 
-            for (fut in mplsFutures) {
-                try {
-                    val (mpls, mplsBytes) = fut.get()
-                    if (mplsBytes.size < 32) continue
-                    val sig = String(mplsBytes, 0, 8, StandardCharsets.US_ASCII)
-                    if (!sig.startsWith("MPLS0")) continue
-
-                    val playListStart = readUInt32BE(mplsBytes, 8).toInt()
-                    if (playListStart <= 0 || playListStart + 10 > mplsBytes.size) continue
-                    val numPlayItems = readUInt16BE(mplsBytes, playListStart + 6)
-                    if (numPlayItems <= 0 || numPlayItems > 250) continue
-
-                    var p = playListStart + 10
-                    val clips = ArrayList<BluRayPlaylist.Clip>()
-                    var valid = true
-
-                    for (idx in 0 until numPlayItems) {
-                        if (p + 22 > mplsBytes.size) { valid = false; break }
-                        val itemLen = readUInt16BE(mplsBytes, p)
-                        if (itemLen < 20 || p + 2 + itemLen > mplsBytes.size) { valid = false; break }
-                        val clipId = String(mplsBytes, p + 2, 5, StandardCharsets.US_ASCII).uppercase(Locale.ROOT)
-                        val inTime = readUInt32BE(mplsBytes, p + 14)
-                        val outTime = readUInt32BE(mplsBytes, p + 18)
-                        if (outTime <= inTime) { valid = false; break }
-                        val m2tsEntry = m2tsMap[clipId]
-                        if (m2tsEntry == null) { valid = false; break }
-                        clips.add(BluRayPlaylist.Clip(clipId, outTime - inTime, m2tsEntry.size, m2tsEntry.extents, inTime))
-                        p += 2 + itemLen
+            fun profile(playlist: ResolvedPlaylist): BluRayProfile {
+                val profiles = playlist.clips.mapNotNull { clip ->
+                    val info = clpiMap[clip.id] ?: return@mapNotNull null
+                    try {
+                        BluRayClipInfo.parse(readIsoFileBytes(isoUrl, info, 8 * 1024 * 1024), clip.inTicks, clip.ticks, clip.size)
+                    } catch (error: Exception) {
+                        appendDebugLog("ISO_CLPI_ERR", "clip=${clip.id} ${isoFailureDetails(error)}")
+                        null
                     }
-
-                    val selected = BluRayPlaylist.playbackClips(clips)
-                    val clipNames = selected.map { it.id }
-                    val segs = selected.flatMap { it.extents }
-                    val totalBytes = selected.fold(0L) { total, clip -> Math.addExact(total, clip.size) }
-                    val durSec = (selected.sumOf { it.ticks } / 45000L).toInt()
-                    val clipSig = clipNames.joinToString("+")
-                    if (selected.size != clips.size) {
-                        appendDebugLog("ISO_MPLS_FEATURE", "mpls=${mpls.name} originalClips=${clips.joinToString("+") { it.id }} originalDuration=${clips.sumOf { it.ticks } / 45000L}s selected=$clipSig duration=${durSec}s bytes=$totalBytes")
-                    }
-                    val isMenuLoop = clipNames.size > 3 && clipNames.toSet().size == 1
-                    if (valid && !isMenuLoop && segs.isNotEmpty() && totalBytes >= 50L * 1024L * 1024L && durSec >= 180 && seenSignatures.add(clipSig)) {
-                        playlists.add(ResolvedPlaylist(mpls.name, durSec, totalBytes, segs, clipSig, selected))
-                        appendDebugLog("ISO_MPLS_HIT", "mpls=${mpls.name} dur=${durSec}s bytes=$totalBytes clips=$clipSig")
-                    }
-                } catch (_: Throwable) {}
-            }
-
-            val profiles = HashMap<String, BluRayProfile?>()
-            fun profile(playlist: ResolvedPlaylist): BluRayProfile? {
-                // A single clip has one timestamp epoch. Never apply one clip's map to spliced clips.
-                val clip = playlist.clips.singleOrNull() ?: return null
-                val key = "${clip.id}:${clip.inTicks}:${clip.ticks}"
-                if (profiles.containsKey(key)) return profiles[key]
-                val info = clpiMap[clip.id]
-                val parsed = if (info == null) null else try {
-                    BluRayClipInfo.parse(readIsoFileBytes(isoUrl, info, 8 * 1024 * 1024), clip.inTicks, clip.ticks, clip.size).also {
-                        appendDebugLog("ISO_CLPI_OK", "clip=${clip.id} points=${it.points.size} durationUs=${it.durationUs} audio=${it.audio}")
-                    }
-                } catch (error: Exception) {
-                    appendDebugLog("ISO_CLPI_ERR", "clip=${clip.id} ${isoFailureDetails(error)}; retaining PCR seek fallback")
-                    null
                 }
-                if (info == null) appendDebugLog("ISO_CLPI_MISSING", "clip=${clip.id}; retaining PCR seek fallback")
-                profiles[key] = parsed
-                return parsed
+                val base = profiles.firstOrNull() ?: BluRayProfile(playlist.durationSec * 1_000_000L, emptyList(), emptyList())
+                val streams = mergeBluRayStreams(profiles.flatMap { it.streams } + playlist.specs.streams)
+                return base.copy(durationUs = playlist.clips.sumOf { it.ticks } * 1_000_000 / 45000,
+                    points = if (playlist.clips.size == 1) base.points else emptyList(),
+                    audio = streams.filter { it.audio }.map { BluRayAudio(it.pid, it.type, it.language) },
+                    streams = streams, discLabel = discLabel, dolbyVision = playlist.specs.dolbyVision).also {
+                    appendDebugLog("ISO_CLPI_OK", "points=${it.points.size} durationUs=${it.durationUs} mediaInfo=${it.mediaInfo(playlist.totalBytes)}")
+                }
             }
 
             if (playlists.isNotEmpty()) {
-                val epCandidates = playlists.filter { it.durationSec in 1080..4800 }
-                val longFeatures = playlists.filter { it.durationSec > 4800 }
-                val isSeriesDisc = epCandidates.size >= 2 && longFeatures.isEmpty()
-
-                if (isSeriesDisc) {
-                    val orderedEps = epCandidates.sortedBy { it.mplsName }
-                    val seasonMatch = Regex("S(\\d{1,2})", RegexOption.IGNORE_CASE).find(discTitle)
-                    val sNum = seasonMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
-                    val cleanShow = discTitle
-                        .replace(Regex("\\bS\\d{1,2}(?:E\\d{1,2}|D\\d{1,2}|\\s*Disc\\s*\\d+)?\\b", RegexOption.IGNORE_CASE), "")
-                        .replace(Regex("\\b(BluRay|BD50|BD25|UHD|REMUX|1080p|2160p|4K|AVC|HEVC).*$", RegexOption.IGNORE_CASE), "")
-                        .trim()
-                        .ifEmpty { discTitle }
-
-                    orderedEps.forEachIndexed { idx, ep ->
-                        val epCode = String.format(Locale.US, "S%02dE%02d", sNum, idx + 1)
-                        val durTag = formatIsoDurationLabel(ep.durationSec)
-                        val displayName = if (durTag.isNotEmpty()) "$cleanShow $epCode [$durTag].m2ts" else "$cleanShow $epCode.m2ts"
-                        outItems.add(registerIsoStreamTarget(isoUrl, displayName, ep.totalBytes, ep.segments, port, "video/mp2t", ep.durationSec, profile(ep)))
-                    }
-                    appendDebugLog("ISO_DONE_SERIES", "Resolved ${outItems.size} episodes in ${System.currentTimeMillis() - t0}ms")
-                    return Pair(outItems, "")
-                } else {
-                    val sortedMovies = playlists.sortedByDescending { it.durationSec }
-                    sortedMovies.forEachIndexed { idx, pl ->
-                        val durTag = formatIsoDurationLabel(pl.durationSec)
-                        val featureNum = idx + 1
-                        val label = when {
-                            idx == 0 && durTag.isNotEmpty() -> "$discTitle [Main Movie - $durTag].m2ts"
-                            idx == 0 -> "$discTitle [Main Movie].m2ts"
-                            durTag.isNotEmpty() -> "$discTitle - Feature $featureNum [$durTag].m2ts"
-                            else -> "$discTitle - Feature $featureNum.m2ts"
-                        }
-                        outItems.add(registerIsoStreamTarget(isoUrl, label, pl.totalBytes, pl.segments, port, "video/mp2t", pl.durationSec, profile(pl)))
-                    }
-                    appendDebugLog("ISO_DONE_MOVIE", "Resolved ${outItems.size} features in ${System.currentTimeMillis() - t0}ms")
-                    return Pair(outItems, "")
-                }
+                val main = BluRayPlaylist.largest(playlists) { it.totalBytes }!!
+                val label = "$discTitle [Main Movie - ${formatIsoDurationLabel(main.durationSec)}].m2ts"
+                outItems.add(registerIsoStreamTarget(isoUrl, label, main.totalBytes, main.segments, port, "video/mp2t", main.durationSec, profile(main)))
+                appendDebugLog("ISO_MAIN_ONLY", "selected=${main.mplsName} bytes=${main.totalBytes} candidates=${playlists.size}")
+                return Pair(outItems, "")
             }
 
             val largeM2ts = m2tsMap.values.filter { it.size >= 100L * 1024L * 1024L }.sortedByDescending { it.size }
             if (largeM2ts.isNotEmpty()) {
-                largeM2ts.forEachIndexed { idx, f ->
-                    val cName = f.name
-                    val label = if (idx == 0) "$discTitle [Main Stream - $cName].m2ts" else "$discTitle - $cName"
-                    outItems.add(registerIsoStreamTarget(isoUrl, label, f.size, f.extents, port, "video/mp2t"))
+                val f = largeM2ts.first()
+                val info = clpiMap[f.name.substringBeforeLast('.').uppercase(Locale.ROOT)]
+                val profile = try {
+                    info?.let { BluRayClipInfo.parseRaw(readIsoFileBytes(isoUrl, it, 8 * 1024 * 1024), f.size) }
+                } catch (error: Exception) {
+                    appendDebugLog("ISO_CLPI_ERR", "clip=${f.name} ${isoFailureDetails(error)}")
+                    null
                 }
+                val metadata = (profile ?: BluRayProfile(0, emptyList(), emptyList())).copy(discLabel = discLabel)
+                val label = "$discTitle [Main Stream - ${f.name}].m2ts"
+                outItems.add(registerIsoStreamTarget(isoUrl, label, f.size, f.extents, port, "video/mp2t",
+                    (metadata.durationUs / 1_000_000).toInt(), metadata))
                 appendDebugLog("ISO_DONE_M2TS", "Resolved ${outItems.size} raw M2TS clips in ${System.currentTimeMillis() - t0}ms")
                 return Pair(outItems, "")
             }
@@ -3923,7 +3915,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
             }
             if (titles.isNotEmpty()) {
-                titles.sortedByDescending { it.totalBytes }.forEachIndexed { idx, dt ->
+                titles.sortedByDescending { it.totalBytes }.take(1).forEachIndexed { idx, dt ->
                     val tSet = dt.titleSet
                     val label = if (idx == 0) "$discTitle [DVD Main].vob" else "$discTitle - Title $tSet.vob"
                     outItems.add(registerIsoStreamTarget(isoUrl, label, dt.totalBytes, dt.segs, port, "video/mpeg"))
@@ -3937,7 +3929,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         for (v in allFiles.filter {
             !it.isDir && it.size > 10L * 1024L * 1024L && it.extents.isNotEmpty() &&
                 directExts.any { ext -> it.name.lowercase(Locale.ROOT).endsWith(ext) }
-        }.sortedBy { it.name }) {
+        }.sortedByDescending { it.size }.take(1)) {
             val lower = v.name.lowercase(Locale.ROOT)
             val mime = when {
                 lower.endsWith(".mp4") || lower.endsWith(".m4v") -> "video/mp4"
@@ -3995,6 +3987,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             put("zipCompression", "STORE")
             put("archiveFormat", "ISO")
             if (durationSec > 0) put("durationSec", durationSec)
+            bluRay?.let { put("mediaInfo", JSONObject(it.mediaInfo(exposedBytes))) }
         }
     }
 

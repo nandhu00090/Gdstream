@@ -201,7 +201,7 @@ class ArchiveProxyTest {
             val item = JSONObject().put("id", "disc").put("name", "Movie.m2ts").put("link", "http://127.0.0.1:1111/zip/obsolete/Movie.m2ts")
             val cache = JSONObject().put("rawJson", JSONArray().put(item).toString()).put("targets", JSONArray().put(target))
             assertNull(restore.invoke(module, cache.toString(), "https://example/disc.iso"))
-            cache.put("isoIndexVersion", 5)
+            cache.put("isoIndexVersion", 6)
             val restored = JSONArray(restore.invoke(module, cache.toString(), "https://example/disc.iso?fresh=1") as String).getJSONObject(0)
             val activePort = field(module, "archiveProxyPort") as Int
             assertTrue(activePort > 0)
@@ -230,7 +230,8 @@ class ArchiveProxyTest {
         val rawSize = 220_000_000L * 192
         val exposedSize = 220_000_000L * 188
         val target = SecurityVaultModule.ArchiveEntryTarget("handshake", "http://127.0.0.1:1/never-fetch", "movie.m2ts", "ISO",
-            0, rawSize, exposedSize, 0, 0, listOf(0L to rawSize), true)
+            0, rawSize, exposedSize, 0, 0, listOf(0L to rawSize), true,
+            BluRayProfile(9995_000_000L, emptyList(), emptyList()))
         @Suppress("UNCHECKED_CAST")
         val entries = field(module, "archiveEntryRegistry") as ConcurrentHashMap<String, SecurityVaultModule.ArchiveEntryTarget>
         entries[target.id] = target
@@ -252,6 +253,10 @@ class ArchiveProxyTest {
                     assertTrue(result.endsWith("\r\n\r\n"))
                     assertTrue(result.contains("Content-Length: ${if (method == "HEAD") exposedSize else 0}\r\n"))
                     if (status != 404) assertTrue(result.contains("Accept-Ranges: bytes"))
+                    if (method == "HEAD") {
+                        assertTrue(result.contains("X-Content-Duration: 9995\r\n"))
+                        assertTrue(result.contains("contentFeatures.dlna.org: DLNA.ORG_OP=01;DLNA.ORG_CI=0\r\n"))
+                    }
                     assertFalse(cancelled)
                     assertSame(target, entries[target.id])
                 }

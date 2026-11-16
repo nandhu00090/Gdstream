@@ -15,6 +15,8 @@ internal class UdfReader(
     private data class MapSpec(val number: Int, val metadata: Boolean, val file: Long = -1, val mirror: Long = -1)
     private data class Entry(val size: Long, val extents: List<Pair<Long, Long>>)
 
+    var volumeLabel: String = ""
+        private set
     private var blockSize = 2048L
     private val partitions = HashMap<Int, Partition>()
     private val metadata = HashMap<Int, List<Pair<Long, Long>>>()
@@ -193,6 +195,7 @@ internal class UdfReader(
             p += SECTOR_SIZE.toInt()
         }
         val logical = lvd ?: throw IOException("Missing UDF logical volume descriptor")
+        volumeLabel = decodeVolumeLabel(logical.copyOfRange(84, 212))
         blockSize = u32(logical, 212)
         checked(blockSize in 512..32768 && (blockSize and (blockSize - 1)) == 0L, "Invalid UDF logical block size")
         val count = u32(logical, 268)
@@ -316,6 +319,17 @@ internal class UdfReader(
     }
 
     companion object {
+        internal fun decodeVolumeLabel(field: ByteArray): String {
+            if (field.size < 2) return ""
+            val length = (field.last().toInt() and 255).coerceAtMost(field.size - 1)
+            if (length <= 1) return ""
+            return when (field[0].toInt() and 255) {
+                8 -> String(field, 1, length - 1, Charsets.ISO_8859_1)
+                16 -> if ((length - 1) % 2 == 0) String(field, 1, length - 1, Charsets.UTF_16BE) else ""
+                else -> ""
+            }.trimEnd('\u0000').trim()
+        }
+
         private const val SECTOR_SIZE = 2048L
         private const val MAX_METADATA = 8L * 1024 * 1024
         private val MEDIA_EXTENSIONS = listOf(".CLPI", ".MPLS", ".M2TS", ".VOB", ".MKV", ".MP4", ".AVI", ".MOV", ".M4V", ".TS")
