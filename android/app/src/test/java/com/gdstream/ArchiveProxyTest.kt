@@ -240,7 +240,7 @@ class ArchiveProxyTest {
         try {
             ServerSocket(0).use { server ->
                 val handler = SecurityVaultModule::class.java.getDeclaredMethod("handleArchiveProxyClient", Socket::class.java).apply { isAccessible = true }
-                for ((method, name, status) in listOf(Triple("HEAD", "movie.m2ts", 200), Triple("OPTIONS", "movie.m2ts", 200), Triple("GET", "movie.eng.srt", 404))) {
+                for ((method, name, status) in listOf(Triple("HEAD", "movie.m2ts", 200), Triple("OPTIONS", "movie.m2ts", 200), Triple("HEAD", "movie.ts", 200), Triple("GET", "movie.eng.srt", 404))) {
                     val job = pool.submit { handler.invoke(module, server.accept()) }
                     val result = Socket("127.0.0.1", server.localPort).use { client ->
                         client.soTimeout = 5000
@@ -278,7 +278,7 @@ class ArchiveProxyTest {
                     client.soTimeout = 5000
                     val input = client.getInputStream()
                     for (method in listOf("HEAD", "GET", "GET")) {
-                        client.getOutputStream().write("$method /zip/persistent/movie.m2ts HTTP/1.1\r\nRange: bytes=188-191\r\n\r\n".toByteArray())
+                        client.getOutputStream().write("$method /zip/persistent/movie.ts HTTP/1.1\r\nRange: bytes=188-191\r\n\r\n".toByteArray())
                         val header = StringBuilder()
                         while (!header.endsWith("\r\n\r\n")) { val b = input.read(); assertTrue(b >= 0); header.append(b.toChar()) }
                         assertTrue(header.contains("Connection: keep-alive"))

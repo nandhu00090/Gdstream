@@ -161,6 +161,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         @Volatile private var clearIsoChunks: (() -> Unit)? = null
         @Volatile private var bluRayProfile: ((String) -> BluRayProfile?)? = null
         internal fun bluRayProfile(url: String): BluRayProfile? = ArchiveProxyStreams.streamId(url)?.let { bluRayProfile?.invoke(it) }
+        @Volatile private var externalIsoUrl: ((String) -> String)? = null
+        internal fun externalPlayerUrl(url: String): String = externalIsoUrl?.invoke(url) ?: url
         @Volatile private var archiveFormat: ((String) -> String?)? = null
         internal fun isIsoStream(url: String): Boolean =
             ArchiveProxyStreams.streamId(url)?.let { archiveFormat?.invoke(it) } == "ISO"
@@ -192,6 +194,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         DebugLogger.initialize(reactContext)
         clearIsoChunks = { isoChunkCache.clear() }
         archiveFormat = { id -> archiveEntryRegistry[id]?.archiveFormat }
+        externalIsoUrl = { url ->
+            val entry = ArchiveProxyStreams.streamId(url)?.let { archiveEntryRegistry[it] }
+            if (entry == null) url else externalIsoTsUrl(url, entry.fileName, entry.archiveFormat == "ISO" && entry.isBdavM2ts)
+        }
         bluRayProfile = { id -> archiveEntryRegistry[id]?.bluRay }
         ioExecutor.submit {
             appendDebugLog("APP_BOOT", "GDStream Native Engine ready (SDK=" + Build.VERSION.SDK_INT + ")")
@@ -880,7 +886,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             requestDetails = "method=$method id=${segments[1]} requestedRange=${rangeHeader ?: "full"} userAgent=$userAgent"
             val entryId = segments[1]
             val entry = archiveEntryRegistry[entryId]
-            if (entry == null || segments.size != 3 || !archiveFilenameMatches(segments.getOrNull(2), entry.fileName)) {
+            if (entry == null || segments.size != 3 || !archiveFilenameMatches(segments.getOrNull(2), entry.fileName, entry.archiveFormat == "ISO" && entry.isBdavM2ts)) {
                 appendDebugLog("ARCHIVE_PROXY_STATUS", "$requestDetails HTTP=404 filename or stream registration mismatch")
                 val out = proxyOutput(socket)
                 out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray())

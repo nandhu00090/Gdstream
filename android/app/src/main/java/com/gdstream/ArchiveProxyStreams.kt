@@ -3,9 +3,20 @@ package com.gdstream
 import java.io.InterruptedIOException
 import java.net.URLDecoder
 
-internal fun archiveFilenameMatches(encoded: String?, expected: String): Boolean = try {
-    encoded != null && URLDecoder.decode(encoded.replace("+", "%2B"), "UTF-8") == expected
+internal fun archiveFilenameMatches(encoded: String?, expected: String, bdavAlias: Boolean = false): Boolean = try {
+    val decoded = encoded?.let { URLDecoder.decode(it.replace("+", "%2B"), "UTF-8") }
+    decoded == expected || (bdavAlias && expected.endsWith(".m2ts", true) && decoded == expected.dropLast(5) + ".ts")
 } catch (_: IllegalArgumentException) { false }
+
+/** Rewrite only the registered Blu-ray path; retain encoded names, query and fragment verbatim. */
+internal fun externalIsoTsUrl(url: String, expected: String, bdav: Boolean): String = try {
+    val uri = java.net.URI(url)
+    val path = uri.rawPath.orEmpty()
+    if (!bdav || ArchiveProxyStreams.streamId(url) == null || !path.endsWith(".m2ts", true) ||
+        !archiveFilenameMatches(path.substringAfterLast('/'), expected)) url else
+        "${uri.scheme}://${uri.rawAuthority}${path.dropLast(5)}.ts" +
+            (uri.rawQuery?.let { "?$it" } ?: "") + (uri.rawFragment?.let { "#$it" } ?: "")
+} catch (_: Exception) { url }
 
 /** Owns downstream sockets, including writes blocked on a player that never closes its socket. */
 internal class ProxyStreamRegistry {
