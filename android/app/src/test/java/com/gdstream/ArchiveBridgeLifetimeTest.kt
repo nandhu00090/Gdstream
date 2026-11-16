@@ -4,18 +4,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ArchiveBridgeLifetimeTest {
-    @Test fun watchdogStopsAfter15SecondsWithoutTransferredBytesEvenWithZombieClients() {
+    @Test fun watchdogStopsAfter120SecondsWithoutTransferredBytesEvenWithZombieClients() {
         var clock = 0L
         val bridge = ArchiveBridgeLifetime { clock }
         bridge.launched()
         bridge.transferred(188)
-        clock = 14_999
+        clock = 119_999
         assertFalse(bridge.canStop())
         bridge.transferred(0)
-        clock = 15_000
+        clock = 120_000
         assertTrue(bridge.canStop())
         bridge.transferred(65536)
-        clock += 14_999
+        clock += 119_999
         assertFalse(bridge.canStop())
         clock++
         assertTrue(bridge.canStop())
@@ -39,7 +39,7 @@ class ArchiveBridgeLifetimeTest {
         val body = HttpBodyCounter()
         assertEquals(0, body.bodyBytes(combined, 0, 20))
         bridge.transferred(body.bodyBytes(combined, 20, combined.size - 20).toLong())
-        clock += 15_000
+        clock += 120_000
         assertTrue(bridge.canStop())
     }
 

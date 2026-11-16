@@ -164,10 +164,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         @Volatile private var archiveFormat: ((String) -> String?)? = null
         internal fun isIsoStream(url: String): Boolean =
             ArchiveProxyStreams.streamId(url)?.let { archiveFormat?.invoke(it) } == "ISO"
-        internal fun stopArchiveStreams(reason: String) {
+        internal fun stopArchiveStreams(reason: String, resumable: Boolean = false) {
             ArchiveProxyStreams.registry.stopAll(reason)
             IsoRangeReader.cancelAll(reason)
             clearIsoChunks?.invoke()
+            if (resumable) ArchiveProxyStreams.registry.resume()
             DebugLogger.log("ARCHIVE_PROXY_STOP_ALL", reason)
         }
         init {
@@ -804,7 +805,22 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         override fun flush() = output.flush()
     }
 
+    private class ProxyConnection(val socket: Socket) {
+        val input = java.io.PushbackInputStream(socket.getInputStream())
+        var reusable = false
+    }
     private fun handleArchiveProxyClient(socket: Socket) {
+        val connection = ProxyConnection(socket)
+        try {
+            do {
+                connection.reusable = false
+                handleArchiveProxyRequest(connection)
+            } while (connection.reusable && !socket.isClosed)
+        } finally { try { socket.close() } catch (_: java.io.IOException) {} }
+    }
+
+    private fun handleArchiveProxyRequest(connection: ProxyConnection) {
+        val socket = connection.socket
         val remoteConnToClean = java.util.concurrent.atomic.AtomicReference<HttpURLConnection?>()
         var inflaterToClean: Inflater? = null
         var requestDetails = "unparsed request"
@@ -813,9 +829,17 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         var clientWatch: IsoClientWatch? = null
         var registration: AutoCloseable? = null
         try {
-            socket.soTimeout = 30000
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII))
-            fun readClientLine(): String? = try { reader.readLine() } catch (e: java.io.IOException) {
+            socket.soTimeout = 120000
+            fun readClientLine(): String? = try {
+                val line = java.io.ByteArrayOutputStream()
+                while (true) {
+                    val byte = connection.input.read()
+                    if (byte < 0 || byte == 10) break
+                    if (line.size() >= 8192) throw java.io.IOException("Proxy request line too long")
+                    line.write(byte)
+                }
+                if (line.size() == 0) null else line.toString("US-ASCII").trimEnd('\r')
+            } catch (e: java.io.IOException) {
                 throw IsoClientDisconnected(e)
             }
             val requestLine = readClientLine() ?: return
@@ -826,9 +850,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
             var rangeHeader: String? = null
             var userAgent = "(absent)"
+            var closeRequested = false
             while (true) {
                 val line = readClientLine() ?: break
                 if (line.isEmpty()) break
+                if (line.equals("Connection: close", true)) closeRequested = true
                 if (line.startsWith("User-Agent:", ignoreCase = true)) userAgent = line.substringAfter(":").trim().take(512)
                 if (line.startsWith("Range:", ignoreCase = true)) {
                     rangeHeader = line.substringAfter(":").trim()
@@ -887,14 +913,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
             val out = BufferedOutputStream(proxyOutput(socket), 65536)
             if (entry.archiveFormat == "ISO") {
-                clientWatch = IsoClientWatch(socket, session, ioExecutor)
+                clientWatch = IsoClientWatch(socket, session, ioExecutor, connection.input)
                 session.log("ISO_PROXY_SOURCE", "$requestDetails url=${safeStreamUrl(entry.archiveUrl)}")
                 val file = IsoVirtualFile(entry.segments ?: throw java.io.IOException("Missing ISO extent map"), entry.isBdavM2ts)
                 isoFile = file
                 if (file.rawSize != entry.compressedSize || file.size != totalSize) {
                     throw java.io.IOException("Inconsistent ISO stream length")
                 }
-                file.serve(method, rangeHeader, mimeType, out, ioExecutor, session) { start, length ->
+                val complete = file.serve(method, rangeHeader, "video/MP2T".takeIf { entry.isBdavM2ts } ?: mimeType, out, ioExecutor, session) { start, length ->
                     file.read(start, length,
                         { remoteStart, remoteEnd ->
                             val extent = entry.segments!!.first { (offset, length) ->
@@ -907,7 +933,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         },
                         { _, _ -> /* Preserve HDMV PMT stream types for VLC/MX and our Blu-ray extractor. */ })
                 }
-
+                connection.reusable = complete && !closeRequested
                 return
             }
 
@@ -1067,7 +1093,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         } finally {
             clientWatch?.close()
             // Finish the local response before upstream cleanup can contend with an HTTP reader.
-            try { socket.close() } catch (_: Throwable) {}
+            if (!connection.reusable) try { socket.close() } catch (_: Throwable) {}
             isoSession?.cancel()
             registration?.close()
             val connRef = remoteConnToClean.get()

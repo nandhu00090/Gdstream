@@ -59,7 +59,7 @@ class ArchiveProxyTest {
             val localJob = pool.submit { handler.invoke(module, local.accept()) }
             val bytes = Socket(bind, local.localPort).use { socket ->
                 socket.soTimeout = 5000
-                socket.getOutputStream().write("GET /zip/fixture/movie.mp4?probe=1 HTTP/1.1\r\nHost: localhost\r\nRange: bytes=17-2000\r\n\r\n".toByteArray())
+                socket.getOutputStream().write("GET /zip/fixture/movie.mp4?probe=1 HTTP/1.1\r\nConnection: close\r\nHost: localhost\r\nRange: bytes=17-2000\r\n\r\n".toByteArray())
                 socket.getInputStream().readBytes()
             }
             upstreamJob.get(5, TimeUnit.SECONDS)
@@ -102,7 +102,7 @@ class ArchiveProxyTest {
         val module = SecurityVaultModule(mock(ReactApplicationContext::class.java))
         val pool = Executors.newCachedThreadPool()
         val base = 42_000_000_000L
-        val payload = ByteArray(3 * 1024 * 1024) { (it % 251).toByte() }
+        val payload = ByteArray(9 * 1024 * 1024) { (it % 251).toByte() }
         ServerSocket(0).use { origin ->
             ServerSocket(0).use { local ->
                 try {
@@ -116,7 +116,7 @@ class ArchiveProxyTest {
                                 while (true) { val line = reader.readLine() ?: break; if (line.isEmpty()) break; headers.add(line) }
                                 assertTrue(headers.any { it.equals("Connection: close", true) })
                                 val range = HttpByteRange.parse(headers.first { it.startsWith("Range:", true) }.substringAfter(':').trim(), base + payload.size)
-                                assertTrue(range.length <= 2 * 1024 * 1024)
+                                assertTrue(range.length <= 8 * 1024 * 1024)
                                 requests.add(range)
                                 socket.getOutputStream().apply {
                                     write("HTTP/1.1 206 Partial Content\r\nContent-Length: ${range.length}\r\nContent-Range: bytes ${range.start}-${range.end}/${base + payload.size}\r\nConnection: close\r\n\r\n".toByteArray())
@@ -135,7 +135,7 @@ class ArchiveProxyTest {
                     val proxy = pool.submit { handler.invoke(module, local.accept()) }
                     val response = Socket("127.0.0.1", local.localPort).use { client ->
                         client.soTimeout = 5000
-                        client.getOutputStream().write("GET /zip/disc/feature.ts HTTP/1.1\r\nHost: localhost\r\nRange: bytes=0-\r\n\r\n".toByteArray())
+                        client.getOutputStream().write("GET /zip/disc/feature.ts HTTP/1.1\r\nConnection: close\r\nHost: localhost\r\nRange: bytes=0-\r\n\r\n".toByteArray())
                         client.getInputStream().readBytes()
                     }
                     proxy.get(5, TimeUnit.SECONDS)
@@ -171,7 +171,7 @@ class ArchiveProxyTest {
                     val work = pool.submit { handler.invoke(module, local.accept()) }
                     val response = Socket("127.0.0.1", local.localPort).use { client ->
                         client.soTimeout = 1000
-                        client.getOutputStream().write("GET /zip/disc/$filename HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray())
+                        client.getOutputStream().write("GET /zip/disc/$filename HTTP/1.1\r\nConnection: close\r\nHost: localhost\r\n\r\n".toByteArray())
                         client.getInputStream().readBytes().toString(Charsets.US_ASCII)
                     }
                     work.get(1, TimeUnit.SECONDS)
@@ -181,7 +181,7 @@ class ArchiveProxyTest {
                 val work = pool.submit { handler.invoke(module, local.accept()) }
                 val response = Socket("127.0.0.1", local.localPort).use { client ->
                     client.soTimeout = 1000
-                    client.getOutputStream().write("HEAD /zip/disc/Movie%20%2B%20Tamil.m2ts HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray())
+                    client.getOutputStream().write("HEAD /zip/disc/Movie%20%2B%20Tamil.m2ts HTTP/1.1\r\nConnection: close\r\nHost: localhost\r\n\r\n".toByteArray())
                     client.getInputStream().readBytes().toString(Charsets.US_ASCII)
                 }
                 work.get(1, TimeUnit.SECONDS)
@@ -244,7 +244,7 @@ class ArchiveProxyTest {
                     val job = pool.submit { handler.invoke(module, server.accept()) }
                     val result = Socket("127.0.0.1", server.localPort).use { client ->
                         client.soTimeout = 5000
-                        client.getOutputStream().write("$method /zip/handshake/$name HTTP/1.1\r\nUser-Agent: VLC/3.6 test\r\nRange: bytes=0-\r\n\r\n".toByteArray())
+                        client.getOutputStream().write("$method /zip/handshake/$name HTTP/1.1\r\nConnection: close\r\nUser-Agent: VLC/3.6 test\r\nRange: bytes=0-\r\n\r\n".toByteArray())
                         client.getInputStream().readBytes().toString(Charsets.US_ASCII)
                     }
                     job.get(5, TimeUnit.SECONDS)
@@ -260,6 +260,43 @@ class ArchiveProxyTest {
         } finally {
             active.close(); pool.shutdownNow(); (field(module, "ioExecutor") as ExecutorService).shutdownNow(); log.delete()
         }
+    }
+
+    @Test fun isoKeepAliveHandlesHeadThenTwoRangesOnOneSocket() {
+        val module = SecurityVaultModule(mock(ReactApplicationContext::class.java))
+        val pool = Executors.newSingleThreadExecutor()
+        @Suppress("UNCHECKED_CAST")
+        val entries = field(module, "archiveEntryRegistry") as ConcurrentHashMap<String, SecurityVaultModule.ArchiveEntryTarget>
+        entries["persistent"] = SecurityVaultModule.ArchiveEntryTarget("persistent", "http://unused/", "movie.m2ts", "ISO",
+            0, 192000, 188000, 0, 0, listOf(-1L to 192000L), true)
+        ArchiveProxyStreams.registry.resume()
+        try {
+            ServerSocket(0).use { server ->
+                val handler = SecurityVaultModule::class.java.getDeclaredMethod("handleArchiveProxyClient", Socket::class.java).apply { isAccessible = true }
+                val job = pool.submit { handler.invoke(module, server.accept()) }
+                Socket("127.0.0.1", server.localPort).use { client ->
+                    client.soTimeout = 5000
+                    val input = client.getInputStream()
+                    for (method in listOf("HEAD", "GET", "GET")) {
+                        client.getOutputStream().write("$method /zip/persistent/movie.m2ts HTTP/1.1\r\nRange: bytes=188-191\r\n\r\n".toByteArray())
+                        val header = StringBuilder()
+                        while (!header.endsWith("\r\n\r\n")) { val b = input.read(); assertTrue(b >= 0); header.append(b.toChar()) }
+                        assertTrue(header.contains("Connection: keep-alive"))
+                        assertTrue(header.contains("Accept-Ranges: bytes"))
+                        assertTrue(header.contains("Content-Type: video/MP2T"))
+                        if (method == "HEAD") assertTrue(header.contains("Content-Length: 188000")) else {
+                            assertTrue(header.contains("206 Partial Content"))
+                            assertTrue(header.contains("Content-Length: 4"))
+                            repeat(4) { assertEquals(0, input.read()) }
+                        }
+                    }
+                }
+                job.get(5, TimeUnit.SECONDS)
+                SecurityVaultModule.stopArchiveStreams("idle pause", true)
+                assertNotNull(entries["persistent"])
+                ArchiveProxyStreams.registry.register("persistent", false) {}.close()
+            }
+        } finally { pool.shutdownNow(); (field(module, "ioExecutor") as ExecutorService).shutdownNow() }
     }
 
 }

@@ -38,7 +38,7 @@ class ArchiveStreamService : Service() {
     private var wifiLock: WifiManager.WifiLock? = null
     private val checkIdle = object : Runnable {
         override fun run() {
-            if (lifetime.canStop()) shutdown("external handshake / media inactivity deadline expired") else handler.postDelayed(this, 1000)
+            if (lifetime.canStop()) shutdown("120-second external media inactivity deadline expired", true) else handler.postDelayed(this, 1000)
         }
     }
 
@@ -83,8 +83,10 @@ class ArchiveStreamService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun shutdown(reason: String) {
-        SecurityVaultModule.stopArchiveStreams(reason)
+    private var resumableShutdown = false
+    private fun shutdown(reason: String, resumable: Boolean = false) {
+        resumableShutdown = resumable
+        SecurityVaultModule.stopArchiveStreams(reason, resumable)
         stopSelf()
     }
 
@@ -94,7 +96,7 @@ class ArchiveStreamService : Service() {
     }
 
     override fun onDestroy() {
-        SecurityVaultModule.stopArchiveStreams("playback service destroyed")
+        SecurityVaultModule.stopArchiveStreams("playback service destroyed", resumableShutdown)
         handler.removeCallbacks(checkIdle)
         try { if (wifiLock?.isHeld == true) wifiLock?.release() } finally {
             if (wakeLock?.isHeld == true) wakeLock?.release()

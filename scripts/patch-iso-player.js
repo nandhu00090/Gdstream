@@ -1,5 +1,9 @@
 // Keep native ISO policy on the app side of the dependency boundary. The library cannot import app classes.
 function patchIsoPlayer(content) {
+  content = content.replace(': 1500 , // ISO fast startup;', ': 2000 , // ISO fast startup;');
+  content = content.replace(': DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,', ': 15000,');
+  content = content.replace(': DefaultLoadControl.DEFAULT_MAX_BUFFER_MS,', ': 45000,');
+  content = content.replace(': DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,', ': 4000,');
   // The old fallback rebuilds the source. ISO recovery owns its renderer/clock without a reload loop.
   content = content.replace(
     'if (e.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED && e.getMessage()',
@@ -39,7 +43,7 @@ function patchIsoPlayer(content) {
   replace('    private void releasePlayer() {', '    private void releasePlayer() {\n        closeIsoPolicy();');
   replace('    public void onPlayerError(@NonNull PlaybackException e) {', '    public void onPlayerError(@NonNull PlaybackException e) {\n        if (recoverIsoAudio(e)) return;');
   // RNVLoadControl subclasses DefaultLoadControl. Set its default as well as the stable JS source config.
-  replace(': DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS ,', ': 1500 , // ISO fast startup; explicit source config still takes precedence');
+  replace(': DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS ,', ': 2000 , // ISO fast startup; explicit source config still takes precedence');
   return patchIsoAudioCatalog(patchBluRayFactory(content));
 }
 module.exports = { patchIsoPlayer };

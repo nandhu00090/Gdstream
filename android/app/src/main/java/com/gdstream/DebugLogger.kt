@@ -15,12 +15,13 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
-/** Durable app-private copy; reopening the bridge must not erase the preceding playback trace. */
+/** A bounded current-session log; APP_BOOT invalidates the export append cursor. */
 internal class DebugLogStore(private val file: File) {
     private var generation = 0L
     data class Snapshot(val text: String, val generation: Long)
     @Synchronized fun append(tag: String, message: String) {
         file.parentFile?.mkdirs()
+        if (tag == "APP_BOOT") { file.writeText(""); generation++ }
         val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
         // Bound individual messages too; use byte lengths so non-ASCII names cannot exceed 2 MiB.
         val line = "[$timestamp] [$tag] ${message.take(16 * 1024)}\n".toByteArray(Charsets.UTF_8)
@@ -135,7 +136,7 @@ internal object DebugLogger {
         } catch (error: Exception) {
             failed = true
             synchronized(this) { exportedStore = null }
-            snapshot.first?.append("DEBUG_EXPORT_ERR", isoFailureDetails(error))
+            try { snapshot.first?.append("DEBUG_EXPORT_ERR", isoFailureDetails(error)) } catch (_: Exception) { }
         } finally {
             synchronized(this) {
                 scheduled = false

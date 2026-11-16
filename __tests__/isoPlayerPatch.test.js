@@ -25,7 +25,7 @@ new ProgressiveMediaSource.Factory(
   expect(patchIsoPlayer(patched)).toBe(patched);
   expect(patched).toContain('attachIsoPolicy(runningSource);');
   expect(patched).toContain('if (recoverIsoAudio(e)) return;');
-  expect(patched).toContain(': 1500');
+  expect(patched).toContain(': 2000');
   expect(patched.match(/getMethod\("audioTrackCatalog"/g)).toHaveLength(2);
   expect(patched).toContain('getMethod("selectAudioTrackFromCatalog"');
   expect(patched.match(/gdArchiveExtractors\(uri\)/g)).toHaveLength(3);
