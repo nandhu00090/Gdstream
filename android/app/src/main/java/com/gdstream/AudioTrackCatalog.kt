@@ -27,7 +27,8 @@ internal object AudioTrackCatalog {
     fun select(player: ExoPlayer, type: String?, value: String?, preserveDefault: Boolean = true): Boolean {
         // Initial undefined/default props must not undo IsoAudioClockGuard's automatic selection.
         if (type.isNullOrEmpty() || type == "default" || type == "system") return preserveDefault
-        val params = player.trackSelectionParameters.buildUpon().clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+        val selector = player.trackSelector as? androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+        val params = (selector?.parameters ?: player.trackSelectionParameters).buildUpon().clearOverridesOfType(C.TRACK_TYPE_AUDIO)
         if (type == "disabled") {
             player.trackSelectionParameters = params.setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true).build()
             return true
@@ -43,11 +44,22 @@ internal object AudioTrackCatalog {
         }?.value ?: return true
         if (params is androidx.media3.exoplayer.trackselection.DefaultTrackSelector.Parameters.Builder) {
             for (renderer in 0 until player.rendererCount) {
-                if (player.getRendererType(renderer) == C.TRACK_TYPE_AUDIO) params.setRendererDisabled(renderer, false)
+                if (player.getRendererType(renderer) == C.TRACK_TYPE_AUDIO) {
+                    params.setRendererDisabled(renderer, false)
+                    params.clearSelectionOverrides(renderer)
+                }
             }
+        }
+        if (preserveDefault && selector != null) {
+            player.trackSelectionParameters = params.setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true).build()
         }
         player.trackSelectionParameters = params.setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
             .setOverrideForType(TrackSelectionOverride(entry.group.mediaTrackGroup, entry.index)).build()
+        // An explicit ISO selection also retries the current track after a sink failure.
+        if (preserveDefault) {
+            player.seekTo(player.currentPosition)
+            if (player.playerError != null) player.prepare()
+        }
         DebugLogger.log(if (preserveDefault) "ISO_AUDIO_USER_SELECT" else "PLAYER_AUDIO_SELECT", "id=${entry.group.getTrackFormat(entry.index).id} type=$type value=$value")
         return true
     }

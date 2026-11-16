@@ -1,11 +1,18 @@
 # Blu-ray playback verification
 
-Registered ISO `.m2ts` URLs use `BluRayTsExtractor`; ZIP/RAR and other media keep
-Media3's normal extractors. The local proxy strips only the four-byte M2TS prefix,
-retaining the original HDMV PMT and audio payloads for external players.
+Registered ISO `.m2ts` and `.ts` URLs use `BluRayTsExtractor`; ZIP/RAR and other media keep
+Media3's normal extractors. The local proxy strips the four-byte M2TS prefix. In-app requests retain HDMV
+stream declarations. External `.ts` requests whose User-Agent does not contain
+GDStream receive a CRC-correct PMT with LPCM and dependent video PID 0x1015
+removed, TrueHD advertised as AC-3 (the embedded companion), and DTS-HD as 0x8A.
+Stock Media3 gates 0x82 behind FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS, so 0x8A is
+needed for its default factory. Payload bytes and virtual offsets stay unchanged.
+PMT rewriting handles continuation packets within a bounded 32-packet range
+context; sections whose complete bytes/CRC are unavailable are left unchanged.
 
 Audio uses the bundled Media3 1.8.0 Jellyfin FFmpeg extension with renderer mode
-PREFER for DTS/DTS-HD. The HDMV LPCM reader converts packetized PCM into standard
+PREFER for DTS/DTS-HD, AC-3 and TrueHD. TrueHD access units are framed separately
+from the interleaved AC-3 companion, and seek recovery waits for a major sync. The HDMV LPCM reader converts packetized PCM into standard
 raw PCM. DTS core and HD extension bytes remain in one access unit. The selector
 lists and selects tracks across both software and platform audio renderers, with
 language, codec and channel labels from CLPI/elementary headers.
@@ -100,3 +107,27 @@ X-Content-Duration and Content-Duration when known, and DLNA Streaming/OP=01/CI=
 Byte ranges and Content-Length remain in the exposed 188-byte TS address space.
 OP=01 advertises byte seeking, not DLNA TimeSeekRange support; VLC/MX time-seek
 behavior and display-format rendering still need device validation.
+
+
+## PR 9 status and remaining Dolby Vision work
+
+The extractor suppresses independent HEVC playback of PID 0x1015. This protects
+HDR10 base-layer playback, but currently applies to both HDR and DV selections.
+**Profile 7 to Profile 8.1 RPU conversion and timestamp-matched injection are not
+implemented.** The stream is not falsely labeled video/dolby-vision. The PR must
+remain draft until a real RPU conversion implementation and bounded dual-PID
+access-unit synchronizer are integrated and tested with MEL/FEL material. FEL
+residual reconstruction is not provided by dropping enhancement video.
+
+PGS display sets are assembled across PES packets and transcoded by Media3's
+subtitle parser into cues, using the existing React Native text-track menu.
+Seek resets drop partial display sets and reset the subtitle parser. Manual
+ISO audio selection clears renderer and track-type disables, clears legacy
+overrides, toggles selection and seeks to the current position to flush the sink.
+Timestamp discontinuities get one retry before audio rejection.
+
+Additional device checks: verify every TrueHD/AC-3 language on Dhoom 3 and Project
+Hail Mary, render an embedded PGS bitmap, seek across multiple gigabytes and
+manually reselect a disabled track, and launch Just Player with a non-GDStream
+User-Agent. JVM tests exercise framing and selection, not Lavc60 JNI playback,
+Atmos passthrough, hardware Dolby Vision, or Just Player itself.

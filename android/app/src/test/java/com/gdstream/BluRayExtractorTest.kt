@@ -84,6 +84,12 @@ class BluRayExtractorTest {
         // A core-only HD frame is emitted at EOF, not silently discarded waiting for EXTSS.
         reader.consume(ParsableByteArray(core())); reader.packetFinished(true)
         assertEquals(2, capture.samples.size)
+        reader.seek()
+        reader.packetStarted(9_000_000, 0)
+        reader.consume(ParsableByteArray(extension())) // No cached pre-seek configuration.
+        assertEquals(2, capture.samples.size)
+        reader.consume(ParsableByteArray(core() + extension()))
+        assertEquals(Sample(9_000_000, 140), capture.samples.last())
     }
     @Test fun seekMapDirectlySelectsEndOfMovieAccessPointAbove40Gb() {
         val profile = BluRayProfile(10009_000_000, listOf(BluRayPoint(0, 0),
@@ -155,6 +161,76 @@ class BluRayExtractorTest {
         AudioTrackCatalog.select(player, "index", "1")
         verify(player).setTrackSelectionParameters(chosen.capture())
         assertEquals(pcm, chosen.value.overrides.values.single().mediaTrackGroup)
+    }
+
+    @Test fun enhancementPidNeverCreatesAVideoTrack() {
+        val delegate = mock(TsPayloadReader::class.java)
+        val reader = BaseLayerPayloadReader(delegate)
+        reader.init(androidx.media3.common.util.TimestampAdjuster(0), Capture(), TsPayloadReader.TrackIdGenerator(0x1015, 8192))
+        val bytes = ParsableByteArray(ByteArray(100))
+        reader.consume(bytes, 0); reader.seek()
+        assertEquals(0, bytes.bytesLeft())
+        verifyNoInteractions(delegate)
+    }
+
+    @Test fun pgsDisplaySetSpansPesAndSeekDropsPartialSubtitle() {
+        val capture = Capture()
+        val reader = BluRayPgsReader(listOf(BluRayStream(0x1200, 0x90, language = "tam")), null)
+        reader.createTracks(capture, TsPayloadReader.TrackIdGenerator(0x1200, 8192))
+        val display = byteArrayOf(0x16, 0, 2, 1, 2, 0x80.toByte(), 0, 0)
+        reader.packetStarted(1000, 0)
+        display.forEach { reader.consume(ParsableByteArray(byteArrayOf(it))) }
+        assertEquals("application/pgs", capture.formats.single().sampleMimeType)
+        assertEquals(listOf(Sample(1000, 8)), capture.samples)
+        assertArrayEquals(display, capture.data.toByteArray())
+        reader.consume(ParsableByteArray(display.copyOf(4)))
+        reader.seek(); reader.packetStarted(9000000, 0)
+        reader.consume(ParsableByteArray(display))
+        assertEquals(Sample(9000000, 8), capture.samples.last())
+    }
+
+    @Test fun trueHdWaitsForMajorSyncAfterSeekAndSkipsAc3Companion() {
+        val capture = Capture()
+        val reader = BluRayTrueHdReader(listOf(BluRayAudio(0x1100, 0x83, "tam")), null)
+        reader.createTracks(capture, TsPayloadReader.TrackIdGenerator(0x1100, 8192))
+        val major = ByteArray(32)
+        major[1] = 16; major[4] = 0xf8.toByte(); major[5] = 0x72; major[6] = 0x6f; major[7] = 0xba.toByte()
+        major[11] = 1 // stereo, 48 kHz
+        val ac3 = ByteArray(128); ac3[0] = 0x0b; ac3[1] = 0x77
+        val minor = ByteArray(12); minor[1] = 6
+        reader.packetStarted(1000, 0)
+        (ac3 + major + minor).forEach { reader.consume(ParsableByteArray(byteArrayOf(it))) }
+        assertEquals("audio/true-hd", capture.formats.single().sampleMimeType)
+        assertEquals(2, capture.formats.single().channelCount)
+        assertEquals(listOf(32, 12), capture.samples.map { it.size })
+        reader.seek(); reader.packetStarted(9000000, 0)
+        reader.consume(ParsableByteArray(minor + major))
+        assertEquals(Sample(9000000, 32), capture.samples.last())
+        assertEquals(3, capture.samples.size)
+    }
+
+    @Test fun manualIsoSelectionClearsRendererDisableAndFlushesSameTrack() {
+        val group = androidx.media3.common.TrackGroup("ac3", Format.Builder().setSampleMimeType("audio/ac3").build())
+        val tracks = androidx.media3.common.Tracks(listOf(androidx.media3.common.Tracks.Group(
+            group, false, intArrayOf(C.FORMAT_HANDLED), booleanArrayOf(false))))
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        val selector = androidx.media3.exoplayer.trackselection.DefaultTrackSelector(context)
+        selector.setParameters(selector.buildUponParameters().setRendererDisabled(1, true).setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true))
+        val player = mock(androidx.media3.exoplayer.ExoPlayer::class.java)
+        `when`(player.trackSelector).thenReturn(selector)
+        `when`(player.currentTracks).thenReturn(tracks)
+        `when`(player.rendererCount).thenReturn(2)
+        `when`(player.getRendererType(1)).thenReturn(C.TRACK_TYPE_AUDIO)
+        `when`(player.currentPosition).thenReturn(9000000)
+        AudioTrackCatalog.select(player, "index", "0")
+        val chosen = org.mockito.ArgumentCaptor.forClass(androidx.media3.common.TrackSelectionParameters::class.java)
+        verify(player, times(2)).setTrackSelectionParameters(chosen.capture())
+        val params = chosen.value as androidx.media3.exoplayer.trackselection.DefaultTrackSelector.Parameters
+        assertFalse(params.getRendererDisabled(1))
+        assertFalse(params.disabledTrackTypes.contains(C.TRACK_TYPE_AUDIO))
+        assertEquals(group, params.overrides.values.single().mediaTrackGroup)
+        verify(player).seekTo(9000000)
+        selector.release()
     }
 
 }
