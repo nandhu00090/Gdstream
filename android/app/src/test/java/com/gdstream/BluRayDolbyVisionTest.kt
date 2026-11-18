@@ -117,6 +117,10 @@ class BluRayDolbyVisionTest {
             assertEquals(if (dv) "video/dolby-vision" else "video/hevc", output.formats.single().sampleMimeType)
             if (dv) assertEquals("dvhe.08.06", output.formats.single().codecs)
             assertEquals(6, output.samples.size)
+            // An extractor can be polled at EOF again: never submit the last AU/RPU twice.
+            val empty = DefaultExtractorInput({ _, _, _ -> -1 }, bytes.size.toLong(), bytes.size.toLong())
+            assertEquals(Extractor.RESULT_END_OF_INPUT, extractor.read(empty, PositionHolder()))
+            assertEquals(6, output.samples.size)
             if (dv) {
                 extractor.seek(0, 0); read(extractor)
                 assertEquals(12, output.samples.size)

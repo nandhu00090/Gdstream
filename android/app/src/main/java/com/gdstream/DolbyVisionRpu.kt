@@ -122,8 +122,8 @@ internal object DolbyVisionRpu {
                 w.ue(0); w.ue(0)
                 repeat(3) {
                     w.ue(0); w.ue(0); w.put(0, 1)
-                    w.ue(0); w.put(0, denominator) // signed 0
-                    w.ue(2); w.put(0, denominator) // signed +1
+                    w.se(0); w.put(0, denominator)
+                    w.se(1); w.put(0, denominator) // identity coefficient +1
                 }
             }
         }
@@ -213,6 +213,11 @@ internal object DolbyVisionRpu {
             val v = value.toLong() + 1
             val n = 64 - java.lang.Long.numberOfLeadingZeros(v)
             put(0, n - 1); put(v, n)
+        }
+        // Signed Exp-Golomb maps 0,+1,-1,+2,-2 to codeNum 0,1,2,3,4.
+        fun se(value: Int) {
+            require(value in -0x3fffffff..0x3fffffff)
+            ue(if (value <= 0) -2 * value else 2 * value - 1)
         }
         fun copy(bytes: ByteArray, start: Int, end: Int) {
             for (i in start until end) put(((bytes[i / 8].toInt() ushr (7 - i % 8)) and 1).toLong(), 1)
