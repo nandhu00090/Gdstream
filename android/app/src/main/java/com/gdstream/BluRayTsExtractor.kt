@@ -29,18 +29,21 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
         profile.streams.any { it.pid == 0x1015 && it.type == 0x24 }) BluRayDolbyVision() else null
     private val indexed = profile?.let { BluRaySeekMap(it) }?.takeIf { it.isSeekable }
     private val videoReaders = ArrayList<EndOfInputPayloadReader>()
+    private val pidReaders = ArrayList<BluRayPidReader>()
     private val fallback = DefaultTsPayloadReaderFactory(DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)
     private val payloads = object : TsPayloadReader.Factory {
         override fun createInitialPayloadReaders() = fallback.createInitialPayloadReaders()
-        override fun createPayloadReader(streamType: Int, esInfo: TsPayloadReader.EsInfo): TsPayloadReader? = when (streamType) {
-            0x81 -> PesReader(Ac3Reader(esInfo.language, 0, androidx.media3.common.MimeTypes.VIDEO_MP2T))
+        override fun createPayloadReader(streamType: Int, esInfo: TsPayloadReader.EsInfo): TsPayloadReader =
+            BluRayPidReader(profile?.audio.orEmpty(), streamType) { resolved -> reader(resolved, esInfo) }.also(pidReaders::add)
+        private fun reader(streamType: Int, esInfo: TsPayloadReader.EsInfo): TsPayloadReader? = when (streamType) {
+            0x81, 0x84, 0xa1 -> PesReader(Ac3Reader(esInfo.language, 0, androidx.media3.common.MimeTypes.VIDEO_MP2T))
             0x83 -> PesReader(BluRayTrueHdReader(profile?.audio.orEmpty(), esInfo.language))
             0x90 -> PesReader(BluRayPgsReader(profile?.streams.orEmpty(), esInfo.language))
             0x24 -> fallback.createPayloadReader(streamType, esInfo)!!.let {
                 EndOfInputPayloadReader(dv?.payload(it) ?: BaseLayerPayloadReader(it)).also(videoReaders::add)
             }
             0x80 -> PesReader(HdmvPcmReader(profile?.audio.orEmpty(), esInfo.language))
-            0x82, 0x85, 0x86, 0x8a -> PesReader(BluRayDtsReader(streamType != 0x82, profile?.audio.orEmpty(), esInfo.language))
+            0x82, 0x85, 0x86, 0x8a, 0xa2 -> PesReader(BluRayDtsReader(streamType != 0x82, profile?.audio.orEmpty(), esInfo.language))
             else -> fallback.createPayloadReader(streamType, esInfo)
         }
     }
@@ -55,10 +58,19 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
             override fun track(id: Int, type: Int): TrackOutput {
                 val target = transcoded.track(id, type)
                 val audio = profile?.audio?.firstOrNull { it.pid == id }
-                return if (audio == null || type != C.TRACK_TYPE_AUDIO) target else object : TrackOutput by target {
+                return object : TrackOutput by target {
                     override fun format(format: androidx.media3.common.Format) {
-                        target.format(format.buildUpon().setLanguage(audio.language)
-                            .setLabel(format.label ?: audio.label).build())
+                        val enriched = if (audio != null && type == C.TRACK_TYPE_AUDIO)
+                            format.buildUpon().setLanguage(audio.language).setLabel(format.label ?: audio.label).build()
+                            else format
+                        if (type == C.TRACK_TYPE_AUDIO) DebugLogger.log("ISO_AUDIO_FORMAT",
+                            "pid=$id id=${enriched.id} mime=${enriched.sampleMimeType} channels=${enriched.channelCount} rate=${enriched.sampleRate} language=${enriched.language}")
+                        if (type == C.TRACK_TYPE_VIDEO) {
+                            val mode = if (enriched.sampleMimeType == "video/dolby-vision") "DV"
+                                else if (enriched.colorInfo?.colorTransfer in listOf(C.COLOR_TRANSFER_ST2084, C.COLOR_TRANSFER_HLG)) "HDR10" else "SDR"
+                            DebugLogger.log("ISO_VIDEO_FORMAT", "pid=$id mode=$mode mime=${enriched.sampleMimeType} codecs=${enriched.codecs}")
+                        }
+                        target.format(enriched)
                     }
                 }
             }
@@ -78,6 +90,7 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
             if (it == Extractor.RESULT_END_OF_INPUT) {
                 // TsExtractor only flushes direct PesReader instances; our PID wrappers hide them.
                 // Flush both elementary readers before checking for unmatched base AUs.
+                pidReaders.forEach { reader -> reader.finish() }
                 videoReaders.forEach { reader -> reader.finish() }
                 dv?.finish()
             }
@@ -125,5 +138,32 @@ internal class EndOfInputPayloadReader(private val reader: TsPayloadReader) : Ts
         if (!initialized || finished) return
         finished = true
         reader.consume(androidx.media3.common.util.ParsableByteArray(), TsPayloadReader.FLAG_PAYLOAD_UNIT_START_INDICATOR)
+    }
+}
+
+/** Resolve private/incorrect PMT audio types from CLPI only after Media3 supplies the actual PID.
+ * MODE_SINGLE_PMT keeps each PID distinct, including multiple tracks with the same codec.
+ */
+internal class BluRayPidReader(
+    private val audio: List<BluRayAudio>, private val advertisedType: Int,
+    private val create: (Int) -> TsPayloadReader?
+) : TsPayloadReader {
+    private var reader: TsPayloadReader? = null
+    override fun init(adjuster: TimestampAdjuster, output: ExtractorOutput, ids: TsPayloadReader.TrackIdGenerator) {
+        ids.generateNewId()
+        val pid = ids.trackId
+        val type = audio.firstOrNull { it.pid == pid && pid in 0x1100..0x111f }?.type ?: advertisedType
+        val freshIds = TsPayloadReader.TrackIdGenerator(ids.formatId.substringBefore('/', "").toIntOrNull() ?: Int.MIN_VALUE, pid, 8192)
+        reader = create(type)
+        reader?.init(adjuster, output, freshIds)
+        if (pid in 0x1100..0x111f) DebugLogger.log("ISO_AUDIO_BIND", "pid=$pid type=$type active=${reader != null}")
+    }
+    override fun consume(data: androidx.media3.common.util.ParsableByteArray, flags: Int) {
+        reader?.consume(data, flags) ?: data.skipBytes(data.bytesLeft())
+    }
+    override fun seek() { reader?.seek() }
+    fun finish() {
+        // Wrapping a PesReader hides it from TsExtractor's EOF drain.
+        (reader as? PesReader)?.consume(androidx.media3.common.util.ParsableByteArray(), TsPayloadReader.FLAG_PAYLOAD_UNIT_START_INDICATOR)
     }
 }

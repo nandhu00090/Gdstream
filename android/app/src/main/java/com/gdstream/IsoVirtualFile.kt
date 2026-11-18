@@ -162,8 +162,8 @@ internal class IsoVirtualFile(
                 }
             }
             fun prefetch() {
-                // Four sequential 8 MiB raw windows ahead of the chunk currently being delivered.
-                while (queued.size < 4 && cursor <= range.end && method != "HEAD") {
+                // Twelve sequential 8 MiB raw windows ahead of the chunk currently being delivered.
+                while (queued.size < 12 && cursor <= range.end && method != "HEAD") {
                     session.checkActive()
                     val start = cursor
                     val limit = if (bdav) (IsoRangeReader.WINDOW_BYTES / 192) * 188 else IsoRangeReader.WINDOW_BYTES

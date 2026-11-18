@@ -72,7 +72,7 @@ internal object ArchiveProxyStreams {
     fun streamId(url: String): String? = try {
         val uri = java.net.URI(url)
         if (uri.host !in listOf("127.0.0.1", "localhost")) null else
-            uri.rawPath.split('/').takeIf { it.size >= 3 && it[1] == "zip" }?.get(2)
+            uri.rawPath.split('/').takeIf { it.size >= 3 && it[1] in listOf("zip", "hls") }?.get(2)
     } catch (_: Exception) { null }
 
     fun prepare(url: String) {

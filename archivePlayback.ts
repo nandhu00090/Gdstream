@@ -41,5 +41,23 @@ export function archiveSourceUrl(name: string, baseUrl: string, parentPath: stri
 /** An ISO resolves to one feature. Preserve the outer card identity for artwork and resume. */
 export function isoMovieDetails(item: any, entries: any[]): any | null {
   if (!/\.iso$/i.test(String(item?.name || '')) || entries.length !== 1 || !entries[0]?.link) return null;
-  return { ...item, ...entries[0], name: item.name, archiveFormat: 'ISO', isZipEntry: true };
+  return { ...item, ...entries[0], name: item.name, outerId: item.id, innerName: entries[0].name,
+    historyAliases: [item.name, item.id, item.link, item.outerUrl, entries[0].name, entries[0].id, entries[0].link].filter(Boolean),
+    archiveFormat: 'ISO', isoPending: false, isZipEntry: true };
+}
+
+/** Require episode identity and the same normalized show, never archive membership alone. */
+export function sameShowEpisodes(selected: any, files: any[], parse: (name: string, folder: boolean) => {
+  searchTitle: string; episodeNum: number; seasonEpisode: string;
+}): any[] {
+  if (!selected || selected.archiveFormat === 'ISO' || /\.iso$/i.test(selected.name || '')) return [];
+  const current = parse(selected.name, false);
+  if (current.episodeNum <= 0) return [];
+  const show = current.searchTitle.trim().toLowerCase();
+  const episodes = files.filter(file => !file.mimeType?.includes('folder') && file.archiveFormat !== 'ISO' &&
+    !/\.iso$/i.test(file.name || '') && (() => {
+      const info = parse(file.name, false);
+      return info.episodeNum > 0 && info.searchTitle.trim().toLowerCase() === show;
+    })());
+  return episodes.some(file => file.name === selected.name) && episodes.length > 1 ? episodes : [];
 }

@@ -19,6 +19,7 @@ class BluRayExtractorTest {
     private class Capture : ExtractorOutput {
         val formats = ArrayList<Format>()
         val samples = ArrayList<Sample>()
+        val samplesByPid = HashMap<Int, Int>()
         val data = java.io.ByteArrayOutputStream()
         var map: SeekMap? = null
         override fun track(id: Int, type: Int): TrackOutput {
@@ -29,7 +30,7 @@ class BluRayExtractorTest {
                 val count = it.getArgument<Int>(1)
                 val bytes = ByteArray(count); source.readBytes(bytes, 0, count); data.write(bytes); null
             }.`when`(output).sampleData(any(ParsableByteArray::class.java), anyInt())
-            doAnswer { samples.add(Sample(it.getArgument(0), it.getArgument(2))); null }.`when`(output)
+            doAnswer { samples.add(Sample(it.getArgument(0), it.getArgument(2))); samplesByPid[id] = (samplesByPid[id] ?: 0) + 1; null }.`when`(output)
                 .sampleMetadata(anyLong(), anyInt(), anyInt(), anyInt(), isNull())
             return output
         }
@@ -209,7 +210,7 @@ class BluRayExtractorTest {
         assertEquals(3, capture.samples.size)
     }
 
-    @Test fun manualIsoSelectionClearsRendererDisableAndFlushesSameTrack() {
+    @Test fun manualIsoSelectionClearsRendererDisableWithoutSeekingOrReloading() {
         val group = androidx.media3.common.TrackGroup("ac3", Format.Builder().setSampleMimeType("audio/ac3").build())
         val tracks = androidx.media3.common.Tracks(listOf(androidx.media3.common.Tracks.Group(
             group, false, intArrayOf(C.FORMAT_HANDLED), booleanArrayOf(false))))
@@ -224,13 +225,79 @@ class BluRayExtractorTest {
         `when`(player.currentPosition).thenReturn(9000000)
         AudioTrackCatalog.select(player, "index", "0")
         val chosen = org.mockito.ArgumentCaptor.forClass(androidx.media3.common.TrackSelectionParameters::class.java)
-        verify(player, times(2)).setTrackSelectionParameters(chosen.capture())
+        verify(player).setTrackSelectionParameters(chosen.capture())
         val params = chosen.value as androidx.media3.exoplayer.trackselection.DefaultTrackSelector.Parameters
         assertFalse(params.getRendererDisabled(1))
         assertFalse(params.disabledTrackTypes.contains(C.TRACK_TYPE_AUDIO))
         assertEquals(group, params.overrides.values.single().mediaTrackGroup)
-        verify(player).seekTo(9000000)
+        verify(player, never()).seekTo(anyLong())
+        verify(player, never()).prepare()
         selector.release()
+    }
+
+    @Test fun all32AudioPidsIncludingTamil1106EmitSamplesEvenWithPrivatePmtTypes() {
+        val fixture = javaClass.getResourceAsStream("/bluray/hdmv.ts.bin")!!.readBytes()
+        val packets = fixture.asList().chunked(188).map { it.toByteArray() }
+        fun pid(packet: ByteArray) = ((packet[1].toInt() and 31) shl 8) + (packet[2].toInt() and 255)
+        val audio = (0x1100..0x111f).mapIndexed { index, pid -> BluRayAudio(pid, listOf(0x80, 0x82, 0x81, 0x84)[index % 4], "tam") }
+        fun packetize(pid: Int, payload: ByteArray): ByteArray {
+            val out = java.io.ByteArrayOutputStream()
+            var offset = 0; var cc = 0
+            while (offset < payload.size) {
+                val count = minOf(184, payload.size - offset)
+                val packet = ByteArray(188) { 0xff.toByte() }
+                packet[0] = 0x47; packet[1] = ((pid ushr 8) or if (offset == 0) 0x40 else 0).toByte()
+                packet[2] = pid.toByte(); packet[3] = ((if (count == 184) 0x10 else 0x30) or cc++).toByte()
+                if (count < 184) { packet[4] = (183 - count).toByte(); if (count < 183) packet[5] = 0 }
+                payload.copyInto(packet, 188 - count, offset, offset + count)
+                out.write(packet); offset += count
+            }
+            return out.toByteArray()
+        }
+        // Private ES with no descriptors resolves to -1 in Media3; CLPI must bind by PID.
+        val body = byteArrayOf(2, 0xb0.toByte(), 0, 0, 1, 0xc1.toByte(), 0, 0, 0xf0.toByte(), 0x11, 0xf0.toByte(), 0) +
+            (listOf(0x1b to 0x1011) + audio.map { 0x06 to it.pid }).flatMap { (type, pid) ->
+                listOf(type.toByte(), (0xe0 or (pid ushr 8)).toByte(), pid.toByte(), 0xf0.toByte(), 0)
+            }.toByteArray()
+        body[1] = (0xb0 or ((body.size + 1) ushr 8)).toByte(); body[2] = (body.size + 1).toByte()
+        val crc = ExternalTsPmt.crc(body)
+        val section = body + ByteArray(4) { (crc ushr (24 - 8 * it)).toByte() }
+        val stream = java.io.ByteArrayOutputStream()
+        stream.write(packets.first { pid(it) == 0 })
+        stream.write(packetize(0x100, byteArrayOf(0) + section))
+        packets.filter { pid(it) == 0x1011 }.forEach(stream::write)
+        for (track in audio) {
+            if (track.type == 0x80 || track.type == 0x82) {
+                packets.filter { pid(it) == if (track.type == 0x80) 0x1100 else 0x1101 }.forEach { original ->
+                    val packet = original.copyOf(); packet[1] = ((packet[1].toInt() and 0xe0) or (track.pid ushr 8)).toByte()
+                    packet[2] = track.pid.toByte(); stream.write(packet)
+                }
+            } else {
+                val frame = javaClass.getResourceAsStream(if (track.type == 0x81) "/bluray/silent.ac3.bin" else "/bluray/silent.eac3.bin")!!.readBytes()
+                val length = frame.size + 8
+                val pes = byteArrayOf(0, 0, 1, 0xbd.toByte(), (length ushr 8).toByte(), length.toByte(),
+                    0x80.toByte(), 0x80.toByte(), 5, 0x21, 0, 7, 0xd8.toByte(), 0x61) + frame
+                stream.write(packetize(track.pid, pes))
+            }
+        }
+        val bytes = stream.toByteArray()
+        val capture = Capture()
+        val extractor = BluRayTsExtractor(BluRayProfile(120000, listOf(BluRayPoint(0, 0), BluRayPoint(100000, 188)), audio))
+        extractor.init(capture)
+        val source = java.io.ByteArrayInputStream(bytes)
+        val input = DefaultExtractorInput({ target, offset, count -> source.read(target, offset, count) }, 0, bytes.size.toLong())
+        val holder = PositionHolder()
+        var result = Extractor.RESULT_CONTINUE
+        while (result != Extractor.RESULT_END_OF_INPUT) {
+            result = extractor.read(input, holder)
+            assertNotEquals(Extractor.RESULT_SEEK, result)
+        }
+        for (track in audio) {
+            assertTrue("No samples on PID ${track.pid.toString(16)}", (capture.samplesByPid[track.pid] ?: 0) > 0)
+            assertTrue("Missing Tamil format on PID ${track.pid}", capture.formats.any { it.id == "1/${track.pid}" && it.language == "ta" })
+        }
+        assertEquals(setOf("audio/raw", "audio/vnd.dts", "audio/ac3", "audio/eac3"), capture.formats.mapNotNull { it.sampleMimeType }.filter { it.startsWith("audio/") }.toSet())
+        extractor.release()
     }
 
 }

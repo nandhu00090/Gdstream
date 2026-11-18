@@ -11,7 +11,9 @@ import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { usePlaybackSource } from './playbackSession';
-import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration, archiveSourceUrl, isoMovieDetails } from './archivePlayback';
+import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration, archiveSourceUrl, isoMovieDetails, sameShowEpisodes } from './archivePlayback';
+
+import { linkedWatchKeys, watchAliases } from './watchHistory';
 
 const {
   VideoPlayerManager, SubtitleFileModule, DownloadEngine, MediaInfoModule, SecurityVault,
@@ -44,6 +46,8 @@ interface ParsedMediaInfo {
 }
 
 interface MediaMetadata {
+  title?: string;
+  tmdbId?: number;
   poster?: string;
   backdrop?: string;
   rating?: string;
@@ -384,6 +388,21 @@ const FocusableButton = ({
       {children}
     </Pressable>
   );
+};
+
+const DiscSpecsSkeleton = () => {
+  const phase = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(Animated.timing(phase, { toValue: 1, duration: 1400, useNativeDriver: true }));
+    loop.start();
+    return () => loop.stop();
+  }, [phase]);
+  return <View accessibilityLabel="Inspecting Blu-ray media specifications" style={{ gap: 14, marginTop: 16 }}>
+    {[0.95, 0.8, 0.9, 0.65].map((width, index) => <View key={index} style={{ height: 16, width: `${width * 100}%`, backgroundColor: '#232936', borderRadius: 6, overflow: 'hidden' }}>
+      <Animated.View style={{ height: 16, width: 110, backgroundColor: '#414B5E', opacity: 0.5,
+        transform: [{ translateX: phase.interpolate({ inputRange: [0, 1], outputRange: [-110, 700] }) }] }} />
+    </View>)}
+  </View>;
 };
 
 const parseCueTime = (ts: string) => {
@@ -1011,57 +1030,87 @@ const App = () => {
   const lastTapTime = useRef(0);
   const lastTapDirection = useRef<boolean | null>(null);
 
-  // Sync Watch Progress to BOTH Native Disk (gdstream_watch_history_v1.json) AND AsyncStorage
+  const historyAliasesRef = useRef<Record<string, string[]>>({});
+  const removedHistoryRef = useRef(new Set<string>());
+  const historyWriteRef = useRef(Promise.resolve());
+  const queueHistoryWrite = useCallback((write: () => Promise<void>) => {
+    const pending = historyWriteRef.current.then(write);
+    historyWriteRef.current = pending.catch(error => {
+      SecurityVault?.writeDebugLog?.('WATCH_HISTORY_ERR', String(error));
+    });
+    return pending;
+  }, []);
+  const writeHistorySnapshot = useCallback(() => AsyncStorage.setItem(CW_STORAGE_KEY, JSON.stringify({
+    times: savedTimesRef.current, durations: savedDurationsRef.current,
+    aliases: historyAliasesRef.current, removed: [...removedHistoryRef.current],
+  })), []);
+
+  // Serialize native + JS writes so an older progress update cannot overtake removal.
   const persistPlaybackProgress = useCallback((fileName: string | undefined, sec: number, dur: number) => {
-    if (!fileName || sec <= 3) return;
+    if (!fileName || sec <= 3 || removedHistoryRef.current.has(fileName)) return;
     if (dur > 0 && dur - sec < 90) {
       delete savedTimesRef.current[fileName];
       setSavedTimesMap({ ...savedTimesRef.current });
-      VideoPlayerManager?.removeWatchProgress?.(fileName);
-      AsyncStorage.removeItem(`time_${fileName}`).catch(() => {});
-      AsyncStorage.setItem(CW_STORAGE_KEY, JSON.stringify({
-        times: savedTimesRef.current,
-        durations: savedDurationsRef.current,
-      })).catch(() => {});
+      void queueHistoryWrite(async () => {
+        await VideoPlayerManager?.removeWatchProgress?.(fileName);
+        await AsyncStorage.removeItem(`time_${fileName}`);
+        await writeHistorySnapshot();
+      }).catch(() => {});
       return;
     }
-
     savedTimesRef.current = { ...savedTimesRef.current, [fileName]: sec };
     setSavedTimesMap(savedTimesRef.current);
     if (dur > 0) {
       savedDurationsRef.current = { ...savedDurationsRef.current, [fileName]: dur };
       setSavedDurationsMap(savedDurationsRef.current);
-      AsyncStorage.setItem(`dur_${fileName}`, dur.toString()).catch(() => {});
     }
-    VideoPlayerManager?.saveWatchProgress?.(fileName, sec, dur);
-    AsyncStorage.setItem(`time_${fileName}`, sec.toString()).catch(() => {});
-    AsyncStorage.setItem(CW_STORAGE_KEY, JSON.stringify({
-      times: savedTimesRef.current,
-      durations: savedDurationsRef.current,
-    })).catch(() => {});
-  }, []);
+    void queueHistoryWrite(async () => {
+      if (removedHistoryRef.current.has(fileName)) return;
+      await VideoPlayerManager?.saveWatchProgress?.(fileName, sec, dur);
+      await AsyncStorage.setItem(`time_${fileName}`, sec.toString());
+      if (dur > 0) await AsyncStorage.setItem(`dur_${fileName}`, dur.toString());
+      await writeHistorySnapshot();
+    }).catch(() => {});
+  }, [queueHistoryWrite, writeHistorySnapshot]);
 
   const removeContinueWatchingItem = useCallback((fileToRemove: any) => {
-    const namesToClear = fileToRemove?._versions
-      ? fileToRemove._versions.map((v: any) => v.name)
-      : [fileToRemove?.name].filter(Boolean);
-    const nextTimes = { ...savedTimesRef.current };
-    for (const n of namesToClear) {
-      delete nextTimes[n];
-      VideoPlayerManager?.removeWatchProgress?.(n);
-      AsyncStorage.removeItem(`time_${n}`).catch(() => {});
-    }
-    savedTimesRef.current = nextTimes;
-    setSavedTimesMap(nextTimes);
-    AsyncStorage.setItem(CW_STORAGE_KEY, JSON.stringify({
-      times: savedTimesRef.current,
-      durations: savedDurationsRef.current,
-    })).catch(() => {});
-  }, []);
+    const item = { ...fileToRemove, metadata: metadataMap[fileToRemove.name] };
+    const purge = (keys: string[]) => {
+      for (const key of keys) {
+        removedHistoryRef.current.add(key);
+        delete savedTimesRef.current[key];
+        delete savedDurationsRef.current[key];
+      }
+      setSavedTimesMap({ ...savedTimesRef.current });
+      setSavedDurationsMap({ ...savedDurationsRef.current });
+    };
+    purge(linkedWatchKeys(item, Object.keys(savedTimesRef.current), historyAliasesRef.current));
+    void queueHistoryWrite(async () => {
+      const source = archiveSourceUrl(item.name || '', vaultRef.current.baseUrl, currentPath, item.link || item.url || '');
+      const [stored, native, storageKeys, nativeAliases] = await Promise.all([
+        AsyncStorage.getItem(CW_STORAGE_KEY), VideoPlayerManager?.getAllWatchProgress?.(), AsyncStorage.getAllKeys(),
+        /\.iso$/i.test(item.name || '') ? SecurityVault?.getArchiveWatchAliases?.(source, Number(item.size || 0)) : [],
+      ]);
+      item.historyAliases = [...(item.historyAliases || []), ...(nativeAliases || [])];
+      let old: any = {};
+      try { old = JSON.parse(stored || '{}'); } catch { /* empty/corrupt legacy index */ }
+      historyAliasesRef.current = { ...old.aliases, ...historyAliasesRef.current };
+      const known = [...Object.keys(old.times || {}), ...Object.keys(old.durations || {}),
+        ...Object.keys(native?.times || {}), ...Object.keys(native?.durations || {}),
+        ...storageKeys.filter(key => /^(time_|dur_)/.test(key)).map(key => key.replace(/^(time_|dur_)/, ''))];
+      const keys = linkedWatchKeys(item, known, historyAliasesRef.current);
+      purge(keys);
+      // Commit tombstones before deleting legacy stores; interrupted cleanup cannot resurrect them.
+      await writeHistorySnapshot();
+      for (const key of keys) await VideoPlayerManager?.removeWatchProgress?.(key);
+      await AsyncStorage.removeMany(keys.flatMap(key => [`time_${key}`, `dur_${key}`]));
+    }).catch(error => Alert.alert('Watch history', `Could not finish clearing saved progress: ${String(error)}`));
+  }, [metadataMap, currentPath, queueHistoryWrite, writeHistorySnapshot]);
 
   // Load Watch Progress from Native Disk + AsyncStorage on startup
   const restoreAllSavedWatchHistory = useCallback(async () => {
     try {
+      await historyWriteRef.current;
       const mergedTimes: Record<string, number> = { ...savedTimesRef.current };
       const mergedDurs: Record<string, number> = { ...savedDurationsRef.current };
 
@@ -1069,6 +1118,8 @@ const App = () => {
       if (cwRaw) {
         try {
           const parsed = JSON.parse(cwRaw);
+          historyAliasesRef.current = { ...parsed.aliases, ...historyAliasesRef.current };
+          for (const key of parsed.removed || []) removedHistoryRef.current.add(key);
           if (parsed?.times) Object.assign(mergedTimes, parsed.times);
           if (parsed?.durations) Object.assign(mergedDurs, parsed.durations);
         } catch {}
@@ -1082,6 +1133,7 @@ const App = () => {
         } catch {}
       }
 
+      for (const key of removedHistoryRef.current) { delete mergedTimes[key]; delete mergedDurs[key]; }
       savedTimesRef.current = mergedTimes;
       savedDurationsRef.current = mergedDurs;
       setSavedTimesMap({ ...mergedTimes });
@@ -1184,7 +1236,7 @@ const App = () => {
         if (val) {
           const parsed = parseFloat(val);
           const fName = k.replace(/^time_/, '');
-          if (parsed > 3 && !savedTimesRef.current[fName]) {
+          if (parsed > 3 && !removedHistoryRef.current.has(fName) && !savedTimesRef.current[fName]) {
             savedTimesRef.current[fName] = parsed;
             changedTimes = true;
           }
@@ -1197,7 +1249,7 @@ const App = () => {
         if (val) {
           const parsed = parseFloat(val);
           const fName = k.replace(/^dur_/, '');
-          if (parsed > 0 && !savedDurationsRef.current[fName]) {
+          if (parsed > 0 && !removedHistoryRef.current.has(fName) && !savedDurationsRef.current[fName]) {
             savedDurationsRef.current[fName] = parsed;
             changedDurs = true;
           }
@@ -1268,8 +1320,7 @@ const App = () => {
         closeInternalPlayer();
         return true;
       } else if (selectedFile) {
-        setSelectedFile(null);
-        setVersionGroup([]);
+        closeDetails();
         return true;
       } else if (activeTab === 'downloads') {
         setActiveTab('catalog');
@@ -1338,6 +1389,8 @@ const App = () => {
 
         if (match) {
           const meta: MediaMetadata = {
+            title: match.title || match.name,
+            tmdbId: match.id,
             poster: match.poster_path ? `https://image.tmdb.org/t/p/w342${match.poster_path}` : undefined,
             backdrop: match.backdrop_path ? `https://image.tmdb.org/t/p/w780${match.backdrop_path}` : undefined,
             rating: match.vote_average && match.vote_average > 0 ? Number(match.vote_average).toFixed(1) : undefined,
@@ -1646,16 +1699,8 @@ const App = () => {
     return sourcePool.filter(f => !f.mimeType?.includes('folder') && (savedTimesMap[f.name] || 0) > 3);
   }, [isInsideFolder, folderFiles, homeFiles, savedTimesMap]);
 
-  const playableFolderEpisodes = useMemo(() => {
-    if (!selectedFile) return [];
-    const currentInfo = parseMediaFilename(selectedFile.name, false);
-    if (!currentInfo.seasonEpisode && seasonFolders.length === 0 && !selectedFile.isZipEntry) return [];
-    return displayedFiles.filter(f => {
-      if (f.mimeType?.includes('folder')) return false;
-      const fInfo = parseMediaFilename(f.name, false);
-      return !!fInfo.seasonEpisode || seasonFolders.length > 0 || !!f.isZipEntry;
-    });
-  }, [displayedFiles, selectedFile, seasonFolders]);
+  const playableFolderEpisodes = useMemo(() => sameShowEpisodes(selectedFile, displayedFiles, parseMediaFilename),
+    [displayedFiles, selectedFile]);
 
 
   const zipParentBackupRef = React.useRef<{
@@ -1681,6 +1726,15 @@ const App = () => {
 
   const archiveOpenRequestRef = useRef(0);
   const [openingIso, setOpeningIso] = useState(false);
+  const [isoInspectionError, setIsoInspectionError] = useState<string | null>(null);
+  const isoRetryRef = useRef<any>(null);
+  const closeDetails = () => {
+    archiveOpenRequestRef.current++;
+    setOpeningIso(false);
+    setIsoInspectionError(null);
+    setSelectedFile(null);
+    setVersionGroup([]);
+  };
 
   const openZipArchiveFile = async (zipItem: any, basePathOverride?: string) => {
     const requestId = ++archiveOpenRequestRef.current;
@@ -1704,6 +1758,13 @@ const App = () => {
 
       const isIso = /\.iso$/i.test(zipItem.name);
       setOpeningIso(isIso);
+      setIsoInspectionError(null);
+      if (isIso) {
+        isoRetryRef.current = zipItem;
+        const pending = { ...zipItem, archiveFormat: 'ISO', isoPending: true };
+        setVersionGroup([pending]);
+        openFile(pending); // No await: render the card's artwork and metadata immediately.
+      }
       if (!isIso) {
         zipParentBackupRef.current = prevBackup;
         setFolderLoading(true);
@@ -1728,19 +1789,24 @@ const App = () => {
                 : ent
             )
           : [];
-        const movie = isoMovieDetails(zipItem, entries);
+        const movie = isoMovieDetails({ ...zipItem, outerUrl: zipUrl, metadata: metadataMap[zipItem.name] }, entries);
         if (movie) {
           if (movie.mediaInfo) {
             setMediaInfoMap(prev => ({ ...prev, [movie.name]: movie.mediaInfo }));
             void AsyncStorage.setItem(`iso_card_v1_${zipItem.name}|${zipItem.size || 0}`, JSON.stringify(movie.mediaInfo)).catch(() => {});
           }
+          historyAliasesRef.current[movie.name] = [...new Set([
+            ...(historyAliasesRef.current[movie.name] || []), ...watchAliases(movie),
+          ])];
+          queueHistoryWrite(async () => { await writeHistorySnapshot(); });
           // Migrate progress saved against PR 8/9's generated inner-entry name.
           const previousName = entries[0].name;
-          if (!savedTimesMap[movie.name] && savedTimesMap[previousName]) {
-            persistPlaybackProgress(movie.name, savedTimesMap[previousName], movie.durationSec || savedDurationsMap[previousName] || 0);
+          if (!removedHistoryRef.current.has(movie.name) && !removedHistoryRef.current.has(previousName) &&
+              !savedTimesRef.current[movie.name] && savedTimesRef.current[previousName]) {
+            persistPlaybackProgress(movie.name, savedTimesRef.current[previousName], movie.durationSec || savedDurationsRef.current[previousName] || 0);
           }
           setVersionGroup([movie]);
-          openFile(movie);
+          setSelectedFile(movie);
           return;
         }
         if (entries.length > 0 && !isIso) {
@@ -1750,6 +1816,7 @@ const App = () => {
         }
       }
 
+      if (isIso) throw new Error('No playable Blu-ray feature was found. Tap Retry to inspect the disc again.');
       // Restore previous view cleanly if archive had no playable video files
       zipParentBackupRef.current = null;
       setFolderLoading(false);
@@ -1762,6 +1829,11 @@ const App = () => {
       Alert.alert('Archive / Disc Info', 'Indha .zip / .rar / .iso file-kulla playable video streams edhuvum kidaikala.');
     } catch (e: any) {
       if (requestId !== archiveOpenRequestRef.current) return;
+      if (/\.iso$/i.test(zipItem.name)) {
+        setIsoInspectionError(String(e?.message || 'Could not inspect this Blu-ray disc.'));
+        SecurityVault?.writeDebugLog?.('APP_ARCHIVE_ERR', `${zipItem.name}: ${e?.message || e}`);
+        return;
+      }
       zipParentBackupRef.current = null;
       setFolderLoading(false);
       setPathStack(prevBackup.pathStack);
@@ -1779,7 +1851,7 @@ const App = () => {
 
 
   useEffect(() => {
-    if (!selectedFile || playMode !== null) return;
+    if (!selectedFile || selectedFile.isoPending || playMode !== null) return;
     const targets = versionGroup.length > 1 ? versionGroup : [selectedFile];
     let cancelled = false;
 
@@ -1944,9 +2016,7 @@ const App = () => {
   }, [fadeAnim, seekBothPlayers]);
 
 
-  const currentActiveLayer = openingIso
-    ? 'isoLoading'
-    : isTvSearchModalOpen
+  const currentActiveLayer = isTvSearchModalOpen
     ? 'searchModal'
     : showHdrChoiceModal
     ? 'hdrModal'
@@ -2043,12 +2113,6 @@ const App = () => {
       lastFocusedScreenKeyRef.current = 'seasonModal';
       const selIdx = Math.max(0, seasonFolders.findIndex(s => s.seasonNum === activeSeason?.seasonNum));
       requestInitialScreenFocus(`season_opt_${selIdx}`);
-      return;
-    }
-
-    if (currentActiveLayer === 'isoLoading') {
-      lastFocusedScreenKeyRef.current = 'isoLoading';
-      requestInitialScreenFocus('iso_cancel_btn');
       return;
     }
 
@@ -2394,6 +2458,9 @@ const App = () => {
   };
 
   const startPlaybackWithMode = async (mode: 'dv' | 'hdr' | 'sdr') => {
+    if (!selectedFile || selectedFile.isoPending) return;
+    removedHistoryRef.current.delete(selectedFile.name); // Only an intentional new play can restore this movie.
+    queueHistoryWrite(async () => { await writeHistorySnapshot(); });
     try { await SecurityVault?.prepareArchivePlayback?.(getStreamUrl(selectedFile)); } catch { return; }
     try { await VideoPlayerManager?.setPreferredHdrMode?.(mode); } catch { return; }
     hasRestoredResumeRef.current = false;
@@ -2408,7 +2475,8 @@ const App = () => {
   };
 
   const handlePlayInAppPress = (fileToPlay = selectedFile) => {
-    if (!fileToPlay) return;
+    if (!fileToPlay || fileToPlay.isoPending) return;
+    if (/\.iso$/i.test(fileToPlay.name || '') && !fileToPlay.isZipEntry) { void openZipArchiveFile(fileToPlay); return; }
     const info = parseMediaFilename(fileToPlay.name, false);
     const realMi: RealMediaInfo | undefined = fileToPlay.mediaInfo ?? mediaInfoMap[fileToPlay.name];
     const effectiveHasDV = realMi ? realMi.hasDV : info.hasDV;
@@ -2518,6 +2586,7 @@ const App = () => {
   };
 
   const openInExternalPlayer = async (targetFile = selectedFile) => {
+    if (!targetFile || targetFile.isoPending) return;
     const url = getStreamUrl(targetFile);
     closeInternalPlayer(false);
     setPlayMode('external'); // Suppress metadata probes while the external player owns the stream.
@@ -2881,7 +2950,7 @@ const App = () => {
 
   const renderFloatingMenu = () => {
     if (!activeMenu) return null;
-    if (activeMenu === 'episodes') {
+    if (activeMenu === 'episodes' && playableFolderEpisodes.length > 1) {
       return (
         <FocusLayerContext.Provider value="playerMenu">
         <View style={styles.netflixSheetOverlay}>
@@ -3412,7 +3481,7 @@ const App = () => {
             </View>
           )}
           <View style={styles.detailHeroShade} />
-          <FocusableButton focusId="detail_back_btn" style={styles.detailBackTopBtn} onPress={() => { setSelectedFile(null); setVersionGroup([]); }}>
+          <FocusableButton focusId="detail_back_btn" style={styles.detailBackTopBtn} onPress={closeDetails}>
             <Icon name="arrow-back" size={24} color="white" />
           </FocusableButton>
         </View>
@@ -3421,7 +3490,7 @@ const App = () => {
           <View style={styles.detailHeaderRow}>
             {meta?.poster ? <Image source={{ uri: meta.poster }} style={styles.detailPosterThumb} resizeMode="cover" /> : null}
             <View style={{ flex: 1 }}>
-              <Text style={styles.detailTitle}>{info.cleanTitle}</Text>
+              <Text style={styles.detailTitle}>{meta?.title || info.cleanTitle}</Text>
               {!!episodeTmdbMeta?.epTitle && (
                 <Text style={{ color: '#D1D5DB', fontSize: 14, fontWeight: '600', marginTop: 2, marginBottom: 4 }} numberOfLines={2}>
                   {episodeTmdbMeta.code ? `${episodeTmdbMeta.code} • ` : ''}{episodeTmdbMeta.epTitle}
@@ -3495,11 +3564,12 @@ const App = () => {
             </View>
           )}
 
+          {!!isoInspectionError && <Text accessibilityRole="alert" style={{ color: '#FCA5A5', marginBottom: 12 }}>{isoInspectionError}</Text>}
           <View style={styles.detailActionButtons}>
-            <FocusableButton focusId="detail_play_btn" hasTVPreferredFocus={true} style={styles.primaryPlayButton} onPress={() => handlePlayInAppPress(selectedFile)}>
+            <FocusableButton focusId="detail_play_btn" hasTVPreferredFocus={true} style={styles.primaryPlayButton} disabled={openingIso} onPress={() => isoInspectionError ? openZipArchiveFile(isoRetryRef.current) : handlePlayInAppPress(selectedFile)}>
               <Icon name="play-arrow" size={26} color="white" />
               <Text style={styles.primaryPlayButtonText}>
-                {savedSec > 3
+                {openingIso ? 'Inspecting Blu-ray disc...' : isoInspectionError ? 'Retry disc inspection' : savedSec > 3
                   ? `Resume ${versionGroup.length > 1 ? getVersionTag(selectedFile.name).split(' • ')[0] : 'Watching'} (${formatRemainingLabel(savedSec, totalDur)})`
                   : versionGroup.length > 1
                   ? `Play ${getVersionTag(selectedFile.name)} in App`
@@ -3508,7 +3578,7 @@ const App = () => {
             </FocusableButton>
 
             <View style={{ flexDirection: 'row', gap: 10 }}>
-              <FocusableButton focusId="detail_ext_btn" style={[styles.secondaryPlayButton, { flex: 1 }]} onPress={() => openInExternalPlayer(selectedFile)}>
+              <FocusableButton focusId="detail_ext_btn" disabled={!!selectedFile.isoPending} style={[styles.secondaryPlayButton, { flex: 1 }]} onPress={() => openInExternalPlayer(selectedFile)}>
                 <Icon name="open-in-new" size={20} color="white" />
                 <Text style={styles.secondaryPlayButtonText}>External Player</Text>
               </FocusableButton>
@@ -3534,7 +3604,7 @@ const App = () => {
                 <Text style={styles.downloadedReadyText}>Saved in Download/GDStream • Tap to Open Folder</Text>
               </FocusableButton>
             ) : (
-              <FocusableButton focusId="detail_dl_btn" style={styles.downloadProgressCard} onPress={() => { setSelectedFile(null); setVersionGroup([]); setActiveTab('downloads'); }}>
+              <FocusableButton focusId="detail_dl_btn" style={styles.downloadProgressCard} onPress={() => { closeDetails(); setActiveTab('downloads'); }}>
                 <View style={styles.dlCardHeaderRow}>
                   <Text style={styles.dlCardStatusText}>
                     {dlTask.status === 'downloading' ? `Downloading • ${formatBytes(dlTask.speedBytesPerSec)}/s` : `Download ${dlTask.status.toUpperCase()}`}
@@ -3648,7 +3718,7 @@ const App = () => {
               )}
             </View>
 
-            {vMi ? (
+            {openingIso ? <DiscSpecsSkeleton /> : vMi ? (
               <View style={{ gap: 10, marginTop: 8 }}>
                 <View style={styles.miSpecRow}>
                   <Text style={styles.miSpecLabel}>VIDEO</Text>
@@ -4027,6 +4097,7 @@ const App = () => {
                 {!IS_TV && (
                   <TouchableOpacity
                     style={styles.cwRemoveBtn}
+                    accessibilityLabel={`Remove ${cwInfo.cleanTitle} from Continue Watching`}
                     hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                     onPress={() => removeContinueWatchingItem(cwItem)}>
                     <Icon name="close" size={15} color="#FFFFFF" />
@@ -4036,6 +4107,7 @@ const App = () => {
                   focusId={`${prefix}cw_play_${idx}`}
                   style={{ borderWidth: 2, borderColor: 'transparent', borderBottomLeftRadius: 8, borderBottomRightRadius: 8 }}
                   onPress={() => {
+                    if (/\.iso$/i.test(cwItem.name || '') && !cwItem.isZipEntry) { void openZipArchiveFile(cwItem); return; }
                     const parentGroup = displayedFiles.find((df: any) => df._versions?.some((v: any) => v.name === cwItem.name));
                     setVersionGroup(parentGroup?._versions || [cwItem]);
                     openFile(cwItem);
@@ -4245,21 +4317,6 @@ const App = () => {
       {renderPlayerOverlay()}
       {renderSeasonModal()}
       {renderHdrChoiceModal()}
-      {openingIso && (
-        <Modal transparent visible onRequestClose={() => { archiveOpenRequestRef.current++; setOpeningIso(false); }}>
-          <FocusLayerContext.Provider value="isoLoading">
-          <View style={styles.modalBackdrop}>
-            <View style={styles.hdrModalCard}>
-              <ActivityIndicator size="large" color="#E50914" />
-              <Text style={styles.hdrModalTitle}>Opening disc…</Text>
-              <FocusableButton focusId="iso_cancel_btn" onPress={() => { archiveOpenRequestRef.current++; setOpeningIso(false); }}>
-                <Text style={{ color: '#99A3B3', fontWeight: '700' }}>Cancel</Text>
-              </FocusableButton>
-            </View>
-          </View>
-          </FocusLayerContext.Provider>
-        </Modal>
-      )}
       {IS_TV && isTvSearchModalOpen && (
         <Modal
           visible={isTvSearchModalOpen}

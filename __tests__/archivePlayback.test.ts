@@ -71,3 +71,13 @@ test('single ISO opens details with homepage identity, quality and resume key', 
   expect(isoMovieDetails(card, [])).toBeNull();
   expect(isoMovieDetails(card, [entry, entry])).toBeNull();
 });
+
+import { sameShowEpisodes } from '../archivePlayback';
+test('episodes require multiple actual episodes of the same show, never archive membership', () => {
+  const parse = (name: string) => ({ searchTitle: name.split(' S')[0], episodeNum: Number(name.match(/E(\d+)/)?.[1] || 0), seasonEpisode: '' });
+  const files = [{ name: 'Show S01E01.mkv', isZipEntry: true }, { name: 'Show S01E02.mkv' }, { name: 'Other S01E01.mkv' }, { name: 'Movie.iso', isZipEntry: true }];
+  expect(sameShowEpisodes(files[3], files, parse)).toEqual([]);
+  expect(sameShowEpisodes(files[0], files, parse)).toEqual(files.slice(0, 2));
+  expect(sameShowEpisodes(files[2], files, parse)).toEqual([]);
+  expect(sameShowEpisodes({ name: 'Movie.m2ts', archiveFormat: 'ISO' }, files, parse)).toEqual([]);
+});
