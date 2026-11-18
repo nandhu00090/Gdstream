@@ -24,8 +24,11 @@ internal class BluRaySeekMap(private val profile: BluRayProfile) : SeekMap {
 }
 
 /** Scoped to registered BD ISO streams. Other sources keep react-native-video's default extractors. */
-internal class BluRayTsExtractor(private val profile: BluRayProfile?) : Extractor {
+internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVision: Boolean = false) : Extractor {
+    private val dv = if (dolbyVision && profile?.streams?.any { it.pid == 0x1011 && it.type == 0x24 && it.height == 2160 } == true &&
+        profile.streams.any { it.pid == 0x1015 && it.type == 0x24 }) BluRayDolbyVision() else null
     private val indexed = profile?.let { BluRaySeekMap(it) }?.takeIf { it.isSeekable }
+    private val videoReaders = ArrayList<EndOfInputPayloadReader>()
     private val fallback = DefaultTsPayloadReaderFactory(DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)
     private val payloads = object : TsPayloadReader.Factory {
         override fun createInitialPayloadReaders() = fallback.createInitialPayloadReaders()
@@ -33,7 +36,9 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?) : Extracto
             0x81 -> PesReader(Ac3Reader(esInfo.language, 0, androidx.media3.common.MimeTypes.VIDEO_MP2T))
             0x83 -> PesReader(BluRayTrueHdReader(profile?.audio.orEmpty(), esInfo.language))
             0x90 -> PesReader(BluRayPgsReader(profile?.streams.orEmpty(), esInfo.language))
-            0x24 -> BaseLayerPayloadReader(fallback.createPayloadReader(streamType, esInfo)!!)
+            0x24 -> fallback.createPayloadReader(streamType, esInfo)!!.let {
+                EndOfInputPayloadReader(dv?.payload(it) ?: BaseLayerPayloadReader(it)).also(videoReaders::add)
+            }
             0x80 -> PesReader(HdmvPcmReader(profile?.audio.orEmpty(), esInfo.language))
             0x82, 0x85, 0x86, 0x8a -> PesReader(BluRayDtsReader(streamType != 0x82, profile?.audio.orEmpty(), esInfo.language))
             else -> fallback.createPayloadReader(streamType, esInfo)
@@ -69,11 +74,19 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?) : Extracto
         val source = if (indexed == null) input else object : ForwardingExtractorInput(input) {
             override fun getLength() = C.LENGTH_UNSET.toLong()
         }
-        return delegate.read(source, seekPosition)
+        return delegate.read(source, seekPosition).also {
+            if (it == Extractor.RESULT_END_OF_INPUT) {
+                // TsExtractor only flushes direct PesReader instances; our PID wrappers hide them.
+                // Flush both elementary readers before checking for unmatched base AUs.
+                videoReaders.forEach { reader -> reader.finish() }
+                dv?.finish()
+            }
+        }
     }
     override fun seek(position: Long, timeUs: Long) {
         val pointTime = profile?.points?.lastOrNull { it.position <= position }?.timeUs ?: timeUs
         DebugLogger.log("ISO_CLPI_SEEK", "position=$position requestedUs=$timeUs pointUs=$pointTime indexed=${indexed != null}")
+        dv?.reset()
         subtitles?.resetSubtitleParsers()
         delegate.seek(position, if (indexed != null) pointTime else timeUs)
     }
@@ -91,5 +104,26 @@ internal class BaseLayerPayloadReader(private val reader: TsPayloadReader) : TsP
     override fun seek() { if (!enhancement) reader.seek() }
     override fun consume(data: androidx.media3.common.util.ParsableByteArray, flags: Int) {
         if (enhancement) data.skipBytes(data.bytesLeft()) else reader.consume(data, flags)
+    }
+}
+
+/** Forwards the same empty-PUSI EOF signal Media3 sends to unwrapped PES readers. */
+internal class EndOfInputPayloadReader(private val reader: TsPayloadReader) : TsPayloadReader {
+    private var initialized = false
+    private var finished = false
+    override fun init(adjuster: TimestampAdjuster, output: ExtractorOutput, ids: TsPayloadReader.TrackIdGenerator) {
+        reader.init(adjuster, output, ids)
+        initialized = true
+        finished = false
+    }
+    override fun consume(data: androidx.media3.common.util.ParsableByteArray, flags: Int) = reader.consume(data, flags)
+    override fun seek() {
+        finished = false
+        reader.seek()
+    }
+    fun finish() {
+        if (!initialized || finished) return
+        finished = true
+        reader.consume(androidx.media3.common.util.ParsableByteArray(), TsPayloadReader.FLAG_PAYLOAD_UNIT_START_INDICATOR)
     }
 }

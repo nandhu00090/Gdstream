@@ -43,7 +43,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
 
         @JvmField
         @Volatile
-        var preferredHdrMode: String = "dv"
+        var preferredHdrMode: String = "hdr"
 
         @Volatile
         private var currentAudioSessionId: Int = 0
@@ -70,7 +70,8 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
             if (url == null || !SecurityVaultModule.isIsoStream(url) ||
                 (!url.substringBefore('?').endsWith(".m2ts", true) && !url.substringBefore('?').endsWith(".ts", true))) return androidx.media3.extractor.DefaultExtractorsFactory()
             val profile = SecurityVaultModule.bluRayProfile(url)
-            return androidx.media3.extractor.ExtractorsFactory { arrayOf(BluRayTsExtractor(profile)) }
+            val dv = preferredHdrMode == "dv"
+            return androidx.media3.extractor.ExtractorsFactory { arrayOf(BluRayTsExtractor(profile, dv)) }
         }
 
         @androidx.annotation.Keep
