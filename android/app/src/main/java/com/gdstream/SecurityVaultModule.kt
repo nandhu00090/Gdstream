@@ -1303,6 +1303,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return items
     }
 
+    private val isoDiskCache by lazy { IsoIndexDiskCache(java.io.File(reactContext.filesDir, "iso-index")) }
+
     private val zipDiskCache = ConcurrentHashMap<String, String>()
     private val zipDiskLoaded = java.util.concurrent.atomic.AtomicBoolean(false)
     private val zipDiskWriteLock = Any()
@@ -1354,7 +1356,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val hasIso = (0 until targetsArr.length()).any {
                 targetsArr.optJSONObject(it)?.optString("archiveFormat") == "ISO"
             }
-            if (hasIso && root.optInt("isoIndexVersion", 0) != 6) return null
+            if (hasIso && root.optInt("isoIndexVersion", 0) != IsoIndexDiskCache.VERSION) return null
             var hasUnstrippedM2ts = false
             for (ci in 0 until targetsArr.length()) {
                 val co = targetsArr.optJSONObject(ci) ?: continue
@@ -1430,7 +1432,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun persistArchiveToDisk(cacheKey: String, rawJson: String) {
+    private fun persistArchiveToDisk(cacheKey: String, rawJson: String, sourceUrl: String, sourceSize: Long) {
         try {
             val arr = JSONArray(rawJson)
             if (arr.length() == 0) return
@@ -1465,10 +1467,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val root = JSONObject().apply {
                     put("rawJson", rawJson)
                     put("targets", targetsArr)
-                    put("isoIndexVersion", 6)
+                    put("isoIndexVersion", IsoIndexDiskCache.VERSION)
                 }
-                zipDiskCache[cacheKey] = root.toString()
-                saveZipDiskCacheAsync()
+                if ((0 until targetsArr.length()).any { targetsArr.getJSONObject(it).optString("archiveFormat") == "ISO" }) {
+                    isoDiskCache.put(sourceUrl, sourceSize, root.toString())
+                } else {
+                    zipDiskCache[cacheKey] = root.toString()
+                    saveZipDiskCacheAsync()
+                }
             }
         } catch (_: Throwable) {}
     }
@@ -1478,8 +1484,16 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         ArchiveProxyStreams.registry.resume()
         ioExecutor.submit {
             ensureZipDiskCacheLoaded()
-            val cacheKey = extractArchiveCacheKey(zipUrl, fileSizeHint)
-            val cachedBlob = zipDiskCache[cacheKey]
+            val hintedName = try { java.net.URLDecoder.decode(zipUrl.substringAfter("#name=", ""), "UTF-8") } catch (_: IllegalArgumentException) { "" }
+            val iso = zipUrl.substringBefore('#').substringBefore('?').endsWith(".iso", true) || hintedName.endsWith(".iso", true)
+            val sourceSize = try {
+                if (iso && fileSizeHint <= 0) detectRemoteFileSize(zipUrl) else fileSizeHint.toLong()
+            } catch (error: Exception) {
+                promise.reject("E_ISO_SIZE", error.message, error)
+                return@submit
+            }
+            val cacheKey = if (iso) IsoIndexDiskCache.key(zipUrl, sourceSize) else extractArchiveCacheKey(zipUrl, fileSizeHint)
+            val cachedBlob = if (iso) isoDiskCache.get(zipUrl, sourceSize) else zipDiskCache[cacheKey]
             if (!cachedBlob.isNullOrEmpty()) {
                 val restoredJson = restoreArchiveFromDisk(cachedBlob, zipUrl)
                 if (!restoredJson.isNullOrEmpty()) {
@@ -1504,7 +1518,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 override fun resolve(value: Any?) {
                     val list = zipInflightMap.remove(cacheKey) ?: listOf(promise)
                     if (value is String && value.startsWith("[") && value.length > 2) {
-                        persistArchiveToDisk(cacheKey, value)
+                        persistArchiveToDisk(cacheKey, value, zipUrl, sourceSize)
                     }
                     for (p in list) p.resolve(value)
                 }
@@ -1551,7 +1565,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
             }
 
-            scanZipMediaEntriesUncached(zipUrl, fileSizeHint, proxyPromise)
+            scanZipMediaEntriesUncached(zipUrl, sourceSize.toDouble(), proxyPromise)
         }
     }
 
@@ -3708,13 +3722,16 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     ): Pair<List<JSONObject>, String> {
         val t0 = System.currentTimeMillis()
         appendDebugLog("ISO_START", "Opening ISO size=$totalIsoSize url=${safeStreamUrl(isoUrl)}")
+        val metadataCache = IsoMetadataReadAhead(totalIsoSize) { start, end -> fetchIsoByteRange(isoUrl, start, end) }
+        fun metadataBytes(entry: IsoFileEntry, maxBytes: Int) =
+            IsoVirtualFile(entry.extents, false).readRaw(0, minOf(entry.size, maxBytes.toLong()).toInt(), metadataCache::read)
         val allFiles = ArrayList<IsoFileEntry>()
         var discLabel = ""
         var udfErr = ""
         var isoErr = ""
 
         try {
-            val reader = UdfReader(totalIsoSize, { start, end -> fetchIsoByteRange(isoUrl, start, end) }, ioExecutor)
+            val reader = UdfReader(totalIsoSize, metadataCache::read, ioExecutor, metadataCache)
             val udfFiles = reader.readTree().map { IsoFileEntry(it.path, it.path.substringAfterLast('/'), false, it.size, it.extents) }
             discLabel = reader.volumeLabel
             appendDebugLog("ISO_VOLUME_LABEL", discLabel)
@@ -3789,7 +3806,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val mplsFutures = batch.map { mpls ->
                     ioExecutor.submit<Pair<IsoFileEntry, ByteArray>> {
                         try {
-                            Pair(mpls, readIsoFileBytes(isoUrl, mpls, 2 * 1024 * 1024))
+                            Pair(mpls, metadataBytes(mpls, 2 * 1024 * 1024))
                         } catch (_: Throwable) {
                             Pair(mpls, ByteArray(0))
                         }
@@ -3855,7 +3872,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val profiles = playlist.clips.mapNotNull { clip ->
                     val info = clpiMap[clip.id] ?: return@mapNotNull null
                     try {
-                        BluRayClipInfo.parse(readIsoFileBytes(isoUrl, info, 8 * 1024 * 1024), clip.inTicks, clip.ticks, clip.size)
+                        BluRayClipInfo.parse(metadataBytes(info, 8 * 1024 * 1024), clip.inTicks, clip.ticks, clip.size)
                     } catch (error: Exception) {
                         appendDebugLog("ISO_CLPI_ERR", "clip=${clip.id} ${isoFailureDetails(error)}")
                         null
@@ -3884,7 +3901,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val f = largeM2ts.first()
                 val info = clpiMap[f.name.substringBeforeLast('.').uppercase(Locale.ROOT)]
                 val profile = try {
-                    info?.let { BluRayClipInfo.parseRaw(readIsoFileBytes(isoUrl, it, 8 * 1024 * 1024), f.size) }
+                    info?.let { BluRayClipInfo.parseRaw(metadataBytes(it, 8 * 1024 * 1024), f.size) }
                 } catch (error: Exception) {
                     appendDebugLog("ISO_CLPI_ERR", "clip=${f.name} ${isoFailureDetails(error)}")
                     null

@@ -26,7 +26,7 @@ normal bounded chunk prefetch still occurs after that reopen.
 Indexes are installed for a selected single-clip feature with one timestamp
 epoch. Missing/malformed CPI, spliced multi-clip playlists, trimmed play items
 and multiple STC epochs retain PCR seeking instead of using an incorrect map.
-The native ISO index cache is version 5 so older entries are rescanned. Signed
+The native ISO index cache is version 7 so older entries are rescanned. Signed
 upstream redirect URLs are still not persisted.
 
 External handoff unmounts the internal view, cancels its existing reads before
@@ -109,15 +109,51 @@ OP=01 advertises byte seeking, not DLNA TimeSeekRange support; VLC/MX time-seek
 behavior and display-format rendering still need device validation.
 
 
-## PR 9 status and remaining Dolby Vision work
+## Profile 7 Dolby Vision and ISO opening
 
-The extractor suppresses independent HEVC playback of PID 0x1015. This protects
-HDR10 base-layer playback, but currently applies to both HDR and DV selections.
-**Profile 7 to Profile 8.1 RPU conversion and timestamp-matched injection are not
-implemented.** The stream is not falsely labeled video/dolby-vision. The PR must
-remain draft until a real RPU conversion implementation and bounded dual-PID
-access-unit synchronizer are integrated and tested with MEL/FEL material. FEL
-residual reconstruction is not provided by dropping enhancement video.
+Selecting Dolby Vision on a dual-track UHD disc enables PES parsing for both
+PID 0x1011 and PID 0x1015. The base layer uses Media3's HEVC access-unit parser;
+the enhancement reader retains only NAL 62 RPU metadata and discards all other
+NALs, including VCL and type 63. A bounded queue matches exact presentation
+timestamps while preserving base-layer decode order. Seek resets both readers
+and queued data. Missing, corrupt or unsupported metadata fails playback with
+an error rather than applying an RPU to the wrong frame; HDR10 remains selectable.
+
+The Kotlin converter follows dovi_tool mode 2: remove NLQ/residual metadata,
+clear enhancement spatial-resampling flags, disable residual reconstruction,
+reset partitions, replace FEL reshaping with identity mapping, and use Profile
+8.1 color coefficients. It preserves DM extension blocks with corrected bit
+alignment, recomputes MPEG-2 CRC32, and reapplies HEVC emulation prevention.
+The merged track advertises `video/dolby-vision` / `dvhe.08.06`. HDR10 and the
+default mode retain `video/hevc` with PID 0x1015 suppressed. Mode selection is
+awaited before creating the player. This converts FEL metadata; it does not
+reconstruct FEL residual video.
+
+Single-feature ISO cards open Movie Details directly. The outer ISO filename
+remains the artwork/watch-progress identity, while playback uses the registered
+inner movie URL. Card metadata persists across app restarts; resolution badges
+use filename metadata before the first scan. Old inner-entry progress is migrated
+when that ISO is opened. ZIP/RAR series archives retain their folder navigation.
+
+UDF, MPLS and CLPI metadata reads share a scan-scoped 512 KiB aligned read-ahead
+cache, bounded to 16 blocks (8 MiB). Concurrent reads coalesce; partial EOF blocks
+are clipped to the image size, and failed/truncated reads are not retained.
+Resolved ISO entries, physical extents, BluRayProfile and MediaInfo persist in
+private app storage with schema version 7. SHA-256 keys include the complete
+source URL (including query parameters, excluding the display-name fragment)
+and ISO byte size. Restores refresh process-local proxy links and registrations
+without scanning UDF descriptors. Unknown sizes require a size probe first.
+Writes use temporary files and rename; the cache retains at most 64 entries.
+Signed redirect locations are never persisted.
+
+Focused JVM tests compare MEL/FEL conversion against independent dovi_tool
+vectors and demux a six-frame synthetic dual-PID TS through Media3. They cover
+fragmented RPUs, reordered timestamps, discarded enhancement slices, HDR10
+isolation and seeks. Cache tests verify 100 adjacent sectors use one range,
+cross-block and EOF reads, concurrent reads, eviction, failures and disk reopen.
+Actual hardware DV output and 2–3 second cold-open latency require device/network
+validation; the sandbox cannot establish those measurements or literal 0 ms disk
+access. Cached opens perform no UDF scan.
 
 PGS display sets are assembled across PES packets and transcoded by Media3's
 subtitle parser into cues, using the existing React Native text-track menu.

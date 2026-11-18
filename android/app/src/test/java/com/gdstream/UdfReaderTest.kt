@@ -126,6 +126,18 @@ class UdfReaderTest {
         fun files() = UdfReader(size, ::read).readTree()
     }
 
+    @Test fun udfTreeScanCoalescesDescriptorAndDirectorySectors() {
+        val disc = Disc()
+        val ranges = ArrayList<Pair<Long, Long>>()
+        val files = UdfReader(disc.size, { start, end ->
+            ranges.add(start to end)
+            disc.read(start, end)
+        }).readTree()
+        assertEquals(disc.expected, files.single().extents)
+        assertEquals(2, ranges.size)
+        assertTrue(ranges.all { it.first % (512 * 1024) == 0L && it.second - it.first + 1 == 512 * 1024L })
+    }
+
     @Test fun bd50MetadataMappingsAndContinuationDescriptors() {
         for (tag in listOf(261, 266)) for (bs in listOf(1024, 2048)) {
             val disc = Disc(bs, tag)

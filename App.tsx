@@ -11,7 +11,7 @@ import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { usePlaybackSource } from './playbackSession';
-import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration, archiveSourceUrl } from './archivePlayback';
+import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration, archiveSourceUrl, isoMovieDetails } from './archivePlayback';
 
 const {
   VideoPlayerManager, SubtitleFileModule, DownloadEngine, MediaInfoModule, SecurityVault,
@@ -244,10 +244,6 @@ const isSeriesContainerItem = (item: any): boolean => {
   if (item.mimeType?.includes('folder')) return true;
   const n = String(item.name || '');
   if (/\.(zip|rar)$/i.test(n)) return true;
-  if (/\.iso$/i.test(n)) {
-    const p = parseMediaFilename(n, false);
-    return p.seasonNum > 0 || !!p.seasonEpisode;
-  }
   return false;
 };
 
@@ -931,6 +927,7 @@ const App = () => {
 
   const getStreamUrl = useCallback((file: any) => {
     if (!file) return '';
+    if (file.isZipEntry && file.archiveFormat === 'ISO' && file.link) return file.link;
     if (file.localPath) return file.localPath.startsWith('file://') ? file.localPath : `file://${file.localPath}`;
     const completedDl = downloads.find(d => d.fileName === file.name && d.status === 'completed' && d.filePath);
     if (completedDl) return `file://${completedDl.filePath}`;
@@ -1670,7 +1667,20 @@ const App = () => {
     activeSeason: any;
   } | null>(null);
 
+  useEffect(() => {
+    let cancelled = false;
+    const isoFiles = [...homeFiles, ...folderFiles].filter((file: any) => /\.iso$/i.test(file.name || ''));
+    void Promise.all(isoFiles.map(async (file: any) => {
+      const cached = await AsyncStorage.getItem(`iso_card_v1_${file.name}|${file.size || 0}`).catch(() => null);
+      if (!cancelled && cached) {
+        try { setMediaInfoMap(prev => ({ ...prev, [file.name]: JSON.parse(cached) })); } catch {}
+      }
+    }));
+    return () => { cancelled = true; };
+  }, [homeFiles, folderFiles]);
+
   const archiveOpenRequestRef = useRef(0);
+  const [openingIso, setOpeningIso] = useState(false);
 
   const openZipArchiveFile = async (zipItem: any, basePathOverride?: string) => {
     const requestId = ++archiveOpenRequestRef.current;
@@ -1692,15 +1702,19 @@ const App = () => {
       const sizeHint = Number(zipItem.size || 0);
       const virtualZipPath = `${effectiveBasePath}${encodeURIComponent(zipItem.name)}/`;
 
-      zipParentBackupRef.current = prevBackup;
-      setFolderLoading(true);
-      setFolderFiles([]);
-      setSeasonFolders([]);
-      setActiveSeason(null);
-      setSeriesParentTitle(info.cleanTitle || zipItem.name.replace(/\.(zip|rar|iso)$/i, ''));
-      setCurrentPath(virtualZipPath);
-      // CRITICAL FIX: Push onto pathStack so isInsideFolder (pathStack.length > 1) becomes true IMMEDIATELY!
-      setPathStack(prev => [...prev, virtualZipPath]);
+      const isIso = /\.iso$/i.test(zipItem.name);
+      setOpeningIso(isIso);
+      if (!isIso) {
+        zipParentBackupRef.current = prevBackup;
+        setFolderLoading(true);
+        setFolderFiles([]);
+        setSeasonFolders([]);
+        setActiveSeason(null);
+        setSeriesParentTitle(info.cleanTitle || zipItem.name.replace(/\.(zip|rar|iso)$/i, ''));
+        setCurrentPath(virtualZipPath);
+        // CRITICAL FIX: Push onto pathStack so isInsideFolder (pathStack.length > 1) becomes true IMMEDIATELY!
+        setPathStack(prev => [...prev, virtualZipPath]);
+      }
 
       if (SecurityVault?.listZipMediaEntries) {
         const rawJson = await fetchZipRawJsonFast(zipUrl, sizeHint);
@@ -1714,7 +1728,22 @@ const App = () => {
                 : ent
             )
           : [];
-        if (entries.length > 0) {
+        const movie = isoMovieDetails(zipItem, entries);
+        if (movie) {
+          if (movie.mediaInfo) {
+            setMediaInfoMap(prev => ({ ...prev, [movie.name]: movie.mediaInfo }));
+            void AsyncStorage.setItem(`iso_card_v1_${zipItem.name}|${zipItem.size || 0}`, JSON.stringify(movie.mediaInfo)).catch(() => {});
+          }
+          // Migrate progress saved against PR 8/9's generated inner-entry name.
+          const previousName = entries[0].name;
+          if (!savedTimesMap[movie.name] && savedTimesMap[previousName]) {
+            persistPlaybackProgress(movie.name, savedTimesMap[previousName], movie.durationSec || savedDurationsMap[previousName] || 0);
+          }
+          setVersionGroup([movie]);
+          openFile(movie);
+          return;
+        }
+        if (entries.length > 0 && !isIso) {
           setFolderFiles(entries);
           setFolderLoading(false);
           return;
@@ -1743,6 +1772,8 @@ const App = () => {
       setActiveSeason(prevBackup.activeSeason);
       SecurityVault?.writeDebugLog?.('APP_ARCHIVE_ERR', `${zipItem?.name || ''}: ${e?.message || e}`);
       Alert.alert('Archive Error', String(e?.message || 'Indha archive file-a open panna mudiyala.'));
+    } finally {
+      if (requestId === archiveOpenRequestRef.current) setOpeningIso(false);
     }
   };
 
@@ -1913,7 +1944,9 @@ const App = () => {
   }, [fadeAnim, seekBothPlayers]);
 
 
-  const currentActiveLayer = isTvSearchModalOpen
+  const currentActiveLayer = openingIso
+    ? 'isoLoading'
+    : isTvSearchModalOpen
     ? 'searchModal'
     : showHdrChoiceModal
     ? 'hdrModal'
@@ -2010,6 +2043,12 @@ const App = () => {
       lastFocusedScreenKeyRef.current = 'seasonModal';
       const selIdx = Math.max(0, seasonFolders.findIndex(s => s.seasonNum === activeSeason?.seasonNum));
       requestInitialScreenFocus(`season_opt_${selIdx}`);
+      return;
+    }
+
+    if (currentActiveLayer === 'isoLoading') {
+      lastFocusedScreenKeyRef.current = 'isoLoading';
+      requestInitialScreenFocus('iso_cancel_btn');
       return;
     }
 
@@ -2356,6 +2395,7 @@ const App = () => {
 
   const startPlaybackWithMode = async (mode: 'dv' | 'hdr' | 'sdr') => {
     try { await SecurityVault?.prepareArchivePlayback?.(getStreamUrl(selectedFile)); } catch { return; }
+    try { await VideoPlayerManager?.setPreferredHdrMode?.(mode); } catch { return; }
     hasRestoredResumeRef.current = false;
     setShowHdrChoiceModal(false);
     setActiveHdrMode(mode);
@@ -2365,7 +2405,6 @@ const App = () => {
     setIsPaused(false);
     setIsVideoBuffering(true);
     setPlayMode('internal');
-    try { VideoPlayerManager?.setPreferredHdrMode?.(mode); } catch {}
   };
 
   const handlePlayInAppPress = (fileToPlay = selectedFile) => {
@@ -4206,6 +4245,21 @@ const App = () => {
       {renderPlayerOverlay()}
       {renderSeasonModal()}
       {renderHdrChoiceModal()}
+      {openingIso && (
+        <Modal transparent visible onRequestClose={() => { archiveOpenRequestRef.current++; setOpeningIso(false); }}>
+          <FocusLayerContext.Provider value="isoLoading">
+          <View style={styles.modalBackdrop}>
+            <View style={styles.hdrModalCard}>
+              <ActivityIndicator size="large" color="#E50914" />
+              <Text style={styles.hdrModalTitle}>Opening disc…</Text>
+              <FocusableButton focusId="iso_cancel_btn" onPress={() => { archiveOpenRequestRef.current++; setOpeningIso(false); }}>
+                <Text style={{ color: '#99A3B3', fontWeight: '700' }}>Cancel</Text>
+              </FocusableButton>
+            </View>
+          </View>
+          </FocusLayerContext.Provider>
+        </Modal>
+      )}
       {IS_TV && isTvSearchModalOpen && (
         <Modal
           visible={isTvSearchModalOpen}

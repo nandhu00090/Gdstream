@@ -37,3 +37,9 @@ export function archiveSourceUrl(name: string, baseUrl: string, parentPath: stri
       !/^\/\d+:\//.test(parentPath) || /^(file|content):/i.test(fallback)) return fallback;
   return `${baseUrl.replace(/\/$/, '')}${parentPath.replace(/\/$/, '')}/${encodeURIComponent(name)}`;
 }
+
+/** An ISO resolves to one feature. Preserve the outer card identity for artwork and resume. */
+export function isoMovieDetails(item: any, entries: any[]): any | null {
+  if (!/\.iso$/i.test(String(item?.name || '')) || entries.length !== 1 || !entries[0]?.link) return null;
+  return { ...item, ...entries[0], name: item.name, archiveFormat: 'ISO', isZipEntry: true };
+}

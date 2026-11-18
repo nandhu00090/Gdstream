@@ -7,9 +7,11 @@ import java.util.concurrent.TimeUnit
 /** Random-access UDF reader. All external offsets and lengths are bytes, never sectors. */
 internal class UdfReader(
     private val imageSize: Long,
-    private val readRange: (Long, Long) -> ByteArray,
-    private val executor: ExecutorService? = null
+    readRange: (Long, Long) -> ByteArray,
+    private val executor: ExecutorService? = null,
+    private val readAhead: IsoMetadataReadAhead = IsoMetadataReadAhead(imageSize, readRange)
 ) {
+
     data class File(val path: String, val size: Long, val extents: List<Pair<Long, Long>>)
     private data class Partition(val start: Long, val size: Long)
     private data class MapSpec(val number: Int, val metadata: Boolean, val file: Long = -1, val mirror: Long = -1)
@@ -30,7 +32,7 @@ internal class UdfReader(
         checked(!Thread.currentThread().isInterrupted && System.nanoTime() < deadline, "UDF scan timed out or was cancelled")
         checked(offset >= 0 && length in 1..MAX_METADATA && offset <= imageSize - length,
             "UDF read outside image: $offset + $length / $imageSize")
-        return readRange(offset, offset + length - 1).also {
+        return readAhead.read(offset, offset + length - 1).also {
             checked(it.size.toLong() == length, "Truncated UDF read at $offset")
         }
     }
