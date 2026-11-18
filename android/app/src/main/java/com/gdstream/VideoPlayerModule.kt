@@ -509,6 +509,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
 
 // The ISO proxy emits 188-byte MPEG-TS even though the display filename ends in .m2ts.
 internal fun externalVideoMimeType(path: String): String = when (path.substringAfterLast('.').lowercase(java.util.Locale.ROOT)) {
+    "m3u8" -> "application/x-mpegURL"
     "m2ts", "ts" -> "video/mp2t"
     "mp4", "m4v" -> "video/mp4"
     "mkv" -> "video/x-matroska"

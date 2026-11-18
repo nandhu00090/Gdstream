@@ -25,3 +25,8 @@ The base was generated with:
 
 Then run `python3 scripts/generate-dv-fixture.py base.hevc` from the repository root.
 This tests demuxing and metadata injection, not UHD hardware decoding.
+
+`silent.ac3.bin` and `silent.eac3.bin` are one synthetic stereo silence frame each
+(48 kHz, 192 kbps), generated with FFmpeg using `anullsrc`, `-frames:a 1`, and
+`-c:a ac3 -f ac3` / `-c:a eac3 -f eac3`. The extractor regression packetizes these
+alongside LPCM/DTS into all 32 Blu-ray audio PIDs, including Tamil PID 0x1106.

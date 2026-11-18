@@ -201,7 +201,7 @@ class ArchiveProxyTest {
             val item = JSONObject().put("id", "disc").put("name", "Movie.m2ts").put("link", "http://127.0.0.1:1111/zip/obsolete/Movie.m2ts")
             val cache = JSONObject().put("rawJson", JSONArray().put(item).toString()).put("targets", JSONArray().put(target))
             assertNull(restore.invoke(module, cache.toString(), "https://example/disc.iso"))
-            cache.put("isoIndexVersion", 6)
+            cache.put("isoIndexVersion", IsoIndexDiskCache.VERSION)
             val restored = JSONArray(restore.invoke(module, cache.toString(), "https://example/disc.iso?fresh=1") as String).getJSONObject(0)
             val activePort = field(module, "archiveProxyPort") as Int
             assertTrue(activePort > 0)

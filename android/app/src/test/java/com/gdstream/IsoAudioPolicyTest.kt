@@ -20,12 +20,12 @@ class IsoAudioPolicyTest {
         var now = 0L
         val clock = IsoClockProgress { now }
         assertFalse(clock.stalled(0, 2000, true, true))
-        now = 3999
+        now = 2499
         assertFalse(clock.stalled(0, 2000, true, true))
-        now = 4000
+        now = 2500
         assertTrue(clock.stalled(0, 2000, true, true))
         clock.reset()
-        now += 3999
+        now += 2499
         assertFalse(clock.stalled(0, 2000, true, true))
         assertFalse(clock.stalled(100, 2000, true, true))
         now += 10000

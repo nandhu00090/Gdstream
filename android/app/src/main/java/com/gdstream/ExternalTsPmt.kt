@@ -19,6 +19,15 @@ internal object ExternalTsPmt {
         if (programEnd > section.size - 4) return null
         val result = java.io.ByteArrayOutputStream()
         result.write(section, 0, programEnd)
+        var scan = programEnd
+        var nativeDolby = false
+        while (scan < section.size - 4) {
+            if (scan + 5 > section.size - 4) return null
+            val size = 5 + ((u(scan + 3) and 15) shl 8) + u(scan + 4)
+            if (scan + size > section.size - 4) return null
+            if (u(scan) == 0x81 || u(scan) == 0x84) nativeDolby = true
+            scan += size
+        }
         var pos = programEnd
         while (pos < section.size - 4) {
             if (pos + 5 > section.size - 4) return null
@@ -26,11 +35,11 @@ internal object ExternalTsPmt {
             val pid = ((u(pos + 1) and 31) shl 8) + u(pos + 2)
             val size = 5 + ((u(pos + 3) and 15) shl 8) + u(pos + 4)
             if (pos + size > section.size - 4) return null
-            if (type != 0x80 && pid != 0x1015) {
+            if (type != 0x80 && pid != 0x1015 && !(type == 0x83 && nativeDolby)) {
                 val entry = section.copyOfRange(pos, pos + size)
-                // Stock Media3 gates HDMV 0x82 behind an opt-in flag. 0x8a is its
-                // unconditional DTS type and lets the standard reader find the core.
-                entry[0] = when (type) { 0x82, 0x85, 0x86 -> 0x8a.toByte(); 0x83 -> 0x81.toByte(); else -> type.toByte() }
+                // Preserve ES descriptors (especially HEVC registration) byte for byte.
+                // Only expose the interleaved AC-3 companion when no native Dolby PID exists.
+                entry[0] = when (type) { 0x85, 0x86 -> 0x82.toByte(); 0x83 -> 0x81.toByte(); else -> type.toByte() }
                 result.write(entry)
             }
             pos += size

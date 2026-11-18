@@ -34,7 +34,7 @@ internal class IsoAudioClockGuard(private val player: ExoPlayer) : AutoCloseable
             IsoAudioCandidate(key(group, index), group.getTrackFormat(index).sampleMimeType, group.isTrackSupported(index))
         } }
         val chosen = policy.choose(candidates)
-        val params = player.trackSelectionParameters.buildUpon().clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+        val params = AudioTrackCatalog.clearedAudioParameters(player)
         if (chosen == null) {
             if (audioDisabled) return false
             audioDisabled = true
@@ -63,6 +63,10 @@ internal class IsoAudioClockGuard(private val player: ExoPlayer) : AutoCloseable
     }
 
     override fun onTracksChanged(tracks: Tracks) {
+        val selected = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }.firstNotNullOfOrNull { group ->
+            (0 until group.length).firstOrNull { group.isTrackSelected(it) }?.let { key(group, it) }
+        }
+        if (selected != null && selected != selectedKey) { selectedKey = selected; clock.reset() }
         if (audioDisabled && tracks.groups.any { it.type == C.TRACK_TYPE_AUDIO && it.isSelected }) {
             audioDisabled = false
             clock.reset()

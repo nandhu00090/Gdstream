@@ -118,7 +118,7 @@ internal fun isoFailureDetails(error: Throwable): String = generateSequence(erro
 
 internal object IsoRangeReader {
     internal const val WINDOW_BYTES = 8 * 1024 * 1024
-    private val upstreamSlots = Semaphore(6, true)
+    private val upstreamSlots = Semaphore(10, true)
     private val activeReads = java.util.concurrent.ConcurrentHashMap<Any, IsoReadSession>()
     fun cancelAll(reason: String) { activeReads.values.toSet().forEach { it.cancel(reason) } }
 
@@ -251,8 +251,8 @@ internal object IsoRangeReader {
 
 /** Physical blocks are immutable here: packet rewriting happens on each caller's copy. */
 internal class IsoChunkCache(
-    private val maxBytes: Int = 64 * 1024 * 1024,
-    private val executor: java.util.concurrent.ExecutorService = java.util.concurrent.Executors.newFixedThreadPool(6) { task ->
+    private val maxBytes: Int = 96 * 1024 * 1024,
+    private val executor: java.util.concurrent.ExecutorService = java.util.concurrent.Executors.newFixedThreadPool(10) { task ->
         Thread(task, "ISOChunkFetch").apply { isDaemon = true }
     }
 ) {

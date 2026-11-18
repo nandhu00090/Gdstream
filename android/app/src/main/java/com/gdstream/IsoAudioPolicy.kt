@@ -24,6 +24,6 @@ internal class IsoClockProgress(private val now: () -> Long) {
         val time = now()
         if (!playing || !renderedFrame || bufferedMs < 1500 || position != lastPosition) lastAdvance = time
         lastPosition = position
-        return playing && renderedFrame && bufferedMs >= 1500 && time - lastAdvance >= 4000
+        return playing && renderedFrame && bufferedMs >= 1500 && time - lastAdvance >= 2500
     }
 }
