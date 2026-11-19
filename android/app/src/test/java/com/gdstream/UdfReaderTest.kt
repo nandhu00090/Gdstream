@@ -128,14 +128,18 @@ class UdfReaderTest {
 
     @Test fun udfTreeScanCoalescesDescriptorAndDirectorySectors() {
         val disc = Disc()
-        val ranges = ArrayList<Pair<Long, Long>>()
-        val files = UdfReader(disc.size, { start, end ->
-            ranges.add(start to end)
-            disc.read(start, end)
-        }).readTree()
-        assertEquals(disc.expected, files.single().extents)
-        assertEquals(2, ranges.size)
-        assertTrue(ranges.all { it.first % (512 * 1024) == 0L && it.second - it.first + 1 == 512 * 1024L })
+        val ranges = java.util.concurrent.ConcurrentLinkedQueue<LongRange>()
+        val pool = java.util.concurrent.Executors.newCachedThreadPool()
+        try {
+            val metadata = IsoMetadataReadAhead(disc.size, IsoChunkCache(), IsoReadSession(), pool) { start, end, _ ->
+                ranges.add(start..end)
+                disc.read(start, end)
+            }
+            val files = UdfReader(disc.size, metadata::read, pool).readTree()
+            assertEquals(disc.expected, files.single().extents)
+            assertEquals(1, ranges.size)
+            assertEquals(0L until IsoChunkCache.BLOCK_BYTES, ranges.single())
+        } finally { pool.shutdownNow() }
     }
 
     @Test fun bd50MetadataMappingsAndContinuationDescriptors() {

@@ -23,11 +23,12 @@ internal class BluRaySeekMap(private val profile: BluRayProfile) : SeekMap {
     }
 }
 
-/** Scoped to registered BD ISO streams. Other sources keep react-native-video's default extractors. */
+/** Reads the 188-byte view of a registered Blu-ray or standalone BDAV source. */
 internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVision: Boolean = false) : Extractor {
     private val dv = if (dolbyVision && profile?.streams?.any { it.pid == 0x1011 && it.type == 0x24 && it.height == 2160 } == true &&
         profile.streams.any { it.pid == 0x1015 && it.type == 0x24 }) BluRayDolbyVision() else null
     private val indexed = profile?.let { BluRaySeekMap(it) }?.takeIf { it.isSeekable }
+    private var inputLength = C.LENGTH_UNSET.toLong()
     private val videoReaders = ArrayList<EndOfInputPayloadReader>()
     private val pidReaders = ArrayList<BluRayPidReader>()
     private val fallback = DefaultTsPayloadReaderFactory(DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)
@@ -77,12 +78,24 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
             override fun endTracks() = output.endTracks()
             override fun seekMap(seekMap: SeekMap) {
                 DebugLogger.log("ISO_SEEK_MAP", "source=${if (indexed != null) "CLPI" else "PCR"} points=${profile?.points?.size ?: 0} durationUs=${profile?.durationUs ?: 0}")
-                output.seekMap(indexed ?: seekMap)
+                val duration = profile?.durationUs ?: 0
+                val measured = if (duration > 0 && inputLength >= 188) object : SeekMap {
+                    override fun getDurationUs() = duration
+                    override fun isSeekable() = true
+                    override fun getSeekPoints(timeUs: Long): SeekMap.SeekPoints {
+                        if (seekMap.isSeekable) return seekMap.getSeekPoints(timeUs)
+                        val fraction = timeUs.coerceIn(0L, duration).toDouble() / duration
+                        val packet = (fraction * (inputLength / 188)).toLong().coerceAtMost(inputLength / 188 - 1)
+                        return SeekMap.SeekPoints(SeekPoint(timeUs, packet * 188))
+                    }
+                } else seekMap
+                output.seekMap(indexed ?: measured)
             }
         })
     }
     override fun read(input: ExtractorInput, seekPosition: PositionHolder): Int {
         // Unknown length disables the delegate's end-of-file PCR scan and binary-search seeker.
+        inputLength = input.length
         val source = if (indexed == null) input else object : ForwardingExtractorInput(input) {
             override fun getLength() = C.LENGTH_UNSET.toLong()
         }

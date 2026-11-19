@@ -265,9 +265,9 @@ internal class IsoChunkCaches {
     private var latest: String? = null
 
     @Synchronized
-    fun acquire(url: String, session: IsoReadSession): IsoChunkCache {
+    fun acquire(url: String, session: IsoReadSession, size: Long = 0): IsoChunkCache {
         session.checkActive()
-        val source = url.substringBefore('#')
+        val source = url.substringBefore('#') + "\n$size"
         val previous = latest
         if (previous != null && previous != source && discs[previous]?.readers == 0) {
             discs.remove(previous)?.chunks?.clear()
@@ -298,6 +298,10 @@ internal class IsoChunkCache(
     private val executor: java.util.concurrent.ExecutorService = sharedExecutor
 ) {
     companion object {
+        const val BLOCK_BYTES = 2 * 1024 * 1024
+        private val warmWorkers = java.util.concurrent.Executors.newFixedThreadPool(4) { task ->
+            Thread(task, "ISOReadAhead").apply { isDaemon = true }
+        }
         private val sharedExecutor = java.util.concurrent.Executors.newFixedThreadPool(IsoRangeReader.MAX_CONCURRENT_READS) { task ->
             Thread(task, "ISOChunkFetch").apply { isDaemon = true }
         }
@@ -313,6 +317,38 @@ internal class IsoChunkCache(
     private val flights = HashMap<Key, Flight>()
     private var bytes = 0
 
+    private val warmSession = IsoReadSession()
+    private val pending = LinkedHashSet<Key>()
+    private var warming = 0
+
+    /** Replace the remaining speculative window on seek. Foreground and audio/video readers
+     * all join the same immutable block flight. Never copy a movie buffer just to warm it. */
+    fun prefetch(ranges: List<LongRange>, sourceSize: Long, fetch: (Long, Long, IsoReadSession) -> ByteArray) {
+        synchronized(lock) {
+            if (warmSession.isCancelled) return
+            pending.clear()
+            for (range in ranges) {
+                var from = range.first / BLOCK_BYTES * BLOCK_BYTES
+                while (from <= range.last) {
+                    val key = Key(from, minOf(from + BLOCK_BYTES, sourceSize) - 1)
+                    if (key !in cached && key !in flights) pending.add(key)
+                    from += BLOCK_BYTES
+                }
+            }
+            repeat(minOf(pending.size, 4 - warming)) {
+                warming++
+                warmWorkers.execute {
+                    while (true) {
+                        val next = synchronized(lock) {
+                            pending.firstOrNull()?.also { pending.remove(it) } ?: run { warming--; null }
+                        } ?: break
+                        try { block(next, warmSession, fetch) } catch (_: Exception) { /* demand reads retry */ }
+                    }
+                }
+            }
+        }
+    }
+
     fun read(start: Long, end: Long, extentStart: Long, extentEnd: Long,
              session: IsoReadSession, fetch: (Long, Long, IsoReadSession) -> ByteArray): ByteArray {
         require(start >= extentStart && end >= start && end <= extentEnd && end - start < Int.MAX_VALUE)
@@ -320,8 +356,8 @@ internal class IsoChunkCache(
         var cursor = start
         while (cursor <= end) {
             session.checkActive()
-            val from = extentStart + ((cursor - extentStart) / IsoRangeReader.WINDOW_BYTES) * IsoRangeReader.WINDOW_BYTES
-            val to = from + minOf(IsoRangeReader.WINDOW_BYTES.toLong() - 1, extentEnd - from)
+            val from = extentStart + ((cursor - extentStart) / BLOCK_BYTES) * BLOCK_BYTES
+            val to = from + minOf(BLOCK_BYTES.toLong() - 1, extentEnd - from)
             val data = block(Key(from, to), session, fetch)
             session.checkActive()
             val offset = (cursor - from).toInt()
@@ -380,7 +416,9 @@ internal class IsoChunkCache(
     internal fun activeReaders(): Int = synchronized(lock) { flights.values.sumOf { it.readers } }
     internal fun cachedBytes(): Int = synchronized(lock) { bytes }
     fun clear() {
+        warmSession.cancel("cache closed")
         val pending = synchronized(lock) {
+            pending.clear()
             cached.clear(); bytes = 0
             flights.values.toList().also { flights.clear() }
         }
