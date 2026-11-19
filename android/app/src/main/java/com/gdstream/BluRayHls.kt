@@ -4,8 +4,33 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 
 /** CLPI positions already address the continuous 188-byte virtual TS, not physical M2TS bytes. */
-internal class BluRayHls private constructor(val segments: List<Segment>) {
+internal class BluRayHls private constructor(val segments: List<Segment>, val audio: List<BluRayStream>) {
     data class Segment(val start: Long, val end: Long, val durationUs: Long) {
+        fun audioBytes(prefix: ByteArray, pid: Int, read: (Long, Int) -> ByteArray): ByteArray {
+            val out = ByteArrayOutputStream()
+            out.write(prefix)
+            var position = start
+            while (position < end) {
+                val chunk = read(position, minOf(end-position, 188L * 4096).toInt())
+                require(chunk.isNotEmpty() && chunk.size % 188 == 0)
+                for (p in chunk.indices step 188) {
+                    val packetPid = ((chunk[p+1].toInt() and 31) shl 8) or (chunk[p+2].toInt() and 255)
+                    if (packetPid == pid) out.write(chunk, p, 188)
+                    else if (chunk[p+3].toInt() and 32 != 0 && (chunk[p+4].toInt() and 255) >= 7 && chunk[p+5].toInt() and 16 != 0) {
+                        // Retain clock references on the PMT's PCR PID without its video payload.
+                        val clock = ByteArray(188) { 0xff.toByte() }
+                        chunk.copyInto(clock, 0, p, p+12)
+                        clock[1] = (clock[1].toInt() and 31).toByte()
+                        clock[3] = (0x20 or (clock[3].toInt() and 15)).toByte()
+                        clock[4] = 183.toByte()
+                        clock[5] = 16
+                        out.write(clock)
+                    }
+                }
+                position += chunk.size
+            }
+            return out.toByteArray()
+        }
         fun size(prefix: ByteArray) = prefix.size + end - start
         fun read(prefix: ByteArray, offset: Long, length: Int, readTs: (Long, Int) -> ByteArray): ByteArray {
             require(offset >= 0 && length >= 0 && offset + length <= size(prefix))
@@ -16,12 +41,26 @@ internal class BluRayHls private constructor(val segments: List<Segment>) {
             return result
         }
     }
-    fun playlist(): ByteArray = buildString {
+    fun master(): ByteArray = buildString {
+        append("#EXTM3U\n#EXT-X-VERSION:3\n")
+        audio.forEachIndexed { i, track ->
+            val language = track.language.takeIf { it.length == 3 && it.all { c -> c in 'a'..'z' } } ?: "und"
+            val name = bluRayLanguage(language)
+            append("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"${name} (${track.codec}, ${i + 1})\",")
+            append("LANGUAGE=\"${language}\",DEFAULT=${if (i == 0) "YES" else "NO"},AUTOSELECT=YES,URI=\"audio_${track.pid}.m3u8\"\n")
+        }
+        val peak = segments.maxOf { ((it.end - it.start) * 8.0e6 / it.durationUs).toLong() }.coerceAtLeast(1)
+        append("#EXT-X-STREAM-INF:BANDWIDTH=$peak")
+        if (audio.isNotEmpty()) append(",AUDIO=\"audio\"")
+        append("\nvideo.m3u8\n")
+    }.toByteArray()
+
+    fun playlist(audioPid: Int? = null): ByteArray = buildString {
         append("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:VOD\n")
         append("#EXT-X-TARGETDURATION:${(segments.maxOf { it.durationUs } + 999999) / 1000000}\n")
         append("#EXT-X-MEDIA-SEQUENCE:0\n")
         segments.forEachIndexed { index, segment ->
-            append("#EXTINF:${java.math.BigDecimal.valueOf(segment.durationUs, 6).toPlainString()},\nseg_$index.ts\n")
+            append("#EXTINF:${java.math.BigDecimal.valueOf(segment.durationUs, 6).toPlainString()},\n${if (audioPid == null) "" else "audio_${audioPid}_"}seg_$index.ts\n")
         }
         append("#EXT-X-ENDLIST\n")
     }.toByteArray(Charsets.UTF_8)
@@ -34,10 +73,11 @@ internal class BluRayHls private constructor(val segments: List<Segment>) {
                 points.zipWithNext().any { (a, b) -> b.timeUs <= a.timeUs || b.position <= a.position }) return null
             val boundaries = arrayListOf(BluRayPoint(0, 0))
             for (point in points) {
-                if (point.timeUs - boundaries.last().timeUs >= 9_000_000 && point.position > boundaries.last().position) boundaries.add(point)
+                if (point.timeUs - boundaries.last().timeUs >= 4_000_000 && point.position > boundaries.last().position) boundaries.add(point)
             }
             boundaries.add(BluRayPoint(profile.durationUs, size))
-            return BluRayHls(boundaries.zipWithNext { a, b -> Segment(a.position, b.position, b.timeUs - a.timeUs) })
+            return BluRayHls(boundaries.zipWithNext { a, b -> Segment(a.position, b.position, b.timeUs - a.timeUs) },
+                profile.streams.filter { it.audio }.distinctBy { it.pid })
         }
     }
 }
@@ -99,7 +139,7 @@ internal object BluRayPsi {
         }
         return out.toByteArray()
     }
-    fun prefix(data: ByteArray): ByteArray? {
+    fun prefix(data: ByteArray, streams: List<BluRayStream> = emptyList(), audioPid: Int? = null): ByteArray? {
         val pat = section(data, 0, 0) ?: return null
         var at = 8
         while (at + 4 <= pat.size - 4) {
@@ -107,7 +147,7 @@ internal object BluRayPsi {
             val pid = ((pat[at + 2].toInt() and 31) shl 8) + (pat[at + 3].toInt() and 255)
             if (program != 0) {
                 val pmt = section(data, pid, 2) ?: return null
-                val external = ExternalTsPmt.rewrite(pmt) ?: throw IOException("Invalid external PMT")
+                val external = ExternalTsPmt.rewrite(pmt, streams, audioPid) ?: throw IOException("Invalid external PMT")
                 return packets(0, pat) + packets(pid, external)
             }
             at += 4

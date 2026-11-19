@@ -61,6 +61,7 @@ interface RealMediaInfo {
   height: number;
   resolution: string;
   videoCodec: string;
+  videoBitrateMbps?: number;
   frameRate: number;
   durationSec: number;
   totalBytes: number;
@@ -1716,7 +1717,7 @@ const App = () => {
     let cancelled = false;
     const isoFiles = [...homeFiles, ...folderFiles].filter((file: any) => /\.iso$/i.test(file.name || ''));
     void Promise.all(isoFiles.map(async (file: any) => {
-      const cached = await AsyncStorage.getItem(`iso_card_v1_${file.name}|${file.size || 0}`).catch(() => null);
+      const cached = await AsyncStorage.getItem(`iso_card_v2_${file.name}|${file.size || 0}`).catch(() => null);
       if (!cancelled && cached) {
         try { setMediaInfoMap(prev => ({ ...prev, [file.name]: JSON.parse(cached) })); } catch {}
       }
@@ -1789,11 +1790,11 @@ const App = () => {
                 : ent
             )
           : [];
-        const movie = isoMovieDetails({ ...zipItem, outerUrl: zipUrl, metadata: metadataMap[zipItem.name] }, entries);
+        const movie = isoMovieDetails({ ...zipItem, outerUrl: zipUrl, outerSize: sizeHint, metadata: metadataMap[zipItem.name] }, entries);
         if (movie) {
           if (movie.mediaInfo) {
             setMediaInfoMap(prev => ({ ...prev, [movie.name]: movie.mediaInfo }));
-            void AsyncStorage.setItem(`iso_card_v1_${zipItem.name}|${zipItem.size || 0}`, JSON.stringify(movie.mediaInfo)).catch(() => {});
+            void AsyncStorage.setItem(`iso_card_v2_${zipItem.name}|${zipItem.size || 0}`, JSON.stringify(movie.mediaInfo)).catch(() => {});
           }
           historyAliasesRef.current[movie.name] = [...new Set([
             ...(historyAliasesRef.current[movie.name] || []), ...watchAliases(movie),
@@ -2508,12 +2509,15 @@ const App = () => {
   };
 
   const handleStartDownload = async (file: any) => {
-    if (!file) return;
+    if (!file || file.isoPending) return;
     const info = parseMediaFilename(file.name, false);
     const meta = metadataMap[file.name];
-    const url = getRemoteDownloadUrl(file);
+    const movie = file.archiveFormat === 'ISO' && /\.m2ts$/i.test(file.innerName || '');
+    const url = movie
+      ? `${file.link}?offline=m2ts#${file.outerSize || 0}:${encodeURIComponent(file.outerUrl)}`
+      : getRemoteDownloadUrl(file);
     try {
-      await DownloadEngine?.startDownload(url, file.name, info.cleanTitle, meta?.poster || '');
+      await DownloadEngine?.startDownload(url, file.innerName || file.name, info.cleanTitle, meta?.poster || '');
     } catch {
       Alert.alert('Error', 'Could not start download!');
     }
@@ -2585,7 +2589,7 @@ const App = () => {
     }
   };
 
-  const openInExternalPlayer = async (targetFile = selectedFile) => {
+  const openInExternalPlayer = async (targetFile = selectedFile, vlc = false) => {
     if (!targetFile || targetFile.isoPending) return;
     const url = getStreamUrl(targetFile);
     closeInternalPlayer(false);
@@ -2594,12 +2598,26 @@ const App = () => {
     await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
     try {
       await SecurityVault?.stopArchivePlayback?.(playbackSource.uri);
-      await VideoPlayerManager.playVideo(url, 'Open with External Player (VLC / MX / MPV recommended for Blu-ray)');
+      if (vlc) await VideoPlayerManager.playVideoInVlc(url);
+      else await VideoPlayerManager.playVideo(url, 'Open with External Player (VLC / MX / MPV recommended for Blu-ray)');
     } catch (error) {
       setPlayMode(null);
       Alert.alert('External player error', error instanceof Error ? error.message : 'Could not open the player.');
     }
   };
+
+  useEffect(() => {
+    if (playMode !== 'internal') return;
+    const sub = DeviceEventEmitter.addListener('DVD_MPEG2_UNSUPPORTED', (url: string) => {
+      if (url !== playbackSource.uri) return;
+      closeInternalPlayer();
+      Alert.alert('DVD playback', 'This device cannot decode MPEG-2 video.', [
+        { text: 'Close', style: 'cancel' },
+        { text: 'Open in VLC', onPress: () => openInExternalPlayer(selectedFile, true) },
+      ]);
+    });
+    return () => sub.remove();
+  }, [playMode, playbackSource.uri, selectedFile, closeInternalPlayer]);
 
   const handleZoomToggle = () => setResizeMode(prev => (prev === 'contain' ? 'cover' : 'contain'));
 
@@ -3447,7 +3465,7 @@ const App = () => {
     const totalDur = playbackDuration(selectedFile, realMi?.durationSec || 0, savedDurationsMap[selectedFile.name]);
     const resumePct = totalDur > 0 && savedSec > 0 ? Math.min(98, Math.max(3, (savedSec / totalDur) * 100)) : 45;
     const bannerImage = meta?.backdrop || meta?.poster;
-    const dlTask = downloads.find(d => d.fileName === selectedFile.name);
+    const dlTask = downloads.find(d => d.fileName === (selectedFile.innerName || selectedFile.name));
     const isFav = !!watchlist[selectedFile.name];
 
     const effectiveResolution = realMi?.resolution || info.resolution;
@@ -3592,7 +3610,7 @@ const App = () => {
             </View>
 
             {!dlTask ? (
-              <FocusableButton focusId="detail_dl_btn" style={styles.downloadActionBtn} onPress={() => handleStartDownload(selectedFile)}>
+              <FocusableButton focusId="detail_dl_btn" disabled={!!selectedFile.isoPending} style={styles.downloadActionBtn} onPress={() => handleStartDownload(selectedFile)}>
                 <Icon name="file-download" size={22} color="#46d369" />
                 <Text style={styles.downloadActionText}>
                   {versionGroup.length > 1 ? `Download (${getVersionTag(selectedFile.name)})` : 'Download'}
@@ -3725,7 +3743,9 @@ const App = () => {
                   <Text style={styles.miSpecValue}>
                     {[
                       vMi.width > 0 ? `${vMi.width}×${vMi.height} (${vMi.resolution})` : vRes,
-                      vMi.videoCodec,
+                      [vMi.videoCodec === 'AVC' ? 'AVC (H.264)' : vMi.videoCodec,
+                        vMi.videoBitrateMbps && vMi.videoBitrateMbps > 0 ? `@ ${vMi.videoBitrateMbps.toFixed(1)} Mbps` : null,
+                      ].filter(Boolean).join(' '),
                       vMi.hasDV && vMi.hasHDR ? 'Dolby Vision + HDR10' : vMi.hasDV ? 'Dolby Vision (Single Layer)' : vMi.hasHDR ? 'HDR10' : 'SDR',
                       vMi.frameRate > 0 ? `${vMi.frameRate.toFixed(2).replace(/\.00$/, '')} fps` : null,
                     ].filter(Boolean).join(' • ')}

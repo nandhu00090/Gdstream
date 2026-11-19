@@ -334,6 +334,6 @@ internal class UdfReader(
 
         private const val SECTOR_SIZE = 2048L
         private const val MAX_METADATA = 8L * 1024 * 1024
-        private val MEDIA_EXTENSIONS = listOf(".CLPI", ".MPLS", ".M2TS", ".VOB", ".MKV", ".MP4", ".AVI", ".MOV", ".M4V", ".TS")
+        private val MEDIA_EXTENSIONS = listOf(".IFO", ".CLPI", ".MPLS", ".M2TS", ".VOB", ".MKV", ".MP4", ".AVI", ".MOV", ".M4V", ".TS")
     }
 }

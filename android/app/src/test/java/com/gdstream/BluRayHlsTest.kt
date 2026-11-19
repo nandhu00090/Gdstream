@@ -14,7 +14,7 @@ class BluRayHlsTest {
         val playlist = String(hls.playlist())
         assertTrue(playlist.startsWith("#EXTM3U\n"))
         assertTrue(playlist.contains("#EXT-X-PLAYLIST-TYPE:VOD"))
-        assertTrue(playlist.contains("#EXT-X-TARGETDURATION:9"))
+        assertTrue(playlist.contains("#EXT-X-TARGETDURATION:4"))
         assertTrue(playlist.endsWith("#EXT-X-ENDLIST\n"))
         assertEquals(100_123_456, hls.segments.sumOf { it.durationUs })
         assertEquals(size, hls.segments.sumOf { it.end - it.start })
@@ -22,7 +22,7 @@ class BluRayHlsTest {
         assertEquals(size, hls.segments.last().end)
         assertTrue(hls.segments.zipWithNext().all { (a, b) -> a.end == b.start })
         assertTrue(hls.segments.all { it.start % 188 == 0L && it.end % 188 == 0L })
-        assertTrue(playlist.contains("#EXTINF:1.123456,"))
+        assertTrue(playlist.contains("#EXTINF:0.123456,"))
     }
     @Test fun absentOrInvalidClpiRequiresRawTsFallback() {
         assertNull(BluRayHls.create(null, 18800))

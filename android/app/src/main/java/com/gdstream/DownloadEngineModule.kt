@@ -496,17 +496,19 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
 
     private fun executeSegmentedDownload(task: DownloadTask) {
         try {
+            val source = SecurityVaultModule.downloadUrl(task.url)
             val targetFile = File(task.filePath)
             targetFile.parentFile?.mkdirs()
 
             if (task.totalBytes <= 0L || task.chunks.isEmpty()) {
-                val (probedSize, supportsRange) = probeRemoteFile(task.url)
+                val (probedSize, supportsRange) = probeRemoteFile(source)
                 task.totalBytes = probedSize
 
                 synchronized(task.chunks) {
                     task.chunks.clear()
                     if (supportsRange && probedSize > 4 * 1024 * 1024L) {
-                        val numParts = 8
+                        // The ISO proxy already pipelines upstream reads. One writer keeps memory bounded.
+                        val numParts = if (source.endsWith("?offline=m2ts")) 1 else 8
                         task.threadsCount = numParts
                         RandomAccessFile(targetFile, "rw").use { raf ->
                             raf.setLength(probedSize)
@@ -574,7 +576,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
             for (chunk in task.chunks) {
                 if (chunk.current > chunk.end) continue
                 val f = workerPool.submit<Boolean> {
-                    downloadSingleChunk(task, chunk, task.threadsCount > 1)
+                    downloadSingleChunk(task, source, chunk, task.threadsCount > 1 || source.endsWith("?offline=m2ts"))
                 }
                 chunkFutures.add(f)
                 task.futures.add(f)
@@ -630,6 +632,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
 
     private fun downloadSingleChunk(
         task: DownloadTask,
+        source: String,
         chunk: ChunkRange,
         useRange: Boolean
     ): Boolean {
@@ -639,7 +642,7 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
             try {
                 if (chunk.current > chunk.end) return true
                 val rangeHeader = if (useRange) "bytes=${chunk.current}-${chunk.end}" else null
-                conn = openConnection(task.url, rangeHeader)
+                conn = openConnection(source, rangeHeader)
                 val code = conn.responseCode
                 if (code !in 200..299) {
                     attempts++
@@ -647,6 +650,10 @@ class DownloadEngineModule(private val reactContext: ReactApplicationContext) :
                     continue
                 }
 
+                if (source.endsWith("?offline=m2ts")) {
+                    require(code == 206 && conn.getHeaderField("Content-Range") ==
+                        "bytes ${chunk.current}-${chunk.end}/${task.totalBytes}") { "Movie download range changed" }
+                }
                 var madeProgressInAttempt = false
                 conn.inputStream.use { input ->
                     RandomAccessFile(File(task.filePath), "rw").use { raf ->

@@ -114,6 +114,8 @@ internal class IsoVirtualFile(
         executor: ExecutorService,
         session: IsoReadSession = IsoReadSession(),
         durationUs: Long = 0,
+        maxReadBytes: Int = IsoRangeReader.WINDOW_BYTES,
+        onStreamStart: (() -> Unit)? = null,
         read: (Long, Int) -> ByteArray
     ): Boolean {
         session.log("ISO_PROXY_REQUEST", "method=$method requestedRange=${rangeHeader ?: "full"} size=$size")
@@ -166,7 +168,7 @@ internal class IsoVirtualFile(
                     session.checkActive()
                     val start = cursor
                     val limit = if (bdav) (IsoRangeReader.WINDOW_BYTES / 192) * 188 else IsoRangeReader.WINDOW_BYTES
-                    val count = minOf(limit.toLong(), range.end - cursor + 1).toInt()
+                    val count = minOf(limit, maxReadBytes).toLong().coerceAtMost(range.end - cursor + 1).toInt()
                     cursor += count
                     session.log("ISO_PROXY_MAP", "virtual=$start-${start + count - 1} physical=${physicalRanges(start, count)}")
                     queued.add(Pending(start, count, executor.submit<ByteArray> {
@@ -205,6 +207,7 @@ internal class IsoVirtualFile(
                 prefetch(IsoRangeReader.MAX_CONCURRENT_READS)
                 write(chunk)
                 flush()
+                if (delivered == 0L) onStreamStart?.invoke()
                 delivered += chunk.size
                 session.log("ISO_PROXY_CHUNK_COMPLETE", "sent=$delivered/${range.length} virtual=${range.start}-${range.end}")
                 chunk = nextChunk()

@@ -5,7 +5,7 @@ import org.json.JSONObject
 import java.util.Locale
 
 data class BluRayStream(val pid: Int, val type: Int, val format: Int = 0, val rate: Int = 0,
-                        val dynamicRange: Int = 0, val language: String = "") {
+                        val dynamicRange: Int = 0, val language: String = "", val layout: String = "", val kbps: Int = 0, val sampledKbps: Int = 0) {
     val height: Int get() = when (format) { 1, 3 -> 480; 2, 7 -> 576; 4, 6 -> 1080; 5 -> 720; 8 -> 2160; else -> 0 }
     val video: Boolean get() = type in listOf(1, 2, 0x1b, 0x20, 0x24, 0xea)
     val audio: Boolean get() = type in listOf(3, 4, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0xa1, 0xa2)
@@ -15,9 +15,9 @@ data class BluRayStream(val pid: Int, val type: Int, val format: Int = 0, val ra
         0x84, 0xa1 -> "E-AC-3"; 0x85 -> "DTS-HD"; 0x86 -> "DTS-HD MA"; 0xa2 -> "DTS Express"
         0x90 -> "PGS"; else -> "Unknown"
     }
-    fun json() = JSONArray().put(pid).put(type).put(format).put(rate).put(dynamicRange).put(language)
+    fun json() = JSONArray().put(pid).put(type).put(format).put(rate).put(dynamicRange).put(language).put(layout).put(kbps).put(sampledKbps)
     companion object {
-        fun fromJson(a: JSONArray) = BluRayStream(a.getInt(0), a.getInt(1), a.getInt(2), a.getInt(3), a.getInt(4), a.getString(5))
+        fun fromJson(a: JSONArray) = BluRayStream(a.getInt(0), a.getInt(1), a.getInt(2), a.getInt(3), a.getInt(4), a.getString(5), a.optString(6), a.optInt(7), a.optInt(8))
         fun descriptor(pid: Int, data: ByteArray, clpi: Boolean): BluRayStream {
             require(data.isNotEmpty())
             fun byte(i: Int) = data.getOrNull(i)?.toInt()?.and(255) ?: 0
@@ -64,13 +64,17 @@ internal fun BluRayProfile.mediaInfo(totalBytes: Long): Map<String, Any> {
     val hdr = labelHdr || videos.any { it.dynamicRange == 2 } || (dv && height == 2160)
     val audioStreams = streams.filter { it.audio }.ifEmpty { audio.map { BluRayStream(it.pid, it.type, language = it.language) } }
     val audioInfo = audioStreams.distinctBy { it.pid }.map { stream ->
-        val channels = when (stream.format) { 1 -> "Mono"; 3 -> "Stereo"; 6 -> "Multichannel"; else -> "" }
+        val channels = stream.layout.ifEmpty { when (stream.format) { 1 -> "1.0 ch"; 3 -> "2.0 ch"; else -> "" } }
         val language = bluRayLanguage(stream.language)
-        mapOf("language" to language, "codec" to stream.codec, "channels" to channels, "bitrateKbps" to 0,
-            "summary" to listOf(language, stream.codec, channels).filter { it.isNotEmpty() }.joinToString(" • "))
+        val rate = if (stream.type in listOf(0x83, 0x86)) {
+            if (stream.kbps > 0) "Lossless (${stream.kbps} kbps core)" else "Lossless"
+        } else if (stream.kbps > 0) "${stream.kbps} kbps" else ""
+        mapOf("language" to language, "codec" to stream.codec, "channels" to channels, "bitrateKbps" to stream.kbps,
+            "summary" to listOf(language, stream.codec, channels, rate).filter { it.isNotEmpty() }.joinToString(" • "))
     }
     return mapOf("width" to when (height) { 2160 -> 3840; 1080 -> 1920; 720 -> 1280; 480, 576 -> 720; else -> 0 },
         "height" to height, "resolution" to if (height == 0) "Unknown" else "${height}${if (main?.format in listOf(1, 2, 4)) "i" else "p"}", "videoCodec" to (main?.codec ?: "Unknown"),
+        "videoBitrateMbps" to if (durationUs > 0) (totalBytes * 8.0 / durationUs - audioStreams.sumOf { it.sampledKbps.takeIf { rate -> rate > 0 } ?: it.kbps } / 1000.0).coerceAtLeast(0.0) else 0.0,
         "frameRate" to when (main?.rate) { 1 -> 23.976; 2 -> 24.0; 3 -> 25.0; 4 -> 29.97; 6 -> 50.0; 7 -> 59.94; else -> 0.0 },
         "durationSec" to durationUs / 1_000_000.0, "totalBytes" to totalBytes.toDouble(), "hasDV" to dv, "hasHDR" to hdr,
         "dvProfile" to if (dv && hdr) 7 else -1, "hasAtmos" to false, "audioTracks" to audioInfo,
