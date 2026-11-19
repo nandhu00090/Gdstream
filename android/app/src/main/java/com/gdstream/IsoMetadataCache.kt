@@ -67,7 +67,7 @@ internal class IsoIndexDiskCache(private val directory: File) {
     }
 
     companion object {
-        const val VERSION = 7
+        const val VERSION = 8
         private const val MAX_ENTRY_BYTES = 8L * 1024 * 1024
         fun key(url: String, size: Long): String {
             // Keep query parameters: two downloads may differ only by id/token. Never persist redirects.

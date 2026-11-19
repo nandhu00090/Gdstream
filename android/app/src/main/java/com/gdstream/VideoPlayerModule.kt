@@ -83,12 +83,16 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
         fun attachArchivePlayer(rawPlayer: Any, url: String?): AutoCloseable? {
             val player = rawPlayer as? androidx.media3.exoplayer.ExoPlayer ?: return null
             // This hook runs on every source change, before prepare().
-            player.removeAnalyticsListener(DvdDiagnostics)
             if (url == null || !SecurityVaultModule.isIsoStream(url)) return null
             when (Uri.parse(url).videoExtension) {
                 "vob" -> {
-                    player.addAnalyticsListener(DvdDiagnostics)
-                    return null
+                    val listener = DvdDiagnostics {
+                        instance?.reactApplicationContext?.takeIf { it.hasActiveReactInstance() }
+                            ?.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                            ?.emit("DVD_MPEG2_UNSUPPORTED", url)
+                    }
+                    player.addAnalyticsListener(listener)
+                    return AutoCloseable { player.removeAnalyticsListener(listener) }
                 }
                 "m2ts", "ts" -> Unit
                 else -> return null
@@ -345,7 +349,12 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
     }
 
     @ReactMethod
-    fun playVideo(url: String, chooserTitle: String, promise: Promise) {
+    fun playVideo(url: String, chooserTitle: String, promise: Promise) = launchVideo(url, chooserTitle, promise)
+
+    @ReactMethod
+    fun playVideoInVlc(url: String, promise: Promise) = launchVideo(url, null, promise)
+
+    private fun launchVideo(url: String, chooserTitle: String?, promise: Promise) {
         try {
             val playableUri = resolvePlayableUri(SecurityVaultModule.externalPlayerUrl(url))
             if (playableUri.host == "127.0.0.1" || playableUri.host == "localhost") {
@@ -357,7 +366,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
             val chooser = Intent.createChooser(intent, chooserTitle).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            reactApplicationContext.startActivity(chooser)
+            reactApplicationContext.startActivity(if (chooserTitle == null) intent.setPackage("org.videolan.vlc") else chooser)
             promise.resolve(true)
         } catch (e: Exception) {
             DebugLogger.log("ARCHIVE_EXTERNAL_ERR", isoFailureDetails(e))
@@ -529,9 +538,22 @@ internal fun externalVideoIntent(uri: Uri) = Intent(Intent.ACTION_VIEW).apply {
     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
 }
 
-private object DvdDiagnostics : AnalyticsListener {
+internal fun dvdMpeg2Unsupported(tracks: Tracks): Boolean {
+    val videos = tracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }
+    return videos.none { it.isSupported } && videos.any { group ->
+        (0 until group.length).any { group.getTrackFormat(it).sampleMimeType == "video/mpeg2" }
+    }
+}
+
+private class DvdDiagnostics(private val unsupported: () -> Unit) : AnalyticsListener {
+    private var reported = false
     override fun onTracksChanged(eventTime: AnalyticsListener.EventTime, tracks: Tracks) {
-        for (group in tracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }) {
+        val videos = tracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }
+        if (!reported && dvdMpeg2Unsupported(tracks)) {
+            reported = true
+            unsupported()
+        }
+        for (group in videos) {
             for (index in 0 until group.length) {
                 val format = group.getTrackFormat(index)
                 DebugLogger.log("DVD_VIDEO_FORMAT", "mime=${format.sampleMimeType} codecs=${format.codecs} " +

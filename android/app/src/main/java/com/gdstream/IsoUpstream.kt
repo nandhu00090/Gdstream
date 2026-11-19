@@ -180,10 +180,11 @@ internal object IsoRangeReader {
         open: (Long, Long) -> HttpURLConnection,
         onFailure: (IsoRangeException) -> Unit = {},
         pause: (Long) -> Unit = { Thread.sleep(it) },
-        session: IsoReadSession = IsoReadSession()
+        session: IsoReadSession = IsoReadSession(),
+        cancelWithPlayback: Boolean = true
     ): ByteArray {
         val registration = Any()
-        activeReads[registration] = session
+        if (cancelWithPlayback) activeReads[registration] = session
         return try { readFullyInternal(url, start, end, open, onFailure, pause, session) }
         finally { activeReads.remove(registration) }
     }
