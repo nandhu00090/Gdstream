@@ -29,6 +29,9 @@ internal class RangeConnections(
     private val cookies = CookieManager(null, CookiePolicy.ACCEPT_ORIGINAL_SERVER)
     private val seededCookies = HashMap<String, String>()
 
+    fun openIsoRange(url: String, start: Long, end: Long, session: IsoReadSession): HttpURLConnection =
+        open(url, "bytes=$start-$end", connectTimeout = 10000, readTimeout = IsoRangeReader.READ_STALL_MS, session = session)
+
     fun open(rawUrl: String, range: String?, connectTimeout: Int = 15000, readTimeout: Int = 25000, session: IsoReadSession? = null): HttpURLConnection {
         val original = URL(rawUrl.substringBefore('#'))
         val initialHeaders = headers()
@@ -118,7 +121,10 @@ internal fun isoFailureDetails(error: Throwable): String = generateSequence(erro
 
 internal object IsoRangeReader {
     internal const val WINDOW_BYTES = 8 * 1024 * 1024
-    private val upstreamSlots = Semaphore(10, true)
+    internal const val MAX_CONCURRENT_READS = 6
+    // SO_TIMEOUT applies to each blocking read, so a progressing chunk can take longer.
+    internal const val READ_STALL_MS = 3500
+    private val upstreamSlots = Semaphore(MAX_CONCURRENT_READS, true)
     private val activeReads = java.util.concurrent.ConcurrentHashMap<Any, IsoReadSession>()
     fun cancelAll(reason: String) { activeReads.values.toSet().forEach { it.cancel(reason) } }
 
@@ -232,7 +238,7 @@ internal object IsoRangeReader {
                 val causes = generateSequence<Throwable>(e) { it.cause }.take(12).toList()
                 retry = failure.status in listOf(404, 408, 429, 500, 502, 503, 504) ||
                     causes.any { it is SocketException || it is SocketTimeoutException || it is EOFException || it is UnknownHostException }
-                if (!retry || failures >= 3 || requests > 4096) throw failure
+                if (!retry || failures >= 4 || requests > 4096) throw failure
             } finally {
                 try { conn?.let { session.disconnect(it) } } finally { permit?.close() }
             }
@@ -249,14 +255,53 @@ internal object IsoRangeReader {
     }
 }
 
+/** Keep the most recent disc warm between requests. Concurrent readers of other discs
+ * retain their own caches until their last HTTP request ends.
+ */
+internal class IsoChunkCaches {
+    private class Disc(val chunks: IsoChunkCache = IsoChunkCache(), var readers: Int = 0)
+    private val discs = HashMap<String, Disc>()
+    private var latest: String? = null
+
+    @Synchronized
+    fun acquire(url: String, session: IsoReadSession): IsoChunkCache {
+        session.checkActive()
+        val source = url.substringBefore('#')
+        val previous = latest
+        if (previous != null && previous != source && discs[previous]?.readers == 0) {
+            discs.remove(previous)?.chunks?.clear()
+        }
+        latest = source
+        val disc = discs.getOrPut(source) { Disc() }
+        disc.readers++
+        session.onCancel {
+            synchronized(this) {
+                disc.readers--
+                if (disc.readers == 0 && latest != source && discs.remove(source, disc)) disc.chunks.clear()
+            }
+        }
+        return disc.chunks
+    }
+
+    @Synchronized
+    fun clear() {
+        discs.values.forEach { it.chunks.clear() }
+        discs.clear()
+        latest = null
+    }
+}
+
 /** Physical blocks are immutable here: packet rewriting happens on each caller's copy. */
 internal class IsoChunkCache(
-    private val maxBytes: Int = 96 * 1024 * 1024,
-    private val executor: java.util.concurrent.ExecutorService = java.util.concurrent.Executors.newFixedThreadPool(10) { task ->
-        Thread(task, "ISOChunkFetch").apply { isDaemon = true }
-    }
+    private val maxBytes: Int = 128 * 1024 * 1024,
+    private val executor: java.util.concurrent.ExecutorService = sharedExecutor
 ) {
-    private data class Key(val source: String, val start: Long, val end: Long)
+    companion object {
+        private val sharedExecutor = java.util.concurrent.Executors.newFixedThreadPool(IsoRangeReader.MAX_CONCURRENT_READS) { task ->
+            Thread(task, "ISOChunkFetch").apply { isDaemon = true }
+        }
+    }
+    private data class Key(val start: Long, val end: Long)
     private class Flight(val owner: IsoReadSession) {
         lateinit var task: java.util.concurrent.FutureTask<ByteArray>
         var readers = 0
@@ -267,7 +312,7 @@ internal class IsoChunkCache(
     private val flights = HashMap<Key, Flight>()
     private var bytes = 0
 
-    fun read(source: String, start: Long, end: Long, extentStart: Long, extentEnd: Long,
+    fun read(start: Long, end: Long, extentStart: Long, extentEnd: Long,
              session: IsoReadSession, fetch: (Long, Long, IsoReadSession) -> ByteArray): ByteArray {
         require(start >= extentStart && end >= start && end <= extentEnd && end - start < Int.MAX_VALUE)
         val result = ByteArray((end - start + 1).toInt())
@@ -276,7 +321,7 @@ internal class IsoChunkCache(
             session.checkActive()
             val from = extentStart + ((cursor - extentStart) / IsoRangeReader.WINDOW_BYTES) * IsoRangeReader.WINDOW_BYTES
             val to = from + minOf(IsoRangeReader.WINDOW_BYTES.toLong() - 1, extentEnd - from)
-            val data = block(Key(source.substringBefore('#'), from, to), session, fetch)
+            val data = block(Key(from, to), session, fetch)
             session.checkActive()
             val offset = (cursor - from).toInt()
             val count = minOf(end - cursor + 1, (data.size - offset).toLong()).toInt()
@@ -289,6 +334,7 @@ internal class IsoChunkCache(
 
     private fun block(key: Key, session: IsoReadSession, fetch: (Long, Long, IsoReadSession) -> ByteArray): ByteArray {
         val flight = synchronized(lock) {
+            session.checkActive()
             cached[key]?.let { return it }
             val current = flights[key] ?: Flight(IsoReadSession()).also { created ->
                 created.task = java.util.concurrent.FutureTask {
@@ -316,21 +362,8 @@ internal class IsoChunkCache(
             current.readers++
             current
         }
-        val released = java.util.concurrent.atomic.AtomicBoolean()
-        fun release() {
-            if (!released.compareAndSet(false, true)) return
-            val abort = synchronized(lock) {
-                flight.readers--
-                (flight.readers == 0 && !flight.task.isDone).also {
-                    if (it && flights[key] === flight) flights.remove(key)
-                }
-            }
-            if (abort) {
-                flight.owner.cancel("no remaining chunk readers")
-                flight.task.cancel(true)
-            }
-        }
-        val cancellation = session.onCancel { release() }
+        // The cache owns the flight across downstream disconnects. A seek can rejoin it
+        // even if the old HTTP request has already detached. Service shutdown calls clear().
         try {
             // FutureTask.run is single-flight even when several callers enqueue it concurrently.
             if (flight.started.compareAndSet(false, true)) executor.execute(flight.task)
@@ -340,7 +373,7 @@ internal class IsoChunkCache(
                 catch (_: java.util.concurrent.TimeoutException) { }
                 catch (error: java.util.concurrent.ExecutionException) { throw (error.cause ?: error) }
             }
-        } finally { cancellation.close(); release() }
+        } finally { synchronized(lock) { flight.readers-- } }
     }
 
     internal fun activeReaders(): Int = synchronized(lock) { flights.values.sumOf { it.readers } }

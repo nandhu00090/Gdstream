@@ -34,7 +34,7 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
     private val payloads = object : TsPayloadReader.Factory {
         override fun createInitialPayloadReaders() = fallback.createInitialPayloadReaders()
         override fun createPayloadReader(streamType: Int, esInfo: TsPayloadReader.EsInfo): TsPayloadReader =
-            BluRayPidReader(profile?.audio.orEmpty(), streamType) { resolved -> reader(resolved, esInfo) }.also(pidReaders::add)
+            BluRayPidReader(profile?.audio.orEmpty(), streamType, dv != null) { resolved -> reader(resolved, esInfo) }.also(pidReaders::add)
         private fun reader(streamType: Int, esInfo: TsPayloadReader.EsInfo): TsPayloadReader? = when (streamType) {
             0x81, 0x84, 0xa1 -> PesReader(Ac3Reader(esInfo.language, 0, androidx.media3.common.MimeTypes.VIDEO_MP2T))
             0x83 -> PesReader(BluRayTrueHdReader(profile?.audio.orEmpty(), esInfo.language))
@@ -145,14 +145,15 @@ internal class EndOfInputPayloadReader(private val reader: TsPayloadReader) : Ts
  * MODE_SINGLE_PMT keeps each PID distinct, including multiple tracks with the same codec.
  */
 internal class BluRayPidReader(
-    private val audio: List<BluRayAudio>, private val advertisedType: Int,
+    private val audio: List<BluRayAudio>, private val advertisedType: Int, private val dualPidDv: Boolean,
     private val create: (Int) -> TsPayloadReader?
 ) : TsPayloadReader {
     private var reader: TsPayloadReader? = null
     override fun init(adjuster: TimestampAdjuster, output: ExtractorOutput, ids: TsPayloadReader.TrackIdGenerator) {
         ids.generateNewId()
         val pid = ids.trackId
-        val type = audio.firstOrNull { it.pid == pid && pid in 0x1100..0x111f }?.type ?: advertisedType
+        val type = if (dualPidDv && (pid == 0x1011 || pid == 0x1015)) 0x24
+            else audio.firstOrNull { it.pid == pid && pid in 0x1100..0x111f }?.type ?: advertisedType
         val freshIds = TsPayloadReader.TrackIdGenerator(ids.formatId.substringBefore('/', "").toIntOrNull() ?: Int.MIN_VALUE, pid, 8192)
         reader = create(type)
         reader?.init(adjuster, output, freshIds)

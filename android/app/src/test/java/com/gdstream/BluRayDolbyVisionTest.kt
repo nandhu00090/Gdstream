@@ -6,7 +6,6 @@ import androidx.media3.common.util.ParsableByteArray
 import androidx.media3.extractor.*
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
-import java.io.IOException
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -57,14 +56,18 @@ class BluRayDolbyVisionTest {
         queue.base(9000, 1, byteArrayOf(2)); queue.finish()
         assertEquals(1, emitted)
     }
-    @Test fun missingOrUnboundedMetadataFailsInsteadOfCrossFrameInjection() {
-        val queue = DolbyVisionSampleQueue { _, _, _ -> fail("mismatched PTS") }
-        queue.base(0, 1, byteArrayOf(1)); queue.rpu(1, rpu())
-        assertThrows(IOException::class.java) { queue.finish() }
-        queue.reset()
-        assertThrows(IOException::class.java) { repeat(33) { queue.base(it.toLong(), 0, byteArrayOf(1)) } }
-        queue.reset()
-        assertThrows(IOException::class.java) { queue.rpu(C.TIME_UNSET, rpu()) }
+    @Test fun missingMetadataAllowsBaseProgressAndNeverAttachesToAnotherPts() {
+        val times = ArrayList<Long>()
+        val samples = ArrayList<ByteArray>()
+        val queue = DolbyVisionSampleQueue { time, _, data -> times.add(time); samples.add(data) }
+        queue.rpu(C.TIME_UNSET, rpu())
+        repeat(80) { queue.rpu(1000L + it, rpu()) }
+        repeat(40) { queue.base(it.toLong(), 0, byteArrayOf(it.toByte())) }
+        assertTrue(times.size >= 38)
+        queue.rpu(0, rpu()) // The frame was already delivered.
+        queue.finish()
+        assertEquals((0L until 40L).toList(), times)
+        samples.forEachIndexed { index, bytes -> assertArrayEquals(byteArrayOf(index.toByte()), bytes) }
     }
 
     private data class Captured(val time: Long, val bytes: ByteArray)
@@ -75,13 +78,14 @@ class BluRayDolbyVisionTest {
         private val bytes = ByteArrayOutputStream()
         override fun track(id: Int, type: Int): TrackOutput {
             tracks.add(id)
-            val output = mock(TrackOutput::class.java)
+            // Run TrackOutput's two-argument default method so both Media3 write paths consume input.
+            val output = mock(TrackOutput::class.java, CALLS_REAL_METHODS)
             doAnswer { formats.add(it.getArgument(0)); null }.`when`(output).format(any(Format::class.java))
             doAnswer {
                 val data = it.getArgument<ParsableByteArray>(0)
                 val count = it.getArgument<Int>(1)
                 val chunk = ByteArray(count); data.readBytes(chunk, 0, count); bytes.write(chunk); null
-            }.`when`(output).sampleData(any(ParsableByteArray::class.java), anyInt())
+            }.`when`(output).sampleData(any(ParsableByteArray::class.java), anyInt(), anyInt())
             doAnswer {
                 val data = bytes.toByteArray()
                 val size = it.getArgument<Int>(2)
@@ -94,6 +98,8 @@ class BluRayDolbyVisionTest {
         override fun seekMap(seekMap: SeekMap) {}
     }
     @Test fun actualDualPidTransportExposesOneDvTrackAndSixInjectedAccessUnitsAndHdrStaysHevc() {
+        val log = DebugLogStore(java.io.File.createTempFile("dual-pid", ".log").apply { deleteOnExit() })
+        DebugLogger.attach(log)
         val bytes = javaClass.getResourceAsStream("/bluray/dual-dv.ts.bin")!!.use { it.readBytes() }
         val profile = BluRayProfile(1000000, listOf(BluRayPoint(0, 0), BluRayPoint(500000, 188)), emptyList(),
             listOf(BluRayStream(0x1011, 0x24, 8), BluRayStream(0x1015, 0x24, 6)))
@@ -129,6 +135,7 @@ class BluRayDolbyVisionTest {
             extractor.release()
             output.samples.take(6)
         }
+        assertTrue(log.snapshot().contains("[ISO_VIDEO_FORMAT] pid=4113 mode=DV mime=video/dolby-vision codecs=dvhe.08.06"))
         val suffix = start + rpu("mel_to_81")
         captures[0].zip(captures[1]).forEach { (hdr, dv) ->
             assertEquals(hdr.time, dv.time)

@@ -97,7 +97,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     @Volatile
     private var cachedSslFactory: SSLSocketFactory? = null
 
-    private val isoChunkCache = IsoChunkCache()
+    private val isoChunkCaches = IsoChunkCaches()
 
     data class DirectTrailerStream(
         val label: String,
@@ -194,7 +194,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     init {
         DebugLogger.initialize(reactContext)
-        clearIsoChunks = { isoChunkCache.clear() }
+        clearIsoChunks = isoChunkCaches::clear
         archiveFormat = { id -> archiveEntryRegistry[id]?.archiveFormat }
         externalIsoUrl = { url ->
             val entry = ArchiveProxyStreams.streamId(url)?.let { archiveEntryRegistry[it] }
@@ -704,14 +704,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 session.checkActive()
                 ensureVaultSessionReady()
                 session.checkActive()
-                var conn = rangeConnections.open(isoUrl, "bytes=$from-$to", 10000, 20000, session)
+                var conn = rangeConnections.openIsoRange(isoUrl, from, to, session)
                 if (conn.responseCode == 401 || conn.responseCode == 403) {
                     session.log("ISO_UPSTREAM_AUTH", "HTTP=${conn.responseCode} physical=$from-$to; refreshing session and source redirect once")
                     session.disconnect(conn)
                     nativeSessionLoggedIn = false
                     ensureVaultSessionReady()
                     session.checkActive()
-                    conn = rangeConnections.open(isoUrl, "bytes=$from-$to", 10000, 20000, session)
+                    conn = rangeConnections.openIsoRange(isoUrl, from, to, session)
                 }
                 conn
             }, session = session)
@@ -943,6 +943,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
                 val externalTs = hls != null || entry.isBdavM2ts && segments.last().endsWith(".ts", true) &&
                     !userAgent.contains("GDStream", ignoreCase = true)
+                val isoChunkCache = isoChunkCaches.acquire(entry.archiveUrl, session)
                 fun readTs(start: Long, length: Int): ByteArray {
                     val windowStart = if (externalTs) ((start / 188 - 32).coerceAtLeast(0)) * 188 else start
                     val windowEnd = if (externalTs) minOf(file.size, ((start + length + 187) / 188 + 32) * 188) else start + length
@@ -951,7 +952,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             val extent = entry.segments!!.first { (offset, length) ->
                                 offset >= 0 && remoteStart >= offset && remoteEnd < offset + length
                             }
-                            isoChunkCache.read(entry.archiveUrl, remoteStart, remoteEnd,
+                            isoChunkCache.read(remoteStart, remoteEnd,
                                 extent.first, extent.first + extent.second - 1, session) { from, to, sharedSession ->
                                 fetchIsoByteRange(entry.archiveUrl, from, to, sharedSession)
                             }
@@ -965,7 +966,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 } else if (hlsSegment == null) {
                     val playlist = hls.playlist()
                     IsoVirtualFile(listOf(0L to playlist.size.toLong()), false).serve(method, rangeHeader,
-                        "application/x-mpegURL", out, ioExecutor, session) { start, length ->
+                        "application/vnd.apple.mpegurl", out, ioExecutor, session) { start, length ->
                         playlist.copyOfRange(start.toInt(), start.toInt() + length)
                     }
                 } else {

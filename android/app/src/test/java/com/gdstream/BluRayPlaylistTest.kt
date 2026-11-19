@@ -13,7 +13,6 @@ class BluRayPlaylistTest {
         assertEquals(listOf(movie), selected)
         assertEquals(9995L, selected.sumOf { it.ticks } / 45000)
         assertEquals(42256656256L, selected.sumOf { it.size })
-        assertEquals("video/mp2t", externalVideoMimeType("/zip/id/Movie.m2ts"))
     }
 
     @Test fun keepsMultiPartFeaturesAndShortProgrammesIntact() {

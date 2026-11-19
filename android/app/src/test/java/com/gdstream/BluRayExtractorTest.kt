@@ -23,13 +23,14 @@ class BluRayExtractorTest {
         val data = java.io.ByteArrayOutputStream()
         var map: SeekMap? = null
         override fun track(id: Int, type: Int): TrackOutput {
-            val output = mock(TrackOutput::class.java)
+            // Run TrackOutput's two-argument default method so both Media3 write paths consume input.
+            val output = mock(TrackOutput::class.java, CALLS_REAL_METHODS)
             doAnswer { formats.add(it.getArgument(0)); null }.`when`(output).format(any(Format::class.java))
             doAnswer {
                 val source = it.getArgument<ParsableByteArray>(0)
                 val count = it.getArgument<Int>(1)
                 val bytes = ByteArray(count); source.readBytes(bytes, 0, count); data.write(bytes); null
-            }.`when`(output).sampleData(any(ParsableByteArray::class.java), anyInt())
+            }.`when`(output).sampleData(any(ParsableByteArray::class.java), anyInt(), anyInt())
             doAnswer { samples.add(Sample(it.getArgument(0), it.getArgument(2))); samplesByPid[id] = (samplesByPid[id] ?: 0) + 1; null }.`when`(output)
                 .sampleMetadata(anyLong(), anyInt(), anyInt(), anyInt(), isNull())
             return output
