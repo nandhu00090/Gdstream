@@ -956,9 +956,30 @@ const App = () => {
     return `${baseUrl}${currentPath}${encodeURIComponent(file.name)}`;
   }, [downloads, currentPath]);
 
+  const standaloneSources = useRef(new Map<string, Promise<string>>());
+  const resolvePlaybackUrl = useCallback(async (file: any) => {
+    const url = getStreamUrl(file);
+    if (file?.isZipEntry || !/^(https?|file):/i.test(url) || !SecurityVault?.resolveStandaloneDisc) return url;
+    const name = String(file?.name || '');
+    // Opaque download endpoints sometimes have no extension in either the path or title.
+    const namedDisc = /\.(m2ts|vob)(?:$|[?#&])/i.test(url) || /\.(m2ts|vob)$/i.test(name);
+    if (!namedDisc && !/mp2t/i.test(file?.mimeType || '') && /\.(mkv|mp4|avi|mov|webm|m4v|iso)$/i.test(name)) return url;
+    const key = JSON.stringify([url, file?.size, name]);
+    let pending = standaloneSources.current.get(key);
+    if (!pending) {
+      pending = SecurityVault.resolveStandaloneDisc(url, name, Number(file?.size || 0)) as Promise<string>;
+      standaloneSources.current.set(key, pending);
+      pending.catch(() => standaloneSources.current.delete(key));
+    }
+    try { return await pending; } catch (error) {
+      if (namedDisc) throw error;
+      return url;
+    }
+  }, [getStreamUrl]);
+  const [preparedUrl, setPreparedUrl] = useState('');
   const playbackIdentity = playMode === 'internal'
     ? `${selectedFile?.id || selectedFile?.name || ''}:${playerInstanceKey}` : null;
-  const playbackSource = usePlaybackSource(getStreamUrl(selectedFile), playbackIdentity);
+  const playbackSource = usePlaybackSource(preparedUrl || getStreamUrl(selectedFile), playbackIdentity);
 
   const requestPreviewAtTime = useCallback((sec: number) => {
     const active = selectedFileRef.current;
@@ -1864,14 +1885,15 @@ const App = () => {
           if (mediaInfoMap[fName] !== fileObj.mediaInfo) setMediaInfoMap(prev => ({ ...prev, [fName]: fileObj.mediaInfo }));
           continue;
         }
-        if (mediaInfoMap[fName] && (mediaInfoMap[fName].width > 0 || (mediaInfoMap[fName].audioTracks && mediaInfoMap[fName].audioTracks.length > 0))) {
+        if (mediaInfoMap[fName] && (mediaInfoMap[fName].durationSec > 0 || mediaInfoMap[fName].width > 0 || (mediaInfoMap[fName].audioTracks && mediaInfoMap[fName].audioTracks.length > 0))) {
           if (mediaInfoMap[fName].durationSec > 0) {
             savedDurationsRef.current[fName] = mediaInfoMap[fName].durationSec;
             setSavedDurationsMap({ ...savedDurationsRef.current });
           }
           continue;
         }
-        const cacheKey = `mediainfo_v8_${fName}`;
+        const discProbe = !fileObj.isZipEntry && (!/\.(mkv|mp4|avi|mov|webm|m4v|iso)$/i.test(fName) || /mp2t/i.test(fileObj.mimeType || ''));
+        const cacheKey = discProbe ? `mediainfo_v9_${getStreamUrl(fileObj)}_${fileObj.size || 0}` : `mediainfo_v8_${fName}`;
         try {
           const cached = await AsyncStorage.getItem(cacheKey);
           if (cached) {
@@ -1891,9 +1913,9 @@ const App = () => {
         if (!MediaInfoModule?.inspectMedia) continue;
         if (fName === selectedFile.name) setScanningMediaInfo(true);
         try {
-          const streamUrl = getStreamUrl(fileObj);
+          const streamUrl = await resolvePlaybackUrl(fileObj);
           const res: RealMediaInfo = await MediaInfoModule.inspectMedia(streamUrl, fName);
-          if (res && !cancelled && (res.width > 0 || (res.audioTracks && res.audioTracks.length > 0))) {
+          if (res && !cancelled && (res.width > 0 || res.audioTracks?.length > 0 || (discProbe && res.durationSec > 0 && !!res.videoCodec))) {
             setMediaInfoMap(prev => ({ ...prev, [fName]: res }));
             if (res.durationSec > 0) {
               savedDurationsRef.current[fName] = res.durationSec;
@@ -1911,7 +1933,7 @@ const App = () => {
     };
     const miTimer = setTimeout(runMultiMediaInfo, 350);
     return () => { cancelled = true; clearTimeout(miTimer); };
-  }, [selectedFile, versionGroup, playMode, mediaInfoMap, getStreamUrl]);
+  }, [selectedFile, versionGroup, playMode, mediaInfoMap, getStreamUrl, resolvePlaybackUrl]);
 
   const seekBothPlayers = useCallback((targetTime: number) => {
     videoRef.current?.seek(targetTime);
@@ -2455,15 +2477,27 @@ const App = () => {
     setIsLocked(false);
     setExternalSubtitle(null);
     setExternalAudio(null);
+    selectedFileRef.current = file;
     setSelectedFile(file);
   };
 
-  const startPlaybackWithMode = async (mode: 'dv' | 'hdr' | 'sdr') => {
-    if (!selectedFile || selectedFile.isoPending) return;
-    removedHistoryRef.current.delete(selectedFile.name); // Only an intentional new play can restore this movie.
+  const startPlaybackWithMode = async (mode: 'dv' | 'hdr' | 'sdr', file = selectedFile) => {
+    if (!file || file.isoPending) return;
+    removedHistoryRef.current.delete(file.name); // Only an intentional new play can restore this movie.
     queueHistoryWrite(async () => { await writeHistorySnapshot(); });
-    try { await SecurityVault?.prepareArchivePlayback?.(getStreamUrl(selectedFile)); } catch { return; }
-    try { await VideoPlayerManager?.setPreferredHdrMode?.(mode); } catch { return; }
+    try {
+      const source = await resolvePlaybackUrl(file);
+      const url = /\.vob$/i.test(source) && SecurityVault?.dvdPlaybackUrl ? await SecurityVault.dvdPlaybackUrl(source) : source;
+      if (selectedFileRef.current !== file) return;
+      await SecurityVault?.prepareArchivePlayback?.(url);
+      await VideoPlayerManager?.setPreferredHdrMode?.(mode);
+      if (selectedFileRef.current !== file) return;
+      setPreparedUrl(url);
+    } catch (error) {
+      if ((error as any)?.code === 'DVD_MPEG2_UNSUPPORTED') { showDvdFallback(file); return; }
+      Alert.alert('Playback error', error instanceof Error ? error.message : 'Could not open the stream.');
+      return;
+    }
     hasRestoredResumeRef.current = false;
     setShowHdrChoiceModal(false);
     setActiveHdrMode(mode);
@@ -2484,9 +2518,9 @@ const App = () => {
     const effectiveHasHDR = realMi ? realMi.hasHDR : info.hasHDR;
 
     if (effectiveHasDV && effectiveHasHDR) setShowHdrChoiceModal(true);
-    else if (effectiveHasDV) startPlaybackWithMode('dv');
-    else if (effectiveHasHDR) startPlaybackWithMode('hdr');
-    else startPlaybackWithMode('sdr');
+    else if (effectiveHasDV) startPlaybackWithMode('dv', fileToPlay);
+    else if (effectiveHasHDR) startPlaybackWithMode('hdr', fileToPlay);
+    else startPlaybackWithMode('sdr', fileToPlay);
   };
 
   const toggleLiveHdrModeInPlayer = async () => {
@@ -2591,19 +2625,28 @@ const App = () => {
 
   const openInExternalPlayer = async (targetFile = selectedFile, vlc = false) => {
     if (!targetFile || targetFile.isoPending) return;
-    const url = getStreamUrl(targetFile);
     closeInternalPlayer(false);
     setPlayMode('external'); // Suppress metadata probes while the external player owns the stream.
     // Commit the paused/unmounted native view before handing the proxy to the external app.
     await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
     try {
       await SecurityVault?.stopArchivePlayback?.(playbackSource.uri);
+      const source = await resolvePlaybackUrl(targetFile);
+      const url = !vlc && /\.vob$/i.test(source) && SecurityVault?.dvdPlaybackUrl ? await SecurityVault.dvdPlaybackUrl(source) : source;
       if (vlc) await VideoPlayerManager.playVideoInVlc(url);
       else await VideoPlayerManager.playVideo(url, 'Open with External Player (VLC / MX / MPV recommended for Blu-ray)');
     } catch (error) {
       setPlayMode(null);
+      if ((error as any)?.code === 'DVD_MPEG2_UNSUPPORTED') { showDvdFallback(targetFile); return; }
       Alert.alert('External player error', error instanceof Error ? error.message : 'Could not open the player.');
     }
+  };
+
+  const showDvdFallback = (file: any) => {
+    Alert.alert('DVD playback', 'This device cannot decode MPEG-2 video.', [
+      { text: 'Close', style: 'cancel' },
+      { text: 'Open in VLC', onPress: () => openInExternalPlayer(file, true) },
+    ]);
   };
 
   useEffect(() => {
@@ -2611,10 +2654,7 @@ const App = () => {
     const sub = DeviceEventEmitter.addListener('DVD_MPEG2_UNSUPPORTED', (url: string) => {
       if (url !== playbackSource.uri) return;
       closeInternalPlayer();
-      Alert.alert('DVD playback', 'This device cannot decode MPEG-2 video.', [
-        { text: 'Close', style: 'cancel' },
-        { text: 'Open in VLC', onPress: () => openInExternalPlayer(selectedFile, true) },
-      ]);
+      showDvdFallback(selectedFile);
     });
     return () => sub.remove();
   }, [playMode, playbackSource.uri, selectedFile, closeInternalPlayer]);
@@ -2796,13 +2836,18 @@ const App = () => {
     return null;
   }, [selectedFile, playableFolderEpisodes]);
 
+  const playEpisode = (file: any) => {
+    setPlayMode(null);
+    openFile(file);
+    void startPlaybackWithMode(activeHdrMode, file);
+  };
+
   const playNextEpisode = () => {
     if (!nextEpisodeFile) return;
     if (selectedFile?.name && currentTimeRef.current > 3) {
       persistPlaybackProgress(selectedFile.name, currentTimeRef.current, durationRef.current);
     }
-    openFile(nextEpisodeFile);
-    setPlayMode('internal');
+    playEpisode(nextEpisodeFile);
   };
 
   const handleVideoEnd = async () => {
@@ -2812,8 +2857,7 @@ const App = () => {
       removeContinueWatchingItem(selectedFile);
     }
     if (nextEpisodeFile) {
-      openFile(nextEpisodeFile);
-      setPlayMode('internal');
+      playEpisode(nextEpisodeFile);
       return;
     }
     closeInternalPlayer();
@@ -2994,8 +3038,7 @@ const App = () => {
                         if (selectedFile?.name && currentTimeRef.current > 3) {
                           persistPlaybackProgress(selectedFile.name, currentTimeRef.current, durationRef.current);
                         }
-                        openFile(ep);
-                        setPlayMode('internal');
+                        playEpisode(ep);
                       }
                     }}>
                     <Icon name={isCurrent ? 'play-circle-fill' : 'play-circle-outline'} size={22} color={isCurrent ? '#E50914' : '#AAA'} />

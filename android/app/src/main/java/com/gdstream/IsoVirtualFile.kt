@@ -90,7 +90,7 @@ internal class IsoVirtualFile(
         return result
     }
 
-    fun physicalRanges(start: Long, length: Int): String {
+    fun mappedRanges(start: Long, length: Int): List<LongRange> {
         val rawStart = if (bdav) (start / 188L) * 192L else start
         val rawEnd = if (bdav) ((start + length - 1) / 188L + 1) * 192L else start + length
         var cursor = 0L
@@ -98,12 +98,14 @@ internal class IsoVirtualFile(
             val from = maxOf(cursor, rawStart)
             val until = minOf(cursor + size, rawEnd)
             val mapped = if (from < until) {
-                if (offset < 0) "zero:${until - from}" else "${offset + from - cursor}-${offset + until - cursor - 1}"
+                if (offset < 0) null else (offset + from - cursor) until (offset + until - cursor)
             } else null
             cursor += size
             mapped
-        }.joinToString(",")
+        }
     }
+
+    fun physicalRanges(start: Long, length: Int) = mappedRanges(start, length).joinToString(",") { "${it.first}-${it.last}" }
 
     /** Preflight the first chunk before committing 200/206; later failures close a truncated body. */
     fun serve(

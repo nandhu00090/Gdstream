@@ -66,8 +66,21 @@ internal class BluRayHls private constructor(val segments: List<Segment>, val au
     }.toByteArray(Charsets.UTF_8)
 
     companion object {
-        fun create(profile: BluRayProfile?, size: Long): BluRayHls? {
-            if (profile == null || profile.durationUs <= 0 || profile.points.size < 2 || size <= 0 || size % 188 != 0L) return null
+        fun create(profile: BluRayProfile?, size: Long, standalone: Boolean = false): BluRayHls? {
+            if (profile == null || profile.durationUs <= 0 || size <= 0 || size % 188 != 0L) return null
+            if (standalone && profile.points.isEmpty()) {
+                // A standalone clip has no CLPI. Map its measured PTS span onto complete TS packets.
+                // Keep Media3's PCR binary seeker for the in-app progressive stream.
+                val packets = size / 188
+                val count = minOf(packets, (profile.durationUs + 3_999_999) / 4_000_000).toInt()
+                val segments = (0 until count).map { i ->
+                    val start = (packets / count * i + packets % count * i / count) * 188
+                    val end = (packets / count * (i + 1) + packets % count * (i + 1) / count) * 188
+                    Segment(start, end, profile.durationUs * (i + 1) / count - profile.durationUs * i / count)
+                }
+                return BluRayHls(segments, profile.streams.filter { it.audio }.distinctBy { it.pid })
+            }
+            if (profile.points.size < 2) return null
             val points = profile.points
             if (points.any { it.timeUs < 0 || it.timeUs >= profile.durationUs || it.position < 0 || it.position >= size || it.position % 188 != 0L } ||
                 points.zipWithNext().any { (a, b) -> b.timeUs <= a.timeUs || b.position <= a.position }) return null
@@ -139,7 +152,15 @@ internal object BluRayPsi {
         }
         return out.toByteArray()
     }
-    fun prefix(data: ByteArray, streams: List<BluRayStream> = emptyList(), audioPid: Int? = null): ByteArray? {
+    class Program(private val pat: ByteArray, private val pid: Int, private val pmt: ByteArray) {
+        val streams by lazy { elementaryStreams(pmt) }
+        fun prefix(streams: List<BluRayStream>, audioPid: Int?, videoOnly: Boolean): ByteArray {
+            val external = ExternalTsPmt.rewrite(pmt, streams, audioPid, videoOnly = videoOnly)
+                ?: throw IOException("Invalid external PMT")
+            return packets(0, pat) + packets(pid, external)
+        }
+    }
+    fun program(data: ByteArray): Program? {
         val pat = section(data, 0, 0) ?: return null
         var at = 8
         while (at + 4 <= pat.size - 4) {
@@ -147,11 +168,36 @@ internal object BluRayPsi {
             val pid = ((pat[at + 2].toInt() and 31) shl 8) + (pat[at + 3].toInt() and 255)
             if (program != 0) {
                 val pmt = section(data, pid, 2) ?: return null
-                val external = ExternalTsPmt.rewrite(pmt, streams, audioPid) ?: throw IOException("Invalid external PMT")
-                return packets(0, pat) + packets(pid, external)
+                return Program(pat, pid, pmt)
             }
             at += 4
         }
         return null
     }
+
+    fun streams(data: ByteArray) = program(data)?.streams.orEmpty()
+
+    private fun elementaryStreams(pmt: ByteArray): List<BluRayStream> {
+        fun u(p: Int) = pmt[p].toInt() and 255
+        val result = mutableListOf<BluRayStream>()
+        var p = 12 + ((u(10) and 15) shl 8) + u(11)
+        while (p + 5 <= pmt.size - 4) {
+            val end = p + 5 + ((u(p + 3) and 15) shl 8) + u(p + 4)
+            if (end > pmt.size - 4) break
+            var language = ""
+            var at = p + 5
+            while (at + 2 <= end) {
+                val length = u(at + 1)
+                if (at + 2 + length > end) break
+                if (u(at) == 10 && length >= 4) language = String(pmt, at + 2, 3, Charsets.US_ASCII)
+                at += 2 + length
+            }
+            result.add(BluRayStream(((u(p + 1) and 31) shl 8) or u(p + 2), u(p), language = language))
+            p = end
+        }
+        return result
+    }
+
+    fun prefix(data: ByteArray, streams: List<BluRayStream> = emptyList(), audioPid: Int? = null,
+               videoOnly: Boolean = false): ByteArray? = program(data)?.prefix(streams, audioPid, videoOnly)
 }

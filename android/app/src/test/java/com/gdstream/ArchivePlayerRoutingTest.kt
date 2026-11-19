@@ -64,6 +64,18 @@ class ArchivePlayerRoutingTest {
         assertTrue(frames > 0)
     }
 
+    @Test fun dvdTranscoderDemuxesInterlacedPicturesAtSectorBoundaries() {
+        val data = javaClass.getResourceAsStream("/dvd/interlaced.vob.bin")!!.readBytes()
+        val frames = mutableListOf<ByteArray>()
+        DvdProxy.demux(data, -1) { video, time, bytes ->
+            assertTrue(video)
+            assertTrue(time >= 0)
+            frames.add(bytes)
+        }
+        assertTrue(frames.size >= 3)
+        assertTrue(frames.first().size > 4)
+    }
+
     @Test fun dvdProgramStreamsAndBlurayTransportStreamsChooseTheirOwnExtractors() {
         val dvd = Uri.parse("http://127.0.0.1:9090/zip/disc/%5BDVD%20Main%5D.VOB?label=.ts#name=disc.iso")
         assertTrue(isoExtractors(dvd, null, true).createExtractors().single() is PsExtractor)

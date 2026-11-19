@@ -11,47 +11,29 @@ import org.json.JSONArray
 
 class IsoMetadataCacheTest {
     @get:Rule val folder = TemporaryFolder()
-    @Test fun hundredAdjacentSectorsUseOneAligned512KiBRange() {
-        val ranges = ArrayList<Pair<Long, Long>>()
-        val cache = IsoMetadataReadAhead(2 * IsoMetadataReadAhead.BLOCK_SIZE) { start, end ->
-            ranges.add(start to end)
-            ByteArray((end - start + 1).toInt()) { ((start + it) % 251).toByte() }
-        }
-        repeat(100) { sector ->
-            val start = 524288L + sector * 2048
-            val actual = cache.read(start, start + 2047)
-            assertArrayEquals(ByteArray(2048) { ((start + it) % 251).toByte() }, actual)
-        }
-        assertEquals(listOf(524288L to 1048575L), ranges)
-    }
-    @Test fun crossBlockAndPartialFinalBlockAreExactAndParallelReadsCoalesce() {
-        val ranges = ArrayList<Pair<Long, Long>>()
-        val size = IsoMetadataReadAhead.BLOCK_SIZE + 123
-        val cache = IsoMetadataReadAhead(size) { start, end ->
-            ranges.add(start to end)
-            ByteArray((end - start + 1).toInt()) { ((start + it) % 251).toByte() }
-        }
-        val pool = Executors.newFixedThreadPool(8)
+    @Test fun crossingTwoAlignedBlocksFetchesInParallelAndReopeningSharesTheBytes() {
+        val pool = Executors.newCachedThreadPool()
+        val size = IsoChunkCache.BLOCK_BYTES + 123L
+        val shared = IsoChunkCache()
+        val calls = java.util.concurrent.ConcurrentLinkedQueue<LongRange>()
+        val bothEntered = java.util.concurrent.CountDownLatch(2)
+        val session = IsoReadSession()
         try {
-            val jobs = (0 until 24).map { pool.submit<ByteArray> { cache.read(524280, size - 1) } }
-            jobs.forEach { assertArrayEquals(ByteArray(131) { ((524280L + it) % 251).toByte() }, it.get()) }
-            assertEquals(listOf(0L to 524287L, 524288L to size - 1), ranges)
-        } finally { pool.shutdownNow() }
-        assertThrows(IOException::class.java) { cache.read(size - 1, size) }
-        assertThrows(IOException::class.java) { cache.read(-1, 2) }
+            val metadata = IsoMetadataReadAhead(size, shared, session, pool) { from, to, _ ->
+                calls.add(from..to)
+                bothEntered.countDown()
+                assertTrue(bothEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                ByteArray((to - from + 1).toInt()) { ((from + it) % 251).toByte() }
+            }
+            val first = IsoChunkCache.BLOCK_BYTES - 8L
+            val expected = ByteArray(131) { ((first + it) % 251).toByte() }
+            repeat(2) { assertArrayEquals(expected, metadata.read(first, size - 1)) }
+            assertEquals(setOf(0L until IsoChunkCache.BLOCK_BYTES, IsoChunkCache.BLOCK_BYTES.toLong() until size), calls.toSet())
+            assertEquals(2, calls.size)
+            assertThrows(IOException::class.java) { metadata.read(first, size) }
+        } finally { session.cancel(); shared.clear(); pool.shutdownNow() }
     }
-    @Test fun failedReadsAreNotCachedAndEvictionIsBounded() {
-        var calls = 0
-        val cache = IsoMetadataReadAhead(20 * IsoMetadataReadAhead.BLOCK_SIZE) { start, end ->
-            calls++
-            if (calls == 1) ByteArray(2) else ByteArray((end - start + 1).toInt())
-        }
-        assertThrows(IOException::class.java) { cache.read(0, 10) }
-        cache.read(0, 10)
-        repeat(17) { cache.read(it * IsoMetadataReadAhead.BLOCK_SIZE, it * IsoMetadataReadAhead.BLOCK_SIZE + 1) }
-        cache.read(0, 10)
-        assertEquals(19, calls)
-    }
+
     @Test fun diskReopenRestoresMainMovieSpecsAndMediaInfoWithoutReadingSource() {
         val dir = folder.newFolder()
         val url = "https://library/disc.iso?id=one#name=Movie.iso"
@@ -65,6 +47,7 @@ class IsoMetadataCacheTest {
                 .put("mediaInfo", JSONObject(profile.mediaInfo(size))))).toString()
         IsoIndexDiskCache(dir).put(url, size, blob)
         val reopened = IsoIndexDiskCache(dir)
+        assertEquals(size, reopened.lastKnownSize(url))
         val restored = JSONObject(reopened.get(url, size)!!)
         assertEquals(profile, BluRayProfile.fromJson(restored.getJSONArray("targets").getJSONObject(0).getJSONObject("bluRay")))
         assertTrue(restored.getJSONArray("rawJson").getJSONObject(0).getJSONObject("mediaInfo").getBoolean("hasDV"))
@@ -74,6 +57,24 @@ class IsoMetadataCacheTest {
         assertEquals(blob, reopened.get(url.substringBefore('#'), size))
         assertFalse(dir.listFiles()!!.single().name.contains("library"))
     }
+    @Test fun migratesPr13ProfileAndPersistsLaterInspectorResultsBySourceIdentity() {
+        val legacy = folder.newFolder()
+        val url = "https://library/movie.iso?id=17"
+        val size = 12345L
+        val hash = java.security.MessageDigest.getInstance("SHA-256").digest("8\n$url\n$size".toByteArray())
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
+        val item = JSONObject().put("name", "movie.mkv")
+        java.io.File(legacy, "$hash.json").writeText(JSONObject().put("isoIndexVersion", 8)
+            .put("rawJson", JSONArray().put(item).toString()).toString())
+        val current = folder.newFolder()
+        val cache = IsoIndexDiskCache(current, legacy)
+        assertEquals(size, JSONObject(cache.get(url, size)!!).getLong("sourceSize"))
+        cache.rememberInfo(url, size, "movie.mkv", JSONObject().put("durationSec", 1234))
+        val restored = JSONObject(IsoIndexDiskCache(current).get(url, size)!!)
+        assertEquals(1234, JSONArray(restored.getString("rawJson")).getJSONObject(0).getJSONObject("mediaInfo").getInt("durationSec"))
+        assertNull(cache.get(url, size+1))
+    }
+
     @Test fun emptyOrOversizedDiskEntryIsACacheMiss() {
         val dir = folder.newFolder()
         val file = java.io.File(dir, IsoIndexDiskCache.key("https://library/a.iso", 100))

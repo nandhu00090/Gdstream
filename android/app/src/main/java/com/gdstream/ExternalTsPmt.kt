@@ -12,7 +12,7 @@ internal object ExternalTsPmt {
         }
         return value
     }
-    fun rewrite(section: ByteArray, streams: List<BluRayStream> = emptyList(), audioPid: Int? = null, offline: Boolean = false): ByteArray? {
+    fun rewrite(section: ByteArray, streams: List<BluRayStream> = emptyList(), audioPid: Int? = null, offline: Boolean = false, videoOnly: Boolean = false): ByteArray? {
         fun u(i: Int) = section[i].toInt() and 255
         if (section.size < 16 || u(0) != 2 || crc(section) != 0) return null
         val programEnd = 12 + ((u(10) and 15) shl 8) + u(11)
@@ -38,7 +38,7 @@ internal object ExternalTsPmt {
             val stream = streams.firstOrNull { it.pid == pid }
             val include = if (audioPid != null) pid == audioPid else offline || pid != 0x1015 &&
                 (type != 0x80 || stream != null) && (type != 0x83 || !nativeDolby || stream != null)
-            if (include) {
+            if (include && !(videoOnly && (stream ?: BluRayStream(pid, type)).audio)) {
                 val language = stream?.takeIf { it.audio || type == 0x90 }?.language
                     ?.takeIf { it.length == 3 && it.all { c -> c in 'a'..'z' } }
                 val descriptors = java.io.ByteArrayOutputStream()
@@ -86,13 +86,33 @@ internal object ExternalTsPmt {
         return raw.copyOfRange(offset, offset + length)
     }
 
-    fun patch(data: ByteArray, streams: List<BluRayStream> = emptyList(), m2ts: Boolean = false) {
+    fun patch(data: ByteArray, streams: List<BluRayStream> = emptyList(), m2ts: Boolean = false, videoOnly: Boolean = false) {
         val stride = if (m2ts) 192 else 188
         val first = stride - 188
         fun u(i: Int) = data[i].toInt() and 255
         fun payload(p: Int): Int {
             if (u(p) != 0x47 || u(p + 1) and 0x80 != 0 || u(p + 3) and 0xc0 != 0 || u(p + 3) and 0x10 == 0) return p + 188
             return p + 4 + if (u(p + 3) and 0x20 != 0) 1 + u(p + 4) else 0
+        }
+        // Keep byte-range offsets stable by replacing removed PES with null packets.
+        // If the audio PID carries PCR, retain its adaptation field clock without payload.
+        if (videoOnly) {
+            val audioPids = streams.filter { it.audio }.mapTo(HashSet()) { it.pid }
+            for (p in first until data.size - 187 step stride) {
+                if (u(p) != 0x47 || (((u(p + 1) and 31) shl 8) or u(p + 2)) !in audioPids) continue
+                if (u(p + 3) and 32 != 0 && u(p + 4) in 7..183 && u(p + 5) and 16 != 0) {
+                    data[p + 1] = (u(p + 1) and 31).toByte()
+                    data[p + 3] = (32 or (u(p + 3) and 15)).toByte()
+                    data[p + 4] = 183.toByte()
+                    data[p + 5] = 16
+                    data.fill(0xff.toByte(), p + 12, p + 188)
+                } else {
+                    data[p + 1] = 31
+                    data[p + 2] = 0xff.toByte()
+                    data[p + 3] = 0x10
+                    data.fill(0xff.toByte(), p + 4, p + 188)
+                }
+            }
         }
         for (p in first until data.size - 187 step stride) {
             var start = payload(p)
@@ -118,7 +138,7 @@ internal object ExternalTsPmt {
             }
             if (positions.size != length) continue
             val section = ByteArray(length) { data[positions[it]] }
-            val changed = rewrite(section, streams, offline = m2ts) ?: continue
+            val changed = rewrite(section, streams, offline = m2ts, videoOnly = videoOnly) ?: continue
             // Grow into PSI stuffing only. Never overwrite an adjacent section or PES.
             while (positions.size < changed.size && start < packet - first && u(start) == 0xff) positions.add(start++)
             if (positions.size < changed.size) {

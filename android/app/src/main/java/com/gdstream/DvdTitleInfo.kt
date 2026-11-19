@@ -21,7 +21,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
         return bcd(u(p)) * 3600 + bcd(u(p + 1)) * 60 + bcd(u(p + 2)) + bcd(u(p + 3) and 63) / fps
     }
 
-    data class Title(val duration: Double, val cells: List<LongRange>, val pgc: Int)
+    data class Title(val duration: Double, val cells: List<LongRange>, val pgc: Int, val cellUs: List<Long>)
 
     fun main(): Title {
         val parts = table(0xc8)
@@ -46,6 +46,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
                         pgc to program
                     }
                 val cells = ArrayList<LongRange>()
+                val durations = mutableListOf<Long>()
                 var duration = 0.0
                 chapters.forEachIndexed { index, (pgc, program) ->
                     val map = pgc + word(pgc + 230)
@@ -65,11 +66,44 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
                         require(until > start)
                         cells.add(start until until)
                         duration += seconds(c + 4)
+                        durations.add((seconds(c + 4) * 1_000_000).toLong())
                     }
                 }
-                Title(duration, cells, chapters.first().first)
+                Title(duration, cells, chapters.first().first, durations)
             }
             .maxByOrNull { it.duration } ?: error("Empty DVD title table")
+    }
+
+    /** The IFO VOBU address map gives independent DVD pack/GOP start sectors.
+     * Interpolate inside each timed cell, retaining its exact end time. */
+    fun segments(title: Title): List<DvdProxy.Segment> {
+        val map = table(0xe4)
+        if (map <= 0 || map + 4 > ifo.size) return emptyList()
+        val length = long(map) + 1
+        if (length !in 8..(ifo.size - map).toLong() || length % 4 != 0L) return emptyList()
+        val starts = (map + 4 until map + length.toInt() step 4).map { long(it) * 2048 }
+        if (starts.zipWithNext().any { (a, b) -> b <= a }) return emptyList()
+        var virtual = 0L
+        val result = mutableListOf<DvdProxy.Segment>()
+        for ((index, cell) in title.cells.withIndex()) {
+            val bytes = cell.last - cell.first + 1
+            val duration = title.cellUs[index]
+            var start = cell.first
+            var time = 0L
+            var i = starts.binarySearch(start)
+            if (i < 0 || duration <= 0) return emptyList()
+            while (++i < starts.size && starts[i] in cell) {
+                val next = starts[i]
+                val nextTime = (duration.toDouble() * (next - cell.first) / bytes).toLong()
+                if (nextTime - time < 4_000_000 && next - start < 6 * 1024 * 1024) continue
+                result.add(DvdProxy.Segment(virtual + start - cell.first, virtual + next - cell.first, nextTime - time))
+                start = next
+                time = nextTime
+            }
+            result.add(DvdProxy.Segment(virtual + start - cell.first, virtual + bytes, duration - time))
+            virtual += bytes
+        }
+        return result.takeIf { list -> list.all { it.end - it.start in 1..12L * 1024 * 1024 && it.durationUs > 0 } }.orEmpty()
     }
 
     fun info(title: Title, sample: ByteArray, bytes: Long): Map<String, Any> {
@@ -104,6 +138,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
             val end = minOf(sample.size, i + 6 + (s(i + 4) shl 8) + s(i + 5))
             if (at + 4 < end && s(at) !in frames) frames[s(at)] = sample.copyOfRange(at + 4, end)
         }
+        var ac3Substream = -1
         val audio =
             (0 until word(0x202).coerceAtMost(8)).mapNotNull { index ->
                 val control = word(title.pgc + 12 + index * 2)
@@ -111,6 +146,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
                 val p = 0x204 + 8 * index
                 val track = (control ushr 8) and 7
                 val type = u(p) ushr 5
+                if (type == 0 && ac3Substream < 0) ac3Substream = 0x80 + track
                 val codec =
                     when (type) {
                         0 -> "AC-3"
@@ -176,6 +212,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
             "resolution" to "${height}i",
             "frameRate" to if (pal) 25.0 else 30000.0 / 1001,
             "audioTracks" to audio,
+            "ac3Substream" to ac3Substream,
             "subtitleTracks" to subs,
             "languages" to audio.map { it.getValue("language") }.distinct(),
             "hasHDR" to false,

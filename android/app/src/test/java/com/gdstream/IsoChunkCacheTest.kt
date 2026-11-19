@@ -9,7 +9,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class IsoChunkCacheTest {
     private val base = 42_000_000_000L
-    private val block = IsoRangeReader.WINDOW_BYTES.toLong()
+    private val block = IsoChunkCache.BLOCK_BYTES.toLong()
 
     private fun awaitReaders(cache: IsoChunkCache, count: Int) {
         val until = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
@@ -33,6 +33,33 @@ class IsoChunkCacheTest {
             assertSame(discA, caches.acquire("https://origin/iso?id=a", IsoReadSession()))
             assertNotSame(discB, caches.acquire("https://origin/iso?id=b", IsoReadSession()))
         } finally { caches.clear() }
+    }
+
+    @Test fun segmentReadAheadStartsFourWorkersAndSharesAll32MiBWithDemandReads() {
+        val cache = IsoChunkCache()
+        val size = 32L * 1024 * 1024
+        val entered = CountDownLatch(4)
+        val release = CountDownLatch(1)
+        val done = CountDownLatch((size / block).toInt())
+        val calls = AtomicInteger()
+        try {
+            cache.prefetch(listOf(0L until size), size) { from, to, _ ->
+                calls.incrementAndGet()
+                entered.countDown()
+                assertTrue(release.await(5, TimeUnit.SECONDS))
+                done.countDown()
+                ByteArray((to - from + 1).toInt()) { (from / block).toByte() }
+            }
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            assertEquals(4, calls.get())
+            release.countDown()
+            assertTrue(done.await(5, TimeUnit.SECONDS))
+            repeat((size / block).toInt()) { i ->
+                val pos = i * block
+                val bytes = cache.read(pos, pos, 0, size - 1, IsoReadSession()) { _, _, _ -> error("duplicate GET") }
+                assertEquals(i.toByte(), bytes.single())
+            }
+        } finally { release.countDown(); cache.clear() }
     }
 
     @Test fun sixReadersShareOneFetchAndOneAbortDoesNotCancelTheOthers() {

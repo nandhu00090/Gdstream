@@ -109,14 +109,14 @@ class ArchiveProxyTest {
                     origin.soTimeout = 5000
                     val requests = ArrayList<HttpByteRange>()
                     val upstreamJob = pool.submit {
-                        repeat(2) {
+                        repeat((payload.size + IsoChunkCache.BLOCK_BYTES - 1) / IsoChunkCache.BLOCK_BYTES) {
                             origin.accept().use { socket ->
                                 val reader = socket.getInputStream().bufferedReader()
                                 val headers = ArrayList<String>()
                                 while (true) { val line = reader.readLine() ?: break; if (line.isEmpty()) break; headers.add(line) }
                                 assertTrue(headers.any { it.equals("Connection: close", true) })
                                 val range = HttpByteRange.parse(headers.first { it.startsWith("Range:", true) }.substringAfter(':').trim(), base + payload.size)
-                                assertTrue(range.length <= 8 * 1024 * 1024)
+                                assertTrue(range.length <= IsoChunkCache.BLOCK_BYTES)
                                 requests.add(range)
                                 socket.getOutputStream().apply {
                                     write("HTTP/1.1 206 Partial Content\r\nContent-Length: ${range.length}\r\nContent-Range: bytes ${range.start}-${range.end}/${base + payload.size}\r\nConnection: close\r\n\r\n".toByteArray())
@@ -264,6 +264,57 @@ class ArchiveProxyTest {
             assertTrue(log.readText().contains("userAgent=VLC/3.6 test"))
         } finally {
             active.close(); pool.shutdownNow(); (field(module, "ioExecutor") as ExecutorService).shutdownNow(); log.delete()
+        }
+    }
+
+    @Test fun opaqueStandaloneUrlUsesBdavProxyForPlaybackInfoAndSeparateHlsAudio() {
+        val ts = javaClass.getResourceAsStream("/bluray/hdmv.ts.bin")!!.readBytes()
+        val raw = ByteArray(ts.size / 188 * 192)
+        for (i in 0 until ts.size / 188) ts.copyInto(raw, i * 192 + 4, i * 188, (i + 1) * 188)
+        val origin = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
+        val listener = Executors.newSingleThreadExecutor()
+        listener.submit {
+            while (!origin.isClosed) origin.accept().use { socket ->
+                val reader = socket.getInputStream().bufferedReader()
+                val headers = generateSequence { reader.readLine() }.takeWhile { it.isNotEmpty() }.toList()
+                val range = HttpByteRange.parse(headers.first { it.startsWith("Range:", true) }.substringAfter(':').trim(), raw.size.toLong())
+                socket.getOutputStream().apply {
+                    write("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes ${range.start}-${range.end}/${raw.size}\r\nContent-Length: ${range.length}\r\nConnection: close\r\n\r\n".toByteArray())
+                    write(raw, range.start.toInt(), range.length.toInt())
+                }
+            }
+        }
+        val module = SecurityVaultModule(mock(ReactApplicationContext::class.java))
+        val promise = mock(com.facebook.react.bridge.Promise::class.java)
+        val ready = java.util.concurrent.CompletableFuture<String>()
+        org.mockito.Mockito.doAnswer { ready.complete(it.getArgument(0)); null }
+            .`when`(promise).resolve(org.mockito.Mockito.any())
+        ArchiveProxyStreams.registry.resume()
+        fun get(url: String) = java.net.URL(url).openConnection(java.net.Proxy.NO_PROXY).apply {
+            connectTimeout = 5000; readTimeout = 5000; setRequestProperty("Connection", "close")
+        }.getInputStream().use { it.readBytes() }
+        try {
+            module.resolveStandaloneDisc("http://127.0.0.1:${origin.localPort}/download.aspx?file=opaque",
+                "Untitled feature", raw.size.toDouble(), promise)
+            val url = ready.get(10, TimeUnit.SECONDS)
+            assertTrue(SecurityVaultModule.isIsoStream(url))
+            assertArrayEquals(ts, get(url))
+            val profile = SecurityVaultModule.bluRayProfile(url)!!
+            assertTrue(profile.durationUs > 0)
+            assertTrue(profile.streams.any { it.audio && it.kbps > 0 })
+            assertTrue((SecurityVaultModule.isoMediaInfo(url)!!["videoBitrateMbps"] as Double) > 0)
+            val master = SecurityVaultModule.externalPlayerUrl(url)
+            assertTrue(String(get(master)).contains("#EXT-X-MEDIA:TYPE=AUDIO"))
+            val video = get(master.replace("index.m3u8", "seg_0.ts"))
+            assertTrue(BluRayPsi.streams(video).any { it.video })
+            assertFalse(BluRayPsi.streams(video).any { it.audio })
+            val pid = profile.audio.first().pid
+            assertEquals(pid, BluRayPsi.streams(get(master.replace("index.m3u8", "audio_${pid}_seg_0.ts"))).single().pid)
+        } finally {
+            origin.close(); listener.shutdownNow()
+            val server = SecurityVaultModule::class.java.getDeclaredField("archiveProxyServer").apply { isAccessible = true }
+            (server.get(module) as? ServerSocket)?.close()
+            (field(module, "ioExecutor") as ExecutorService).shutdownNow()
         }
     }
 

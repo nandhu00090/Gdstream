@@ -212,6 +212,10 @@ if (fs.existsSync(cmakeFile)) {
     fs.writeFileSync(cmakeFile, cmakeContent, 'utf8');
     console.log('Patched CMakeLists.txt to build native libgdcore.so shield');
   }
+  if (!cmakeContent.includes('dvd_transcode.cpp')) {
+    const dvdSource = path.resolve(path.dirname(cppFile), 'dvd_transcode.cpp').replace(/\\/g, '/');
+    fs.appendFileSync(cmakeFile, `\ntarget_sources(gdcore PRIVATE "${dvdSource}")\ntarget_link_libraries(gdcore mediandk dl)\n`);
+  }
 }
 
 

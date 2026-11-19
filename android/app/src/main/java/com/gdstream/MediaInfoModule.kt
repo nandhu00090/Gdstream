@@ -1296,6 +1296,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                     putArray("subtitleTracks", subtitleList)
                     putArray("languages", langArray)
                 }
+                if (width > 0 || audioLanguages.isNotEmpty()) SecurityVaultModule.rememberIsoInfo(url, result)
                 promise.resolve(result)
             } catch (e: Exception) {
                 promise.reject("MEDIAINFO_ERROR", e.message)

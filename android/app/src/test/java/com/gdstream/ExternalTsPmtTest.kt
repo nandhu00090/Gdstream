@@ -19,6 +19,25 @@ class ExternalTsPmtTest {
         assertEquals(listOf(0x24, 0x82, 0x81, 0x90), (12 until result.size - 4 step 5).map { result[it].toInt() and 255 })
         assertEquals(0x11, result[14].toInt())
     }
+    @Test fun alternateAudioRemovesPesAndPmtEntriesFromVideoButRetainsClock() {
+        val stream = BluRayStream(0x1101, 0x86)
+        val section = ExternalTsPmt.rewrite(pmt(), listOf(stream), videoOnly = true)!!
+        assertEquals(0, ExternalTsPmt.crc(section))
+        assertEquals(listOf(0x24, 0x90), (12 until section.size - 4 step 5).map { section[it].toInt() and 255 })
+        val data = ByteArray(376) { 99 }.apply {
+            for (p in listOf(0, 188)) {
+                this[p] = 0x47; this[p+1] = 0x51; this[p+2] = 1; this[p+3] = 0x10
+            }
+            this[191] = 0x30; this[192] = 7; this[193] = 16
+        }
+        val clock = data.copyOfRange(194, 200)
+        ExternalTsPmt.patch(data, listOf(stream), videoOnly = true)
+        assertEquals(0x1fff, ((data[1].toInt() and 31) shl 8) or (data[2].toInt() and 255))
+        assertEquals(0x20, data[191].toInt() and 0x30)
+        assertArrayEquals(clock, data.copyOfRange(194, 200))
+        assertTrue(data.drop(200).all { it == 0xff.toByte() })
+    }
+
     @Test fun corruptCrcIsNotRewritten() {
         val section = pmt(); section[8] = 0
         assertNull(ExternalTsPmt.rewrite(section))
