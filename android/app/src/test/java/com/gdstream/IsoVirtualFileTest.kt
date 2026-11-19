@@ -146,9 +146,9 @@ class IsoVirtualFileTest {
         } finally { executor.shutdownNow() }
     }
 
-    @Test fun prefetchesThreeChunksAheadBeforeFirstReadCompletesAndWritesInOrder() {
+    @Test fun prioritizesTheSeekHeadThenReadsAheadAndWritesInOrder() {
         val workers = Executors.newCachedThreadPool()
-        val entered = java.util.concurrent.CountDownLatch(4)
+        val entered = java.util.concurrent.CountDownLatch(1)
         val release = java.util.concurrent.CountDownLatch(1)
         val starts = java.util.concurrent.ConcurrentSkipListSet<Long>()
         val length = 4 * IsoRangeReader.WINDOW_BYTES + 17
@@ -156,19 +156,19 @@ class IsoVirtualFileTest {
         val out = ByteArrayOutputStream()
         try {
             val task = workers.submit {
-                file.serve("GET", "bytes=0-", "video/mp2t", out, workers) { start, count ->
+                file.serve("GET", "bytes=17-", "video/mp2t", out, workers) { start, count ->
                     starts.add(start)
                     entered.countDown()
-                    assertTrue(release.await(3, java.util.concurrent.TimeUnit.SECONDS))
+                    if (start == 17L) assertTrue(release.await(3, java.util.concurrent.TimeUnit.SECONDS))
                     ByteArray(count) { ((start + it) % 251).toByte() }
                 }
             }
-            assertTrue("Current chunk plus three look-ahead reads must overlap", entered.await(3, java.util.concurrent.TimeUnit.SECONDS))
-            assertEquals(4, starts.size)
+            assertTrue("Head chunk must start", entered.await(3, java.util.concurrent.TimeUnit.SECONDS))
+            assertEquals(setOf(17L), starts)
             assertEquals(0, out.size())
             release.countDown()
             task.get(5, java.util.concurrent.TimeUnit.SECONDS)
-            assertArrayEquals(ByteArray(length) { (it % 251).toByte() }, response(out.toByteArray()).body)
+            assertArrayEquals(ByteArray(length - 17) { ((17 + it) % 251).toByte() }, response(out.toByteArray()).body)
         } finally { release.countDown(); workers.shutdownNow() }
     }
 

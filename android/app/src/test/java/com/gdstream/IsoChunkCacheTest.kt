@@ -17,6 +17,24 @@ class IsoChunkCacheTest {
         assertEquals(count, cache.activeReaders())
     }
 
+    @Test fun eachActiveDiscKeepsItsOwnCacheAndTheCurrentDiscSurvivesBetweenRequests() {
+        val caches = IsoChunkCaches()
+        val a = IsoReadSession()
+        val b = IsoReadSession()
+        val seek = IsoReadSession()
+        try {
+            val discA = caches.acquire("https://origin/iso?id=a#title", a)
+            val discB = caches.acquire("https://origin/iso?id=b", b)
+            assertNotSame(discA, discB)
+            assertSame(discA, caches.acquire("https://origin/iso?id=a", seek))
+            a.cancel()
+            b.cancel()
+            seek.cancel()
+            assertSame(discA, caches.acquire("https://origin/iso?id=a", IsoReadSession()))
+            assertNotSame(discB, caches.acquire("https://origin/iso?id=b", IsoReadSession()))
+        } finally { caches.clear() }
+    }
+
     @Test fun sixReadersShareOneFetchAndOneAbortDoesNotCancelTheOthers() {
         val workers = Executors.newFixedThreadPool(4)
         val consumers = Executors.newFixedThreadPool(6)
@@ -27,7 +45,7 @@ class IsoChunkCacheTest {
         val sessions = List(6) { IsoReadSession() }
         try {
             val tasks = sessions.map { session -> consumers.submit<ByteArray> {
-                cache.read("http://origin/disc.iso", base + 17, base + 100, base, base + 4 * block - 1, session) { from, to, owner ->
+                cache.read(base + 17, base + 100, base, base + 4 * block - 1, session) { from, to, owner ->
                     calls.incrementAndGet(); entered.countDown()
                     assertTrue(release.await(3, TimeUnit.SECONDS))
                     assertFalse(owner.isCancelled)
@@ -45,37 +63,41 @@ class IsoChunkCacheTest {
         } finally { release.countDown(); cache.clear(); workers.shutdownNow(); consumers.shutdownNow() }
     }
 
-    @Test fun finalAbortedReaderCancelsFlightAndNextReadCanStart() {
-        val workers = Executors.newFixedThreadPool(4)
+    @Test fun seekAfterLastReaderClosesRejoinsThePendingBlock() {
+        val workers = Executors.newSingleThreadExecutor()
         val consumers = Executors.newCachedThreadPool()
-        val cache = IsoChunkCache(4 * block.toInt(), workers)
+        val cache = IsoChunkCache(executor = workers)
         val entered = CountDownLatch(1)
-        val cancelled = CountDownLatch(1)
+        val release = CountDownLatch(1)
         val session = IsoReadSession()
-        try {
-            val task = consumers.submit<ByteArray> {
-                cache.read("source", base, base + 1, base, base + block - 1, session) { _, _, owner ->
-                    owner.onCancel { cancelled.countDown() }
-                    entered.countDown()
-                    cancelled.await(3, TimeUnit.SECONDS)
-                    owner.checkActive()
-                    error("aborted flight returned data")
-                }
+        val calls = AtomicInteger()
+        fun read(reader: IsoReadSession) = consumers.submit<ByteArray> {
+            cache.read(base, base + 1, base, base + block - 1, reader) { from, to, owner ->
+                calls.incrementAndGet()
+                entered.countDown()
+                assertTrue(release.await(3, TimeUnit.SECONDS))
+                owner.checkActive()
+                ByteArray((to - from + 1).toInt()) { 9 }
             }
+        }
+        try {
+            val previous = read(session)
             assertTrue(entered.await(3, TimeUnit.SECONDS))
-            session.cancel("last downstream reader closed")
-            assertTrue(cancelled.await(1, TimeUnit.SECONDS))
-            assertThrows(java.util.concurrent.ExecutionException::class.java) { task.get(1, TimeUnit.SECONDS) }
-            val data = cache.read("source", base, base + 1, base, base + block - 1, IsoReadSession()) { from, to, _ -> ByteArray((to - from + 1).toInt()) { 9 } }
-            assertArrayEquals(byteArrayOf(9, 9), data)
-        } finally { session.cancel(); cache.clear(); workers.shutdownNow(); consumers.shutdownNow() }
+            session.cancel("seek")
+            assertThrows(java.util.concurrent.ExecutionException::class.java) { previous.get(1, TimeUnit.SECONDS) }
+            val next = read(IsoReadSession())
+            awaitReaders(cache, 1)
+            release.countDown()
+            assertArrayEquals(byteArrayOf(9, 9), next.get(3, TimeUnit.SECONDS))
+            assertEquals(1, calls.get())
+        } finally { release.countDown(); cache.clear(); workers.shutdownNow(); consumers.shutdownNow() }
     }
 
     @Test fun cacheIsLruBoundedCopySafeAndDoesNotRetainFailures() {
         val workers = Executors.newFixedThreadPool(4)
         val cache = IsoChunkCache(2 * block.toInt(), workers)
         val calls = AtomicInteger()
-        fun read(index: Int): ByteArray = cache.read("source", base + index * block, base + index * block + 9,
+        fun read(index: Int): ByteArray = cache.read(base + index * block, base + index * block + 9,
             base, base + 4 * block - 1, IsoReadSession()) { from, to, _ -> calls.incrementAndGet(); ByteArray((to - from + 1).toInt()) { 3 } }
         try {
             read(0)[0] = 99
@@ -86,9 +108,9 @@ class IsoChunkCacheTest {
             read(1) // Block zero was touched most recently, so block one was evicted.
             assertEquals(4, calls.get())
             assertThrows(java.io.IOException::class.java) {
-                cache.read("failed", base, base, base, base + block - 1, IsoReadSession()) { _, _, _ -> throw java.io.IOException("origin failed") }
+                cache.read(base + 4 * block, base + 4 * block, base + 4 * block, base + 5 * block - 1, IsoReadSession()) { _, _, _ -> throw java.io.IOException("origin failed") }
             }
-            assertArrayEquals(byteArrayOf(8), cache.read("failed", base, base, base, base + block - 1, IsoReadSession()) { from, to, _ -> ByteArray((to - from + 1).toInt()) { 8 } })
+            assertArrayEquals(byteArrayOf(8), cache.read(base + 4 * block, base + 4 * block, base + 4 * block, base + 5 * block - 1, IsoReadSession()) { from, to, _ -> ByteArray((to - from + 1).toInt()) { 8 } })
         } finally { cache.clear(); workers.shutdownNow() }
     }
 }

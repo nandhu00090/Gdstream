@@ -11,47 +11,42 @@ import androidx.media3.extractor.ts.*
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 
-/** Queues in BL decode order, matches on presentation time (including reordered pictures).
- * Never applies the closest/last RPU to a different frame. Overflow/missing metadata fails DV
- * playback explicitly so the user can choose HDR10 instead of decoding a mislabeled stream.
+/** Only an exact PTS match may augment a base AU. Missing metadata must never stop
+ * the HDR10-compatible base pictures. Allow a short interleave window in decode order.
  */
 internal class DolbyVisionSampleQueue(private val emit: (Long, Int, ByteArray) -> Unit) {
     private data class Sample(val time: Long, val flags: Int, val data: ByteArray)
     private val base = java.util.ArrayDeque<Sample>()
     private val rpus = LinkedHashMap<Long, ByteArray>()
-    private var bytes = 0
+    private var baseBytes = 0
+
     fun base(time: Long, flags: Int, data: ByteArray) {
-        if (time == C.TIME_UNSET) throw IOException("Dolby Vision base AU has no PTS")
-        base.add(Sample(time, flags, data)); bytes += data.size
+        base.add(Sample(time, flags, data))
+        baseBytes += data.size
         drain()
-        checkBounds()
     }
+
     fun rpu(time: Long, nal: ByteArray) {
-        if (time == C.TIME_UNSET) throw IOException("Dolby Vision RPU has no PTS")
-        if (rpus.containsKey(time)) throw IOException("Duplicate Dolby Vision RPU PTS")
+        if (time == C.TIME_UNSET || time in rpus) return
         rpus[time] = DolbyVisionRpu.toProfile81(nal)
+        if (rpus.size > 64) rpus.remove(rpus.keys.first())
         drain()
-        checkBounds()
     }
-    private fun drain() {
+
+    private fun drain(finishing: Boolean = false) {
         while (base.isNotEmpty()) {
             val sample = base.first
-            val rpu = rpus.remove(sample.time) ?: break
-            base.removeFirst(); bytes -= sample.data.size
-            emit(sample.time, sample.flags, sample.data + byteArrayOf(0, 0, 0, 1) + rpu)
+            val rpu = rpus.remove(sample.time)
+            if (rpu == null && !finishing && base.size <= 2 && baseBytes <= 16 * 1024 * 1024) break
+            base.removeFirst()
+            baseBytes -= sample.data.size
+            val data = if (rpu == null) sample.data else sample.data + byteArrayOf(0, 0, 0, 1) + rpu
+            emit(sample.time, sample.flags, data)
         }
     }
-    private fun checkBounds() {
-        if (base.size > 32 || rpus.size > 64 || bytes > 32 * 1024 * 1024) {
-            throw IOException("Dolby Vision BL/EL timestamps did not synchronize; choose HDR10")
-        }
-    }
-    fun finish() {
-        drain()
-        if (base.isNotEmpty()) throw IOException("Missing Dolby Vision RPU for base AU")
-        rpus.clear()
-    }
-    fun reset() { base.clear(); rpus.clear(); bytes = 0 }
+
+    fun finish() { drain(finishing = true); rpus.clear() }
+    fun reset() { base.clear(); rpus.clear(); baseBytes = 0 }
 }
 
 /** Annex-B scanner retains only type 62, including split start codes and NALs across PES packets.

@@ -56,7 +56,6 @@ class BluRayHlsTest {
                 }
             }
         } finally { executor.shutdownNow() }
-        assertEquals("application/x-mpegURL", externalVideoMimeType("/hls/id/index.m3u8"))
         assertEquals("id", ArchiveProxyStreams.streamId("http://127.0.0.1:99/hls/id/index.m3u8"))
     }
 }

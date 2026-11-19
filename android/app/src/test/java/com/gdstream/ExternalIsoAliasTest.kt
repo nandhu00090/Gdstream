@@ -19,6 +19,5 @@ class ExternalIsoAliasTest {
         assertEquals(url, externalIsoTsUrl(url, name, false))
         assertEquals(url, externalIsoTsUrl(url, "different.m2ts", true))
         assertEquals(alias, externalIsoTsUrl(alias, name, true))
-        assertEquals("video/mp2t", externalVideoMimeType(java.net.URI(alias).path))
     }
 }

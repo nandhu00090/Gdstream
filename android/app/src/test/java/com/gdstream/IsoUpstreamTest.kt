@@ -38,16 +38,48 @@ class IsoUpstreamTest {
             object : Connection(206, "bytes $from-$to/50000000000", byteArrayOf(1, 2, 3, 4)) {
                 override fun getInputStream(): InputStream = when (attempts) {
                     1 -> throw SocketException("Connection reset")
-                    2 -> throw SocketTimeoutException("Read timed out")
+                    2, 3 -> throw SocketTimeoutException("Read timed out")
                     else -> super.getInputStream()
                 }
             }
         }, onFailure = { failures.add(it) }, pause = { pauses.add(it) })
         assertArrayEquals(byteArrayOf(1, 2, 3, 4), data)
-        assertEquals(listOf(150L, 300L), pauses)
-        assertEquals(listOf(206, 206), failures.map { it.status })
+        assertEquals(listOf(150L, 300L, 450L), pauses)
+        assertEquals(listOf(206, 206, 206), failures.map { it.status })
         assertTrue(isoFailureDetails(failures[0]).contains("java.net.SocketException: Connection reset"))
         assertFalse(isoFailureDetails(failures[0]).contains("token=secret"))
+    }
+
+    @Test fun partial206BodyTimesOutAndRetriesOnAnotherSocket() {
+        val pool = Executors.newSingleThreadExecutor()
+        ServerSocket(0).use { server ->
+            val job = pool.submit {
+                fun reply(body: String) = "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n" +
+                    "Content-Range: bytes 0-3/4\r\nConnection: close\r\n\r\n$body"
+                fun accept() = server.accept().also { socket ->
+                    val headers = socket.getInputStream().bufferedReader()
+                    while (!headers.readLine().isNullOrEmpty()) { }
+                }
+                accept().use { first ->
+                    first.getOutputStream().write(reply("XX").toByteArray())
+                    // Keep the first response open while the client reconnects.
+                    accept().use { it.getOutputStream().write(reply("DATA").toByteArray()) }
+                }
+            }
+            val url = "http://127.0.0.1:${server.localPort}/disc.iso"
+            val connections = RangeConnections({ emptyMap() })
+            val session = IsoReadSession()
+            val failures = ArrayList<IsoRangeException>()
+            try {
+                val data = IsoRangeReader.readFully(url, 0, 3, open = { from, to ->
+                    connections.openIsoRange(url, from, to, session)
+                }, onFailure = { failures.add(it) }, pause = {}, session = session)
+                assertEquals("DATA", data.toString(Charsets.US_ASCII))
+                assertTrue(failures.single().cause is SocketTimeoutException)
+                assertEquals(206, failures.single().status)
+                job.get(1, TimeUnit.SECONDS)
+            } finally { session.cancel(); pool.shutdownNow() }
+        }
     }
 
     @Test fun capped206ResponsesContinueAtNextByteAndPermanentFailuresStop() {
@@ -66,7 +98,7 @@ class IsoUpstreamTest {
                     open = { _, _ -> attempts++; Connection(status, null, ByteArray(0)) },
                     onFailure = { failures.add(it) }, pause = {})
             }
-            assertEquals(if (status == 404 || status == 503) 3 else 1, attempts)
+            assertEquals(if (status == 404 || status == 503) 4 else 1, attempts)
             assertTrue(failures.all { it.status == status && it.start == start })
         }
     }

@@ -161,9 +161,8 @@ internal class IsoVirtualFile(
                     }
                 }
             }
-            fun prefetch() {
-                // Twelve sequential 8 MiB raw windows ahead of the chunk currently being delivered.
-                while (queued.size < 12 && cursor <= range.end && method != "HEAD") {
+            fun prefetch(depth: Int) {
+                while (queued.size < depth && cursor <= range.end && method != "HEAD") {
                     session.checkActive()
                     val start = cursor
                     val limit = if (bdav) (IsoRangeReader.WINDOW_BYTES / 192) * 188 else IsoRangeReader.WINDOW_BYTES
@@ -184,7 +183,8 @@ internal class IsoVirtualFile(
                 queued.removeFirst()
                 return data
             }
-            prefetch()
+            // Admit only the active range head until its bytes are ready, including after seeks.
+            prefetch(1)
             var chunk = nextChunk()
             val headers = buildString {
                 append(if (range.partial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
@@ -202,12 +202,11 @@ internal class IsoVirtualFile(
             write(headers.toByteArray(Charsets.US_ASCII))
             var delivered = 0L
             while (chunk != null) {
-                prefetch()
+                prefetch(IsoRangeReader.MAX_CONCURRENT_READS)
                 write(chunk)
                 flush()
                 delivered += chunk.size
                 session.log("ISO_PROXY_CHUNK_COMPLETE", "sent=$delivered/${range.length} virtual=${range.start}-${range.end}")
-                prefetch()
                 chunk = nextChunk()
             }
             flush()

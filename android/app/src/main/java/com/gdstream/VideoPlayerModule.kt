@@ -16,6 +16,13 @@ import android.util.Rational
 import android.view.Display
 import android.view.View
 import android.view.ViewGroup
+import androidx.media3.common.C
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Tracks
+import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.extractor.DefaultExtractorsFactory
+import androidx.media3.extractor.ExtractorsFactory
+import androidx.media3.extractor.ts.PsExtractor
 import com.facebook.react.uimanager.util.ReactFindViewUtil
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
@@ -66,20 +73,26 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
 
         @androidx.annotation.Keep
         @JvmStatic
-        fun archiveExtractors(url: String?): androidx.media3.extractor.ExtractorsFactory {
-            if (url == null || !SecurityVaultModule.isIsoStream(url) ||
-                (!url.substringBefore('?').endsWith(".m2ts", true) && !url.substringBefore('?').endsWith(".ts", true))) return androidx.media3.extractor.DefaultExtractorsFactory()
-            val profile = SecurityVaultModule.bluRayProfile(url)
-            val dv = preferredHdrMode == "dv"
-            return androidx.media3.extractor.ExtractorsFactory { arrayOf(BluRayTsExtractor(profile, dv)) }
+        fun archiveExtractors(url: String?): ExtractorsFactory {
+            if (url == null || !SecurityVaultModule.isIsoStream(url)) return DefaultExtractorsFactory()
+            return isoExtractors(Uri.parse(url), SecurityVaultModule.bluRayProfile(url), preferredHdrMode == "dv")
         }
 
         @androidx.annotation.Keep
         @JvmStatic
         fun attachArchivePlayer(rawPlayer: Any, url: String?): AutoCloseable? {
             val player = rawPlayer as? androidx.media3.exoplayer.ExoPlayer ?: return null
-            if (url == null || !SecurityVaultModule.isIsoStream(url) ||
-                !url.substringBefore('?').endsWith(".m2ts", true) && !url.substringBefore('?').endsWith(".ts", true)) return null
+            // This hook runs on every source change, before prepare().
+            player.removeAnalyticsListener(DvdDiagnostics)
+            if (url == null || !SecurityVaultModule.isIsoStream(url)) return null
+            when (Uri.parse(url).videoExtension) {
+                "vob" -> {
+                    player.addAnalyticsListener(DvdDiagnostics)
+                    return null
+                }
+                "m2ts", "ts" -> Unit
+                else -> return null
+            }
             DebugLogger.log("ISO_FFMPEG_READY", "available=${androidx.media3.decoder.ffmpeg.FfmpegLibrary.isAvailable()} dtsHd=${androidx.media3.decoder.ffmpeg.FfmpegLibrary.supportsFormat(androidx.media3.common.MimeTypes.AUDIO_DTS_HD)} version=${androidx.media3.decoder.ffmpeg.FfmpegLibrary.getVersion()}")
             return IsoAudioClockGuard(player)
         }
@@ -339,14 +352,8 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
                 ArchiveProxyStreams.prepare(url)
                 ArchiveStreamService.start(reactApplicationContext)
             }
-            val mimeType = externalVideoMimeType(playableUri.path.orEmpty())
-            DebugLogger.log("EXTERNAL_PLAYER_LAUNCH", "uri=${safeStreamUrl(playableUri.toString())} mime=$mimeType registeredIso=${SecurityVaultModule.isIsoStream(url)}; preserving proxy registration")
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(playableUri, mimeType)
-                putExtra(Intent.EXTRA_TITLE, playableUri.lastPathSegment ?: "GDStream")
-                putExtra("title", playableUri.lastPathSegment ?: "GDStream")
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
+            val intent = externalVideoIntent(playableUri)
+            DebugLogger.log("EXTERNAL_PLAYER_LAUNCH", "uri=${safeStreamUrl(playableUri.toString())} mime=${intent.type} registeredIso=${SecurityVaultModule.isIsoStream(url)}; preserving proxy registration")
             val chooser = Intent.createChooser(intent, chooserTitle).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
@@ -507,12 +514,37 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
 
 }
 
-// The ISO proxy emits 188-byte MPEG-TS even though the display filename ends in .m2ts.
-internal fun externalVideoMimeType(path: String): String = when (path.substringAfterLast('.').lowercase(java.util.Locale.ROOT)) {
-    "m3u8" -> "application/x-mpegURL"
-    "m2ts", "ts" -> "video/mp2t"
-    "mp4", "m4v" -> "video/mp4"
-    "mkv" -> "video/x-matroska"
-    "webm" -> "video/webm"
-    else -> "video/*"
+private val Uri.videoExtension get() = lastPathSegment?.substringAfterLast('.')?.lowercase()
+
+internal fun isoExtractors(uri: Uri, profile: BluRayProfile?, dv: Boolean): ExtractorsFactory = when (uri.videoExtension) {
+    "vob" -> PsExtractor.FACTORY
+    "m2ts", "ts" -> ExtractorsFactory { arrayOf(BluRayTsExtractor(profile, dv)) }
+    else -> DefaultExtractorsFactory()
+}
+
+internal fun externalVideoIntent(uri: Uri) = Intent(Intent.ACTION_VIEW).apply {
+    setDataAndType(uri, "video/*")
+    putExtra(Intent.EXTRA_TITLE, uri.lastPathSegment ?: "GDStream")
+    putExtra("title", uri.lastPathSegment ?: "GDStream")
+    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+}
+
+private object DvdDiagnostics : AnalyticsListener {
+    override fun onTracksChanged(eventTime: AnalyticsListener.EventTime, tracks: Tracks) {
+        for (group in tracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }) {
+            for (index in 0 until group.length) {
+                val format = group.getTrackFormat(index)
+                DebugLogger.log("DVD_VIDEO_FORMAT", "mime=${format.sampleMimeType} codecs=${format.codecs} " +
+                    "size=${format.width}x${format.height} supported=${group.isTrackSupported(index)} selected=${group.isTrackSelected(index)}")
+            }
+        }
+    }
+
+    override fun onVideoCodecError(eventTime: AnalyticsListener.EventTime, videoCodecError: Exception) {
+        DebugLogger.log("DVD_RENDERER_ERROR", isoFailureDetails(videoCodecError))
+    }
+
+    override fun onPlayerError(eventTime: AnalyticsListener.EventTime, error: PlaybackException) {
+        DebugLogger.log("DVD_RENDERER_ERROR", "code=${error.errorCodeName} ${isoFailureDetails(error)}")
+    }
 }

@@ -21,6 +21,18 @@
         android:name="android.software.leanback"
         android:required="false" />
 
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="http" android:mimeType="video/*" />
+        </intent>
+        <package android:name="com.brouken.player" />
+        <package android:name="org.videolan.vlc" />
+        <package android:name="com.mxtech.videoplayer.ad" />
+        <package android:name="com.mxtech.videoplayer.pro" />
+        <package android:name="is.xyz.mpv" />
+    </queries>
+
     <application
       android:usesCleartextTraffic="true"
       android:name=".MainApplication"
