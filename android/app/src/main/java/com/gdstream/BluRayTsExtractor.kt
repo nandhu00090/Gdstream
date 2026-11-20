@@ -58,12 +58,16 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
         delegate.init(object : ExtractorOutput {
             override fun track(id: Int, type: Int): TrackOutput {
                 val target = transcoded.track(id, type)
-                val audio = profile?.audio?.firstOrNull { it.pid == id }
+                val audioIdx = profile?.audio?.indexOfFirst { it.pid == id } ?: -1
+                val audio = if (audioIdx >= 0) profile!!.audio[audioIdx] else null
                 return object : TrackOutput by target {
                     override fun format(format: androidx.media3.common.Format) {
-                        val enriched = if (audio != null && type == C.TRACK_TYPE_AUDIO)
-                            format.buildUpon().setLanguage(audio.language).setLabel(format.label ?: audio.label).build()
-                            else format
+                        val enriched = if (audio != null && type == C.TRACK_TYPE_AUDIO) {
+                            val ch = when (format.channelCount) { 1 -> "Mono"; 2 -> "Stereo"; 6 -> "5.1"; 8 -> "7.1"; else -> "" }
+                            val lang = audio.language.takeIf { it.isNotBlank() && it != "und" }
+                            format.buildUpon().setLanguage(lang)
+                                .setLabel(format.label ?: audio.displayLabel(audioIdx, ch)).build()
+                        } else format
                         if (type == C.TRACK_TYPE_AUDIO) DebugLogger.log("ISO_AUDIO_FORMAT",
                             "pid=$id id=${enriched.id} mime=${enriched.sampleMimeType} channels=${enriched.channelCount} rate=${enriched.sampleRate} language=${enriched.language}")
                         if (type == C.TRACK_TYPE_VIDEO) {
@@ -94,15 +98,12 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
         })
     }
     override fun read(input: ExtractorInput, seekPosition: PositionHolder): Int {
-        // Unknown length disables the delegate's end-of-file PCR scan and binary-search seeker.
         inputLength = input.length
         val source = if (indexed == null) input else object : ForwardingExtractorInput(input) {
             override fun getLength() = C.LENGTH_UNSET.toLong()
         }
         return delegate.read(source, seekPosition).also {
             if (it == Extractor.RESULT_END_OF_INPUT) {
-                // TsExtractor only flushes direct PesReader instances; our PID wrappers hide them.
-                // Flush both elementary readers before checking for unmatched base AUs.
                 pidReaders.forEach { reader -> reader.finish() }
                 videoReaders.forEach { reader -> reader.finish() }
                 dv?.finish()
@@ -154,9 +155,7 @@ internal class EndOfInputPayloadReader(private val reader: TsPayloadReader) : Ts
     }
 }
 
-/** Resolve private/incorrect PMT audio types from CLPI only after Media3 supplies the actual PID.
- * MODE_SINGLE_PMT keeps each PID distinct, including multiple tracks with the same codec.
- */
+/** Resolve private/incorrect PMT audio types from CLPI only after Media3 supplies the actual PID. */
 internal class BluRayPidReader(
     private val audio: List<BluRayAudio>, private val advertisedType: Int, private val dualPidDv: Boolean,
     private val create: (Int) -> TsPayloadReader?
@@ -177,7 +176,6 @@ internal class BluRayPidReader(
     }
     override fun seek() { reader?.seek() }
     fun finish() {
-        // Wrapping a PesReader hides it from TsExtractor's EOF drain.
         (reader as? PesReader)?.consume(androidx.media3.common.util.ParsableByteArray(), TsPayloadReader.FLAG_PAYLOAD_UNIT_START_INDICATOR)
     }
 }

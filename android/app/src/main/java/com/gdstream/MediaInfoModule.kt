@@ -1015,7 +1015,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             } catch (_: Exception) {}
             val mkvRes = parseMkvHeaderAndClusters(headBuf, tailBuf, len)
             if (mkvRes.tracks.isNotEmpty()) return mkvRes
-            val tsRes = parseMpegTsHeader(headBuf, len, if (fileNameHint.isNotEmpty()) fileNameHint else urlStr)
+            val tsRes = parseMpegTsHeader(headBuf, tailBuf, len, if (fileNameHint.isNotEmpty()) fileNameHint else urlStr)
             if (tsRes.tracks.isNotEmpty()) return tsRes
             return mkvRes
         }
@@ -1073,7 +1073,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
 
             val mkvRes = parseMkvHeaderAndClusters(headBytes, tailBytes, totalBytes)
             if (mkvRes.tracks.isNotEmpty()) return mkvRes
-            val tsRes = parseMpegTsHeader(headBytes, totalBytes, if (fileNameHint.isNotEmpty()) fileNameHint else urlStr)
+            val tsRes = parseMpegTsHeader(headBytes, tailBytes, totalBytes, if (fileNameHint.isNotEmpty()) fileNameHint else urlStr)
             if (tsRes.tracks.isNotEmpty()) return tsRes
             return mkvRes
         } catch (_: Exception) {
@@ -1845,7 +1845,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
     // =========================================================================
     // BLU-RAY BDAV (.M2TS) & MPEG-2 TRANSPORT STREAM (.TS) PAT/PMT PARSER
     // =========================================================================
-    private fun parseMpegTsHeader(buf: ByteArray, totalBytes: Long, urlStr: String): HeaderParseResult {
+    private fun parseMpegTsHeader(buf: ByteArray, tailBuf: ByteArray?, totalBytes: Long, urlStr: String): HeaderParseResult {
         if (buf.size < 192 * 10) return HeaderParseResult(totalBytes, 0.0, emptyList(), false, -1, false)
 
         // Detect 192-byte BDAV M2TS (sync 0x47 at +4) vs 188-byte TS (sync 0x47 at +0)
@@ -1930,14 +1930,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                         val descEnd = minOf(sEnd, descStart + esInfoLen)
 
                         val decodedHint = try { java.net.URLDecoder.decode(urlStr, "UTF-8") } catch (_: Throwable) { urlStr }
-                        val hintLang = when {
-                            Regex("\\b(tamil|tam)\\b", RegexOption.IGNORE_CASE).containsMatchIn(decodedHint) -> "tam"
-                            Regex("\\b(telugu|tel)\\b", RegexOption.IGNORE_CASE).containsMatchIn(decodedHint) -> "tel"
-                            Regex("\\b(hindi|hin)\\b", RegexOption.IGNORE_CASE).containsMatchIn(decodedHint) -> "hin"
-                            Regex("\\b(malayalam|mal)\\b", RegexOption.IGNORE_CASE).containsMatchIn(decodedHint) -> "mal"
-                            Regex("\\b(kannada|kan)\\b", RegexOption.IGNORE_CASE).containsMatchIn(decodedHint) -> "kan"
-                            else -> "eng"
-                        }
+                        val hintLang = inferLanguageCodeFromName(decodedHint)
                         var langCode = hintLang
                         var regTag = ""
                         var dp = descStart
@@ -2024,9 +2017,16 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             pos += stride
         }
 
-        // Parse duration from [Main Movie - 2h46m] tag in URL if present
         var parsedDurSec = 0.0
-        try {
+        if (stride == 192 && tailBuf != null && StandaloneBdav.matches(buf)) {
+            val alignedTailOffset = (tailBuf.size % 192)
+            val alignedTail = if (alignedTailOffset == 0) tailBuf else tailBuf.copyOfRange(alignedTailOffset, tailBuf.size)
+            runCatching {
+                val bdav = StandaloneBdav.profile(buf, alignedTail, urlStr)
+                if (bdav.durationUs > 0L) parsedDurSec = bdav.durationUs / 1_000_000.0
+            }
+        }
+        if (parsedDurSec <= 0.0) try {
             val decoded = java.net.URLDecoder.decode(urlStr, "UTF-8")
             val hm = Regex("\\[(\\d+)h(\\d+)m\\]").find(decoded)
             val mo = Regex("\\[(\\d+)m\\]").find(decoded)

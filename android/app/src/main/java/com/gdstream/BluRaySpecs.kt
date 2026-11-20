@@ -1,7 +1,6 @@
 package com.gdstream
 
 import org.json.JSONArray
-import org.json.JSONObject
 import java.util.Locale
 
 data class BluRayStream(val pid: Int, val type: Int, val format: Int = 0, val rate: Int = 0,
@@ -46,6 +45,28 @@ internal fun bluRayLanguage(code: String): String {
     return name.ifBlank { canonical }
 }
 
+internal fun inferLanguageCodeFromName(raw: String): String {
+    if (raw.isBlank()) return ""
+    val decoded = runCatching { java.net.URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
+    val clean = decoded.replace('_', ' ').replace('.', ' ').replace('-', ' ')
+    val rules = listOf(
+        "tam" to Regex("\\b(tamil|tam)\\b", RegexOption.IGNORE_CASE),
+        "tel" to Regex("\\b(telugu|tel)\\b", RegexOption.IGNORE_CASE),
+        "hin" to Regex("\\b(hindi|hin)\\b", RegexOption.IGNORE_CASE),
+        "mal" to Regex("\\b(malayalam|mal)\\b", RegexOption.IGNORE_CASE),
+        "kan" to Regex("\\b(kannada|kan)\\b", RegexOption.IGNORE_CASE),
+        "eng" to Regex("\\b(english|eng)\\b", RegexOption.IGNORE_CASE),
+        "jpn" to Regex("\\b(japanese|jpn)\\b", RegexOption.IGNORE_CASE),
+        "kor" to Regex("\\b(korean|kor)\\b", RegexOption.IGNORE_CASE),
+        "spa" to Regex("\\b(spanish|spa)\\b", RegexOption.IGNORE_CASE),
+        "fra" to Regex("\\b(french|fra|fre)\\b", RegexOption.IGNORE_CASE),
+        "deu" to Regex("\\b(german|deu|ger)\\b", RegexOption.IGNORE_CASE),
+        "ita" to Regex("\\b(italian|ita)\\b", RegexOption.IGNORE_CASE),
+        "zho" to Regex("\\b(chinese|mandarin|cantonese|zho|chi)\\b", RegexOption.IGNORE_CASE)
+    )
+    return rules.firstOrNull { it.second.containsMatchIn(clean) }?.first ?: ""
+}
+
 internal fun BluRayProfile.mediaInfo(totalBytes: Long): Map<String, Any> {
     val videos = streams.filter { it.video }
     val main = videos.maxByOrNull { it.height }
@@ -55,7 +76,7 @@ internal fun BluRayProfile.mediaInfo(totalBytes: Long): Map<String, Any> {
     val dual = videos.any { it.type == 0x24 && it.height == 2160 } &&
         videos.any { it.type == 0x24 && it.height == 1080 && it.pid == 0x1015 }
     val dv = dolbyVision || labelDv || dual || videos.any { it.dynamicRange == 3 }
-    
+
     val height = main?.height?.takeIf { it > 0 } ?: when {
         Regex("\\b(2160P|UHD|4K)\\b", RegexOption.IGNORE_CASE).containsMatchIn(label) -> 2160
         Regex("\\b1080[PI]\\b", RegexOption.IGNORE_CASE).containsMatchIn(label) -> 1080
@@ -63,23 +84,30 @@ internal fun BluRayProfile.mediaInfo(totalBytes: Long): Map<String, Any> {
     }
     val hdr = labelHdr || videos.any { it.dynamicRange == 2 } || (dv && height == 2160)
     val audioStreams = streams.filter { it.audio }.ifEmpty { audio.map { BluRayStream(it.pid, it.type, language = it.language) } }
-    val audioInfo = audioStreams.distinctBy { it.pid }.map { stream ->
+    val audioInfo = audioStreams.distinctBy { it.pid }.mapIndexed { index, stream ->
         val channels = stream.layout.ifEmpty { when (stream.format) { 1 -> "1.0 ch"; 3 -> "2.0 ch"; else -> "" } }
-        val language = bluRayLanguage(stream.language)
+        val resolvedLang = bluRayLanguage(stream.language)
+        val displayLang = if (resolvedLang == "Unknown") "Audio ${index + 1}" else resolvedLang
         val rate = if (stream.type in listOf(0x83, 0x86)) {
             if (stream.kbps > 0) "Lossless (${stream.kbps} kbps core)" else "Lossless"
         } else if (stream.kbps > 0) "${stream.kbps} kbps" else ""
-        mapOf("language" to language, "codec" to stream.codec, "channels" to channels, "bitrateKbps" to stream.kbps,
-            "summary" to listOf(language, stream.codec, channels, rate).filter { it.isNotEmpty() }.joinToString(" • "))
+        mapOf("language" to displayLang, "codec" to stream.codec, "channels" to channels, "bitrateKbps" to stream.kbps,
+            "summary" to listOf(displayLang, stream.codec, channels, rate).filter { it.isNotEmpty() }.joinToString(" • "))
     }
+    val subInfo = streams.filter { it.type == 0x90 }.distinctBy { it.pid }.mapIndexed { index, stream ->
+        val resolvedLang = bluRayLanguage(stream.language)
+        val displayLang = if (resolvedLang == "Unknown") "PGS Subtitle ${index + 1}" else resolvedLang
+        mapOf("language" to displayLang, "format" to "PGS")
+    }
+    val knownLangs = audioStreams.map { bluRayLanguage(it.language) }.filter { it != "Unknown" }.distinct()
     return mapOf("width" to when (height) { 2160 -> 3840; 1080 -> 1920; 720 -> 1280; 480, 576 -> 720; else -> 0 },
         "height" to height, "resolution" to if (height == 0) "Unknown" else "${height}${if (main?.format in listOf(1, 2, 4)) "i" else "p"}", "videoCodec" to (main?.codec ?: "Unknown"),
         "videoBitrateMbps" to if (durationUs > 0) (totalBytes * 8.0 / durationUs - audioStreams.sumOf { it.sampledKbps.takeIf { rate -> rate > 0 } ?: it.kbps } / 1000.0).coerceAtLeast(0.0) else 0.0,
         "frameRate" to when (main?.rate) { 1 -> 23.976; 2 -> 24.0; 3 -> 25.0; 4 -> 29.97; 6 -> 50.0; 7 -> 59.94; else -> 0.0 },
         "durationSec" to durationUs / 1_000_000.0, "totalBytes" to totalBytes.toDouble(), "hasDV" to dv, "hasHDR" to hdr,
         "dvProfile" to if (dv && hdr) 7 else -1, "hasAtmos" to false, "audioTracks" to audioInfo,
-        "subtitleTracks" to streams.filter { it.type == 0x90 }.distinctBy { it.pid }.map { mapOf("language" to bluRayLanguage(it.language), "format" to "PGS") },
-        "languages" to audioStreams.map { bluRayLanguage(it.language) }.distinct(), "discLabel" to discLabel)
+        "subtitleTracks" to subInfo,
+        "languages" to knownLangs, "discLabel" to discLabel)
 }
 
 /** MPLS primary STN descriptors supplement CLPI; num_dv identifies an enhancement stream. */

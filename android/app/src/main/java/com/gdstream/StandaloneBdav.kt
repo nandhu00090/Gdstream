@@ -11,7 +11,17 @@ internal object StandaloneBdav {
         for (packet in 0 until ts.size / 188) {
             head.copyInto(ts, packet * 188, packet * 192 + 4, (packet + 1) * 192)
         }
-        val streams = DiscAudio.inspectM2ts(head, BluRayPsi.streams(ts))
+        val inferredLang = inferLanguageCodeFromName(label)
+        var appliedPrimary = false
+        val streams = DiscAudio.inspectM2ts(head, BluRayPsi.streams(ts)).map { stream ->
+            if (stream.audio && (stream.language.isBlank() || stream.language == "und") &&
+                inferredLang.isNotEmpty() && !appliedPrimary) {
+                appliedPrimary = true
+                stream.copy(language = inferredLang)
+            } else {
+                stream
+            }
+        }
         val first = timestamps(head)
         val last = timestamps(tail)
         // Use one elementary clock at both ends. Prefer the main video when it spans both samples.

@@ -360,6 +360,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
             if (playableUri.host == "127.0.0.1" || playableUri.host == "localhost") {
                 ArchiveProxyStreams.prepare(url)
                 ArchiveStreamService.start(reactApplicationContext)
+                SecurityVaultModule.prefetchExternalLaunch(url)
             }
             val intent = externalVideoIntent(playableUri)
             DebugLogger.log("EXTERNAL_PLAYER_LAUNCH", "uri=${safeStreamUrl(playableUri.toString())} mime=${intent.type} registeredIso=${SecurityVaultModule.isIsoStream(url)}; preserving proxy registration")

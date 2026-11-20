@@ -6,19 +6,22 @@ import org.json.JSONObject
 /** Positions are in the proxy's 188-byte TS address space, never ISO sectors or 192-byte SPNs. */
 data class BluRayPoint(val timeUs: Long, val position: Long)
 data class BluRayAudio(val pid: Int, val type: Int, val language: String) {
-    val label: String get() {
-        val name = bluRayLanguage(language)
-        val codec = when (type) {
-            0x80 -> "LPCM"
-            0x81 -> "AC-3"
-            0x83 -> "TrueHD"
-            0x82 -> "DTS"
-            0x85 -> "DTS-HD"
-            0x86 -> "DTS-HD MA"
-            else -> "Audio"
-        }
-        return "$name $codec"
+    val codecName: String get() = when (type) {
+        0x80 -> "LPCM"
+        0x81 -> "AC-3"
+        0x83 -> "TrueHD"
+        0x84, 0xa1 -> "E-AC-3"
+        0x82 -> "DTS"
+        0x85 -> "DTS-HD"
+        0x86 -> "DTS-HD MA"
+        else -> "Audio"
     }
+    fun displayLabel(trackIndex: Int, channels: String = ""): String {
+        val name = bluRayLanguage(language)
+        val prefix = if (name == "Unknown") "Audio ${trackIndex + 1} • $codecName" else "$name $codecName"
+        return if (channels.isNotEmpty()) "$prefix • $channels" else prefix
+    }
+    val label: String get() = displayLabel(0)
 }
 data class BluRayProfile(val durationUs: Long, val points: List<BluRayPoint>, val audio: List<BluRayAudio>,
     val streams: List<BluRayStream> = emptyList(), val discLabel: String = "", val dolbyVision: Boolean = false) {
@@ -69,7 +72,6 @@ internal object BluRayClipInfo {
         val outTicks = u32(p + 22)
         require(outTicks > inTicks)
         val profile = parse(data, inTicks, outTicks - inTicks, rawSize)
-        // Multiple clock epochs need a splice timeline; do not advertise a misleading duration.
         return if (data[p + 5].toInt() == 1 && data[p + 10].toInt() == 1) profile
             else profile.copy(durationUs = 0, points = emptyList())
     }
@@ -120,8 +122,6 @@ internal object BluRayClipInfo {
         }
         val points = ArrayList<BluRayPoint>()
         val durationUs = Math.multiplyExact(durationTicks, 1_000_000L) / 45000L
-        // The proxy currently serves the whole selected clip. A trimmed play item or multiple
-        // STC epochs cannot share that clip's zero-based clock without an explicit splice layer.
         section(8)?.let { (start, end) ->
             require(start + 6 <= end)
             if (uint(start + 5, 1) != 1L) return BluRayProfile(durationUs, points, audio, streams)
@@ -160,10 +160,9 @@ internal object BluRayClipInfo {
             val until = coarse.getOrNull(index + 1)?.ref ?: entry.fine
             val fine = Bits(data, (fineStart.toInt() + c.ref * 4) * 8, end)
             for (i in c.ref until until) {
-                fine.read(4) // angle change + I-picture end offset
+                fine.read(4)
                 val ticks = ((c.pts and -2L) shl 18) + (fine.read(11) shl 8)
                 val packet = (c.spn and -131072L) + fine.read(17)
-                // Fine PTS is quantized to 256 ticks. Clamp the first entry to zero.
                 val relative = ticks - inTicks
                 if (relative >= -256 && relative < durationTicks && packet < rawSize / 192) {
                     val point = BluRayPoint(maxOf(0, relative) * 1_000_000 / 45000, packet * 188)

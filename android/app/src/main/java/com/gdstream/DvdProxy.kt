@@ -27,18 +27,23 @@ internal object DvdProxy {
 
     data class Encoder(val name: String, val color: Int)
     fun encoder(width: Int, height: Int): Encoder? {
-        if (!runCatching { androidx.media3.decoder.ffmpeg.FfmpegLibrary.getVersion()?.startsWith("Lavc60.") == true && hasDecoder() }.getOrDefault(false)) return null
-        for (codec in MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos) {
+        if (!runCatching { hasDecoder() }.getOrDefault(false)) return null
+        val codecs = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+        var softwareFallback: Encoder? = null
+        for (codec in codecs) {
             if (!codec.isEncoder || !codec.supportedTypes.contains("video/avc")) continue
-            if (if (Build.VERSION.SDK_INT >= 29) !codec.isHardwareAccelerated else
-                codec.name.startsWith("OMX.google.") || codec.name.startsWith("c2.android.")) continue
+            val isHw = if (Build.VERSION.SDK_INT >= 29) codec.isHardwareAccelerated else
+                !codec.name.startsWith("OMX.google.") && !codec.name.startsWith("c2.android.")
             val caps = codec.getCapabilitiesForType("video/avc")
             if (caps.videoCapabilities?.isSizeSupported(width, height) != true) continue
             val color = listOf(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar).firstOrNull { it in caps.colorFormats }
-            if (color != null) return Encoder(codec.name, color)
+            if (color != null) {
+                if (isHw) return Encoder(codec.name, color)
+                if (softwareFallback == null) softwareFallback = Encoder(codec.name, color)
+            }
         }
-        return null
+        return softwareFallback
     }
 
     data class Segment(val start: Long, val end: Long, val durationUs: Long)
@@ -57,7 +62,8 @@ internal object DvdProxy {
         val height = (info.getValue("height") as Number).toInt()
         val handle = open(encoder.name, encoder.color, width, height, (info.getValue("frameRate") as Number).toDouble())
         if (handle == 0L) throw IOException("DVD AVC encoder initialization failed")
-        val mux = DvdTsMux()
+        val audioLang = (info["audioLanguageCode"] as? String).orEmpty()
+        val mux = DvdTsMux(audioLang)
         try {
             demux(data, (info["ac3Substream"] as? Number)?.toInt() ?: -1) { video, pts, sample ->
                 session.checkActive()
@@ -140,7 +146,7 @@ internal object DvdProxy {
 
     data class Standalone(val info: Map<String, Any>, val segments: List<Segment>)
 
-    fun standalone(head: ByteArray, tail: ByteArray, size: Long): Standalone? {
+    fun standalone(head: ByteArray, tail: ByteArray, size: Long, fileName: String = ""): Standalone? {
         var first = C.TIME_UNSET
         var last = C.TIME_UNSET
         var width = 0
@@ -166,10 +172,11 @@ internal object DvdProxy {
         val span = last - first
         val duration = if (span < 0) span + (1L shl 33) * 1000000 / 90000 else span
         if (duration <= 0) return null
+        val inferredLang = inferLanguageCodeFromName(fileName)
         val streams = mutableListOf(BluRayStream(0xe0, 2, format = if (height == 576) 2 else 1, rate = if (height == 576) 3 else 4))
-        if (audioId >= 0) streams.add(BluRayStream(audioId, 0x81, layout = audioFormat.layout, kbps = audioFormat.kbps))
+        if (audioId >= 0) streams.add(BluRayStream(audioId, 0x81, language = inferredLang, layout = audioFormat.layout, kbps = audioFormat.kbps))
         val info = BluRayProfile(duration, emptyList(), emptyList(), streams).mediaInfo(size) +
-            mapOf("ac3Substream" to audioId, "width" to width)
+            mapOf("ac3Substream" to audioId, "width" to width, "audioLanguageCode" to inferredLang)
         return Standalone(info, estimatedSegments(size, duration))
     }
 
@@ -194,11 +201,10 @@ internal object DvdProxy {
         }
         return offset
     }
-
 }
 
 /** Each segment starts with PSI and an IDR. PCR uses the video timeline. */
-internal class DvdTsMux {
+internal class DvdTsMux(private val audioLanguageCode: String = "") {
     private data class UnitData(val video: Boolean, val pts: Long, val data: ByteArray)
     private val samples = ArrayList<UnitData>()
     fun video(pts: Long, bytes: ByteArray) { samples.add(UnitData(true, pts, bytes)) }
@@ -237,9 +243,19 @@ internal class DvdTsMux {
             packets(pid, byteArrayOf(0) + body + ByteArray(4) { (crc ushr (24 - it * 8)).toByte() })
         }
         psi(0, byteArrayOf(0, 0xb0.toByte(), 0, 0, 1, 0xc1.toByte(), 0, 0, 0, 1, 0xe1.toByte(), 0))
-        val pmt = byteArrayOf(2, 0xb0.toByte(), 0, 0, 1, 0xc1.toByte(), 0, 0, 0xe1.toByte(), 1, 0xf0.toByte(), 0,
+        val pmtBase = byteArrayOf(2, 0xb0.toByte(), 0, 0, 1, 0xc1.toByte(), 0, 0, 0xe1.toByte(), 1, 0xf0.toByte(), 0,
             0x1b, 0xe1.toByte(), 1, 0xf0.toByte(), 0)
-        psi(256, if (samples.any { !it.video }) pmt + byteArrayOf(0x81.toByte(), 0xe1.toByte(), 2, 0xf0.toByte(), 0) else pmt)
+        val audioDesc = ByteArrayOutputStream().apply {
+            write(byteArrayOf(0x05, 0x04, 'A'.code.toByte(), 'C'.code.toByte(), '-'.code.toByte(), '3'.code.toByte()))
+            write(byteArrayOf(0x6A, 0x01, 0x00))
+            if (audioLanguageCode.length == 3 && audioLanguageCode.all { it in 'a'..'z' }) {
+                write(byteArrayOf(0x0A, 0x04))
+                write(audioLanguageCode.toByteArray(Charsets.US_ASCII))
+                write(0)
+            }
+        }.toByteArray()
+        val pmtAudio = byteArrayOf(0x81.toByte(), 0xe1.toByte(), 2, (0xf0 or (audioDesc.size ushr 8)).toByte(), audioDesc.size.toByte()) + audioDesc
+        psi(256, if (samples.any { !it.video }) pmtBase + pmtAudio else pmtBase)
         for (sample in samples.sortedBy { it.pts }) {
             val ticks = sample.pts * 9 / 100
             val size = if (sample.video) 0 else sample.data.size + 8

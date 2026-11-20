@@ -106,11 +106,19 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
         return result.takeIf { list -> list.all { it.end - it.start in 1..12L * 1024 * 1024 && it.durationUs > 0 } }.orEmpty()
     }
 
-    fun info(title: Title, sample: ByteArray, bytes: Long): Map<String, Any> {
-        fun language(p: Int): String {
-            val code = String(ifo, p, 2, Charsets.US_ASCII)
-            return if (code.all { it in 'a'..'z' }) Locale(code).getDisplayLanguage(Locale.ENGLISH)
-            else "Unknown"
+    fun info(title: Title, sample: ByteArray, bytes: Long, fallbackHint: String = ""): Map<String, Any> {
+        val inferredCode = inferLanguageCodeFromName(fallbackHint)
+        val inferredName = if (inferredCode.isNotEmpty()) bluRayLanguage(inferredCode) else ""
+        fun language(p: Int, useFallback: Boolean = false): Pair<String, String> {
+            val code = String(ifo, p, 2, Charsets.US_ASCII).lowercase(Locale.ROOT)
+            if (code.all { it in 'a'..'z' } && code != "xx" && code != "un") {
+                val loc = Locale(code)
+                val name = loc.getDisplayLanguage(Locale.ENGLISH)
+                val iso3 = runCatching { loc.isO3Language }.getOrDefault("")
+                if (name.isNotBlank() && !name.equals(code, true)) return name to iso3
+            }
+            if (useFallback && inferredName.isNotEmpty()) return inferredName to inferredCode
+            return "Unknown" to ""
         }
         fun s(i: Int) = sample[i].toInt() and 255
         val frames = HashMap<Int, ByteArray>()
@@ -139,6 +147,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
             if (at + 4 < end && s(at) !in frames) frames[s(at)] = sample.copyOfRange(at + 4, end)
         }
         var ac3Substream = -1
+        var primaryAudioCode = ""
         val audio =
             (0 until word(0x202).coerceAtMost(8)).mapNotNull { index ->
                 val control = word(title.pgc + 12 + index * 2)
@@ -177,7 +186,8 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
                                 (if (u(p + 1) and 16 != 0) 96 else 48) *
                                 count)
                         else mpegRates[0xc0 + track] ?: 0
-                val lang = language(p + 2)
+                val (lang, iso3) = language(p + 2, useFallback = index == 0)
+                if (primaryAudioCode.isEmpty() && iso3.isNotEmpty()) primaryAudioCode = iso3
                 mapOf(
                     "language" to lang,
                     "channels" to layout,
@@ -191,7 +201,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
         val subs =
             (0 until word(0x254).coerceAtMost(32))
                 .filter { u(title.pgc + 28 + it * 4) and 128 != 0 }
-                .map { mapOf("language" to language(0x258 + it * 6), "format" to "DVD Subpicture") }
+                .map { mapOf("language" to language(0x258 + it * 6).first, "format" to "DVD Subpicture") }
         val pal = u(0x200) and 0x10 != 0
         val picture = (u(0x201) ushr 2) and 3
         val height = (if (pal) 576 else 480) / if (picture == 3) 2 else 1
@@ -213,6 +223,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
             "frameRate" to if (pal) 25.0 else 30000.0 / 1001,
             "audioTracks" to audio,
             "ac3Substream" to ac3Substream,
+            "audioLanguageCode" to primaryAudioCode,
             "subtitleTracks" to subs,
             "languages" to audio.map { it.getValue("language") }.distinct(),
             "hasHDR" to false,

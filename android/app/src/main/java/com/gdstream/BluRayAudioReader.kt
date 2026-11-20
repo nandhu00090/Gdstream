@@ -21,12 +21,15 @@ internal abstract class BluRayAudioReader(private val tracks: List<BluRayAudio>,
     private lateinit var output: TrackOutput
     private var id = ""
     private var track: BluRayAudio? = null
+    private var trackIndex = 0
     private var lastFormat: Format? = null
     protected abstract fun frame(data: ByteArray, length: Int, end: Boolean): Frame?
     override fun createTracks(extractorOutput: ExtractorOutput, idGenerator: TsPayloadReader.TrackIdGenerator) {
         idGenerator.generateNewId()
         id = idGenerator.formatId
-        track = tracks.firstOrNull { it.pid == idGenerator.trackId }
+        val idx = tracks.indexOfFirst { it.pid == idGenerator.trackId }
+        trackIndex = if (idx >= 0) idx else 0
+        track = if (idx >= 0) tracks[idx] else null
         output = extractorOutput.track(idGenerator.trackId, C.TRACK_TYPE_AUDIO)
     }
     protected open fun resetFrameState() {}
@@ -50,8 +53,9 @@ internal abstract class BluRayAudioReader(private val tracks: List<BluRayAudio>,
             while (timestamps.isNotEmpty() && timestamps.first.first <= absoluteStart) timeUs = timestamps.removeFirst().second
             if (frame.data.isNotEmpty()) {
                 val channels = when (frame.format.channelCount) { 1 -> "Mono"; 2 -> "Stereo"; 6 -> "5.1"; 8 -> "7.1"; else -> "${frame.format.channelCount} ch" }
-                val label = track?.label?.let { "$it • $channels" }
-                val format = frame.format.buildUpon().setId(id).setLanguage(track?.language ?: language)
+                val label = track?.displayLabel(trackIndex, channels)
+                val resolvedLang = (track?.language?.takeIf { it.isNotBlank() && it != "und" } ?: language?.takeIf { it.isNotBlank() && it != "und" })
+                val format = frame.format.buildUpon().setId(id).setLanguage(resolvedLang)
                     .setLabel(label).setContainerMimeType(MimeTypes.VIDEO_MP2T).build()
                 if (format != lastFormat) {
                     output.format(format)
@@ -157,10 +161,7 @@ internal class BluRayDtsReader(private val hd: Boolean, tracks: List<BluRayAudio
     }
 }
 
-/** TrueHD access units interleaved with independent AC-3 syncframes on the HDMV PID.
- * Skip the AC-3 companion before handing lossless access units to FFmpeg. After a seek,
- * minor syncs are unusable until a new major sync supplies the decoder configuration.
- */
+/** TrueHD access units interleaved with independent AC-3 syncframes on the HDMV PID. */
 internal class BluRayTrueHdReader(tracks: List<BluRayAudio>, language: String?) : BluRayAudioReader(tracks, language) {
     private var format: Format? = null
     private var duration = 0L
@@ -176,7 +177,6 @@ internal class BluRayTrueHdReader(tracks: List<BluRayAudio>, language: String?) 
         val major = data[4] == 0xf8.toByte() && data[5] == 0x72.toByte() &&
             data[6] == 0x6f.toByte() && data[7] == 0xba.toByte()
         if (format == null && !major) {
-            // Search in one pass after byte seeks; retaining nine bytes handles split sync words.
             val next = (1 until length - 9).firstOrNull { at ->
                 data[at + 4] == 0xf8.toByte() && data[at + 5] == 0x72.toByte() &&
                     data[at + 6] == 0x6f.toByte() && data[at + 7] == 0xba.toByte()
