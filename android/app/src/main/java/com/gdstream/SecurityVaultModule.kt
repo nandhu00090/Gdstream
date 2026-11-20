@@ -191,6 +191,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             ArchiveProxyStreams.streamId(url)?.let { saveMediaInfo?.invoke(it, info) }
         }
         @Volatile private var externalIsoUrl: ((String) -> String)? = null
+        @Volatile private var externalPrefetch: ((String) -> Unit)? = null
+        internal fun prefetchExternalLaunch(url: String) { externalPrefetch?.invoke(url) }
         @Volatile private var restoreOffline: ((String) -> String)? = null
         internal fun downloadUrl(url: String): String =
             if (ArchiveProxyStreams.streamId(url) != null && java.net.URI(url).rawQuery == "offline=m2ts")
@@ -234,6 +236,24 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val uri = java.net.URI(url)
                 "${uri.scheme}://${uri.rawAuthority}/hls/${entry.id}/index.m3u8"
             } else externalIsoTsUrl(url, entry.fileName, entry.archiveFormat == "ISO" && entry.isBdavM2ts)
+        }
+        externalPrefetch = { url ->
+            val entry = ArchiveProxyStreams.streamId(url)?.let { archiveEntryRegistry[it] }
+            if (entry != null && entry.archiveFormat == "ISO" && entry.segments != null && entry.sourceSize > 0) {
+                ioExecutor.submit {
+                    try {
+                        val warmSession = IsoReadSession()
+                        val file = IsoVirtualFile(entry.segments, entry.isBdavM2ts)
+                        val cache = isoChunkCaches.acquire(entry.archiveUrl, warmSession, entry.sourceSize)
+                        val length = minOf(file.size, 32L * 1024 * 1024).toInt()
+                        cache.prefetch(file.mappedRanges(0L, length), entry.sourceSize) { from, to, owner ->
+                            if (entry.standalone) readStandalone(entry.archiveUrl, from, to, owner)
+                            else fetchIsoByteRange(entry.archiveUrl, from, to, owner)
+                        }
+                        appendDebugLog("EXTERNAL_PREFETCH", "entry=${entry.id} bytes=$length")
+                    } catch (_: Exception) {}
+                }
+            }
         }
         restoreOffline = { url ->
             val uri = java.net.URI(url)
@@ -289,7 +309,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
                 if (vob) {
                     val (head, tail) = sample(512 * 1024)
-                    val disc = DvdProxy.standalone(head, tail, size)
+                    val disc = DvdProxy.standalone(head, tail, size, name)
                     val fileName = if (name.endsWith(".vob", true)) name else "$name.vob"
                     val item = registerIsoStreamTarget(url, size, fileName, size, listOf(0L to size),
                         ensureArchiveProxyRunning(), "video/mpeg", dvdInfo = disc?.info,
@@ -1169,13 +1189,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         if (method != "GET" || entry.sourceSize <= 0 || position >= file.size) return
                         val next = nextWarm.get()
                         if (position < next || !nextWarm.compareAndSet(next, position + 8L * 1024 * 1024)) return
-                        val length = minOf(file.size - position, 32L * 1024 * 1024).toInt()
+                        val length = minOf(file.size - position, 48L * 1024 * 1024).toInt()
                         isoChunkCache.prefetch(file.mappedRanges(position, length), entry.sourceSize, ::upstream)
                     }
                     warm(segment.start)
                     val prefix = program.prefix(renditionStreams, audioPid, hls.audio.isNotEmpty() && audioPid == null)
                     if (audioPid != null) {
-                        val audio = segment.audioBytes(prefix, audioPid) { start, count ->
+                        val audioType = renditionStreams.firstOrNull { it.pid == audioPid }?.type ?: 0
+                        val audio = segment.audioBytes(prefix, audioPid, audioType) { start, count ->
                             warm(start)
                             rawTs(start, count)
                         }

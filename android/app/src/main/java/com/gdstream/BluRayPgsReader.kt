@@ -19,10 +19,15 @@ internal class BluRayPgsReader(private val tracks: List<BluRayStream>, private v
     private var displayTimeUs = C.TIME_UNSET
     override fun createTracks(extractorOutput: ExtractorOutput, idGenerator: TsPayloadReader.TrackIdGenerator) {
         idGenerator.generateNewId()
-        val track = tracks.firstOrNull { it.pid == idGenerator.trackId }
+        val pgsTracks = tracks.filter { it.type == 0x90 }
+        val idx = pgsTracks.indexOfFirst { it.pid == idGenerator.trackId }
+        val track = if (idx >= 0) pgsTracks[idx] else tracks.firstOrNull { it.pid == idGenerator.trackId }
+        val rawLang = (track?.language?.takeIf { it.isNotBlank() && it != "und" } ?: language?.takeIf { it.isNotBlank() && it != "und" })
+        val resolvedLang = rawLang?.let { bluRayLanguage(it) } ?: "Unknown"
+        val label = if (resolvedLang == "Unknown") "PGS Subtitle ${(if (idx >= 0) idx else 0) + 1}" else "$resolvedLang PGS"
         output = extractorOutput.track(idGenerator.trackId, C.TRACK_TYPE_TEXT)
         output.format(Format.Builder().setId(idGenerator.formatId).setSampleMimeType(MimeTypes.APPLICATION_PGS)
-            .setLanguage(track?.language ?: language).setLabel(track?.let { "${bluRayLanguage(it.language)} PGS" })
+            .setLanguage(rawLang).setLabel(label)
             .setContainerMimeType(MimeTypes.VIDEO_MP2T).build())
     }
     override fun seek() { pending = ByteArray(0); display.reset(); timeUs = C.TIME_UNSET; displayTimeUs = C.TIME_UNSET }

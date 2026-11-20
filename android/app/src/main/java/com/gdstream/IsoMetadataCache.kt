@@ -4,8 +4,7 @@ import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
 
-/** Split a logical metadata read at physical block boundaries; UDF entries, CLPI, IFO
- * and audio sampling all join the same block flights as playback. */
+/** Split a logical metadata read at 2 MiB physical block boundaries. */
 internal class IsoMetadataReadAhead(
     private val size: Long,
     private val cache: IsoChunkCache,
@@ -16,8 +15,8 @@ internal class IsoMetadataReadAhead(
     fun read(first: Long, last: Long): ByteArray {
         if (first < 0 || last >= size || last < first || last - first >= 8L * 1024 * 1024)
             throw IOException("Invalid ISO metadata range")
-        fun slice(start: Long, end: Long) = cache.read(start, end, 0, size - 1, session, fetch)
-        val block = IsoChunkCache.BLOCK_BYTES
+        val block = IsoChunkCache.METADATA_BLOCK_BYTES
+        fun slice(start: Long, end: Long) = cache.read(start, end, 0, size - 1, session, fetch, blockBytes = block)
         if (first / block == last / block) return slice(first, last)
         val jobs = (first / block..last / block).map { index ->
             executor.submit<ByteArray> { slice(maxOf(first, index * block), minOf(last, (index + 1) * block - 1)) }
@@ -37,8 +36,6 @@ internal class IsoMetadataReadAhead(
 
 /** Resolved entry/profile blob, separate from transient proxy URLs and legacy ZIP identity rules. */
 internal class IsoIndexDiskCache(private val directory: File, private val legacy: File? = null) {
-    // Directory listings occasionally omit size. Reuse the most recently resolved identity
-    // until a listing supplies a fresh size, retaining the size check on every actual lookup.
     @Synchronized
     fun lastKnownSize(url: String): Long? {
         val prefix = identity(url) + "-"
@@ -48,7 +45,7 @@ internal class IsoIndexDiskCache(private val directory: File, private val legacy
 
     @Synchronized
     fun get(url: String, size: Long): String? {
-        if (size <= 0) return null // Unknown size cannot safely identify a cached image.
+        if (size <= 0) return null
         return try {
             val file = File(directory, key(url, size))
             if (file.length() in 1..MAX_ENTRY_BYTES) file.readText(Charsets.UTF_8) else {
@@ -87,7 +84,6 @@ internal class IsoIndexDiskCache(private val directory: File, private val legacy
             directory.listFiles()?.filter { it.name.endsWith(".json") }
                 ?.sortedByDescending { it.lastModified() }?.drop(64)?.forEach { it.delete() }
         } catch (_: IOException) {
-            // Cache failure must not prevent playback.
         } finally { temporary?.delete() }
     }
 
@@ -96,7 +92,6 @@ internal class IsoIndexDiskCache(private val directory: File, private val legacy
         private const val MAX_ENTRY_BYTES = 8L * 1024 * 1024
         fun key(url: String, size: Long) = "${identity(url)}-$size.json"
         private fun identity(url: String): String {
-            // Keep query parameters: two downloads may differ only by id/token. Never persist redirects.
             val canonical = runCatching { java.net.URI(url.substringBefore('#')).normalize().toASCIIString() }.getOrDefault(url.substringBefore('#'))
             return digest("$VERSION\n$canonical")
         }
