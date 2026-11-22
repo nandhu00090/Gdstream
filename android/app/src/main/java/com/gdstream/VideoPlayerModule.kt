@@ -19,6 +19,10 @@ import android.view.ViewGroup
 import androidx.media3.common.C
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Tracks
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.extractor.ExtractorsFactory
@@ -70,6 +74,20 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
         @JvmStatic
         fun selectAudioTrackFromCatalog(rawPlayer: Any, type: String?, value: String?, preserveDefault: Boolean): Boolean =
             AudioTrackCatalog.select(rawPlayer as androidx.media3.exoplayer.ExoPlayer, type, value, preserveDefault)
+
+        @androidx.annotation.Keep
+        @JvmStatic
+        fun archiveHttp(url: String, headers: Map<String, String>, retryCount: Int):
+            android.util.Pair<DataSource.Factory, LoadErrorHandlingPolicy>? {
+            if (!SecurityVaultModule.isIsoStream(url)) return null
+            val http = DefaultHttpDataSource.Factory().setConnectTimeoutMs(25_000).setReadTimeoutMs(25_000)
+                .setUserAgent("GDStream").setDefaultRequestProperties(headers)
+            val retry = object : DefaultLoadErrorHandlingPolicy(retryCount) {
+                override fun getRetryDelayMsFor(info: LoadErrorHandlingPolicy.LoadErrorInfo): Long =
+                    if (super.getRetryDelayMsFor(info) == C.TIME_UNSET) C.TIME_UNSET else 150L
+            }
+            return android.util.Pair(http, retry)
+        }
 
         @androidx.annotation.Keep
         @JvmStatic

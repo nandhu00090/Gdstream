@@ -4,11 +4,33 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DvdProxyTest {
+    @Test fun audioAndCodecConfigurationAloneCannotProduceASegment() {
+        val mux = DvdTsMux()
+        mux.audio(0, ByteArray(100))
+        mux.video(0, byteArrayOf(0, 0, 1, 0x67, 66), true)
+        assertEquals(0, mux.frames)
+        assertThrows(java.io.IOException::class.java) { mux.finish() }
+    }
+
+    @Test fun avcConfigurationRecordAndLengthPrefixedSlicesBecomeAnnexB() {
+        val mux = DvdTsMux()
+        // Two-byte lengths on samples, separate SPS and PPS in avcC.
+        mux.video(0, byteArrayOf(1, 66, 0, 30, -3, -31, 0, 2, 0x67, 66, 1, 0, 2, 0x68, 1), true)
+        mux.video(1_000_000, byteArrayOf(0, 2, 0x65, 42))
+        val bytes = mux.finish()
+        val expected = listOf(9, 0xf0, 0x67, 66, 0x68, 1, 0x65, 42).chunked(2)
+            .flatMap { listOf(0, 0, 0, 1) + it }.map(Int::toByte).toByteArray()
+        assertArrayEquals(expected, bytes.takeLast(expected.size).toByteArray())
+        assertEquals(1, mux.frames)
+    }
+
     @Test fun segmentOpensWithValidPatAndPmtAndKeepsAc3Bytes() {
         val mux = DvdTsMux()
         val audio = ByteArray(1024) { it.toByte() }
         mux.audio(1_200_000, audio)
-        mux.video(1_210_000, byteArrayOf(0, 0, 0, 1, 0x65))
+        mux.video(0, byteArrayOf(0, 0, 1, 0x67, 66), true)
+        mux.video(0, byteArrayOf(0, 0, 1, 0x68, 1), true)
+        mux.video(1_210_000, byteArrayOf(0, 0, 0, 1, 0x65, 1))
         val bytes = mux.finish()
         assertEquals(0, bytes.size % 188)
         val streams = BluRayPsi.streams(bytes)

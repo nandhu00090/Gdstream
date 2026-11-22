@@ -15,6 +15,14 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE, sdk = [28])
 class ArchivePlayerRoutingTest {
+    @Test fun externalDvdLaunchUsesDirectVobFromEitherEntryPoint() {
+        val base = "http://127.0.0.1:9090"
+        val direct = "$base/zip/disc/Arundhati%20%5BDVD%20Main%5D.vob"
+        for (url in listOf(direct, "$base/hls/disc/dvd.m3u8")) {
+            assertEquals(direct, externalDvdUrl(url, "disc", "Arundhati [DVD Main].vob"))
+        }
+    }
+
     @Test fun allExternalPlayerIntentsMatchVideoHandlersIncludingLocalHls() {
         for (path in listOf("hls/disc/index.m3u8", "zip/disc/movie.ts", "zip/disc/movie.m2ts", "movie.mp4")) {
             val uri = Uri.parse("http://127.0.0.1:9090/$path")
@@ -74,6 +82,19 @@ class ArchivePlayerRoutingTest {
         }
         assertTrue(frames.size >= 3)
         assertTrue(frames.first().size > 4)
+    }
+
+    @Test fun dvdGopWithoutRepeatedSequenceHeaderUsesTitleConfiguration() {
+        val data = javaClass.getResourceAsStream("/dvd/interlaced.vob.bin")!!.readBytes()
+        val header = requireNotNull(DvdProxy.sequenceHeader(data))
+        // Keep all PES lengths and timestamps intact while removing the local sequence headers.
+        for (i in 0 until data.size - 4) {
+            if (data[i] == 0.toByte() && data[i+1] == 0.toByte() && data[i+2] == 1.toByte() &&
+                data[i+3] == 0xb3.toByte()) data[i+3] = 0xb2.toByte()
+        }
+        var pictures = 0
+        DvdProxy.demux(data, -1, { header }) { video, _, _ -> if (video) pictures++ }
+        assertTrue(pictures >= 3)
     }
 
     @Test fun dvdProgramStreamsAndBlurayTransportStreamsChooseTheirOwnExtractors() {

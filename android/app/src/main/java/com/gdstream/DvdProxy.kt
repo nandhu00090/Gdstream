@@ -57,7 +57,8 @@ internal object DvdProxy {
         append("#EXT-X-ENDLIST\n")
     }.toByteArray()
 
-    fun transcode(data: ByteArray, info: Map<String, Any>, encoder: Encoder, session: IsoReadSession): ByteArray {
+    fun transcode(data: ByteArray, info: Map<String, Any>, encoder: Encoder, session: IsoReadSession, segment: Int,
+                  sequenceHeader: () -> ByteArray?): ByteArray {
         val width = (info.getValue("width") as Number).toInt()
         val height = (info.getValue("height") as Number).toInt()
         val handle = open(encoder.name, encoder.color, width, height, (info.getValue("frameRate") as Number).toDouble())
@@ -65,18 +66,41 @@ internal object DvdProxy {
         val audioLang = (info["audioLanguageCode"] as? String).orEmpty()
         val mux = DvdTsMux(audioLang)
         try {
-            demux(data, (info["ac3Substream"] as? Number)?.toInt() ?: -1) { video, pts, sample ->
+            var pictures = 0
+            demux(data, (info["ac3Substream"] as? Number)?.toInt() ?: -1, sequenceHeader) { video, pts, sample ->
                 session.checkActive()
-                if (video) encode(handle, sample, pts, mux) else mux.audio(pts, sample)
+                if (video) {
+                    pictures++
+                    encode(handle, sample, pts, mux)
+                } else mux.audio(pts, sample)
             }
+            if (pictures == 0) throw IOException("DVD segment $segment produced 0 MPEG-2 pictures")
             encode(handle, null, 0, mux)
-            return mux.finish()
+            return mux.finish().also { DebugLogger.log("DVD_SEG_OK", "seg=$segment frames=${mux.frames} bytes=${it.size}") }
         } finally { close(handle) }
+    }
+
+    // Some VOBUs begin with a GOP or picture and omit the sequence header. A new H262Reader
+    // needs that header to publish any pictures, even when a seek starts on a valid I-frame.
+    fun sequenceHeader(head: ByteArray): ByteArray? {
+        val es = ByteArrayOutputStream()
+        forEachPes(head) { id, start, end, _ -> if (id == 0xe0) es.write(head, start, end - start) }
+        val bytes = es.toByteArray()
+        var sequence = -1
+        for (i in 0 until bytes.size - 3) {
+            if (bytes[i] != 0.toByte() || bytes[i+1] != 0.toByte() || bytes[i+2] != 1.toByte()) continue
+            when (bytes[i+3].toInt() and 255) {
+                0xb3 -> sequence = i
+                0xb8, 0 -> if (sequence >= 0) return bytes.copyOfRange(sequence, i)
+            }
+        }
+        return null
     }
 
     /** DVD packs are sector aligned. Deliver only elementary payload to the frame readers.
      * A private-stream PES can start with the tail of the preceding AC-3 frame. */
-    fun demux(data: ByteArray, audioId: Int, sample: (Boolean, Long, ByteArray) -> Unit) {
+    fun demux(data: ByteArray, audioId: Int, sequenceHeader: () -> ByteArray? = { null },
+              sample: (Boolean, Long, ByteArray) -> Unit) {
         val output = object : ExtractorOutput {
             override fun endTracks() {}
             override fun seekMap(map: SeekMap) {}
@@ -102,6 +126,7 @@ internal object DvdProxy {
         val audio = Ac3Reader(null, 0, "video/mpeg")
         video.createTracks(output, TsPayloadReader.TrackIdGenerator(0, 1))
         audio.createTracks(output, TsPayloadReader.TrackIdGenerator(1, 1))
+        var firstVideo = true
         var selectedAudio = audioId
         forEachPes(data) { id, start, end, pts ->
             var payload = start
@@ -111,6 +136,12 @@ internal object DvdProxy {
                 val reader: ElementaryStreamReader = if (id == 0xe0) video else audio
                 if (id == 0xbd) payload += 4
                 reader.packetStarted(pts, 0)
+                if (id == 0xe0 && firstVideo) {
+                    firstVideo = false
+                    val hasHeader = end - payload >= 4 && data[payload] == 0.toByte() && data[payload + 1] == 0.toByte() &&
+                        data[payload + 2] == 1.toByte() && data[payload + 3] == 0xb3.toByte()
+                    if (!hasHeader) sequenceHeader()?.let { video.consume(ParsableByteArray(it)) }
+                }
                 reader.consume(ParsableByteArray(data, end).apply { position = payload })
                 reader.packetFinished(false)
             }
@@ -205,13 +236,105 @@ internal object DvdProxy {
 
 /** Each segment starts with PSI and an IDR. PCR uses the video timeline. */
 internal class DvdTsMux(private val audioLanguageCode: String = "") {
-    private data class UnitData(val video: Boolean, val pts: Long, val data: ByteArray)
+    private data class UnitData(val video: Boolean, val ticks: Long, val data: ByteArray)
     private val samples = ArrayList<UnitData>()
-    fun video(pts: Long, bytes: ByteArray) { samples.add(UnitData(true, pts, bytes)) }
-    fun audio(pts: Long, bytes: ByteArray) { samples.add(UnitData(false, pts, bytes)) }
+    private var sps: ByteArray? = null
+    private var pps: ByteArray? = null
+    private var lengthBytes = 4
+    private var lastVideoTicks = -1L
+    private var lastAudioTicks = -1L
+    var frames = 0
+        private set
+
+    // Called by name from MediaCodec JNI. Format changes can deliver csd-0 and csd-1 separately.
+    fun video(pts: Long, bytes: ByteArray, config: Boolean = false) {
+        val nals = splitNals(bytes, config)
+        fun type(nal: ByteArray) = nal[0].toInt() and 31
+        for (nal in nals) when (type(nal)) {
+            7 -> sps = nal
+            8 -> pps = nal
+        }
+        if (nals.any { it.size < 2 && type(it) in 1..8 }) throw IOException("Truncated DVD AVC NAL")
+        if (nals.none { type(it) in 1..5 }) return
+        val idr = nals.any { type(it) == 5 }
+        if (frames == 0 && !idr) return
+        val au = ByteArrayOutputStream()
+        fun nal(data: ByteArray) {
+            au.write(byteArrayOf(0, 0, 0, 1))
+            au.write(data)
+        }
+        // Media3's HLS AVC reader uses access-unit delimiters to commit samples.
+        nal(byteArrayOf(9, 0xf0.toByte()))
+        if (idr) {
+            nal(sps ?: throw IOException("DVD IDR missing SPS"))
+            nal(pps ?: throw IOException("DVD IDR missing PPS"))
+        }
+        nals.filter { type(it) !in 7..9 }.forEach(::nal)
+        lastVideoTicks = maxOf(pts * 9 / 100, lastVideoTicks + 1)
+        samples.add(UnitData(true, lastVideoTicks, au.toByteArray()))
+        frames++
+    }
+
+    private fun splitNals(data: ByteArray, config: Boolean): List<ByteArray> {
+        fun u(i: Int) = data[i].toInt() and 255
+        val result = ArrayList<ByteArray>()
+        var pos = 0
+        fun takeLength(prefix: Int) {
+            if (pos + prefix > data.size) throw IOException("Truncated DVD AVC length")
+            var size = 0L
+            repeat(prefix) { size = (size shl 8) + u(pos++) }
+            if (size !in 1L..(data.size - pos).toLong()) throw IOException("Invalid DVD AVC NAL size $size")
+            result.add(data.copyOfRange(pos, pos + size.toInt()))
+            pos += size.toInt()
+        }
+        if (config && data.size >= 7 && u(0) == 1) {
+            lengthBytes = (u(4) and 3) + 1
+            pos = 6
+            repeat(u(5) and 31) { takeLength(2) }
+            if (pos == data.size) throw IOException("DVD AVC configuration missing PPS count")
+            repeat(u(pos++)) { takeLength(2) }
+            return result
+        }
+        fun prefix(i: Int): Int {
+            if (i + 3 > data.size || u(i) != 0 || u(i + 1) != 0) return 0
+            if (u(i + 2) == 1) return 3
+            return if (i + 4 <= data.size && u(i + 2) == 0 && u(i + 3) == 1) 4 else 0
+        }
+        // A four-byte length of 256..511 starts with 00 00 01, just like a short start code.
+        // Only prefer that interpretation when lengths describe the entire access unit.
+        fun hasCompleteLengths(): Boolean {
+            var i = 0
+            while (i < data.size) {
+                if (i + lengthBytes >= data.size) return false
+                var n = 0L
+                repeat(lengthBytes) { n = (n shl 8) + u(i++) }
+                if (n !in 1L..(data.size - i).toLong() || u(i) !in 1..127) return false
+                i += n.toInt()
+            }
+            return true
+        }
+        val firstPrefix = prefix(0)
+        if (firstPrefix == 4 || firstPrefix == 3 && !hasCompleteLengths()) {
+            while (pos < data.size) {
+                val start = pos + prefix(pos)
+                pos = start
+                while (pos < data.size && prefix(pos) == 0) pos++
+                if (pos > start) result.add(data.copyOfRange(start, pos))
+            }
+        } else if (config && data.isNotEmpty() && (u(0) and 31) in 7..8) {
+            result.add(data)
+        } else {
+            while (pos < data.size) takeLength(lengthBytes)
+        }
+        return result
+    }
+    fun audio(pts: Long, bytes: ByteArray) {
+        lastAudioTicks = maxOf(pts * 9 / 100, lastAudioTicks + 1)
+        samples.add(UnitData(false, lastAudioTicks, bytes))
+    }
 
     fun finish(): ByteArray {
-        require(samples.any { it.video }) { "DVD segment produced no AVC frames" }
+        if (frames == 0) throw IOException("DVD segment produced 0 decodable AVC frames (no IDR)")
         val out = ByteArrayOutputStream()
         val cc = IntArray(8192)
         fun packets(pid: Int, data: ByteArray, clock: Long? = null) {
@@ -256,8 +379,8 @@ internal class DvdTsMux(private val audioLanguageCode: String = "") {
         }.toByteArray()
         val pmtAudio = byteArrayOf(0x81.toByte(), 0xe1.toByte(), 2, (0xf0 or (audioDesc.size ushr 8)).toByte(), audioDesc.size.toByte()) + audioDesc
         psi(256, if (samples.any { !it.video }) pmtBase + pmtAudio else pmtBase)
-        for (sample in samples.sortedBy { it.pts }) {
-            val ticks = sample.pts * 9 / 100
+        for (sample in samples.sortedBy { it.ticks }) {
+            val ticks = sample.ticks
             val size = if (sample.video) 0 else sample.data.size + 8
             val header = byteArrayOf(0, 0, 1, (if (sample.video) 0xe0 else 0xbd).toByte(), (size shr 8).toByte(), size.toByte(),
                 0x80.toByte(), 0x80.toByte(), 5, (33 or ((ticks ushr 29).toInt() and 14)).toByte(),

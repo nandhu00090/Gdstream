@@ -30,7 +30,7 @@ internal class RangeConnections(
     private val seededCookies = HashMap<String, String>()
 
     fun openIsoRange(url: String, start: Long, end: Long, session: IsoReadSession): HttpURLConnection =
-        open(url, "bytes=$start-$end", connectTimeout = 10000, readTimeout = IsoRangeReader.READ_STALL_MS, session = session)
+        open(url, "bytes=$start-$end", connectTimeout = 25_000, readTimeout = IsoRangeReader.READ_STALL_MS, session = session)
 
     fun open(rawUrl: String, range: String?, connectTimeout: Int = 15000, readTimeout: Int = 25000, session: IsoReadSession? = null): HttpURLConnection {
         val original = URL(rawUrl.substringBefore('#'))
@@ -120,7 +120,7 @@ internal fun isoFailureDetails(error: Throwable): String = generateSequence(erro
 internal object IsoRangeReader {
     internal const val WINDOW_BYTES = 8 * 1024 * 1024
     internal const val MAX_CONCURRENT_READS = 6
-    internal const val READ_STALL_MS = 3500
+    internal const val READ_STALL_MS = 25_000
     private val upstreamSlots = Semaphore(MAX_CONCURRENT_READS, true)
     private val activeReads = java.util.concurrent.ConcurrentHashMap<Any, IsoReadSession>()
     fun cancelAll(reason: String) { activeReads.values.toSet().forEach { it.cancel(reason) } }
@@ -251,37 +251,72 @@ internal object IsoRangeReader {
     }
 }
 
-/** Keep the most recent disc warm between requests. */
+/** Keep the current source warm. Two recently closed sources keep only their startup block. */
 internal class IsoChunkCaches {
+    private data class Source(val url: String, val size: Long)
     private class Disc(val chunks: IsoChunkCache = IsoChunkCache(), var readers: Int = 0)
-    private val discs = HashMap<String, Disc>()
-    private var latest: String? = null
+    private val discs = LinkedHashMap<Source, Disc>(4, 0.75f, true)
+    private var latest: Source? = null
 
     @Synchronized
     fun acquire(url: String, session: IsoReadSession, size: Long = 0): IsoChunkCache {
         session.checkActive()
-        val source = url.substringBefore('#') + "\n$size"
-        val previous = latest
-        if (previous != null && previous != source && discs[previous]?.readers == 0) {
-            discs.remove(previous)?.chunks?.clear()
-        }
-        latest = source
+        val source = Source(canonicalIsoSourceUrl(url), size)
         val disc = discs.getOrPut(source) { Disc() }
+        val changed = latest != source
+        latest = source
         disc.readers++
+        if (changed) trimIdle()
         session.onCancel {
             synchronized(this) {
                 disc.readers--
-                if (disc.readers == 0 && latest != source && discs.remove(source, disc)) disc.chunks.clear()
+                if (disc.readers == 0 && source != latest) trimIdle()
             }
         }
         return disc.chunks
     }
+
+    private fun trimIdle() {
+        val idle = discs.entries.filter { it.key != latest && it.value.readers == 0 }
+        idle.dropLast(2).forEach { discs.remove(it.key)?.chunks?.clear() }
+        idle.takeLast(2).forEach { it.value.chunks.retainStartupBlock() }
+    }
+
+    @Synchronized
+    fun cancelFlights() { discs.values.forEach { it.chunks.cancelFlights() } }
 
     @Synchronized
     fun clear() {
         discs.values.forEach { it.chunks.clear() }
         discs.clear()
         latest = null
+    }
+}
+
+/** Detect seeks in client byte coordinates. Fetch blocks on the physical BDAV grid. */
+internal class M2tsReadCursor {
+    private var request = 0L
+    private var nextByte = 0L
+    @Synchronized fun begin(id: Long, target: Long): Boolean {
+        if (id < request) return false
+        request = id
+        val seek = kotlin.math.abs(target - nextByte) > 4L * 1024 * 1024
+        nextByte = target
+        return seek
+    }
+    @Synchronized fun advance(id: Long, next: Long): Boolean {
+        if (request != id) return false
+        nextByte = next
+        return true
+    }
+
+    fun seekBlocks(target: Long, size: Long): List<LongRange> {
+        val block = IsoChunkCache.BLOCK_BYTES.toLong()
+        val start = target / block * block
+        val ahead = (0..2).map { start + it * block }.filter { it < size }.toMutableList()
+        // The previous block contains the beginning of the PCR search window near a boundary.
+        if (start > 0 && target - start < 600 * 192) ahead.add(start - block)
+        return ahead.map { it until minOf(it + block, size) }
     }
 }
 
@@ -301,75 +336,130 @@ internal class IsoChunkCache(
         }
     }
     private data class Key(val start: Long, val end: Long)
-    private class Flight(val owner: IsoReadSession, var speculative: Boolean) {
+    private class Flight {
+        val owner = IsoReadSession()
         lateinit var task: java.util.concurrent.FutureTask<ByteArray>
         var readers = 0
-        val started = java.util.concurrent.atomic.AtomicBoolean()
+        val warmers = HashMap<IsoReadSession, AutoCloseable>()
+        var scheduled = false
+        var foreground = false
+        fun abort(reason: String) {
+            owner.cancel(reason)
+            task.cancel(true)
+        }
     }
     private val lock = Any()
     private val cached = LinkedHashMap<Key, ByteArray>(16, 0.75f, true)
     private val flights = HashMap<Key, Flight>()
     private var bytes = 0
+    private var window = emptyList<LongRange>()
 
-    private val warmSession = IsoReadSession()
-    private val pending = LinkedHashSet<Key>()
-    private var warming = 0
-
-    /** Replace the remaining speculative window on seek and abort in-flight speculative fetches
-     * for abandoned offsets so upstream permits are freed immediately. */
-    fun prefetch(ranges: List<LongRange>, sourceSize: Long, fetch: (Long, Long, IsoReadSession) -> ByteArray) {
+    fun prefetch(ranges: List<LongRange>, sourceSize: Long, session: IsoReadSession,
+                 priority: Boolean = false, fetch: (Long, Long, IsoReadSession) -> ByteArray): List<java.util.concurrent.Future<ByteArray>> {
+        val target = ranges.firstOrNull()?.first ?: return emptyList()
         val desired = LinkedHashSet<Key>()
         for (range in ranges) {
-            var from = range.first / BLOCK_BYTES * BLOCK_BYTES
-            while (from <= range.last) {
-                desired.add(Key(from, minOf(from + BLOCK_BYTES, sourceSize) - 1))
-                from += BLOCK_BYTES
+            var start = range.first / BLOCK_BYTES * BLOCK_BYTES
+            while (start <= range.last && start < sourceSize) {
+                desired.add(Key(start, minOf(start + BLOCK_BYTES, sourceSize) - 1))
+                start += BLOCK_BYTES
             }
         }
-        val abandoned = ArrayList<Flight>()
-        synchronized(lock) {
-            if (warmSession.isCancelled) return
-            pending.clear()
-            val it = flights.entries.iterator()
-            while (it.hasNext()) {
-                val (key, flight) = it.next()
-                if (flight.speculative && flight.readers == 0 && key !in desired) {
-                    abandoned.add(flight)
-                    it.remove()
+        val abandoned = synchronized(lock) {
+            session.checkActive()
+            val far = window.isNotEmpty() && window.all {
+                target < it.first - 32L * 1024 * 1024 || target > it.last + 32L * 1024 * 1024
+            }
+            window = ranges
+            if (priority || far) flights.filter { (key, flight) -> flight.readers == 0 && key !in desired }
+                .also { flights.keys.removeAll(it.keys) }.values else emptyList()
+        }
+        abandoned.forEach { it.abort(if (priority) "M2TS timeline seek" else "abandoned read-ahead after seek") }
+        return synchronized(lock) {
+            session.checkActive()
+            desired.mapNotNull { key ->
+                if (key in cached) return@mapNotNull null
+                val flight = flight(key, fetch)
+                if (session !in flight.warmers) {
+                    val registration = session.onCancel { release(key, flight, session) }
+                    if (session.isCancelled) { registration.close(); session.checkActive() }
+                    flight.warmers[session] = registration
                 }
+                schedule(flight, priority)
+                flight.task
             }
-            for (key in desired) {
-                if (key !in cached && key !in flights) pending.add(key)
-            }
-            repeat(minOf(pending.size, 4 - warming)) {
-                warming++
-                warmWorkers.execute {
-                    while (true) {
-                        val next = synchronized(lock) {
-                            pending.firstOrNull()?.also { pending.remove(it) } ?: run { warming--; null }
-                        } ?: break
-                        try { block(next, warmSession, fetch, speculative = true) } catch (_: Exception) { }
+        }
+    }
+
+    // FutureTask runs only once, even when demand promotes a queued speculative block.
+    private fun schedule(flight: Flight, priority: Boolean) {
+        if (priority && !flight.foreground) {
+            flight.foreground = true
+            executor.execute(flight.task)
+        } else if (!priority && !flight.foreground && !flight.scheduled) {
+            flight.scheduled = true
+            warmWorkers.execute(flight.task)
+        }
+    }
+
+    private fun flight(key: Key, fetch: (Long, Long, IsoReadSession) -> ByteArray): Flight =
+        flights.getOrPut(key) {
+            Flight().also { created ->
+                created.task = object : java.util.concurrent.FutureTask<ByteArray>({
+                    created.owner.checkActive()
+                    val data = fetch(key.start, key.end, created.owner)
+                    if (data.size.toLong() != key.end - key.start + 1) throw EOFException("Incomplete ISO cache block")
+                    synchronized(lock) {
+                        if (flights[key] === created && data.size <= maxBytes) {
+                            cached[key] = data
+                            bytes += data.size
+                            val entries = cached.entries.iterator()
+                            while (bytes > maxBytes && entries.hasNext()) {
+                                val entry = entries.next()
+                                // Retain the initial playback block across seeks and long sequential reads.
+                                if (entry.key.start == 0L && entry.value.size == BLOCK_BYTES) continue
+                                bytes -= entry.value.size
+                                entries.remove()
+                            }
+                        }
+                    }
+                    data
+                }) {
+                    override fun done() {
+                        synchronized(lock) {
+                            flights.remove(key, created)
+                            created.warmers.values.forEach { it.close() }
+                            created.warmers.clear()
+                        }
                     }
                 }
             }
         }
-        abandoned.forEach { flight ->
-            flight.owner.cancel("abandoned read-ahead after seek")
-            flight.task.cancel(true)
+
+    private fun release(key: Key, flight: Flight, warmer: IsoReadSession?) {
+        val orphan = synchronized(lock) {
+            if (warmer == null) flight.readers-- else flight.warmers.remove(warmer)
+            flight.readers == 0 && flight.warmers.isEmpty() && flights.remove(key, flight)
         }
+        if (orphan) flight.abort("last proxy client closed")
     }
 
     fun read(start: Long, end: Long, extentStart: Long, extentEnd: Long,
-             session: IsoReadSession, fetch: (Long, Long, IsoReadSession) -> ByteArray,
-             blockBytes: Int = BLOCK_BYTES): ByteArray {
+             session: IsoReadSession, blockBytes: Int = BLOCK_BYTES, borrowFullBlock: Boolean = false,
+             fetch: (Long, Long, IsoReadSession) -> ByteArray): ByteArray {
         require(start >= extentStart && end >= start && end <= extentEnd && end - start < Int.MAX_VALUE)
+        if (borrowFullBlock && (start - extentStart) % blockBytes == 0L &&
+            end - start == minOf(blockBytes - 1L, extentEnd - start)) {
+            // IsoVirtualFile copies physical extents before stripping packet headers or editing the PMT.
+            return block(Key(start, end), session, fetch)
+        }
         val result = ByteArray((end - start + 1).toInt())
         var cursor = start
         while (cursor <= end) {
             session.checkActive()
             val from = extentStart + ((cursor - extentStart) / blockBytes) * blockBytes
             val to = from + minOf(blockBytes.toLong() - 1, extentEnd - from)
-            val data = block(Key(from, to), session, fetch, speculative = false)
+            val data = block(Key(from, to), session, fetch)
             session.checkActive()
             val offset = (cursor - from).toInt()
             val count = minOf(end - cursor + 1, (data.size - offset).toLong()).toInt()
@@ -383,43 +473,17 @@ internal class IsoChunkCache(
     private fun block(
         key: Key,
         session: IsoReadSession,
-        fetch: (Long, Long, IsoReadSession) -> ByteArray,
-        speculative: Boolean
+        fetch: (Long, Long, IsoReadSession) -> ByteArray
     ): ByteArray {
         val flight = synchronized(lock) {
             session.checkActive()
             cached[key]?.let { return it }
-            val current = flights[key] ?: Flight(IsoReadSession(), speculative).also { created ->
-                created.task = java.util.concurrent.FutureTask {
-                    try {
-                        val data = fetch(key.start, key.end, created.owner)
-                        if (data.size.toLong() != key.end - key.start + 1) throw EOFException("Incomplete ISO cache block")
-                        synchronized(lock) {
-                            if (flights[key] === created && !created.owner.isCancelled && data.size <= maxBytes) {
-                                cached.put(key, data)?.let { bytes -= it.size }
-                                bytes += data.size
-                                val iterator = cached.entries.iterator()
-                                while (bytes > maxBytes && iterator.hasNext()) {
-                                    bytes -= iterator.next().value.size
-                                    iterator.remove()
-                                }
-                            }
-                        }
-                        data
-                    } finally {
-                        synchronized(lock) { if (flights[key] === created) flights.remove(key) }
-                    }
-                }
-                flights[key] = created
-            }
-            if (!speculative) {
-                current.speculative = false
-                current.readers++
-            }
-            current
+            flight(key, fetch).also { it.readers++; schedule(it, true) }
         }
+        val released = java.util.concurrent.atomic.AtomicBoolean()
+        fun detach() { if (released.compareAndSet(false, true)) release(key, flight, null) }
+        val registration = session.onCancel(::detach)
         try {
-            if (flight.started.compareAndSet(false, true)) executor.execute(flight.task)
             while (true) {
                 session.checkActive()
                 try { return flight.task.get(100, java.util.concurrent.TimeUnit.MILLISECONDS).also { session.checkActive() } }
@@ -427,19 +491,29 @@ internal class IsoChunkCache(
                 catch (error: java.util.concurrent.ExecutionException) { throw (error.cause ?: error) }
             }
         } finally {
-            if (!speculative) synchronized(lock) { flight.readers-- }
+            registration.close()
+            detach()
         }
     }
 
     internal fun activeReaders(): Int = synchronized(lock) { flights.values.sumOf { it.readers } }
     internal fun cachedBytes(): Int = synchronized(lock) { bytes }
-    fun clear() {
-        warmSession.cancel("cache closed")
-        val pending = synchronized(lock) {
-            pending.clear()
-            cached.clear(); bytes = 0
+    fun retainStartupBlock() {
+        synchronized(lock) {
+            cached.entries.removeAll { it.key.start != 0L }
+            bytes = cached.values.sumOf { it.size }
+        }
+    }
+
+    fun cancelFlights() {
+        val active = synchronized(lock) {
+            window = emptyList()
             flights.values.toList().also { flights.clear() }
         }
-        pending.forEach { it.owner.cancel("chunk cache stopped"); it.task.cancel(true) }
+        active.forEach { it.abort("playback session ended") }
+    }
+    fun clear() {
+        cancelFlights()
+        synchronized(lock) { cached.clear(); bytes = 0 }
     }
 }

@@ -12,7 +12,12 @@ import java.util.concurrent.atomic.AtomicLong
 
 /** Cancellation owns sockets AND permits; Future.cancel alone cannot interrupt an Android HTTP read. */
 internal class IsoReadSession {
-    companion object { private val ids = AtomicLong() }
+    companion object {
+        private val ids = AtomicLong()
+        private val socketClosers = java.util.concurrent.Executors.newCachedThreadPool { task ->
+            Thread(task, "ISOSocketClose").apply { isDaemon = true }
+        }
+    }
     val id = ids.incrementAndGet()
     @Volatile var isCancelled = false
         private set
@@ -86,7 +91,11 @@ internal class IsoReadSession {
         // Worker finally blocks also close these leases; each lease releases exactly once.
         resources.first.forEach { it.close() }
         resources.third.forEach { it() }
-        resources.second.forEach { disconnect(it) }
+        // Android disconnect can contend with responseCode. Let sibling flights release their
+        // permits immediately even if this socket is still unwinding on another thread.
+        resources.second.forEach { conn ->
+            if (resources.first.isEmpty()) disconnect(conn) else socketClosers.execute { disconnect(conn) }
+        }
     }
 }
 

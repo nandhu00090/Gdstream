@@ -13,6 +13,9 @@ test('native ISO policy hooks are idempotent and fail loudly if upstream method 
     }
     public void setSelectedTrack(int trackType, String type, String value) {
     }
+    config.setDisableDisconnectError(this.disableDisconnectError);
+    case CONTENT_TYPE_OTHER:
+    config.buildLoadErrorHandlingPolicy(source.getMinLoadRetryCount())
     : DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS ,
 new ProgressiveMediaSource.Factory(assetDataSourceFactory)
 new ProgressiveMediaSource.Factory(
@@ -28,7 +31,7 @@ new ProgressiveMediaSource.Factory(
   expect(patched).toContain(': 2000');
   expect(patched.match(/getMethod\("audioTrackCatalog"/g)).toHaveLength(2);
   expect(patched).toContain('getMethod("selectAudioTrackFromCatalog"');
-  expect(patched.match(/gdArchiveExtractors\(uri\)/g)).toHaveLength(3);
+  expect(patched.match(/gdArchiveExtractors\(uri\)/g)).toHaveLength(4);
   expect(patched).toContain('getMethod("archiveExtractors", String.class)');
   expect(() => patchIsoPlayer('incompatible dependency')).toThrow('anchor missing');
 });

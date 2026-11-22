@@ -9,7 +9,7 @@ function patchIsoPlayer(content) {
     'if (e.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED && e.getMessage()',
     'if (gdIsoPolicy == null && e.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED && e.getMessage()',
   );
-  if (content.includes('GD_ISO_PLAYER_POLICY_V1')) return patchIsoAudioCatalog(patchBluRayFactory(content));
+  if (content.includes('GD_ISO_PLAYER_POLICY_V1')) return patchArchiveHttp(patchIsoAudioCatalog(patchBluRayFactory(content)));
   const replace = (anchor, replacement) => {
     if (!content.includes(anchor)) throw new Error(`react-native-video ISO patch anchor missing: ${anchor}`);
     content = content.replace(anchor, replacement);
@@ -44,7 +44,7 @@ function patchIsoPlayer(content) {
   replace('    public void onPlayerError(@NonNull PlaybackException e) {', '    public void onPlayerError(@NonNull PlaybackException e) {\n        if (recoverIsoAudio(e)) return;');
   // RNVLoadControl subclasses DefaultLoadControl. Set its default as well as the stable JS source config.
   replace(': DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS ,', ': 2000 , // ISO fast startup; explicit source config still takes precedence');
-  return patchIsoAudioCatalog(patchBluRayFactory(content));
+  return patchArchiveHttp(patchIsoAudioCatalog(patchBluRayFactory(content)));
 }
 module.exports = { patchIsoPlayer };
 
@@ -103,4 +103,30 @@ function patchIsoAudioCatalog(content) {
             } catch (Exception error) { DebugLog.e(TAG, "ISO audio selection: " + error); }
         }`);
   return content;
+}
+
+function patchArchiveHttp(content) {
+  if (content.includes('GD_ARCHIVE_HTTP')) return content;
+  const anchor = 'config.setDisableDisconnectError(this.disableDisconnectError);';
+  const retry = 'config.buildLoadErrorHandlingPolicy(source.getMinLoadRetryCount())';
+  const factory = 'case CONTENT_TYPE_OTHER:';
+  for (const required of [anchor, retry, factory]) {
+    if (!content.includes(required)) throw new Error('Archive HTTP patch anchor missing: ' + required);
+  }
+  return content.replace(anchor, anchor + `
+        // GD_ARCHIVE_HTTP
+        android.util.Pair<DataSource.Factory, androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy> archiveHttp = null;
+        try {
+            archiveHttp = (android.util.Pair<DataSource.Factory, androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy>)
+                    Class.forName("com.gdstream.VideoPlayerModule")
+                            .getMethod("archiveHttp", String.class, java.util.Map.class, int.class)
+                            .invoke(null, uri.toString(), source.getHeaders(), source.getMinLoadRetryCount());
+        } catch (ReflectiveOperationException error) { DebugLog.e(TAG, "Archive HTTP: " + error); }
+`).replace(factory, factory + `
+                if (archiveHttp != null) {
+                    mediaSourceFactory = new ProgressiveMediaSource.Factory(archiveHttp.first, gdArchiveExtractors(uri));
+                    break;
+                }`).replace('new HlsMediaSource.Factory(\n                        dataSourceFactory',
+                'new HlsMediaSource.Factory(\n                        archiveHttp != null ? archiveHttp.first : dataSourceFactory')
+    .replace(retry, 'archiveHttp != null ? archiveHttp.second : ' + retry);
 }

@@ -4,6 +4,11 @@ import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
 
+internal fun canonicalIsoSourceUrl(url: String): String {
+    val source = url.substringBefore('#')
+    return runCatching { java.net.URI(source).normalize().toASCIIString() }.getOrDefault(source)
+}
+
 /** Split a logical metadata read at 2 MiB physical block boundaries. */
 internal class IsoMetadataReadAhead(
     private val size: Long,
@@ -16,7 +21,7 @@ internal class IsoMetadataReadAhead(
         if (first < 0 || last >= size || last < first || last - first >= 8L * 1024 * 1024)
             throw IOException("Invalid ISO metadata range")
         val block = IsoChunkCache.METADATA_BLOCK_BYTES
-        fun slice(start: Long, end: Long) = cache.read(start, end, 0, size - 1, session, fetch, blockBytes = block)
+        fun slice(start: Long, end: Long) = cache.read(start, end, 0, size - 1, session, block, fetch = fetch)
         if (first / block == last / block) return slice(first, last)
         val jobs = (first / block..last / block).map { index ->
             executor.submit<ByteArray> { slice(maxOf(first, index * block), minOf(last, (index + 1) * block - 1)) }
@@ -91,10 +96,7 @@ internal class IsoIndexDiskCache(private val directory: File, private val legacy
         const val VERSION = 9
         private const val MAX_ENTRY_BYTES = 8L * 1024 * 1024
         fun key(url: String, size: Long) = "${identity(url)}-$size.json"
-        private fun identity(url: String): String {
-            val canonical = runCatching { java.net.URI(url.substringBefore('#')).normalize().toASCIIString() }.getOrDefault(url.substringBefore('#'))
-            return digest("$VERSION\n$canonical")
-        }
+        private fun identity(url: String) = digest("$VERSION\n${canonicalIsoSourceUrl(url)}")
         private fun digest(value: String) = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
                 .joinToString("") { "%02x".format(it.toInt() and 255) }
     }

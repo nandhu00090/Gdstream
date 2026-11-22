@@ -2631,8 +2631,7 @@ const App = () => {
     await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
     try {
       await SecurityVault?.stopArchivePlayback?.(playbackSource.uri);
-      const source = await resolvePlaybackUrl(targetFile);
-      const url = !vlc && /\.vob$/i.test(source) && SecurityVault?.dvdPlaybackUrl ? await SecurityVault.dvdPlaybackUrl(source) : source;
+      const url = await resolvePlaybackUrl(targetFile);
       if (vlc) await VideoPlayerManager.playVideoInVlc(url);
       else await VideoPlayerManager.playVideo(url, 'Open with External Player (VLC / MX / MPV recommended for Blu-ray)');
     } catch (error) {
@@ -3171,7 +3170,8 @@ const App = () => {
                   }}>
                   <Icon name="check" size={20} color="#E50914" style={{ opacity: isSelected ? 1 : 0 }} />
                   <Text style={styles.menuItemText} numberOfLines={1}>
-                    {track.language ? track.language.toUpperCase() : `Track ${index + 1}`} • {track.title || 'Default'}
+                    {track.title && /\.m2ts(?:$|[?#])/i.test(playbackSource.uri) ? track.title :
+                      `${track.language ? track.language.toUpperCase() : `Track ${index + 1}`} • ${track.title || 'Default'}`}
                   </Text>
                 </FocusableButton>
               );

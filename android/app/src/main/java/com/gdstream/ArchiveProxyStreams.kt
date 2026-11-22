@@ -8,6 +8,12 @@ internal fun archiveFilenameMatches(encoded: String?, expected: String, bdavAlia
     decoded == expected || (bdavAlias && expected.endsWith(".m2ts", true) && decoded == expected.dropLast(5) + ".ts")
 } catch (_: IllegalArgumentException) { false }
 
+internal fun externalDvdUrl(url: String, id: String, fileName: String): String {
+    val uri = java.net.URI(url)
+    val name = java.net.URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")
+    return "${uri.scheme}://${uri.rawAuthority}/zip/$id/$name"
+}
+
 /** Rewrite only the registered Blu-ray path; retain encoded names, query and fragment verbatim. */
 internal fun externalIsoTsUrl(url: String, expected: String, bdav: Boolean): String = try {
     val uri = java.net.URI(url)
@@ -75,9 +81,13 @@ internal object ArchiveProxyStreams {
             uri.rawPath.split('/').takeIf { it.size >= 3 && it[1] in listOf("zip", "hls") }?.get(2)
     } catch (_: Exception) { null }
 
-    fun prepare(url: String) {
+    private var lastPlayback: String? = null
+    @Synchronized fun prepare(url: String) {
         registry.resume()
-        streamId(url)?.let { registry.cancelStream(it, "new playback / external handoff") }
+        val next = streamId(url)
+        lastPlayback?.takeIf { it != next }?.let { registry.cancelStream(it, "playback source changed") }
+        next?.let { registry.cancelStream(it, "new playback / external handoff") }
+        lastPlayback = next
     }
     fun stop(url: String) { streamId(url)?.let { registry.cancelStream(it, "player stopped") } }
 }

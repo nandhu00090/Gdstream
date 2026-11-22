@@ -13,7 +13,7 @@ class IsoMetadataCacheTest {
     @get:Rule val folder = TemporaryFolder()
     @Test fun crossingTwoAlignedBlocksFetchesInParallelAndReopeningSharesTheBytes() {
         val pool = Executors.newCachedThreadPool()
-        val size = IsoChunkCache.BLOCK_BYTES + 123L
+        val size = IsoChunkCache.METADATA_BLOCK_BYTES + 123L
         val shared = IsoChunkCache()
         val calls = java.util.concurrent.ConcurrentLinkedQueue<LongRange>()
         val bothEntered = java.util.concurrent.CountDownLatch(2)
@@ -25,10 +25,10 @@ class IsoMetadataCacheTest {
                 assertTrue(bothEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
                 ByteArray((to - from + 1).toInt()) { ((from + it) % 251).toByte() }
             }
-            val first = IsoChunkCache.BLOCK_BYTES - 8L
+            val first = IsoChunkCache.METADATA_BLOCK_BYTES - 8L
             val expected = ByteArray(131) { ((first + it) % 251).toByte() }
             repeat(2) { assertArrayEquals(expected, metadata.read(first, size - 1)) }
-            assertEquals(setOf(0L until IsoChunkCache.BLOCK_BYTES, IsoChunkCache.BLOCK_BYTES.toLong() until size), calls.toSet())
+            assertEquals(setOf(0L until IsoChunkCache.METADATA_BLOCK_BYTES, IsoChunkCache.METADATA_BLOCK_BYTES.toLong() until size), calls.toSet())
             assertEquals(2, calls.size)
             assertThrows(IOException::class.java) { metadata.read(first, size) }
         } finally { session.cancel(); shared.clear(); pool.shutdownNow() }
