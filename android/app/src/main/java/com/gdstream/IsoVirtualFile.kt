@@ -119,6 +119,7 @@ internal class IsoVirtualFile(
         maxReadBytes: Int = IsoRangeReader.WINDOW_BYTES,
         onStreamStart: (() -> Unit)? = null,
         pipelineDepth: Int = IsoRangeReader.MAX_CONCURRENT_READS,
+        firstReadBytes: Int = maxReadBytes,
         read: (Long, Int) -> ByteArray
     ): Boolean {
         session.log("ISO_PROXY_REQUEST", "method=$method requestedRange=${rangeHeader ?: "full"} size=$size")
@@ -171,9 +172,10 @@ internal class IsoVirtualFile(
                     session.checkActive()
                     val start = cursor
                     val limit = if (bdav) (IsoRangeReader.WINDOW_BYTES / 192) * 188 else IsoRangeReader.WINDOW_BYTES
-                    val count = minOf(limit, maxReadBytes).toLong().coerceAtMost(range.end - cursor + 1).toInt()
+                    val count = minOf(limit, if (start == range.start) firstReadBytes else maxReadBytes).toLong().coerceAtMost(range.end - cursor + 1).toInt()
                     cursor += count
-                    session.log("ISO_PROXY_MAP", "virtual=$start-${start + count - 1} physical=${physicalRanges(start, count)}")
+                    if (start == range.start || start / IsoRangeReader.WINDOW_BYTES != (start + count) / IsoRangeReader.WINDOW_BYTES)
+                        session.log("ISO_PROXY_MAP", "virtual=$start-${start + count - 1} physical=${physicalRanges(start, count)}")
                     queued.add(Pending(start, count, executor.submit<ByteArray> {
                         session.checkActive()
                         read(start, count).also { if (it.size != count) throw EOFException("Short ISO proxy read") }
@@ -212,7 +214,9 @@ internal class IsoVirtualFile(
                 flush()
                 if (delivered == 0L) onStreamStart?.invoke()
                 delivered += chunk.size
-                session.log("ISO_PROXY_CHUNK_COMPLETE", "sent=$delivered/${range.length} virtual=${range.start}-${range.end}")
+                if (delivered == chunk.size.toLong() || delivered == range.length ||
+                    delivered / IsoRangeReader.WINDOW_BYTES != (delivered - chunk.size) / IsoRangeReader.WINDOW_BYTES)
+                    session.log("ISO_PROXY_CHUNK_COMPLETE", "sent=$delivered/${range.length} virtual=${range.start}-${range.end}")
                 chunk = nextChunk()
             }
             flush()

@@ -27,7 +27,15 @@ internal class BluRaySeekMap(private val profile: BluRayProfile) : SeekMap {
 internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVision: Boolean = false) : Extractor {
     private val dv = if (dolbyVision && profile?.streams?.any { it.pid == 0x1011 && it.type == 0x24 && it.height == 2160 } == true &&
         profile.streams.any { it.pid == 0x1015 && it.type == 0x24 }) BluRayDolbyVision() else null
-    private val indexed = profile?.let { BluRaySeekMap(it) }?.takeIf { it.isSeekable }
+    private val pcr = profile?.pcrIndex
+    private val indexed: SeekMap? = if (pcr != null && profile != null) object : SeekMap {
+        override fun getDurationUs() = profile.durationUs
+        override fun isSeekable() = true
+        override fun getSeekPoints(timeUs: Long) =
+            SeekMap.SeekPoints(SeekPoint(timeUs, pcr.estimate(timeUs).position))
+    } else profile?.let { BluRaySeekMap(it) }?.takeIf { it.isSeekable }
+    private var checkSeekUs = 0L
+    private var remainingProbes = 0
     private var inputLength = C.LENGTH_UNSET.toLong()
     private val videoReaders = ArrayList<EndOfInputPayloadReader>()
     private val pidReaders = ArrayList<BluRayPidReader>()
@@ -92,7 +100,7 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
             }
             override fun endTracks() = output.endTracks()
             override fun seekMap(seekMap: SeekMap) {
-                DebugLogger.log("ISO_SEEK_MAP", "source=${if (indexed != null) "CLPI" else "PCR"} points=${profile?.points?.size ?: 0} durationUs=${profile?.durationUs ?: 0}")
+                DebugLogger.log("ISO_SEEK_MAP", "source=${if (pcr != null) "sparse PCR" else if (indexed != null) "CLPI" else "PCR"} points=${pcr?.pointCount ?: profile?.points?.size ?: 0} durationUs=${profile?.durationUs ?: 0}")
                 val duration = profile?.durationUs ?: 0
                 val measured = if (duration > 0 && inputLength >= 188) object : SeekMap {
                     override fun getDurationUs() = duration
@@ -113,8 +121,36 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
             }
         })
     }
+    private fun measureClock(input: ExtractorInput, index: StandalonePcrIndex): BluRayPoint? {
+        val length = minOf(188L * 3072, (input.length - input.position).coerceAtLeast(0)).toInt()
+        val bytes = ByteArray(188 * 256)
+        try {
+            var peeked = 0
+            while (peeked + 188 <= length) {
+                val count = minOf(bytes.size, length - peeked) / 188 * 188
+                if (!input.peekFully(bytes, 0, count, true)) break
+                index.sample(bytes, 188, input.position + peeked, count)?.let { return it }
+                peeked += count
+            }
+            return null
+        } finally { input.resetPeekPosition() }
+    }
+
     override fun read(input: ExtractorInput, seekPosition: PositionHolder): Int {
         inputLength = input.length
+        if (pcr != null && remainingProbes > 0) {
+            remainingProbes--
+            // Correct VBR interpolation from the local clock before the delegate consumes any packets.
+            val measured = measureClock(input, pcr)
+            if (measured != null && (measured.timeUs > checkSeekUs || checkSeekUs - measured.timeUs > 2_000_000)) {
+                val corrected = pcr.estimate(checkSeekUs)
+                if (corrected.position != input.position) {
+                    seekPosition.position = corrected.position
+                    return Extractor.RESULT_SEEK
+                }
+            }
+            remainingProbes = 0
+        }
         val source = if (indexed == null) input else object : ForwardingExtractorInput(input) {
             override fun getLength() = C.LENGTH_UNSET.toLong()
         }
@@ -127,8 +163,10 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
         }
     }
     override fun seek(position: Long, timeUs: Long) {
-        val pointTime = profile?.points?.lastOrNull { it.position <= position }?.timeUs ?: timeUs
-        DebugLogger.log("ISO_CLPI_SEEK", "position=$position requestedUs=$timeUs pointUs=$pointTime indexed=${indexed != null}")
+        checkSeekUs = timeUs
+        remainingProbes = if (pcr != null && position > 0) 2 else 0
+        val pointTime = pcr?.estimate(timeUs)?.timeUs ?: profile?.points?.lastOrNull { it.position <= position }?.timeUs ?: timeUs
+        DebugLogger.log(if (pcr == null) "ISO_CLPI_SEEK" else "BDAV_PCR_SEEK", "position=$position requestedUs=$timeUs pointUs=$pointTime indexed=${indexed != null}")
         dv?.reset()
         subtitles?.resetSubtitleParsers()
         delegate.seek(position, if (indexed != null) pointTime else timeUs)

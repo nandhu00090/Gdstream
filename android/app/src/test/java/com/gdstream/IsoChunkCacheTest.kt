@@ -172,6 +172,8 @@ class IsoChunkCacheTest {
         assertTrue(cursor.begin(3, 5 * block + 192))
         assertFalse(cursor.advance(2, block))
         val size = 7 * block + 512
+        assertEquals(listOf(5 * block until 6 * block, 6 * block until 7 * block),
+            cursor.seekBlocks(5 * block + 192, size, throttled = true))
         assertEquals(listOf(5 * block until 6 * block, 6 * block until 7 * block, 7 * block until size,
             4 * block until 5 * block), cursor.seekBlocks(5 * block + 192, size))
     }

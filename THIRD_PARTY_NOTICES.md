@@ -46,3 +46,13 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## DVD MPEG-2 video decoder
+
+GDStream builds the portable C decoder from libmpeg2 0.5.1 into libgdcore.
+The sources in `android/app/src/main/cpp/libmpeg2` come from Debian
+mpeg2dec 0.5.1-11 with an Android config.h. The original files retain their
+copyright notices and GPL-2.0-or-later license. The license is packaged in
+`assets/licenses/libmpeg2-GPL-2.0.txt`.
+
+Source package: https://deb.debian.org/debian/pool/main/m/mpeg2dec/mpeg2dec_0.5.1-11.dsc

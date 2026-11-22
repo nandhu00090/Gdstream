@@ -202,23 +202,6 @@ for (const file of targets) {
 }
 
 
-// Hook CMakeLists.txt to compile Native C++ Vault (libgdcore.so) with hidden symbols
-const cmakeFile = path.resolve(__dirname, '../node_modules/react-native/ReactAndroid/cmake-utils/default-app-setup/CMakeLists.txt');
-const cppFile = path.resolve(__dirname, '../android/app/src/main/cpp/gdcore.cpp').replace(/\\/g, '/');
-if (fs.existsSync(cmakeFile)) {
-  let cmakeContent = fs.readFileSync(cmakeFile, 'utf8');
-  if (!cmakeContent.includes('add_library(gdcore SHARED')) {
-    cmakeContent += `\nadd_library(gdcore SHARED "${cppFile}")\ntarget_compile_options(gdcore PRIVATE -fvisibility=hidden -O2 -s)\ntarget_link_libraries(gdcore log)\n`;
-    fs.writeFileSync(cmakeFile, cmakeContent, 'utf8');
-    console.log('Patched CMakeLists.txt to build native libgdcore.so shield');
-  }
-  if (!cmakeContent.includes('dvd_transcode.cpp')) {
-    const dvdSource = path.resolve(path.dirname(cppFile), 'dvd_transcode.cpp').replace(/\\/g, '/');
-    fs.appendFileSync(cmakeFile, `\ntarget_sources(gdcore PRIVATE "${dvdSource}")\ntarget_link_libraries(gdcore mediandk dl)\n`);
-  }
-}
-
-
 // Inject Google Cloud Maven Central Mirror into @react-native/gradle-plugin to prevent 504 Gateway Timeouts on GitHub Actions
 const rnPluginDir = path.resolve(__dirname, '../node_modules/@react-native/gradle-plugin');
 function injectMavenMirror(dir) {

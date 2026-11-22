@@ -301,6 +301,7 @@ internal object BluRayPsi {
     }
     class Program(private val pat: ByteArray, private val pid: Int, private val pmt: ByteArray) {
         val streams by lazy { elementaryStreams(pmt) }
+        val pcrPid get() = ((pmt[8].toInt() and 31) shl 8) or (pmt[9].toInt() and 255)
         fun prefix(streams: List<BluRayStream>, audioPid: Int?, videoOnly: Boolean): ByteArray {
             val external = ExternalTsPmt.rewrite(pmt, streams, audioPid, videoOnly = videoOnly)
                 ?: throw IOException("Invalid external PMT")

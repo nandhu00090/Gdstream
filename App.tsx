@@ -2633,7 +2633,7 @@ const App = () => {
       await SecurityVault?.stopArchivePlayback?.(playbackSource.uri);
       const url = await resolvePlaybackUrl(targetFile);
       if (vlc) await VideoPlayerManager.playVideoInVlc(url);
-      else await VideoPlayerManager.playVideo(url, 'Open with External Player (VLC / MX / MPV recommended for Blu-ray)');
+      else if (await VideoPlayerManager.playVideo(url, 'Open with external player') === false) setPlayMode(null);
     } catch (error) {
       setPlayMode(null);
       if ((error as any)?.code === 'DVD_MPEG2_UNSUPPORTED') { showDvdFallback(targetFile); return; }

@@ -26,6 +26,32 @@ class StandaloneBdavTest {
         assertEquals(size, hls.segments.single().end)
     }
 
+    @Test fun sparsePcrIndexInterpolatesVbrInVirtualPacketCoordinatesAcrossRollover() {
+        val pid = 0x1001
+        val mask = (1L shl 33) - 1
+        val origin = mask - 90_000
+        fun pcr(seconds: Int, clockPid: Int = pid) = ByteArray(192).apply {
+            this[4] = 0x47
+            this[5] = (clockPid ushr 8).toByte()
+            this[6] = clockPid.toByte()
+            this[7] = 0x20
+            this[8] = 183.toByte()
+            this[9] = 0x10
+            val t = (origin + seconds * 90_000L) and mask
+            for (i in 0..3) this[10 + i] = (t ushr (25 - i * 8)).toByte()
+            this[14] = (((t and 1) shl 7) or 0x7e).toByte()
+        }
+        val index = StandalonePcrIndex.fromEndpoints(pcr(0), pcr(100), 192L * 1001, pid)!!
+        assertEquals(100_000_000L, index.spanUs)
+        val middle = 188L * 500
+        assertNull(index.sample(pcr(15, 0x1002), 192, middle))
+        assertEquals(BluRayPoint(20_000_000L, middle), index.sample(pcr(20), 192, middle))
+        assertEquals(BluRayPoint(60_000_000L, 188L * 750), index.estimate(61_000_000))
+        assertNull(index.sample(pcr(10), 192, middle + 188))
+        assertEquals(BluRayPoint(70_000_000, 188L * 825),
+            index.sample(pcr(70).copyOfRange(4, 192), 188, 188L * 825))
+    }
+
     @Test fun virtualPlaylistCoversEveryPacketOfLargeVariableDurationFile() {
         val size = 188L * 111111111
         val duration = 60123456L
