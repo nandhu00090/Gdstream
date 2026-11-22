@@ -38,6 +38,42 @@ class BluRayExtractorTest {
         override fun endTracks() {}
         override fun seekMap(seekMap: SeekMap) { map = seekMap }
     }
+    @Test fun hlsReaderCommitsDvdIdrAndSubsequentFramesWithPresentationTimes() {
+        // Three real baseline 32x32 access units from libx264, stripped of AUD and SEI.
+        fun hex(text: String) = text.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val mux = DvdTsMux()
+        mux.video(0, hex("000000016742c00ad9096c0440000003004000000c83c48992"), true)
+        mux.video(0, hex("0000000168cb83cb20"), true)
+        mux.video(1_000_000, hex("000000016588840bf2628000abcc9d75e0"))
+        mux.video(1_040_000, hex("00000001419a3817e580"))
+        mux.video(1_080_000, hex("00000001419a54057960"))
+        val bytes = mux.finish()
+        val ts = androidx.media3.extractor.ts.TsExtractor(androidx.media3.extractor.ts.TsExtractor.MODE_HLS,
+            androidx.media3.common.util.TimestampAdjuster(0), androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory())
+        val capture = Capture()
+        ts.init(capture)
+        val stream = bytes.inputStream()
+        val input = DefaultExtractorInput(stream::read, 0, C.LENGTH_UNSET.toLong())
+        while (ts.read(input, PositionHolder()) != Extractor.RESULT_END_OF_INPUT) { }
+        assertTrue(capture.formats.any { it.sampleMimeType == "video/avc" && it.width == 32 })
+        assertEquals(listOf(0L, 40_000L), capture.samples.take(2).map { it.time })
+        ts.release()
+    }
+
+    @Test fun latePmtAudioUsesInferredPrimaryLanguageAndNumberedSecondaryTrack() {
+        val bytes = javaClass.getResourceAsStream("/bluray/hdmv.ts.bin")!!.readBytes()
+        val profile = BluRayProfile(120000, listOf(BluRayPoint(0, 0), BluRayPoint(100000, 188)),
+            emptyList(), discLabel = "Jilla.Tamil.m2ts")
+        val extractor = BluRayTsExtractor(profile)
+        val capture = Capture()
+        extractor.init(capture)
+        val input = DefaultExtractorInput(bytes.inputStream()::read, 0, bytes.size.toLong())
+        while (extractor.read(input, PositionHolder()) != Extractor.RESULT_END_OF_INPUT) { }
+        assertTrue(capture.formats.any { it.sampleMimeType == "audio/raw" && it.language == "ta" })
+        assertTrue(capture.formats.any { it.label?.startsWith("Audio 2 • DTS") == true })
+        extractor.release()
+    }
+
     @Test fun fragmentedLpcmPesExposesTamilRawTrackWithExactSamplesAndPts() {
         val capture = Capture()
         val reader = HdmvPcmReader(listOf(BluRayAudio(0x1100, 0x80, "tam")), null)

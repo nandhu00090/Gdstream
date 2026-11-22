@@ -118,6 +118,7 @@ internal class IsoVirtualFile(
         durationUs: Long = 0,
         maxReadBytes: Int = IsoRangeReader.WINDOW_BYTES,
         onStreamStart: (() -> Unit)? = null,
+        pipelineDepth: Int = IsoRangeReader.MAX_CONCURRENT_READS,
         read: (Long, Int) -> ByteArray
     ): Boolean {
         session.log("ISO_PROXY_REQUEST", "method=$method requestedRange=${rangeHeader ?: "full"} size=$size")
@@ -206,7 +207,7 @@ internal class IsoVirtualFile(
             write(headers.toByteArray(Charsets.US_ASCII))
             var delivered = 0L
             while (chunk != null) {
-                prefetch(IsoRangeReader.MAX_CONCURRENT_READS)
+                prefetch(pipelineDepth)
                 write(chunk)
                 flush()
                 if (delivered == 0L) onStreamStart?.invoke()

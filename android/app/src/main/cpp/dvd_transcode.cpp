@@ -479,10 +479,9 @@ struct Session {
     AvFramePrefix *ffFrame = nullptr;
     std::unique_ptr<BuiltinMpeg2Decoder> builtinDecoder;
     AMediaCodec *encoder = nullptr;
-    int width = 0, height = 0, color = 0;
+    int width = 0, height = 0, color = 0, stride = 0, sliceHeight = 0;
     bool ended = false;
-    int64_t lastPts = 0, frameDuration = 40000;
-    std::vector<uint8_t> config;
+    int64_t lastPts = -1, frameDuration = 40000;
 
     ~Session() {
         if (encoder) { AMediaCodec_stop(encoder); AMediaCodec_delete(encoder); }
@@ -492,43 +491,47 @@ struct Session {
     }
 
     bool drain(JNIEnv *env, jobject mux, jmethodID emit, int64_t timeout) {
-        AMediaCodecBufferInfo info{};
-        ssize_t index = AMediaCodec_dequeueOutputBuffer(encoder, &info, timeout);
-        if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-            AMediaFormat *format = AMediaCodec_getOutputFormat(encoder);
-            config.clear();
-            for (const char *key : {"csd-0", "csd-1"}) {
-                void *p; size_t n;
-                if (AMediaFormat_getBuffer(format, key, &p, &n)) {
-                    auto bytes = static_cast<uint8_t *>(p);
-                    config.insert(config.end(), bytes, bytes + n);
+        auto deliver = [&](const uint8_t *bytes, size_t size, int64_t pts, bool csd) {
+            auto sample = env->NewByteArray(static_cast<jsize>(size));
+            if (!sample) return false;
+            env->SetByteArrayRegion(sample, 0, size, reinterpret_cast<const jbyte *>(bytes));
+            if (!env->ExceptionCheck())
+                env->CallVoidMethod(mux, emit, static_cast<jlong>(pts), sample, static_cast<jboolean>(csd));
+            env->DeleteLocalRef(sample);
+            return !env->ExceptionCheck();
+        };
+        while (!ended) {
+            AMediaCodecBufferInfo info{};
+            ssize_t index = AMediaCodec_dequeueOutputBuffer(encoder, &info, timeout);
+            timeout = 0; // Drain every available access unit before waiting for another input.
+            if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+                AMediaFormat *format = AMediaCodec_getOutputFormat(encoder);
+                if (!format) return false;
+                bool ok = true;
+                for (const char *key : {"csd-0", "csd-1"}) {
+                    void *p; size_t n;
+                    if (ok && AMediaFormat_getBuffer(format, key, &p, &n) && n)
+                        ok = deliver(static_cast<const uint8_t *>(p), n, 0, true);
                 }
+                AMediaFormat_delete(format);
+                if (!ok) return false;
+                continue;
             }
-            AMediaFormat_delete(format);
-            return true;
-        }
-        if (index < 0) return index == AMEDIACODEC_INFO_TRY_AGAIN_LATER || index == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED;
-        size_t capacity;
-        auto bytes = AMediaCodec_getOutputBuffer(encoder, index, &capacity);
-        bool valid = info.size == 0 || (bytes && info.offset >= 0 && info.size > 0 &&
-            static_cast<size_t>(info.offset) + info.size <= capacity);
-        if (valid && info.size > 0) {
-            bytes += info.offset;
-            if (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) config.assign(bytes, bytes + info.size);
-            else {
-                const size_t prefix = (info.flags & 1) ? config.size() : 0;
-                auto sample = env->NewByteArray(static_cast<jsize>(prefix + info.size));
-                if (sample) {
-                    if (prefix) env->SetByteArrayRegion(sample, 0, prefix, reinterpret_cast<const jbyte *>(config.data()));
-                    env->SetByteArrayRegion(sample, prefix, info.size, reinterpret_cast<const jbyte *>(bytes));
-                    env->CallVoidMethod(mux, emit, static_cast<jlong>(info.presentationTimeUs), sample);
-                    env->DeleteLocalRef(sample);
-                }
+            if (index == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
+            if (index < 0) return index == AMEDIACODEC_INFO_TRY_AGAIN_LATER;
+            size_t capacity;
+            auto bytes = AMediaCodec_getOutputBuffer(encoder, index, &capacity);
+            bool valid = info.size == 0 || (bytes && info.offset >= 0 && info.size > 0 &&
+                static_cast<size_t>(info.offset) + info.size <= capacity);
+            if (valid && info.size > 0) {
+                valid = deliver(bytes + info.offset, info.size, info.presentationTimeUs,
+                                (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) != 0);
             }
+            ended = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
+            AMediaCodec_releaseOutputBuffer(encoder, index, false);
+            if (!valid || env->ExceptionCheck()) return false;
         }
-        ended = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
-        AMediaCodec_releaseOutputBuffer(encoder, index, false);
-        return valid && !env->ExceptionCheck();
+        return true;
     }
 
     bool queuePlanes(JNIEnv *env, jobject mux, jmethodID emit,
@@ -549,20 +552,20 @@ struct Session {
             }
             size_t capacity;
             auto dst = AMediaCodec_getInputBuffer(encoder, index, &capacity);
-            int pixels = width * height;
+            const int pixels = stride * sliceHeight;
             if (!dst || capacity < static_cast<size_t>(pixels * 3 / 2)) return false;
             for (int y = 0; y < height; ++y)
-                memcpy(dst + y * width, yPlane + y * yStride, width);
+                memcpy(dst + y * stride, yPlane + y * yStride, width);
             const uint8_t *chroma[2] = {uPlane, vPlane};
             int cStride[2] = {uStride, vStride};
             for (int plane = 0; plane < 2; ++plane) {
                 for (int y = 0; y < height / 2; ++y) {
                     const auto src = chroma[plane] + y * cStride[plane];
-                    if (color == 19) memcpy(dst + pixels + plane * pixels / 4 + y * width / 2, src, width / 2);
-                    else for (int x = 0; x < width / 2; ++x) dst[pixels + y * width + 2 * x + plane] = src[x];
+                    if (color == 19) memcpy(dst + pixels + plane * pixels / 4 + y * stride / 2, src, width / 2);
+                    else for (int x = 0; x < width / 2; ++x) dst[pixels + y * stride + 2 * x + plane] = src[x];
                 }
             }
-            lastPts = pts >= 0 ? pts : lastPts + frameDuration;
+            lastPts = pts > lastPts ? pts : (lastPts < 0 ? 0 : lastPts + frameDuration);
             return AMediaCodec_queueInputBuffer(encoder, index, 0, pixels * 3 / 2, lastPts, 0) == AMEDIA_OK;
         }
         return false;
@@ -605,6 +608,8 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_gdstream_DvdProxy_open(JNIEnv *env, 
     AMediaFormat_setInt32(format, "width", w);
     AMediaFormat_setInt32(format, "height", h);
     AMediaFormat_setInt32(format, "color-format", color);
+    AMediaFormat_setInt32(format, "stride", w);
+    AMediaFormat_setInt32(format, "slice-height", h);
     AMediaFormat_setInt32(format, "bitrate", 4500000);
     AMediaFormat_setFloat(format, "frame-rate", static_cast<float>(fps));
     AMediaFormat_setInt32(format, "i-frame-interval", 1);
@@ -612,6 +617,20 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_gdstream_DvdProxy_open(JNIEnv *env, 
     auto status = AMediaCodec_configure(s->encoder, format, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
     AMediaFormat_delete(format);
     if (status != AMEDIA_OK || AMediaCodec_start(s->encoder) != AMEDIA_OK) return 0;
+    s->stride = w;
+    s->sliceHeight = h;
+    // API 24-27 do not export getInputFormat. Their byte-buffer encoders use the configured layout.
+    using GetInputFormat = AMediaFormat *(*)(AMediaCodec *);
+    if (auto getInputFormat = reinterpret_cast<GetInputFormat>(dlsym(RTLD_DEFAULT, "AMediaCodec_getInputFormat"))) {
+        AMediaFormat *inputFormat = getInputFormat(s->encoder);
+        if (inputFormat) {
+            int32_t value;
+            if (AMediaFormat_getInt32(inputFormat, "stride", &value) && value > w) s->stride = value;
+            if (AMediaFormat_getInt32(inputFormat, "slice-height", &value) && value > h) s->sliceHeight = value;
+            AMediaFormat_delete(inputFormat);
+        }
+    }
+    if (s->stride > 4096 || s->sliceHeight > 4096 || (s->stride | s->sliceHeight) & 1) return 0;
     s->width = w; s->height = h; s->color = color; s->frameDuration = static_cast<int64_t>(1000000.0 / fps);
     return reinterpret_cast<jlong>(s.release());
 }
@@ -619,7 +638,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_gdstream_DvdProxy_open(JNIEnv *env, 
 extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_encode(JNIEnv *env, jobject, jlong handle,
                                                                     jbyteArray input, jlong pts, jobject mux) {
     auto &s = *reinterpret_cast<Session *>(handle);
-    auto emit = env->GetMethodID(env->GetObjectClass(mux), "video", "(J[B)V");
+    auto emit = env->GetMethodID(env->GetObjectClass(mux), "video", "(J[BZ)V");
     if (!emit) return;
 
     auto run = [&]() {
@@ -652,6 +671,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_encode(JNIEnv *env,
                 env->GetByteArrayRegion(input, 0, length, reinterpret_cast<jbyte *>(buf.data()));
                 out = s.builtinDecoder->decodePicture(buf.data(), buf.size(), pts);
                 if (out) {
+                    if (out->width < s.width || out->height < s.height) return false;
                     if (!s.queuePlanes(env, mux, emit,
                                        out->y.data(), out->width,
                                        out->u.data(), out->width / 2,
@@ -662,6 +682,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_encode(JNIEnv *env,
             } else {
                 out = s.builtinDecoder->flush();
                 if (out) {
+                    if (out->width < s.width || out->height < s.height) return false;
                     if (!s.queuePlanes(env, mux, emit,
                                        out->y.data(), out->width,
                                        out->u.data(), out->width / 2,

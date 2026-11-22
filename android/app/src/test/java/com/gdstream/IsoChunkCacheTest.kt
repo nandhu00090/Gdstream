@@ -23,7 +23,7 @@ class IsoChunkCacheTest {
         val b = IsoReadSession()
         val seek = IsoReadSession()
         try {
-            val discA = caches.acquire("https://origin/iso?id=a#title", a)
+            val discA = caches.acquire("https://origin/folder/../iso?id=a#title", a)
             val discB = caches.acquire("https://origin/iso?id=b", b)
             assertNotSame(discA, discB)
             assertSame(discA, caches.acquire("https://origin/iso?id=a", seek))
@@ -31,7 +31,7 @@ class IsoChunkCacheTest {
             b.cancel()
             seek.cancel()
             assertSame(discA, caches.acquire("https://origin/iso?id=a", IsoReadSession()))
-            assertNotSame(discB, caches.acquire("https://origin/iso?id=b", IsoReadSession()))
+            assertSame(discB, caches.acquire("https://origin/iso?id=b", IsoReadSession()))
         } finally { caches.clear() }
     }
 
@@ -43,7 +43,7 @@ class IsoChunkCacheTest {
         val done = CountDownLatch((size / block).toInt())
         val calls = AtomicInteger()
         try {
-            cache.prefetch(listOf(0L until size), size) { from, to, _ ->
+            cache.prefetch(listOf(0L until size), size, IsoReadSession()) { from, to, _ ->
                 calls.incrementAndGet()
                 entered.countDown()
                 assertTrue(release.await(5, TimeUnit.SECONDS))
@@ -90,7 +90,7 @@ class IsoChunkCacheTest {
         } finally { release.countDown(); cache.clear(); workers.shutdownNow(); consumers.shutdownNow() }
     }
 
-    @Test fun seekAfterLastReaderClosesRejoinsThePendingBlock() {
+    @Test fun seekAfterLastReaderClosesStartsANewUpstreamRequest() {
         val workers = Executors.newSingleThreadExecutor()
         val consumers = Executors.newCachedThreadPool()
         val cache = IsoChunkCache(executor = workers)
@@ -116,8 +116,64 @@ class IsoChunkCacheTest {
             awaitReaders(cache, 1)
             release.countDown()
             assertArrayEquals(byteArrayOf(9, 9), next.get(3, TimeUnit.SECONDS))
-            assertEquals(1, calls.get())
+            assertEquals(2, calls.get())
         } finally { release.countDown(); cache.clear(); workers.shutdownNow(); consumers.shutdownNow() }
+    }
+
+    @Test fun nearbyAudioRequestPreservesVideoFlightAndFarSeekAbortsIt() {
+        val cache = IsoChunkCache()
+        val client = IsoReadSession()
+        val entered = CountDownLatch(1)
+        val aborted = CountDownLatch(1)
+        val size = 20 * block
+        try {
+            cache.prefetch(listOf(0L until block), size, client) { _, _, owner ->
+                owner.onCancel { aborted.countDown() }
+                entered.countDown()
+                aborted.await(5, TimeUnit.SECONDS)
+                owner.checkActive()
+                error("expected far seek")
+            }
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            fun warm(index: Int) = cache.prefetch(listOf(index * block until (index + 1) * block), size, client) { from, to, _ ->
+                ByteArray((to - from + 1).toInt())
+            }.single().get(2, TimeUnit.SECONDS)
+            warm(3)
+            assertEquals(1L, aborted.count)
+            warm(10)
+            assertTrue(aborted.await(1, TimeUnit.SECONDS))
+        } finally { client.cancel(); cache.clear() }
+    }
+
+    @Test fun startupBlockSurvivesLruPressureAndAClosedPlaybackSession() {
+        val cache = IsoChunkCache(2 * block.toInt())
+        val session = IsoReadSession()
+        val size = 4 * block
+        try {
+            repeat(4) { index ->
+                cache.read(index * block, index * block, 0, size - 1, session) { from, to, _ ->
+                    ByteArray((to - from + 1).toInt()) { (from / block).toByte() }
+                }
+            }
+            session.cancel()
+            cache.cancelFlights()
+            val head = cache.read(0, block - 1, 0, size - 1, IsoReadSession()) { _, _, _ -> error("reopened upstream") }
+            assertEquals(block.toInt(), head.size)
+            assertEquals(0, head.last().toInt())
+            assertEquals(2 * block, cache.cachedBytes().toLong())
+        } finally { cache.clear() }
+    }
+
+    @Test fun m2tsCursorUsesDeliveredOffsetsAndClipsPriorityWindowAtEof() {
+        val cursor = M2tsReadCursor()
+        assertFalse(cursor.begin(1, 0))
+        cursor.advance(1, block)
+        assertFalse(cursor.begin(2, block / 2))
+        assertTrue(cursor.begin(3, 5 * block + 192))
+        assertFalse(cursor.advance(2, block))
+        val size = 7 * block + 512
+        assertEquals(listOf(5 * block until 6 * block, 6 * block until 7 * block, 7 * block until size,
+            4 * block until 5 * block), cursor.seekBlocks(5 * block + 192, size))
     }
 
     @Test fun cacheIsLruBoundedCopySafeAndDoesNotRetainFailures() {

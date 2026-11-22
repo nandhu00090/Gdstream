@@ -14,10 +14,12 @@ jest.mock('react-native', () => {
     listZipMediaEntries: jest.fn(),
     getArchiveWatchAliases: jest.fn().mockResolvedValue(['inner', 'Example.2009 [Main Movie - 2h].m2ts', 'http://127.0.0.1:99/zip/inner/movie.m2ts']),
     writeDebugLog: jest.fn(),
+    dvdPlaybackUrl: jest.fn(),
   };
   rn.NativeModules.MediaInfoModule = { inspectMedia: jest.fn() };
   rn.NativeModules.VideoPlayerManager = {
     getAllWatchProgress: jest.fn().mockResolvedValue({ times: {}, durations: {} }),
+    playVideo: jest.fn().mockResolvedValue(true),
     removeWatchProgress: jest.fn().mockResolvedValue(true),
   };
   return rn;
@@ -102,4 +104,20 @@ test('X removes outer and persisted inner progress and remains removed after rem
   NativeModules.SecurityVault.listZipMediaEntries.mockResolvedValue(JSON.stringify([{ name: inner, link: 'http://127.0.0.1:99/zip/inner/movie.m2ts' }]));
   await Renderer.act(async () => renderer.root.findByProps({ focusId: 'card_0' }).props.onPress());
   expect(renderedText(renderer.toJSON())).not.toContain('Resume Watching');
+});
+
+test('external DVD chooser gets the virtual VOB after ISO resolution', async () => {
+  const direct = 'http://127.0.0.1:99/zip/disc/Example%20%5BDVD%20Main%5D.vob';
+  NativeModules.SecurityVault.listZipMediaEntries.mockResolvedValue(JSON.stringify([
+    { name: 'Example [DVD Main].vob', link: direct, durationSec: 7200 },
+  ]));
+  await mount();
+  await Renderer.act(async () => renderer.root.findByProps({ focusId: 'card_0' }).props.onPress());
+  await Renderer.act(async () => {
+    const launch = renderer.root.findByProps({ focusId: 'detail_ext_btn' }).props.onPress();
+    jest.advanceTimersByTime(32);
+    await launch;
+  });
+  expect(NativeModules.VideoPlayerManager.playVideo).toHaveBeenCalledWith(direct, expect.any(String));
+  expect(NativeModules.SecurityVault.dvdPlaybackUrl).not.toHaveBeenCalled();
 });

@@ -12,11 +12,11 @@ internal object StandaloneBdav {
             head.copyInto(ts, packet * 188, packet * 192 + 4, (packet + 1) * 192)
         }
         val inferredLang = inferLanguageCodeFromName(label)
-        var appliedPrimary = false
+        var firstAudio = true
         val streams = DiscAudio.inspectM2ts(head, BluRayPsi.streams(ts)).map { stream ->
-            if (stream.audio && (stream.language.isBlank() || stream.language == "und") &&
-                inferredLang.isNotEmpty() && !appliedPrimary) {
-                appliedPrimary = true
+            val primary = stream.audio && firstAudio
+            if (stream.audio) firstAudio = false
+            if (primary && (stream.language.isBlank() || stream.language == "und") && inferredLang.isNotEmpty()) {
                 stream.copy(language = inferredLang)
             } else {
                 stream

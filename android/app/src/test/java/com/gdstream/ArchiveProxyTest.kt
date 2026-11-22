@@ -272,11 +272,13 @@ class ArchiveProxyTest {
         val raw = ByteArray(ts.size / 188 * 192)
         for (i in 0 until ts.size / 188) ts.copyInto(raw, i * 192 + 4, i * 188, (i + 1) * 188)
         val origin = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
+        val requests = java.util.concurrent.atomic.AtomicInteger()
         val listener = Executors.newSingleThreadExecutor()
         listener.submit {
             while (!origin.isClosed) origin.accept().use { socket ->
                 val reader = socket.getInputStream().bufferedReader()
                 val headers = generateSequence { reader.readLine() }.takeWhile { it.isNotEmpty() }.toList()
+                requests.incrementAndGet()
                 val range = HttpByteRange.parse(headers.first { it.startsWith("Range:", true) }.substringAfter(':').trim(), raw.size.toLong())
                 socket.getOutputStream().apply {
                     write("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes ${range.start}-${range.end}/${raw.size}\r\nContent-Length: ${range.length}\r\nConnection: close\r\n\r\n".toByteArray())
@@ -299,6 +301,11 @@ class ArchiveProxyTest {
             val url = ready.get(10, TimeUnit.SECONDS)
             assertTrue(SecurityVaultModule.isIsoStream(url))
             assertArrayEquals(ts, get(url))
+            val initialRequests = requests.get()
+            ArchiveProxyStreams.stop(url)
+            ArchiveProxyStreams.prepare(url)
+            assertArrayEquals(ts, get(url))
+            assertEquals("warm reopen contacted origin", initialRequests, requests.get())
             val profile = SecurityVaultModule.bluRayProfile(url)!!
             assertTrue(profile.durationUs > 0)
             assertTrue(profile.streams.any { it.audio && it.kbps > 0 })
@@ -308,7 +315,8 @@ class ArchiveProxyTest {
             val video = get(master.replace("index.m3u8", "seg_0.ts"))
             assertTrue(BluRayPsi.streams(video).any { it.video })
             assertFalse(BluRayPsi.streams(video).any { it.audio })
-            val pid = profile.audio.first().pid
+            // LPCM is available to the direct extractor. Choose an advertised HLS rendition.
+            val pid = Regex("audio_([0-9]+)\\.m3u8").find(String(get(master)))!!.groupValues[1].toInt()
             assertEquals(pid, BluRayPsi.streams(get(master.replace("index.m3u8", "audio_${pid}_seg_0.ts"))).single().pid)
         } finally {
             origin.close(); listener.shutdownNow()

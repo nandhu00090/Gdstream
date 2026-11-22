@@ -18,7 +18,8 @@ data class BluRayAudio(val pid: Int, val type: Int, val language: String) {
     }
     fun displayLabel(trackIndex: Int, channels: String = ""): String {
         val name = bluRayLanguage(language)
-        val prefix = if (name == "Unknown") "Audio ${trackIndex + 1} • $codecName" else "$name $codecName"
+        if (name == "Unknown") return listOf("Audio ${trackIndex + 1} • $codecName", channels).filter { it.isNotEmpty() }.joinToString(" ")
+        val prefix = "$name $codecName"
         return if (channels.isNotEmpty()) "$prefix • $channels" else prefix
     }
     val label: String get() = displayLabel(0)

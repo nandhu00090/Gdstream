@@ -31,26 +31,37 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
     private var inputLength = C.LENGTH_UNSET.toLong()
     private val videoReaders = ArrayList<EndOfInputPayloadReader>()
     private val pidReaders = ArrayList<BluRayPidReader>()
+    private val audioTracks = profile?.audio.orEmpty().associateByTo(linkedMapOf()) { it.pid }
+    private val streams = profile?.streams.orEmpty().associateByTo(linkedMapOf()) { it.pid }
+    private val filenameLanguage = inferLanguageCodeFromName(profile?.discLabel.orEmpty())
     private val fallback = DefaultTsPayloadReaderFactory(DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)
     private val payloads = object : TsPayloadReader.Factory {
         override fun createInitialPayloadReaders() = fallback.createInitialPayloadReaders()
         override fun createPayloadReader(streamType: Int, esInfo: TsPayloadReader.EsInfo): TsPayloadReader =
-            BluRayPidReader(profile?.audio.orEmpty(), streamType, dv != null) { resolved -> reader(resolved, esInfo) }.also(pidReaders::add)
+            BluRayPidReader(profile?.audio.orEmpty(), streamType, dv != null) { pid, resolved ->
+                val stream = streams[pid] ?: BluRayStream(pid, resolved)
+                val lang = sequenceOf(audioTracks[pid]?.language, stream.language, esInfo.language,
+                    filenameLanguage.takeIf { stream.audio && (audioTracks.keys.firstOrNull() ?: pid) == pid })
+                    .firstOrNull { !it.isNullOrBlank() && it != "und" }
+                streams[pid] = stream.copy(language = lang.orEmpty())
+                if (stream.audio) audioTracks[pid] = BluRayAudio(pid, resolved, lang.orEmpty())
+                reader(resolved, TsPayloadReader.EsInfo(esInfo.streamType, lang, esInfo.audioType, esInfo.dvbSubtitleInfos, esInfo.descriptorBytes))
+            }.also(pidReaders::add)
         private fun reader(streamType: Int, esInfo: TsPayloadReader.EsInfo): TsPayloadReader? = when (streamType) {
             0x81, 0x84, 0xa1 -> PesReader(Ac3Reader(esInfo.language, 0, androidx.media3.common.MimeTypes.VIDEO_MP2T))
-            0x83 -> PesReader(BluRayTrueHdReader(profile?.audio.orEmpty(), esInfo.language))
-            0x90 -> PesReader(BluRayPgsReader(profile?.streams.orEmpty(), esInfo.language))
+            0x83 -> PesReader(BluRayTrueHdReader(audioTracks.values.toList(), esInfo.language))
+            0x90 -> PesReader(BluRayPgsReader(streams.values.toList(), esInfo.language))
             0x24 -> fallback.createPayloadReader(streamType, esInfo)!!.let {
                 EndOfInputPayloadReader(dv?.payload(it) ?: BaseLayerPayloadReader(it)).also(videoReaders::add)
             }
-            0x80 -> PesReader(HdmvPcmReader(profile?.audio.orEmpty(), esInfo.language))
-            0x82, 0x85, 0x86, 0x8a, 0xa2 -> PesReader(BluRayDtsReader(streamType != 0x82, profile?.audio.orEmpty(), esInfo.language))
+            0x80 -> PesReader(HdmvPcmReader(audioTracks.values.toList(), esInfo.language))
+            0x82, 0x85, 0x86, 0x8a, 0xa2 -> PesReader(BluRayDtsReader(streamType != 0x82, audioTracks.values.toList(), esInfo.language))
             else -> fallback.createPayloadReader(streamType, esInfo)
         }
     }
     private var subtitles: androidx.media3.extractor.text.SubtitleTranscodingExtractorOutput? = null
     private val delegate = TsExtractor(TsExtractor.MODE_SINGLE_PMT, TsExtractor.FLAG_EMIT_RAW_SUBTITLE_DATA,
-        DefaultSubtitleParserFactory(), TimestampAdjuster(0), payloads, 112800)
+        DefaultSubtitleParserFactory(), TimestampAdjuster(0), payloads, 600 * 188)
     override fun sniff(input: ExtractorInput) = delegate.sniff(input)
     override fun init(output: ExtractorOutput) {
         val transcoded = androidx.media3.extractor.text.SubtitleTranscodingExtractorOutput(output, DefaultSubtitleParserFactory())
@@ -58,15 +69,15 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
         delegate.init(object : ExtractorOutput {
             override fun track(id: Int, type: Int): TrackOutput {
                 val target = transcoded.track(id, type)
-                val audioIdx = profile?.audio?.indexOfFirst { it.pid == id } ?: -1
-                val audio = if (audioIdx >= 0) profile!!.audio[audioIdx] else null
+                val audioIdx = audioTracks.keys.indexOf(id)
+                val audio = audioTracks[id]
                 return object : TrackOutput by target {
                     override fun format(format: androidx.media3.common.Format) {
                         val enriched = if (audio != null && type == C.TRACK_TYPE_AUDIO) {
                             val ch = when (format.channelCount) { 1 -> "Mono"; 2 -> "Stereo"; 6 -> "5.1"; 8 -> "7.1"; else -> "" }
-                            val lang = audio.language.takeIf { it.isNotBlank() && it != "und" }
+                            val lang = audio.language.takeIf { it.isNotBlank() && it != "und" } ?: format.language
                             format.buildUpon().setLanguage(lang)
-                                .setLabel(format.label ?: audio.displayLabel(audioIdx, ch)).build()
+                                .setLabel(audio.copy(language = lang.orEmpty()).displayLabel(audioIdx, ch)).build()
                         } else format
                         if (type == C.TRACK_TYPE_AUDIO) DebugLogger.log("ISO_AUDIO_FORMAT",
                             "pid=$id id=${enriched.id} mime=${enriched.sampleMimeType} channels=${enriched.channelCount} rate=${enriched.sampleRate} language=${enriched.language}")
@@ -87,7 +98,12 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
                     override fun getDurationUs() = duration
                     override fun isSeekable() = true
                     override fun getSeekPoints(timeUs: Long): SeekMap.SeekPoints {
-                        if (seekMap.isSeekable) return seekMap.getSeekPoints(timeUs)
+                        if (seekMap.isSeekable) {
+                            // The proxy strips the four arrival-time bytes. Start PCR probes on its TS grid.
+                            val points = seekMap.getSeekPoints(timeUs)
+                            fun align(p: SeekPoint) = SeekPoint(p.timeUs, p.position / 188 * 188)
+                            return SeekMap.SeekPoints(align(points.first), align(points.second))
+                        }
                         val fraction = timeUs.coerceIn(0L, duration).toDouble() / duration
                         val packet = (fraction * (inputLength / 188)).toLong().coerceAtMost(inputLength / 188 - 1)
                         return SeekMap.SeekPoints(SeekPoint(timeUs, packet * 188))
@@ -158,7 +174,7 @@ internal class EndOfInputPayloadReader(private val reader: TsPayloadReader) : Ts
 /** Resolve private/incorrect PMT audio types from CLPI only after Media3 supplies the actual PID. */
 internal class BluRayPidReader(
     private val audio: List<BluRayAudio>, private val advertisedType: Int, private val dualPidDv: Boolean,
-    private val create: (Int) -> TsPayloadReader?
+    private val create: (Int, Int) -> TsPayloadReader?
 ) : TsPayloadReader {
     private var reader: TsPayloadReader? = null
     override fun init(adjuster: TimestampAdjuster, output: ExtractorOutput, ids: TsPayloadReader.TrackIdGenerator) {
@@ -167,7 +183,7 @@ internal class BluRayPidReader(
         val type = if (dualPidDv && (pid == 0x1011 || pid == 0x1015)) 0x24
             else audio.firstOrNull { it.pid == pid && pid in 0x1100..0x111f }?.type ?: advertisedType
         val freshIds = TsPayloadReader.TrackIdGenerator(ids.formatId.substringBefore('/', "").toIntOrNull() ?: Int.MIN_VALUE, pid, 8192)
-        reader = create(type)
+        reader = create(pid, type)
         reader?.init(adjuster, output, freshIds)
         if (pid in 0x1100..0x111f) DebugLogger.log("ISO_AUDIO_BIND", "pid=$pid type=$type active=${reader != null}")
     }
