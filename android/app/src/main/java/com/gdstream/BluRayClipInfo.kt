@@ -25,7 +25,8 @@ data class BluRayAudio(val pid: Int, val type: Int, val language: String) {
     val label: String get() = displayLabel(0)
 }
 data class BluRayProfile(val durationUs: Long, val points: List<BluRayPoint>, val audio: List<BluRayAudio>,
-    val streams: List<BluRayStream> = emptyList(), val discLabel: String = "", val dolbyVision: Boolean = false) {
+    val streams: List<BluRayStream> = emptyList(), val discLabel: String = "", val dolbyVision: Boolean = false,
+    val pcrIndex: StandalonePcrIndex? = null) {
     fun toJson() = JSONObject().put("durationUs", durationUs)
         .put("streams", JSONArray().apply { streams.forEach { put(it.json()) } })
         .put("discLabel", discLabel).put("dolbyVision", dolbyVision)

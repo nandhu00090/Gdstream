@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /** Cancellation owns sockets AND permits; Future.cancel alone cannot interrupt an Android HTTP read. */
-internal class IsoReadSession {
+internal class IsoReadSession(val publishPrefix: ((ByteArray, Int) -> Unit)? = null) {
     companion object {
         private val ids = AtomicLong()
         private val socketClosers = java.util.concurrent.Executors.newCachedThreadPool { task ->
@@ -22,7 +22,7 @@ internal class IsoReadSession {
     @Volatile var isCancelled = false
         private set
     private val lock = Any()
-    private val connections = LinkedHashSet<HttpURLConnection>()
+    private val connections = LinkedHashMap<HttpURLConnection, Permit?>()
     private val leases = LinkedHashSet<Permit>()
     private val cancellations = LinkedHashMap<Any, () -> Unit>()
 
@@ -54,19 +54,28 @@ internal class IsoReadSession {
     }
 
     // Register BEFORE responseCode: a cancelled probe can be blocked connecting or reading headers.
-    fun track(connection: HttpURLConnection) {
-        synchronized(lock) {
-            if (!isCancelled) { connections.add(connection); return }
+    fun track(connection: HttpURLConnection, hostSlots: Semaphore? = null) {
+        val permit = hostSlots?.let {
+            checkActive()
+            while (!it.tryAcquire(100, TimeUnit.MILLISECONDS)) checkActive()
+            Permit(it::release)
         }
+        synchronized(lock) {
+            if (!isCancelled) {
+                if (connection !in connections) connections[connection] = permit else permit?.close()
+                return
+            }
+        }
+        permit?.close()
         disconnect(connection)
         checkActive()
     }
 
     fun disconnect(connection: HttpURLConnection) {
-        synchronized(lock) { connections.remove(connection) }
+        val permit = synchronized(lock) { connections.remove(connection) }
         try { connection.disconnect() } catch (error: Exception) {
             log("ISO_UPSTREAM_CLOSE_ERR", "url=${safeStreamUrl(connection.url.toString())} ${isoFailureDetails(error)}")
-        }
+        } finally { permit?.close() }
     }
 
     fun onCancel(action: () -> Unit): AutoCloseable {
@@ -82,8 +91,8 @@ internal class IsoReadSession {
         val resources = synchronized(lock) {
             if (isCancelled) return
             isCancelled = true
-            Triple(leases.toList(), connections.toList(), cancellations.values.toList()).also {
-                leases.clear(); connections.clear(); cancellations.clear()
+            Triple(leases.toList(), connections.keys.toList(), cancellations.values.toList()).also {
+                leases.clear(); cancellations.clear()
             }
         }
         log("ISO_REQUEST_CLOSE", reason)

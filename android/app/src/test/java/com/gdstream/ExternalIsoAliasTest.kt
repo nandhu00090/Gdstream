@@ -4,6 +4,21 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ExternalIsoAliasTest {
+    @Test fun dvdRepresentationDependsOnTheSelectedPlayerAndPlatformDecoder() {
+        for (pkg in listOf("org.videolan.vlc", "is.xyz.mpv", "org.xbmc.kodi"))
+            assertFalse(dvdPlayerNeedsAvc(pkg) { false })
+        assertTrue(dvdPlayerNeedsAvc("com.brouken.player") { true })
+        val vob = "http://127.0.0.1:9090/zip/title/Arundhati.vob"
+        val hls = "http://127.0.0.1:9090/hls/title/dvd.m3u8"
+        for (entry in listOf(vob, hls)) {
+            assertEquals(vob, externalDvdUrl(entry, "title", "Arundhati.vob", avc = false))
+            assertEquals(hls, externalDvdUrl(entry, "title", "Arundhati.vob", avc = true))
+        }
+        assertTrue(dvdPlayerNeedsAvc("androidx.media3.demo.main") { true })
+        assertTrue(dvdPlayerNeedsAvc("com.example.video") { false })
+        assertFalse(dvdPlayerNeedsAvc("com.example.video") { true })
+    }
+
     @Test fun aliasPreservesEncodingQueryAndFragmentAndRejectsOtherFilenames() {
         val name = "தமிழ் Movie + DTS.m2ts"
         val encoded = java.net.URLEncoder.encode(name, "UTF-8").replace("+", "%20")

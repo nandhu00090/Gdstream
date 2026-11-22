@@ -14,6 +14,7 @@ android {
     buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion
 
+    externalNativeBuild.cmake.path file("src/main/jni/CMakeLists.txt")
     namespace "com.gdstream"
     defaultConfig {
         applicationId "com.gdstream"

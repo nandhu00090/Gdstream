@@ -5,7 +5,7 @@ internal object StandaloneBdav {
     fun matches(head: ByteArray) = head.size >= 3 * 192 &&
         (0..2).all { head[it * 192 + 4] == 0x47.toByte() }
 
-    fun profile(head: ByteArray, tail: ByteArray, label: String): BluRayProfile {
+    fun profile(head: ByteArray, tail: ByteArray, label: String, rawSize: Long = 0): BluRayProfile {
         require(matches(head))
         val ts = ByteArray(head.size / 192 * 188)
         for (packet in 0 until ts.size / 188) {
@@ -13,7 +13,8 @@ internal object StandaloneBdav {
         }
         val inferredLang = inferLanguageCodeFromName(label)
         var firstAudio = true
-        val streams = DiscAudio.inspectM2ts(head, BluRayPsi.streams(ts)).map { stream ->
+        val program = BluRayPsi.program(ts)
+        val streams = DiscAudio.inspectM2ts(head, program?.streams.orEmpty()).map { stream ->
             val primary = stream.audio && firstAudio
             if (stream.audio) firstAudio = false
             if (primary && (stream.language.isBlank() || stream.language == "und") && inferredLang.isNotEmpty()) {
@@ -28,8 +29,13 @@ internal object StandaloneBdav {
         val pid = (streams.filter { it.video }.map { it.pid } + first.keys)
             .firstOrNull { it in first && it in last }
         val ticks = if (pid == null) 0L else (last.getValue(pid).last - first.getValue(pid).first) and 0x1ffffffffL
-        return BluRayProfile(ticks * 1_000_000 / 90_000, emptyList(),
-            streams.filter { it.audio }.map { BluRayAudio(it.pid, it.type, it.language) }, streams, label)
+        val ptsDuration = ticks * 1_000_000 / 90_000
+        val index = if (rawSize > 0) StandalonePcrIndex.fromEndpoints(head, tail, rawSize, program?.pcrPid)
+            ?.takeIf { ptsDuration == 0L || kotlin.math.abs(ptsDuration - it.spanUs) <= maxOf(2_000_000L, ptsDuration / 100) }
+            else null
+        val duration = if (ptsDuration > 0) ptsDuration else index?.spanUs ?: 0
+        return BluRayProfile(duration, emptyList(),
+            streams.filter { it.audio }.map { BluRayAudio(it.pid, it.type, it.language) }, streams, label, pcrIndex = index)
     }
 
     private fun timestamps(data: ByteArray): Map<Int, LongRange> {
@@ -49,5 +55,75 @@ internal object StandaloneBdav {
             result[pid] = (result[pid]?.first ?: value)..value
         }
         return result
+    }
+}
+
+/** PCR anchors use the proxy's 188-byte coordinates. Interpolate only between samples on the same clock. */
+class StandalonePcrIndex private constructor(private val pid: Int, private val origin: Long,
+                                             val spanUs: Long, endPosition: Long) {
+    private val anchors = java.util.TreeMap<Long, Long>().apply {
+        put(0L, 0L)
+        put(spanUs, endPosition)
+    }
+
+    internal val pointCount: Int @Synchronized get() = anchors.size
+
+    companion object {
+        private const val MASK = 0x1ffffffffL
+        private fun packetPid(bytes: ByteArray, p: Int) =
+            ((bytes[p + 1].toInt() and 31) shl 8) or (bytes[p + 2].toInt() and 255)
+
+        private fun ticks(bytes: ByteArray, p: Int): Long? {
+            fun u(i: Int) = bytes[p + i].toInt() and 255
+            if (u(0) != 0x47 || u(1) and 0x80 != 0 || u(3) and 0x20 == 0 ||
+                u(4) !in 7..183 || u(5) and 0x90 != 0x10) return null
+            return (u(6).toLong() shl 25) or (u(7).toLong() shl 17) or (u(8).toLong() shl 9) or
+                (u(9).toLong() shl 1) or (u(10) ushr 7).toLong()
+        }
+
+        internal fun fromEndpoints(head: ByteArray, tail: ByteArray, size: Long, preferredPid: Int?): StandalonePcrIndex? {
+            val starts = linkedMapOf<Int, Long>()
+            for (p in 4..head.size - 188 step 192) {
+                val clock = ticks(head, p) ?: continue
+                val pid = packetPid(head, p)
+                if (preferredPid == null || preferredPid == pid) starts.putIfAbsent(pid, clock)
+            }
+            for (packet in tail.size / 192 - 1 downTo 0) {
+                val p = packet * 192 + 4
+                val pid = packetPid(tail, p)
+                val origin = starts[pid] ?: continue
+                val last = ticks(tail, p) ?: continue
+                val spanUs = ((last - origin) and MASK) * 1_000_000 / 90_000
+                val end = (size / 192 - tail.size / 192 + packet) * 188
+                if (spanUs > 0 && end > 0) return StandalonePcrIndex(pid, origin, spanUs, end)
+            }
+            return null
+        }
+    }
+
+    /** Inspect either a raw BDAV probe or a peek into the stripped TS after a seek. */
+    @Synchronized internal fun sample(bytes: ByteArray, packetBytes: Int, position: Long, length: Int = bytes.size): BluRayPoint? {
+        for (packet in 0 until length / packetBytes) {
+            val p = packet * packetBytes + packetBytes - 188
+            if (packetPid(bytes, p) != pid) continue
+            val clock = ticks(bytes, p) ?: continue
+            val us = ((clock - origin) and MASK) * 1_000_000 / 90_000
+            val pos = position + packet * 188L
+            val before = anchors.lowerEntry(us) ?: continue
+            val after = anchors.higherEntry(us) ?: continue
+            if (pos <= before.value || pos >= after.value) continue
+            if (anchors.size < 1024) anchors[us] = pos
+            return BluRayPoint(us, pos)
+        }
+        return null
+    }
+
+    @Synchronized internal fun estimate(timeUs: Long): BluRayPoint {
+        // Allow the elementary reader to synchronize at a nearby video random-access unit.
+        val t = (timeUs - 1_000_000).coerceIn(0, spanUs)
+        val a = anchors.floorEntry(t)!!
+        val b = anchors.higherEntry(t) ?: return BluRayPoint(t, a.value)
+        val fraction = (t - a.key).toDouble() / (b.key - a.key)
+        return BluRayPoint(t, (a.value + ((b.value - a.value) * fraction).toLong()) / 188 * 188)
     }
 }

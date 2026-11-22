@@ -82,6 +82,79 @@ class IsoUpstreamTest {
         }
     }
 
+    @Test fun seekDeliversPrefixBeforeOriginFinishesAndRetriesOnlyTheMissingSuffix() {
+        val cache = IsoChunkCache()
+        val session = IsoReadSession()
+        val pool = Executors.newCachedThreadPool()
+        val release = CountDownLatch(1)
+        val delivered = CountDownLatch(1)
+        val positions = java.util.concurrent.CopyOnWriteArrayList<Long>()
+        // Seek late in a physical block. The first GET starts at the packet being requested.
+        val size = 16_384L
+        val target = 12_288L
+        val body = ByteArray((size - target).toInt()) { (it % 251).toByte() }
+        val output = ByteArrayOutputStream()
+        try {
+            val stream = pool.submit<Boolean> {
+                IsoVirtualFile(listOf(0L to size), false).serve("GET", "bytes=$target-", "video/mp2t",
+                    output, pool, session, maxReadBytes = 256, pipelineDepth = 1,
+                    onStreamStart = { delivered.countDown() }) { pos, count ->
+                    cache.read(pos, pos + count - 1, 0, size - 1, session, suffixStart = target) { from, to, owner ->
+                        IsoRangeReader.readFully("http://origin/download.aspx", from, to, open = { a, b ->
+                            positions.add(a)
+                            object : Connection(206, "bytes $a-$b/$size", body.copyOfRange((a - target).toInt(), body.size)) {
+                                override fun getInputStream(): InputStream {
+                                    if (a != target) return super.getInputStream()
+                                    return object : ByteArrayInputStream(body, 0, 256) {
+                                        override fun read(dst: ByteArray, off: Int, len: Int): Int {
+                                            if (available() > 0) return super.read(dst, off, len)
+                                            check(release.await(5, TimeUnit.SECONDS))
+                                            throw SocketException("reset after prefix")
+                                        }
+                                    }
+                                }
+                            }
+                        }, pause = {}, session = owner)
+                    }
+                }
+            }
+            assertTrue(delivered.await(3, TimeUnit.SECONDS))
+            assertFalse(stream.isDone)
+            assertEquals(0, cache.cachedBytes())
+            release.countDown()
+            assertTrue(stream.get(5, TimeUnit.SECONDS))
+            assertEquals(listOf(target, target + 256), positions)
+            assertArrayEquals(body, output.toByteArray().takeLast(body.size).toByteArray())
+        } finally { release.countDown(); session.cancel(); cache.clear(); pool.shutdownNow() }
+    }
+
+    @Test fun sharePointLimitsActiveRangesUntilTheirConnectionsClose() {
+        val pool = Executors.newFixedThreadPool(4)
+        val firstThree = CountDownLatch(3)
+        val fourth = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val count = AtomicInteger()
+        val sessions = List(4) { IsoReadSession() }
+        val connections = RangeConnections({ emptyMap() }, configure = {
+            if (count.incrementAndGet() <= 3) firstThree.countDown() else fourth.countDown()
+            release.await(5, TimeUnit.SECONDS)
+            throw java.io.IOException("test finished")
+        })
+        try {
+            val jobs = sessions.map { session -> pool.submit {
+                assertThrows(RangeConnectionException::class.java) {
+                    connections.openIsoRange("http://localhost/download.aspx", 0, 3, session)
+                }
+            } }
+            assertTrue(firstThree.await(3, TimeUnit.SECONDS))
+            assertFalse(fourth.await(150, TimeUnit.MILLISECONDS))
+            release.countDown()
+            jobs.forEach { it.get(2, TimeUnit.SECONDS) }
+            assertEquals(0L, fourth.count)
+            assertTrue(IsoHostPolicy.throttled("https://tenant.sharepoint.com/sites/movie"))
+        } finally { release.countDown(); sessions.forEach { it.cancel() }; pool.shutdownNow() }
+    }
+
     @Test fun capped206ResponsesContinueAtNextByteAndPermanentFailuresStop() {
         val positions = ArrayList<Long>()
         val result = IsoRangeReader.readFully("http://origin/download.aspx", start, start + 7, open = { from, _ ->

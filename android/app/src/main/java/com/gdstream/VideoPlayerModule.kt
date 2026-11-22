@@ -373,24 +373,49 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
     fun playVideoInVlc(url: String, promise: Promise) = launchVideo(url, null, promise)
 
     private fun launchVideo(url: String, chooserTitle: String?, promise: Promise) {
-        try {
-            val playableUri = resolvePlayableUri(SecurityVaultModule.externalPlayerUrl(url))
-            if (playableUri.host == "127.0.0.1" || playableUri.host == "localhost") {
-                ArchiveProxyStreams.prepare(url)
-                ArchiveStreamService.start(reactApplicationContext)
-                SecurityVaultModule.prefetchExternalLaunch(url)
-            }
-            val intent = externalVideoIntent(playableUri)
-            DebugLogger.log("EXTERNAL_PLAYER_LAUNCH", "uri=${safeStreamUrl(playableUri.toString())} mime=${intent.type} registeredIso=${SecurityVaultModule.isIsoStream(url)}; preserving proxy registration")
-            val chooser = Intent.createChooser(intent, chooserTitle).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            reactApplicationContext.startActivity(if (chooserTitle == null) intent.setPackage("org.videolan.vlc") else chooser)
-            promise.resolve(true)
-        } catch (e: Exception) {
-            DebugLogger.log("ARCHIVE_EXTERNAL_ERR", isoFailureDetails(e))
-            try { stopExternalStreamBridge() } catch (cleanup: Exception) { e.addSuppressed(cleanup) }
-            promise.reject("E_EXTERNAL_PLAYER", "${e.javaClass.simpleName}: ${e.message ?: "Could not open player"}", e)
+        fun failed(error: Exception) {
+            DebugLogger.log("ARCHIVE_EXTERNAL_ERR", isoFailureDetails(error))
+            try { stopExternalStreamBridge() } catch (cleanup: Exception) { error.addSuppressed(cleanup) }
+            promise.reject("E_EXTERNAL_PLAYER", error)
+        }
+        fun launch(player: String?, component: android.content.ComponentName? = null) {
+            try {
+                val uri = resolvePlayableUri(SecurityVaultModule.externalPlayerUrl(url, player))
+                if (uri.host == "127.0.0.1" || uri.host == "localhost") {
+                    ArchiveProxyStreams.prepare(url)
+                    ArchiveStreamService.start(reactApplicationContext)
+                    SecurityVaultModule.prefetchExternalLaunch(url)
+                }
+                val intent = externalVideoIntent(uri)
+                if (component != null && uri.lastPathSegment == "dvd.m3u8")
+                    intent.setDataAndType(uri, "application/vnd.apple.mpegurl")
+                if (component != null) intent.component = component else intent.setPackage(player)
+                DebugLogger.log("EXTERNAL_PLAYER_LAUNCH", "uri=${safeStreamUrl(uri.toString())} player=$player")
+                reactApplicationContext.startActivity(if (player != null) intent else
+                    Intent.createChooser(intent, chooserTitle).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                promise.resolve(true)
+            } catch (e: Exception) { failed(e) }
+        }
+
+        if (chooserTitle == null) { launch("org.videolan.vlc"); return }
+        val raw = Uri.parse(SecurityVaultModule.externalPlayerUrl(url))
+        if (!SecurityVaultModule.isIsoStream(url) || raw.videoExtension != "vob") { launch(null); return }
+
+        // The system chooser shares one data URI across handlers. Pick the DVD handler before
+        // constructing its ACTION_VIEW so each app gets the representation it can decode.
+        UiThreadUtil.runOnUiThread {
+            try {
+                val activity = checkNotNull(reactApplicationContext.currentActivity) { "Player chooser needs an activity" }
+                val pm = activity.packageManager
+                val handlers = pm.queryIntentActivities(externalVideoIntent(raw), android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
+                    .distinctBy { it.activityInfo.packageName }.sortedBy { it.loadLabel(pm).toString() }
+                check(handlers.isNotEmpty()) { "No external video player installed" }
+                android.app.AlertDialog.Builder(activity).setTitle(chooserTitle)
+                    .setItems(handlers.map { it.loadLabel(pm) }.toTypedArray()) { _, index ->
+                        val target = handlers[index].activityInfo
+                        launch(target.packageName, android.content.ComponentName(target.packageName, target.name))
+                    }.setOnCancelListener { promise.resolve(false) }.show()
+            } catch (e: Exception) { failed(e) }
         }
     }
 

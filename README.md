@@ -50,7 +50,7 @@ The project is written in **TypeScript**, **Kotlin**, and **C++**:
 * **`App.tsx` (React Native + TypeScript):** Handles the entire UI, filename parser (`parseMediaFilename`), multi-version grouping, owned-season calculation, TMDB metadata & episode still caching, Continue Watching state, and the TV D-Pad focus system.
 * **`android/app/src/main/java/com/gdstream/SecurityVaultModule.kt` (Kotlin):** The native backbone of the app. Runs the `127.0.0.1` archive HTTP range proxy, parses ZIP/RAR structures, probes MediaInfo tracks, verifies YouTube trailer streams, and manages background file downloads.
 * **`android/app/src/main/cpp/` (C++ JNI — `libgdcore.so`):** Native library that keeps endpoint URLs, shield tokens, and session cookies isolated from the JavaScript runtime.
-* **`scripts/patch-rnv.js` (Node.js):** Post-install script that patches `react-native-video`'s `ReactExoplayerView.java` for better Dolby Vision / HDR track selection and subtitle handling, and wires up CMake for `libgdcore.so`.
+* **`scripts/patch-rnv.js` (Node.js):** Post-install script that patches `react-native-video`'s `ReactExoplayerView.java` for better Dolby Vision / HDR track selection and subtitle handling.
 * **`AsyncStorage` + Local Disk Cache:** Persists TMDB metadata (`meta_v8`), watch progress, watchlist items, and archive directory indexes locally for fast startup.
 
 ---

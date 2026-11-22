@@ -193,14 +193,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         internal fun rememberIsoInfo(url: String, info: com.facebook.react.bridge.ReadableMap) {
             ArchiveProxyStreams.streamId(url)?.let { saveMediaInfo?.invoke(it, info) }
         }
-        @Volatile private var externalIsoUrl: ((String) -> String)? = null
+        @Volatile private var externalIsoUrl: ((String, String?) -> String)? = null
         @Volatile private var externalPrefetch: ((String) -> Unit)? = null
         internal fun prefetchExternalLaunch(url: String) { externalPrefetch?.invoke(url) }
         @Volatile private var restoreOffline: ((String) -> String)? = null
         internal fun downloadUrl(url: String): String =
             if (ArchiveProxyStreams.streamId(url) != null && java.net.URI(url).rawQuery == "offline=m2ts")
                 checkNotNull(restoreOffline) { "ISO resolver unavailable" }(url) else url
-        internal fun externalPlayerUrl(url: String): String = externalIsoUrl?.invoke(url) ?: url
+        internal fun externalPlayerUrl(url: String, player: String? = null): String = externalIsoUrl?.invoke(url, player) ?: url
         @Volatile private var archiveFormat: ((String) -> String?)? = null
         internal fun isIsoStream(url: String): Boolean =
             ArchiveProxyStreams.streamId(url)?.let { archiveFormat?.invoke(it) } == "ISO"
@@ -232,10 +232,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         DebugLogger.initialize(reactContext)
         clearIsoChunks = { resumable -> if (resumable) isoChunkCaches.cancelFlights() else isoChunkCaches.clear() }
         archiveFormat = { id -> archiveEntryRegistry[id]?.archiveFormat }
-        externalIsoUrl = { url ->
+        externalIsoUrl = { url, player ->
             val entry = ArchiveProxyStreams.streamId(url)?.let { archiveEntryRegistry[it] }
             if (entry?.archiveFormat == "ISO" && entry.fileName.endsWith(".vob", true)) {
-                externalDvdUrl(url, entry.id, entry.fileName)
+                val avc = player != null && dvdPlayerNeedsAvc(player) { DvdProxy.canDecodeMpeg2(entry.resolvedInfo) }
+                check(!avc || entry.dvdEncoder != null) { "AVC conversion unavailable for this DVD. Open it in VLC." }
+                externalDvdUrl(url, entry.id, entry.fileName, avc)
             } else if (entry == null) url else if (entry.archiveFormat == "ISO" && entry.isBdavM2ts &&
                 entry.hls != null) {
                 val uri = java.net.URI(url)
@@ -331,11 +333,25 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
                 val (head, tail) = sample(65536)
                 if (!StandaloneBdav.matches(head)) { promise.resolve(url); return@submit }
-                var profile = StandaloneBdav.profile(head, tail, name)
-                if (profile.durationUs == 0L || profile.streams.isEmpty() ||
+                var profile = StandaloneBdav.profile(head, tail, name, alignedEnd)
+                if (profile.durationUs == 0L || profile.pcrIndex == null || profile.streams.isEmpty() ||
                     profile.streams.any { it.audio && it.layout.isEmpty() }) {
                     val (largerHead, largerTail) = sample(2 * 1024 * 1024)
-                    profile = StandaloneBdav.profile(largerHead, largerTail, name)
+                    profile = StandaloneBdav.profile(largerHead, largerTail, name, alignedEnd)
+                }
+                // Three small interior samples in one round-trip window. The endpoints already
+                // bracket the full file and remain usable when an optional sample is unavailable.
+                profile.pcrIndex?.let { index ->
+                    val length = 192 * 3072
+                    if (alignedEnd >= 8L * length) (1..3).map { quarter ->
+                        val from = alignedEnd / 192 / 4 * quarter * 192
+                        ioExecutor.submit {
+                            try {
+                                val bytes = readStandalone(url, from, from + length - 1, IsoReadSession(), cancelWithPlayback = false)
+                                index.sample(bytes, 192, from / 192 * 188)
+                            } catch (e: java.io.IOException) { appendDebugLog("BDAV_PCR_PROBE", isoFailureDetails(e)) }
+                        }
+                    }.forEach { it.get() }
                 }
                 val fileName = if (name.endsWith(".m2ts", true)) name else "$name.m2ts"
                 val item = registerIsoStreamTarget(url, size, fileName, size, listOf(0L to size),
@@ -1137,10 +1153,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 fun upstream(from: Long, to: Long, owner: IsoReadSession): ByteArray =
                     if (entry.standalone) readStandalone(entry.archiveUrl, from, to, owner)
                     else fetchIsoByteRange(entry.archiveUrl, from, to, owner)
+                var seekSuffix = -1L
                 fun fetch(start: Long, end: Long): ByteArray {
                     val extent = if (entry.sourceSize > 0) 0L to entry.sourceSize else entry.segments!!.first { (offset, length) -> offset >= 0 && start >= offset && end < offset + length }
                     return isoChunkCache.read(start, end, extent.first, extent.first + extent.second - 1, session,
-                        borrowFullBlock = true, fetch = ::upstream)
+                        borrowFullBlock = true, suffixStart = seekSuffix, fetch = ::upstream)
                 }
                 fun rawTs(start: Long, length: Int) = file.read(start, length, ::fetch) { _, _ -> }
                 val program by lazy {
@@ -1198,19 +1215,25 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 } else if (hls == null) {
                     val direct = entry.standalone && entry.isBdavM2ts
+                    val throttled = direct && IsoHostPolicy.throttled(entry.archiveUrl)
                     var first = true
                     var warmAt = 0L
                     file.serve(method, rangeHeader, "video/MP2T".takeIf { entry.isBdavM2ts } ?: mimeType,
                         out, ioExecutor, session, entry.bluRay?.durationUs ?: 0L,
-                        maxReadBytes = if (direct) 188 * 4096 else IsoChunkCache.BLOCK_BYTES,
+                        maxReadBytes = if (direct) 188 * 320 else IsoChunkCache.BLOCK_BYTES,
+                        firstReadBytes = if (direct) 188 * 8 else IsoChunkCache.BLOCK_BYTES,
                         pipelineDepth = if (direct) 1 else IsoRangeReader.MAX_CONCURRENT_READS) { start, length ->
                         if (!direct) return@serve readTs(start, length)
                         val target = start / 188 * 192
                         val block = IsoChunkCache.BLOCK_BYTES.toLong()
+                        if (first) {
+                            // PMT rewriting may need 64 preceding packets, including across a block boundary.
+                            seekSuffix = if (externalTs) maxOf(0L, target - 64 * 192) else target
+                        }
                         if (first && entry.directCursor.begin(session.id, start)) {
-                            val ranges = entry.directCursor.seekBlocks(target, entry.sourceSize)
+                            val ranges = entry.directCursor.seekBlocks(target, entry.sourceSize, throttled)
                             appendDebugLog("M2TS_SEEK_PREFETCH", "targetByte=$start blocks=${ranges.map { it.first / block }}")
-                            isoChunkCache.prefetch(ranges, entry.sourceSize, session, priority = true, fetch = ::upstream)
+                            isoChunkCache.prefetch(ranges, entry.sourceSize, session, priority = true, suffixStart = seekSuffix, fetch = ::upstream)
                             warmAt = ranges.maxOf { it.last } + 1 - block
                         }
                         first = false
@@ -1218,7 +1241,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         val next = (start + length) / 188 * 192
                         if (entry.directCursor.advance(session.id, start + length) && next >= warmAt) {
                             warmAt = (next / block + 1) * block
-                            val end = minOf(entry.sourceSize, warmAt + 3 * block)
+                            val end = minOf(entry.sourceSize, warmAt + (if (throttled) 1 else 3) * block)
                             if (warmAt < end) isoChunkCache.prefetch(listOf(warmAt until end), entry.sourceSize, session, fetch = ::upstream)
                         }
                         data
