@@ -1,8 +1,12 @@
 package com.gdstream
 
+import java.io.ByteArrayOutputStream
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+
 /** Endpoints are aligned to the same BDAV packet grid before inspecting PES timestamps. */
 internal object StandaloneBdav {
-    const val HLS_TARGET_PACKETS = 4 * 1024 * 1024 / 188
+    const val HLS_TARGET_PACKETS = 8 * 1024 * 1024 / 188
 
     fun matches(head: ByteArray) = head.size >= 3 * 192 &&
         (0..2).all { head[it * 192 + 4] == 0x47.toByte() }
@@ -13,6 +17,144 @@ internal object StandaloneBdav {
             head.copyInto(ts, packet * 188, packet * 192 + 4, (packet + 1) * 192)
         }
         return ts
+    }
+
+    private fun payload(ts: ByteArray, p: Int, pid: Int): Int {
+        fun u(i: Int) = ts[p + i].toInt() and 255
+        if (u(0) != 0x47 || ((u(1) and 31) shl 8) + u(2) != pid ||
+            u(1) and 0x80 != 0 || u(3) and 0xd0 != 0x10) return -1
+        val at = 4 + if (u(3) and 32 != 0) 1 + u(4) else 0
+        return if (at < 188) p + at else -1
+    }
+
+    /** Reassemble Annex B across TS and PES boundaries. The last NAL in a probe
+     * may be incomplete; seeing the IDR header closes the preceding parameter set. */
+    fun avcConfig(ts: ByteArray, pid: Int): Avc? {
+        val es = ByteArrayOutputStream()
+        val pes = ByteArrayOutputStream()
+        var cc = -1
+        var firstCc = -1
+        fun flush() {
+            val bytes = pes.toByteArray()
+            pes.reset()
+            if (bytes.size < 9 || bytes[0] != 0.toByte() || bytes[1] != 0.toByte() ||
+                bytes[2] != 1.toByte() || bytes[3].toInt() and 0xf0 != 0xe0) return
+            val start = 9 + (bytes[8].toInt() and 255)
+            val size = ((bytes[4].toInt() and 255) shl 8) + (bytes[5].toInt() and 255)
+            val end = if (size == 0) bytes.size else minOf(bytes.size, 6 + size)
+            if (end > start) es.write(bytes, start, end - start)
+        }
+        for (p in 0..ts.size - 188 step 188) {
+            val at = payload(ts, p, pid)
+            if (at < 0) continue
+            val counter = ts[p + 3].toInt() and 15
+            if (firstCc < 0) firstCc = counter
+            val discontinuity = ts[p + 3].toInt() and 32 != 0 && ts[p + 4] != 0.toByte() && ts[p + 5].toInt() and 128 != 0
+            if (cc == counter && !discontinuity) continue
+            if (cc >= 0 && (discontinuity || counter != ((cc + 1) and 15))) {
+                flush()
+                parameterSets(es.toByteArray(), pid, firstCc)?.let { return it }
+                es.reset()
+            }
+            cc = counter
+            if (ts[p + 1].toInt() and 64 != 0) flush() else if (pes.size() == 0) continue
+            pes.write(ts, at, p + 188 - at)
+        }
+        flush()
+        return parameterSets(es.toByteArray(), pid, firstCc)
+    }
+
+    private fun parameterSets(bytes: ByteArray, pid: Int, firstCc: Int): Avc? {
+        var sps: ByteArray? = null
+        var pps: ByteArray? = null
+        var nal = -1
+        var zeros = 0
+        for (i in bytes.indices) {
+            if (bytes[i] == 0.toByte()) { zeros++; continue }
+            if (bytes[i] == 1.toByte() && zeros >= 2 && i + 1 < bytes.size) {
+                val end = i - zeros
+                if (nal >= 0 && end > nal) when (bytes[nal].toInt() and 31) {
+                    7 -> sps = bytes.copyOfRange(nal, end)
+                    8 -> pps = bytes.copyOfRange(nal, end)
+                }
+                nal = i + 1
+                if (bytes[nal].toInt() and 31 == 5 && sps != null && pps != null &&
+                    sps.size >= 4 && pps.size >= 2 && sps.size + pps.size <= 65524)
+                    return Avc(pid, sps, pps, firstCc)
+            }
+            zeros = 0
+        }
+        return null
+    }
+
+    class Avc(private val pid: Int, sps: ByteArray, pps: ByteArray, firstCc: Int) {
+        val codec = String.format(Locale.ROOT, "avc1.%02x%02x%02x", sps[1], sps[2], sps[3])
+        private val pes = run {
+            val length = 3 + 8 + sps.size + pps.size
+            val startCode = byteArrayOf(0, 0, 0, 1)
+            byteArrayOf(0, 0, 1, 0xe0.toByte(), (length ushr 8).toByte(), length.toByte(),
+                0x80.toByte(), 0, 0) + startCode + sps + startCode + pps
+        }
+
+        private data class Boundary(val offset: Long, val cc: Int)
+        private val boundaries = ConcurrentHashMap<Long, Boundary>().apply { put(0, Boundary(0, firstCc)) }
+
+        // Inserting another video PES in a split source PES would truncate a picture
+        // on sequential playback. Share the same nearby PES cut on both sides.
+        private fun boundary(offset: Long, size: Long, read: (Long, Int) -> ByteArray): Boundary {
+            if (offset == size) return Boundary(size, 0)
+            boundaries[offset]?.let { return it }
+            var position = offset
+            var cut = offset
+            // Sparse video or an audio-only tail must not turn a seek into a scan to EOF.
+            val limit = offset + minOf(size - offset, HLS_TARGET_PACKETS * 188L)
+            var nextCc = 0
+            while (position < limit) {
+                val length = minOf(188L * 256, limit - position).toInt()
+                val bytes = read(position, length)
+                require(bytes.size == length)
+                for (p in bytes.indices step 188) {
+                    if (payload(bytes, p, pid) < 0) continue
+                    if (bytes[p + 1].toInt() and 64 != 0) {
+                        return Boundary(cut, bytes[p + 3].toInt() and 15).also { boundaries[offset] = it }
+                    }
+                    nextCc = (bytes[p + 3] + 1) and 15
+                    cut = position + p + 188
+                }
+                position += length
+            }
+            return Boundary(cut, nextCc).also { boundaries[offset] = it }
+        }
+
+        // A bounded, timestamp-free video PES carries only decoder configuration.
+        // End one counter before the first source payload and stuff via adaptation fields.
+        private fun packets(nextCc: Int): ByteArray {
+            val count = (pes.size + 2 + 183) / 184
+            val ts = ByteArray(count * 188) { 0xff.toByte() }
+            var at = 0
+            for (i in 0 until count) {
+                val p = i * 188
+                val n = minOf(pes.size - at, if (i == 0) 182 else 184)
+                val pad = 184 - n
+                ts[p] = 0x47
+                ts[p + 1] = ((pid ushr 8) or if (i == 0) 64 else 0).toByte()
+                ts[p + 2] = pid.toByte()
+                ts[p + 3] = ((if (pad > 0) 0x30 else 0x10) or ((nextCc - count + i) and 15)).toByte()
+                if (pad > 0) ts[p + 4] = (pad - 1).toByte()
+                if (pad > 1) ts[p + 5] = if (i == 0) 0x80.toByte() else 0
+                pes.copyInto(ts, p + 188 - n, at, at + n)
+                at += n
+            }
+            return ts
+        }
+
+        private val prefixes = Array(16) { packets(it) }
+        fun videoSegment(segment: BluRayHls.Segment, psi: ByteArray, size: Long, read: (Long, Int) -> ByteArray):
+            Pair<BluRayHls.Segment, ByteArray> {
+            val first = boundary(segment.start, size, read)
+            val end = boundary(segment.end, size, read)
+            return segment.copy(start = first.offset, end = end.offset) to (psi + prefixes[first.cc])
+        }
     }
 
     /** Physical ranges for the block containing this segment and the next two blocks. */
@@ -64,7 +206,10 @@ internal object StandaloneBdav {
             else null
         val duration = if (ptsDuration > 0) ptsDuration else index?.spanUs ?: 0
         return BluRayProfile(duration, emptyList(),
-            streams.filter { it.audio }.map { BluRayAudio(it.pid, it.type, it.language) }, streams, label, pcrIndex = index, primaryLanguageHint = inferredLang).also { it.program = program }
+            streams.filter { it.audio }.map { BluRayAudio(it.pid, it.type, it.language) }, streams, label, pcrIndex = index, primaryLanguageHint = inferredLang).also { profile ->
+            profile.program = program
+            profile.avc = profile.mainAvcPid?.let { avcConfig(ts, it) }
+        }
     }
 
     private fun timestamps(data: ByteArray): Map<Int, LongRange> {

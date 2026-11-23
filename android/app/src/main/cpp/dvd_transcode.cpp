@@ -22,7 +22,7 @@ struct Session {
     int width = 0, height = 0, color = 0, stride = 0, sliceHeight = 0;
     bool ended = false;
     // Half-period units of the MPEG 27 MHz clock retain fractional 90 kHz ticks.
-    int64_t nextClock = -1;
+    int64_t nextClock = 0;
     // Baseline AVC has no B pictures. Match each access unit to its source
     // display PTS even on encoders that rebase output timestamps at startup.
     std::deque<int64_t> pendingPts90k;
@@ -118,7 +118,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_gdstream_DvdProxy_hasDecoder(JNIE
 }
 
 extern "C" JNIEXPORT jlong JNICALL Java_com_gdstream_DvdProxy_open(JNIEnv *env, jobject, jstring name, jint color,
-                                                                  jint w, jint h, jdouble fps) {
+                                                                  jint w, jint h, jdouble fps, jlong basePts90k) {
     if (w < 1 || w > 720 || h < 1 || h > 576 || !(fps >= 1 && fps <= 60)) return 0;
     auto s = std::make_unique<Session>();
     if (!s->decoder || ((w | h) & 1) || (color != I420 && color != NV12)) return 0;
@@ -164,14 +164,15 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_gdstream_DvdProxy_open(JNIEnv *env, 
     if ((s->color != I420 && s->color != NV12) || s->stride < w || s->sliceHeight < h) return 0;
     if (s->stride > 4096 || s->sliceHeight > 4096 || (s->stride | s->sliceHeight) & 1) return 0;
     s->width = w; s->height = h;
+    s->nextClock = basePts90k * 600;
     return reinterpret_cast<jlong>(s.release());
 }
 
-extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_encode(JNIEnv *env, jobject, jlong handle,
-                                                                    jbyteArray input, jlong pts, jlong fallback90k, jobject mux, jboolean boundary, jboolean last) {
+extern "C" JNIEXPORT jlong JNICALL Java_com_gdstream_DvdProxy_encode(JNIEnv *env, jobject, jlong handle,
+                                                                    jbyteArray input, jobject mux, jboolean boundary, jboolean last) {
     auto &s = *reinterpret_cast<Session *>(handle);
     auto emit = env->GetMethodID(env->GetObjectClass(mux), "video", "(J[BZ)V");
-    if (!emit) return;
+    if (!emit) return -1;
 
     auto run = [&]() {
         // A segment may stop at a VOBU boundary without an MPEG sequence end.
@@ -182,7 +183,6 @@ extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_encode(JNIEnv *env,
             if (bytes.empty()) return true;
             env->GetByteArrayRegion(input, 0, bytes.size(), reinterpret_cast<jbyte *>(bytes.data()));
             if (env->ExceptionCheck()) return false;
-            if (pts >= 0) mpeg2_tag_picture(s.decoder, static_cast<uint32_t>(pts), static_cast<uint64_t>(pts) >> 32);
         } else if (boundary || last) {
             bytes = {0, 0, 1, 0xb7};
         }
@@ -203,18 +203,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_encode(JNIEnv *env,
             if (!input && !last && state == STATE_END) mpeg2_resume_vobu(s.decoder);
             const auto fields = mpeg2_take_display_fields(s.decoder, state);
             if (!fields || !seq) continue;
-            const auto *tagged = picture;
-            int64_t fieldOffset = 0;
-            if (!(picture->flags & PIC_FLAG_TAGS) && picture->nb_fields == 1) {
-                tagged = info->display_picture_2nd;
-                fieldOffset = picture->frame_period;
-            }
-            if (s.nextClock < 0 && tagged && (tagged->flags & PIC_FLAG_TAGS)) {
-                // DvdProxy already mapped this tag onto the copied AC-3 clock.
-                const int64_t ticks = (static_cast<int64_t>(tagged->tag2) << 32) | tagged->tag;
-                s.nextClock = ticks * 600 - fieldOffset;
-            }
-            if (s.nextClock < 0) s.nextClock = fallback90k * 600;
+            // A sequential VOBU can repeat or reset its PES clock. The first PES
+            // anchored this session at open; only displayed fields advance it.
             const int64_t videoPts90k = s.nextClock / 600;
             s.nextClock += static_cast<int64_t>(picture->frame_period) * fields;
             if (!s.queuePlanes(env, mux, emit, frame, seq, videoPts90k,
@@ -236,8 +226,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_encode(JNIEnv *env,
         return status == AMEDIA_OK;
     };
 
-    if (!run() && !env->ExceptionCheck())
-        env->ThrowNew(env->FindClass("java/io/IOException"), "DVD MPEG-2 to AVC conversion failed");
+    if (!run()) {
+        if (!env->ExceptionCheck())
+            env->ThrowNew(env->FindClass("java/io/IOException"), "DVD MPEG-2 to AVC conversion failed");
+        return -1;
+    }
+    return s.nextClock / 600; // Exclusive end, including the actual last picture's fields.
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_close(JNIEnv *, jobject, jlong handle) {

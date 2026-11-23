@@ -29,9 +29,11 @@ class BluRayHlsTest {
         val program = BluRayPsi.program(bytes)!!
         val pid = 4353
         fun packetPid(data: ByteArray, p: Int) = ((data[p + 1].toInt() and 31) shl 8) or (data[p + 2].toInt() and 255)
-        val profile = BluRayProfile(8_000_000, emptyList(), emptyList(), program.streams)
+        val profile = BluRayProfile(8_000_000, emptyList(), emptyList(), program.streams).apply {
+            avc = StandaloneBdav.avcConfig(bytes, 0x1011)
+        }
         val hls = BluRayHls.create(profile, bytes.size.toLong(), standalone = true, convertDts = true)!!
-        assertTrue(String(hls.master()).contains("CODECS=\"avc1,ac-3\""))
+        assertTrue(String(hls.master()).contains("CODECS=\"avc1.42c00a,ac-3\""))
         assertTrue(String(hls.master()).contains("audio_4353.m3u8"))
         val prefix = hls.prefix(program, program.streams, pid)
         assertSame(prefix, hls.prefix(program, program.streams, pid))

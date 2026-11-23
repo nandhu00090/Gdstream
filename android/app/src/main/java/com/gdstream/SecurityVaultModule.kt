@@ -152,27 +152,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 DvdProxy.estimatedSegments(uncompressedSize, (seconds * 1_000_000).toLong())
             } else emptyList()
         }
-        // The IFO durations within a cell are byte estimates. Only its actual start
-        // and total duration anchor the timestamp mapping, including on random seeks.
-        private val dvdCells by lazy {
-            var cell = 0 to 90_000L // leave room for AC-3 frames leading the first video PTS
-            var elapsedUs = 0L
-            dvdSegments.mapIndexed { i, segment ->
-                if (segment.discontinuity) cell = i to (90_000L + elapsedUs * 9 / 100)
-                elapsedUs += segment.durationUs
-                cell
-            }
-        }
-        private val cellClocks = mutableMapOf<Int, DvdCellClock?>()
-        fun cellClock(index: Int, readSector: (Long) -> ByteArray): DvdCellClock? {
-            val (first, ticks) = dvdCells.getOrNull(index) ?: return null
-            if (first !in cellClocks) {
-                val start = DvdProxy.navStart(readSector(dvdSegments[first].start))
-                cellClocks[first] = start?.let { DvdCellClock(it, ticks) }
-            }
-            return cellClocks[first]
-        }
-
         val dvdEncoder by lazy {
             val audio = resolvedInfo?.get("audioTracks") as? List<*>
             val supportedAudio = audio.isNullOrEmpty() || audio.any { (it as? Map<*, *>)?.get("codec") == "AC-3" }
@@ -362,13 +341,25 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 if (!StandaloneBdav.matches(head)) { promise.resolve(url); return@submit }
                 var profile = StandaloneBdav.profile(head, tail, name, alignedEnd, originalLanguage)
                 if (profile.durationUs == 0L || profile.pcrIndex == null || profile.streams.isEmpty() ||
-                    profile.streams.any { it.audio && it.layout.isEmpty() }) {
+                    profile.streams.any { it.audio && it.layout.isEmpty() } || profile.mainAvcPid != null && profile.avc == null) {
                     try {
                         val (largerHead, largerTail) = sample(2 * 1024 * 1024)
                         profile = StandaloneBdav.profile(largerHead, largerTail, name, alignedEnd, originalLanguage)
                     } catch (error: Exception) {
                         if (profile.streams.isEmpty()) throw error
                         appendDebugLog("BDAV_PROBE", "Using first PMT after optional probe failed: ${isoFailureDetails(error)}")
+                    }
+                }
+                // A high-bitrate opening GOP can put its first IDR beyond both probes.
+                // Cache its parameter sets at resolution so even the first request can be a seek.
+                val avcPid = profile.mainAvcPid
+                if (avcPid != null && profile.avc == null && alignedEnd > 2L * 1024 * 1024 / 192 * 192) {
+                    val length = minOf(alignedEnd, StandaloneBdav.HLS_TARGET_PACKETS * 192L)
+                    try {
+                        val opening = readStandalone(url, 0, length - 1, IsoReadSession(), cancelWithPlayback = false)
+                        profile.avc = StandaloneBdav.avcConfig(StandaloneBdav.transportPackets(opening), avcPid)
+                    } catch (error: java.io.IOException) {
+                        appendDebugLog("BDAV_PROBE", "Opening AVC probe failed: ${isoFailureDetails(error)}")
                     }
                 }
                 // The head and tail bracket fifteen interior PCR samples on the BDAV packet grid.
@@ -1234,18 +1225,21 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 val complete = if (dvd) {
                     if (writeArchiveOptions(method, out, true)) return
                     val body = if (dvdIndex == null) DvdProxy.playlist(entry.dvdPlaylist) else try {
-                        dvdChunks.segment(entry.id, dvdIndex, entry.dvdPlaylist.lastIndex, session, method == "GET") { index, owner ->
+                        dvdChunks.segment(entry.id, dvdIndex, entry.dvdPlaylist.lastIndex, session, method == "GET") { index, owner, sequence ->
                             fun read(from: Long, to: Long) = cachedFetch(from, to, owner)
                             val segment = entry.dvdPlaylist[index]
                             val estimate = entry.standalone || entry.dvdSegments.isEmpty()
-                            val start = if (estimate) DvdProxy.navBoundary(file, segment.start, ::read) ?: segment.start else segment.start
-                            val nextVobu = if (estimate) DvdProxy.navBoundary(file, segment.end, ::read) else segment.end
+                            fun cut(offset: Long): Long? {
+                                if (!estimate) return offset
+                                return DvdProxy.navBoundary(file, offset, ::read) ?: if (entry.standalone) null
+                                    else throw java.io.IOException("Missing DVD navigation pack at title offset $offset")
+                            }
+                            val start = cut(segment.start) ?: segment.start
+                            val nextVobu = cut(segment.end)
                             val data = file.readRaw(start, Math.toIntExact((nextVobu ?: segment.end) - start), ::read)
                             DvdProxy.transcode(data, checkNotNull(entry.resolvedInfo), checkNotNull(entry.dvdEncoder),
-                                owner, entry.id, index, nextVobu != null, index == entry.dvdPlaylist.lastIndex,
-                                entry.cellClock(index) { offset ->
-                                    if (offset == start) data else file.readRaw(offset, 2048, ::read)
-                                }, segment.durationUs) {
+                                owner, entry.id, sequence, index, nextVobu != null, index == entry.dvdPlaylist.lastIndex,
+                                segment.discontinuity) {
                                 entry.dvdSequenceHeader ?: DvdProxy.sequenceHeader(
                                     file.readRaw(0, minOf(file.size, 512L * 1024).toInt(), ::read)
                                 )?.also { entry.dvdSequenceHeader = it }
@@ -1309,36 +1303,34 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val segment = hls.segments[hlsSegment]
                     val nextWarm = java.util.concurrent.atomic.AtomicLong(segment.start)
                     fun warm(position: Long) {
-                        if (method != "GET" || entry.sourceSize <= 0 || position >= file.size) return
+                        if (entry.standalone || method != "GET" || entry.sourceSize <= 0 || position >= file.size) return
                         val next = nextWarm.get()
                         if (position < next || !nextWarm.compareAndSet(next, position + 8L * 1024 * 1024)) return
-                        if (entry.standalone) {
-                            val blocks = StandaloneBdav.readAhead(position, entry.sourceSize)
-                            val owner = IsoReadSession()
-                            val lease = ArchiveProxyStreams.registry.register(entry.id, false, owner::cancel)
-                            // Schedule in request order so a displaced seek cannot enqueue its
-                            // stale window later. Keep it alive between short HLS connections.
-                            val flights = try {
-                                isoChunkCache.prefetch(listOf(blocks), entry.sourceSize, owner, fetch = ::upstream)
-                            } catch (error: Exception) {
-                                lease.close()
-                                owner.cancel()
-                                throw error
-                            }
-                            ioExecutor.execute {
-                                try { flights.forEach { it.get() } } catch (_: Exception) {
-                                    // The next demand read retries any failed fetch.
-                                } finally {
-                                    lease.close()
-                                    owner.cancel()
-                                }
-                            }
-                            return
-                        }
                         val length = minOf(file.size - position, 48L * 1024 * 1024).toInt()
                         isoChunkCache.prefetch(file.mappedRanges(position, length), entry.sourceSize, session, fetch = ::upstream)
                     }
-                    warm(segment.start)
+                    if (entry.standalone && method == "GET" && entry.sourceSize > 0) {
+                        val blocks = StandaloneBdav.readAhead(segment.start, entry.sourceSize)
+                        val seek = audioPid == null && hls.videoSeek(hlsSegment)
+                        val owner = IsoReadSession()
+                        val lease = ArchiveProxyStreams.registry.register(entry.id, false, owner::cancel)
+                        // Start all three physical reads before looking up PSI or probing a PES cut.
+                        val flights = try {
+                            isoChunkCache.prefetch(listOf(blocks), entry.sourceSize, owner, priority = seek, fetch = ::upstream)
+                        } catch (error: Exception) {
+                            lease.close()
+                            owner.cancel()
+                            throw error
+                        }
+                        ioExecutor.execute {
+                            try { flights.forEach { it.get() } } catch (_: Exception) {
+                                // The next demand read retries any failed fetch.
+                            } finally {
+                                lease.close()
+                                owner.cancel()
+                            }
+                        }
+                    } else warm(segment.start)
                     val prefix = hls.prefix(program, renditionStreams, audioPid)
                     if (audioPid != null) {
                         val audioType = renditionStreams.firstOrNull { it.pid == audioPid }?.type ?: 0
@@ -1353,10 +1345,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         IsoVirtualFile(listOf(0L to audio.size.toLong()), false).serve(method, rangeHeader, "video/MP2T",
                             out, ioExecutor, session) { start, length -> audio.copyOfRange(start.toInt(), start.toInt() + length) }
                     } else {
-                        val size = segment.size(prefix)
+                        val (video, header) = entry.bluRay?.avc?.videoSegment(segment, prefix, file.size, ::rawTs)
+                            ?: (segment to prefix)
+                        val size = video.size(header)
                         IsoVirtualFile(listOf(0L to size), false).serve(method, rangeHeader, "video/MP2T",
                             out, ioExecutor, session, maxReadBytes = 188 * 4096) { start, length ->
-                                segment.read(prefix, start, length) { position, count ->
+                                video.read(header, start, length) { position, count ->
                                     warm(position)
                                     readTs(position, count)
                                 }
@@ -1827,6 +1821,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                     list
                 } else null
+                // Re-read the IFO once for DVD indexes written before C_ADT extent selection.
+                if (o.optString("archiveFormat") == "ISO" && o.optString("fileName").endsWith(".vob", true) &&
+                    o.optInt("dvdIndexVersion") != DvdTitleInfo.INDEX_VERSION) return null
                 val dvdSegments = o.optJSONArray("dvdSegments")?.let { array ->
                     (0 until array.length()).map { array.getJSONArray(it).let { row ->
                         DvdProxy.Segment(row.getLong(0), row.getLong(1), row.getLong(2), row.optBoolean(3, true))
@@ -1901,6 +1898,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         put("segments", sArr)
                     }
                     t.bluRay?.let { put("bluRay", it.toJson()) }
+                    if (t.archiveFormat == "ISO" && t.fileName.endsWith(".vob", true)) put("dvdIndexVersion", DvdTitleInfo.INDEX_VERSION)
                     if (t.dvdSegments.isNotEmpty()) put("dvdSegments", JSONArray().apply {
                         t.dvdSegments.forEach { put(JSONArray().put(it.start).put(it.end).put(it.durationUs).put(it.discontinuity)) }
                     })

@@ -14,8 +14,8 @@ import java.io.IOException
 
 internal object DvdProxy {
     private external fun hasDecoder(): Boolean
-    private external fun open(encoder: String, color: Int, width: Int, height: Int, fps: Double): Long
-    private external fun encode(handle: Long, bytes: ByteArray?, pts90k: Long, fallback90k: Long, mux: DvdTsMux, boundary: Boolean, last: Boolean)
+    private external fun open(encoder: String, color: Int, width: Int, height: Int, fps: Double, basePts90k: Long): Long
+    private external fun encode(handle: Long, bytes: ByteArray?, mux: DvdTsMux, boundary: Boolean, last: Boolean): Long
     private external fun close(handle: Long)
 
     fun canDecodeMpeg2(info: Map<String, Any>?): Boolean {
@@ -59,9 +59,13 @@ internal object DvdProxy {
 
     // Android hardware may expose a single AVC encoder. Keep the active stream warm
     // until another source or a non-sequential request takes ownership of it.
-    private class Warm(val id: String, var next: Int, val handle: Long, val mux: DvdTsMux) {
+    private class Warm(val id: String, val sequence: Long, var next: Int, val mux: DvdTsMux) {
+        var handle = 0L
         val audio = audioReader(mux::audio)
-        var clock: DvdPesClock? = null
+        fun closeEncoder() {
+            if (handle != 0L) close(handle)
+            handle = 0L
+        }
     }
     @Volatile private var warm: Warm? = null
     private val cleanup = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { task ->
@@ -79,58 +83,60 @@ internal object DvdProxy {
         val current = warm ?: return
         idleClose?.cancel(false)
         warm = null
-        close(current.handle)
+        current.closeEncoder()
     }
 
     @Synchronized fun transcode(data: ByteArray, info: Map<String, Any>, encoder: Encoder,
-                  session: IsoReadSession, streamId: String, segment: Int, boundary: Boolean, last: Boolean,
-                  cellClock: DvdCellClock?, durationUs: Long, sequenceHeader: () -> ByteArray?): ByteArray {
-        if (warm?.id != streamId || warm?.next != segment) release()
-        fun convert(finish: Boolean): ByteArray {
-            val fresh = warm == null
-            val state = warm ?: run {
-                val handle = open(encoder.name, encoder.color, (info.getValue("width") as Number).toInt(),
-                    (info.getValue("height") as Number).toInt(), (info.getValue("frameRate") as Number).toDouble())
-                if (handle == 0L) throw IOException("DVD AVC encoder initialization failed")
-                Warm(streamId, segment, handle, DvdTsMux((info["audioLanguageCode"] as? String).orEmpty())).also { warm = it }
+                  session: IsoReadSession, streamId: String, sequence: Long, segment: Int, boundary: Boolean, last: Boolean,
+                  discontinuity: Boolean, sequenceHeader: () -> ByteArray?): ByteArray {
+        if (warm?.id != streamId || warm?.sequence != sequence || warm?.next != segment) release()
+        val sequential = warm != null
+        val state = warm ?: Warm(streamId, sequence, segment, DvdTsMux((info["audioLanguageCode"] as? String).orEmpty())).also { warm = it }
+        val audioId = (info["ac3Substream"] as? Number)?.toInt() ?: -1
+        val source = sourceTiming(data, audioId)
+        fun convertVideo(finish: Boolean): Long {
+            val fresh = state.handle == 0L
+            if (fresh) {
+                state.handle = open(encoder.name, encoder.color, (info.getValue("width") as Number).toInt(),
+                    (info.getValue("height") as Number).toInt(), (info.getValue("frameRate") as Number).toDouble(),
+                    state.mux.timing?.nextVideo ?: source.basePts)
+                if (state.handle == 0L) throw IOException("DVD AVC encoder initialization failed")
             }
-            state.mux.beginSegment()
-            val header = if (fresh) sequenceHeader else { -> null }
-            val audioId = (info["ac3Substream"] as? Number)?.toInt() ?: -1
-            val startPts = startClock(data, audioId)
-            val cellChanged = state.clock?.cell != cellClock
-            if (cellChanged) state.audio.seek()
-            val clock = state.clock?.takeUnless { cellChanged } ?: DvdPesClock(cellClock, startPts).also { state.clock = it }
-            clock.beginSegment()
-            val fallback = clock.ticks(startPts)
-            demux(data, audioId, header, state.audio, clock) { pts, sample ->
+            state.mux.beginSegment(fresh)
+            demux(data, audioId, if (fresh) sequenceHeader else { -> null }) { _, sample ->
                 session.checkActive()
-                encode(state.handle, sample, pts, fallback, state.mux, false, false)
+                encode(state.handle, sample, state.mux, false, false)
             }
-            encode(state.handle, null, -1, fallback, state.mux, boundary, finish)
-            val frames = state.mux.frames
-            val start = clock.segmentStart ?: fallback
-            val end = clock.segmentEnd ?: (start + durationUs * 9 / 100)
-            val result = state.mux.finish(start, end, clock.segmentEnd != null)
+            val end = encode(state.handle, null, state.mux, boundary, finish)
+            if (state.mux.frames == 0) throw IOException("DVD segment produced no decodable video")
+            if (finish) state.closeEncoder()
+            return end
+        }
+        try {
+            val hadEncoder = state.handle != 0L
+            val nativeEnd = try { convertVideo(last) } catch (error: IOException) {
+                state.closeEncoder()
+                session.checkActive()
+                if (last && !hadEncoder) throw error
+                // Retry vendor encoders that need EOS to release the last picture.
+                convertVideo(true)
+            }
+            // Consume audio once after any encoder retry. A frame can straddle two
+            // VOBUs and its pending bytes belong to the sequential AC-3 reader.
+            if (discontinuity) state.audio.seek()
+            demux(data, audioId, audio = state.audio, video = null)
+            val result = state.mux.finish(source.basePts, nativeEnd, source.navDuration)
+            val pts = checkNotNull(state.mux.timing)
             state.next = segment + 1
-            if (finish) release() else {
+            if (last) release() else {
                 idleClose?.cancel(false)
                 idleClose = cleanup.schedule({
-                    synchronized(this) { if (warm === state && state.next == segment + 1) release() }
+                    synchronized(this) { if (warm === state && state.next == segment + 1) state.closeEncoder() }
                 }, 30, java.util.concurrent.TimeUnit.SECONDS)
             }
-            DebugLogger.log("DVD_SEG_OK", "seg=$segment frames=$frames bytes=${result.size} warm=${!fresh} pts90k=$start..$end")
+            DebugLogger.log("DVD_SEG_OK", "seg=$segment frames=${state.mux.frames} bytes=${result.size} warm=$sequential " +
+                "pts90k=${pts.firstVideo}..${pts.lastVideo} nextVideo90k=${pts.nextVideo} firstAudio90k=${pts.firstAudio} nextAudio90k=${pts.nextAudio}")
             return result
-        }
-        val wasWarm = warm != null
-        try {
-            return try { convert(last) } catch (error: IOException) {
-                release()
-                session.checkActive()
-                if (last && !wasWarm) throw error
-                // Some vendor encoders buffer the last picture until EOS or ignore request-sync.
-                convert(true)
-            }
         } catch (error: Throwable) { release(); throw error }
     }
 
@@ -177,23 +183,20 @@ internal object DvdProxy {
     /** DVD packs are sector aligned. Deliver only elementary payload to the frame readers.
      * A private-stream PES can start with the tail of the preceding AC-3 frame. */
     fun demux(data: ByteArray, audioId: Int, sequenceHeader: () -> ByteArray? = { null },
-              audio: Ac3Reader? = null, clock: DvdPesClock? = null, video: (Long, ByteArray) -> Unit) {
+              audio: Ac3Reader? = null, video: ((Long, ByteArray) -> Unit)?) {
         var firstVideo = true
         var selectedAudio = audioId
-        forEachPes(data, clock) { id, start, end, rawPts ->
-            val pts = if (rawPts == C.TIME_UNSET || clock == null) rawPts else clock.ticks(rawPts)
+        forEachPes(data) { id, start, end, pts ->
             var payload = start
             if (id == 0xbd && payload + 4 <= end && selectedAudio < 0 && (data[payload].toInt() and 255) in 0x80..0x87)
                 selectedAudio = data[payload].toInt() and 255
-            if (id == 0xe0) {
+            if (id == 0xe0 && video != null) {
                 if (firstVideo) {
                     firstVideo = false
                     val hasHeader = end - start >= 4 && data[start] == 0.toByte() && data[start + 1] == 0.toByte() &&
                         data[start + 2] == 1.toByte() && data[start + 3] == 0xb3.toByte()
                     if (!hasHeader) sequenceHeader()?.let { video(C.TIME_UNSET, it) }
                 }
-                // libmpeg2 associates a PES tag with the next picture start and reorders it
-                // along with that picture. H262Reader would synthesize timestamps here.
                 video(pts, data.copyOfRange(start, end))
             } else if (id == 0xbd && audio != null && payload + 4 <= end && (data[payload].toInt() and 255) == selectedAudio) {
                 val pointer = ((data[payload + 2].toInt() and 255) shl 8) or (data[payload + 3].toInt() and 255)
@@ -213,18 +216,27 @@ internal object DvdProxy {
 
     /** PCI_GI.vobu_s_ptm is the low 32 bits of the first presentation time of a VOBU. */
     fun navStart(data: ByteArray, sector: Int = 0): Long? {
-        if (data.size - sector < 2048 || data[sector + 3] != 0xba.toByte() || data[sector + 0x29] != 0xbf.toByte() ||
-            data[sector + 0x2c] != 0.toByte() || data[sector + 0x403] != 0xbf.toByte()) return null
+        fun code(offset: Int, id: Int) = ptm(data, sector + offset) == 0x100L + id
+        if (sector < 0 || data.size - sector < 2048 || !code(0, 0xba) || !code(14, 0xbb) ||
+            !code(0x26, 0xbf) || data[sector + 0x2c] != 0.toByte() ||
+            !code(0x400, 0xbf) || data[sector + 0x406] != 1.toByte()) return null
         return ptm(data, sector + 0x39)
     }
 
     private fun ptm(data: ByteArray, pos: Int): Long =
         (pos until pos + 4).fold(0L) { n, i -> (n shl 8) or (data[i].toLong() and 255) }
 
-    private fun startClock(data: ByteArray, audioId: Int): Long {
-        navStart(data)?.let { return it }
+    data class SourceTiming(val basePts: Long, val navDuration: Long)
+
+    fun sourceTiming(data: ByteArray, audioId: Int): SourceTiming {
         var audioPts: Long? = null
         var videoPts: Long? = null
+        var navDuration = 0L
+        for (p in 0 until data.size - 2047 step 2048) {
+            val start = navStart(data, p) ?: continue
+            val duration = (ptm(data, p + 0x3d) - start).toInt()
+            if (duration > 0) navDuration += duration
+        }
         forEachPes(data) { id, start, _, pts ->
             if (pts != C.TIME_UNSET) {
                 val substream = data[start].toInt() and 255
@@ -232,13 +244,12 @@ internal object DvdProxy {
                 if (id == 0xe0 && videoPts == null) videoPts = pts
             }
         }
-        return audioPts ?: videoPts ?: 0
+        return SourceTiming(videoPts ?: audioPts ?: navStart(data) ?: 0, navDuration)
     }
 
-    private fun forEachPes(data: ByteArray, clock: DvdPesClock? = null, visit: (Int, Int, Int, Long) -> Unit) {
+    private fun forEachPes(data: ByteArray, visit: (Int, Int, Int, Long) -> Unit) {
         fun u(p: Int) = data[p].toInt() and 255
         for (sector in 0 until data.size - 13 step 2048) {
-            if (clock != null) navStart(data, sector)?.let { clock.vobu(it, ptm(data, sector + 0x3d)) }
             val limit = minOf(data.size, sector + 2048)
             var p = sector
             while (p + 6 <= limit && u(p) == 0 && u(p + 1) == 0 && u(p + 2) == 1) {
@@ -312,8 +323,7 @@ internal object DvdProxy {
         if (offset == 0L || offset >= file.size / 2048 * 2048) return offset
         val data = file.readRaw(offset, minOf(file.size - offset, 2L * 1024 * 1024).toInt(), fetch)
         for (p in 0 until data.size - 2047 step 2048) {
-            if (data[p+3] == 0xba.toByte() && data[p+0x29] == 0xbf.toByte() &&
-                data[p+0x403] == 0xbf.toByte()) return offset + p
+            if (navStart(data, p) != null) return offset + p
         }
         return null
     }
@@ -330,28 +340,47 @@ internal class DvdSegmentCache {
     }
     private var pending: Pair<Pair<String, Int>, IsoReadSession>? = null
 
+    private var lastRequest: Pair<String, Int>? = null
+    private var sequence = 0L
+
     fun segment(id: String, index: Int, last: Int, session: IsoReadSession, prefetch: Boolean,
-                load: (Int, IsoReadSession) -> ByteArray): ByteArray {
+                load: (Int, IsoReadSession, Long) -> ByteArray): ByteArray {
+        val key = id to index
+        val next = id to index + 1
+        var displaced: IsoReadSession? = null
+        val requestSequence = synchronized(cache) {
+            val previous = lastRequest
+            if (previous == null || id != previous.first || index !in previous.second..previous.second + 1) {
+                // A cached response may have been normalized on a different playback
+                // timeline. Only retries and forward playback can reuse it.
+                sequence++
+                cache.clear()
+                displaced = pending?.second
+                pending = null
+            }
+            lastRequest = key
+            sequence
+        }
+        displaced?.cancel("DVD seek")
         fun get(n: Int, owner: IsoReadSession): ByteArray {
             val key = id to n
-            synchronized(cache) { cache[key]?.let { return it } }
+            fun cached() = synchronized(cache) {
+                if (sequence != requestSequence) throw java.io.InterruptedIOException("DVD seek")
+                cache[key]
+            }
+            cached()?.let { return it }
             return synchronized(encoder) {
                 owner.checkActive()
-                synchronized(cache) { cache[key] } ?: load(n, owner).also { bytes ->
+                cached() ?: load(n, owner, requestSequence).also { bytes ->
                     owner.checkActive()
-                    synchronized(cache) { cache[key] = bytes }
+                    synchronized(cache) { if (sequence == requestSequence) cache[key] = bytes }
                 }
             }
         }
-        val key = id to index
-        val next = id to index + 1
-        synchronized(cache) {
-            pending?.takeIf { it.first != key && it.first != next && key !in cache }?.second
-        }?.cancel("DVD seek")
         val body = get(index, session)
         if (prefetch && index < last) synchronized(cache) {
             session.checkActive()
-            if (next !in cache && pending?.first != next) {
+            if (sequence == requestSequence && lastRequest == key && next !in cache && pending?.first != next) {
                 val owner = IsoReadSession()
                 val lease = ArchiveProxyStreams.registry.register(id, false, owner::cancel)
                 pending = next to owner
@@ -368,40 +397,5 @@ internal class DvdSegmentCache {
             }
         }
         return body
-    }
-}
-
-/** Apply the same cell offset to both elementary streams before decoding/reordering.
- * Signed modulo-2^32 distance handles PCI rollover and audio leading the first video frame. */
-internal data class DvdCellClock(val sourceStart: Long, val titleStart: Long) {
-    fun ticks(pts: Long): Long = titleStart + (pts - sourceStart).toInt()
-}
-
-internal class DvdPesClock(val cell: DvdCellClock?, firstPts: Long) {
-    private var base = cell ?: DvdCellClock(firstPts, firstPts)
-    private var previousEnd: Long? = null
-
-    var segmentStart: Long? = null
-        private set
-    var segmentEnd: Long? = null
-        private set
-
-    fun beginSegment() {
-        segmentStart = null
-        segmentEnd = null
-    }
-
-    fun ticks(pts: Long) = base.ticks(pts)
-
-    fun vobu(start: Long, end: Long) {
-        // PCI end PTM is the exclusive presentation end. A new source epoch can
-        // start at a VOBU boundary even in a standalone VOB without an IFO.
-        val duration = (end - start).toInt()
-        if (duration <= 0) return
-        val next = previousEnd
-        if (next != null && start != next) base = DvdCellClock(start, ticks(next))
-        if (segmentStart == null) segmentStart = ticks(start)
-        segmentEnd = ticks(end)
-        previousEnd = end
     }
 }

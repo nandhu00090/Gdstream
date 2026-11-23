@@ -19,6 +19,7 @@ class BluRayExtractorTest {
     private class Capture : ExtractorOutput {
         val formats = ArrayList<Format>()
         val samples = ArrayList<Sample>()
+        val syncSamples = ArrayList<Long>()
         val samplesByPid = HashMap<Int, Int>()
         val data = java.io.ByteArrayOutputStream()
         var map: SeekMap? = null
@@ -31,7 +32,12 @@ class BluRayExtractorTest {
                 val count = it.getArgument<Int>(1)
                 val bytes = ByteArray(count); source.readBytes(bytes, 0, count); data.write(bytes); null
             }.`when`(output).sampleData(any(ParsableByteArray::class.java), anyInt(), anyInt())
-            doAnswer { samples.add(Sample(it.getArgument(0), it.getArgument(2))); samplesByPid[id] = (samplesByPid[id] ?: 0) + 1; null }.`when`(output)
+            doAnswer {
+                samples.add(Sample(it.getArgument(0), it.getArgument(2)))
+                if (it.getArgument<Int>(1) and C.BUFFER_FLAG_KEY_FRAME != 0) syncSamples.add(it.getArgument(0))
+                samplesByPid[id] = (samplesByPid[id] ?: 0) + 1
+                null
+            }.`when`(output)
                 .sampleMetadata(anyLong(), anyInt(), anyInt(), anyInt(), isNull())
             return output
         }
@@ -47,7 +53,7 @@ class BluRayExtractorTest {
         mux.video(90_000, hex("000000016588840bf2628000abcc9d75e0"))
         mux.video(93_600, hex("00000001419a3817e580"))
         mux.video(97_200, hex("00000001419a54057960"))
-        val bytes = mux.finish()
+        val bytes = mux.finish(90_000, 100_800)
         val ts = androidx.media3.extractor.ts.TsExtractor(androidx.media3.extractor.ts.TsExtractor.MODE_HLS,
             androidx.media3.common.util.TimestampAdjuster(0), androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory())
         val capture = Capture()
@@ -59,6 +65,51 @@ class BluRayExtractorTest {
         assertFalse(capture.formats.any { it.sampleMimeType == "application/cea-608" })
         assertEquals(listOf(0L, 40_000L), capture.samples.take(2).map { it.time })
         ts.release()
+    }
+
+    @Test fun standaloneSeekParsesBothRenditionsAndReadsFirstIdrWithoutInBandParameterSets() {
+        val head = javaClass.getResourceAsStream("/bluray/hdmv.ts.bin")!!.readBytes()
+        val m2ts = ByteArray(head.size / 188 * 192)
+        for (p in head.indices step 188) head.copyInto(m2ts, p / 188 * 192 + 4, p, p + 188)
+        val opening = StandaloneBdav.profile(m2ts, m2ts, "Movie.tamil.m2ts")
+        val program = checkNotNull(opening.program)
+        val avc = checkNotNull(opening.avc)
+        val streams = program.streams.map { if (it.pid == 4352) it.copy(type = 0x81, language = "tam") else it }
+        val profile = opening.copy(streams = streams).also { it.avc = avc }
+        val hls = BluRayHls.create(profile, head.size.toLong(), standalone = true, convertDts = true)!!
+        val uri = android.net.Uri.parse("http://localhost/hls/test/index.m3u8")
+        val master = androidx.media3.exoplayer.hls.playlist.HlsPlaylistParser().parse(uri, hls.master().inputStream())
+            as androidx.media3.exoplayer.hls.playlist.HlsMultivariantPlaylist
+        assertEquals(listOf("audio_4352.m3u8", "audio_4353.m3u8"), master.audios.map { it.url!!.lastPathSegment })
+        assertEquals(listOf(C.SELECTION_FLAG_AUTOSELECT or C.SELECTION_FLAG_DEFAULT, C.SELECTION_FLAG_AUTOSELECT),
+            master.audios.map { it.format.selectionFlags })
+        assertTrue(master.audios.all { it.format.sampleMimeType == "audio/ac3" })
+
+        // Keep the real IDR and subsequent slices, remove the fixture's in-band
+        // SPS/PPS from the first video PES. Leading zero bytes are valid Annex B padding.
+        val body = head.copyOf()
+        val video = (body.indices step 188).first { body[it+1].toInt() and 0x5f == 0x50 && body[it+2] == 0x11.toByte() }
+        val sps = (video until video + 184).first { body[it] == 1.toByte() && body[it+1] == 0x67.toByte() } - 3
+        val sei = (sps + 4 until video + 184).first { body[it] == 1.toByte() && body[it+1] == 6.toByte() } - 2
+        body.fill(0, sps, sei)
+        assertNull(StandaloneBdav.avcConfig(body, 0x1011))
+        val psi = hls.prefix(program, streams, null)
+        val source = head + body
+        fun read(pos: Long, n: Int) = source.copyOfRange(pos.toInt(), pos.toInt() + n)
+        val (segment, header) = avc.videoSegment(BluRayHls.Segment(head.size.toLong(), source.size.toLong(), 120_000),
+            psi, source.size.toLong(), ::read)
+        val seek = segment.read(header, 0, segment.size(header).toInt(), ::read)
+        ExternalTsPmt.patch(seek, streams, videoOnly = true)
+        val extractor = androidx.media3.extractor.ts.TsExtractor(androidx.media3.extractor.ts.TsExtractor.MODE_HLS,
+            androidx.media3.common.util.TimestampAdjuster(0), androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory())
+        val capture = Capture()
+        extractor.init(capture)
+        val input = DefaultExtractorInput(seek.inputStream()::read, 0, C.LENGTH_UNSET.toLong())
+        while (extractor.read(input, PositionHolder()) != Extractor.RESULT_END_OF_INPUT) { }
+        extractor.release()
+        assertTrue(capture.formats.any { it.sampleMimeType == "video/avc" && it.width == 64 && it.height == 64 })
+        assertEquals(0L, capture.syncSamples.first())
+        assertEquals(listOf(0L, 40_000L), capture.samples.take(2).map { it.time })
     }
 
     @Test fun latePmtAudioUsesInferredPrimaryLanguageAndNumberedSecondaryTrack() {

@@ -21,7 +21,27 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
         return bcd(u(p)) * 3600 + bcd(u(p + 1)) * 60 + bcd(u(p + 2)) + bcd(u(p + 3) and 63) / fps
     }
 
-    data class Title(val duration: Double, val cells: List<LongRange>, val pgc: Int, val cellUs: List<Long>)
+    data class Cell(val ranges: List<LongRange>, val durationUs: Long, val discontinuity: Boolean)
+    data class Title(val duration: Double, val playback: List<Cell>, val pgc: Int) {
+        val cells get() = playback.flatMap { it.ranges }
+    }
+
+    // The table length includes the last byte, relative to its own header.
+    private fun entries(pointer: Int, header: Int, stride: Int): IntProgression? {
+        val base = long(pointer) * 2048
+        if (base == 0L || base + header > ifo.size) return null
+        val end = base + long(base.toInt() + header - 4) + 1
+        if (end > ifo.size || end <= base + header || (end - base - header) % stride != 0L) return null
+        return (base.toInt() + header until end.toInt() step stride)
+    }
+
+    // VTS_C_ADT can give one (VOB ID, cell ID) several physically separated extents.
+    private val cellAddresses by lazy {
+        entries(0xe0, 8, 12)?.groupBy(
+            { word(it) to u(it + 2) },
+            { long(it + 4) * 2048 until (long(it + 8) + 1) * 2048 }
+        ).orEmpty()
+    }
 
     fun main(): Title {
         val parts = table(0xc8)
@@ -45,8 +65,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
                         require(program in 1..u(pgc + 2))
                         pgc to program
                     }
-                val cells = ArrayList<LongRange>()
-                val durations = mutableListOf<Long>()
+                val cells = ArrayList<Cell>()
                 var duration = 0.0
                 chapters.forEachIndexed { index, (pgc, program) ->
                     val map = pgc + word(pgc + 230)
@@ -64,46 +83,59 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
                         val start = long(c + 8) * 2048
                         val until = (long(c + 20) + 1) * 2048
                         require(until > start)
-                        cells.add(start until until)
-                        duration += seconds(c + 4)
-                        durations.add((seconds(c + 4) * 1_000_000).toLong())
+                        val positions = word(pgc + 234)
+                        val position = pgc + positions + (cell - 1) * 4
+                        val addresses = if (positions == 0) null else cellAddresses[word(position) to u(position + 3)]
+                        val ranges = addresses?.mapNotNull {
+                            (maxOf(it.first, start) until minOf(it.last + 1, until)).takeUnless(LongRange::isEmpty)
+                        }?.distinct()?.sortedBy { it.first } ?: listOf(start until until)
+                        require(ranges.isNotEmpty() && ranges.zipWithNext().all { (a, b) -> a.last < b.first })
+                        val seconds = seconds(c + 4)
+                        val jump = cells.lastOrNull()?.let { it.ranges.last().last + 1 != ranges.first().first } ?: false
+                        val discontinuity = u(c) and 2 != 0 || jump && u(c) and 8 == 0
+                        cells.add(Cell(ranges, (seconds * 1_000_000).toLong(), discontinuity))
+                        duration += seconds
                     }
                 }
-                Title(duration, cells, chapters.first().first, durations)
+                Title(duration, cells, chapters.first().first)
             }
             .maxByOrNull { it.duration } ?: error("Empty DVD title table")
     }
 
-    /** The IFO VOBU address map gives independent DVD pack/GOP start sectors.
-     * Interpolate inside each timed cell, retaining its exact end time. */
+    /** Address-map sectors are relative to VTS_XX_1.VOB. Translate through exactly
+     * the same selected cell extents that back the virtual movie. */
     fun segments(title: Title): List<DvdProxy.Segment> {
-        val map = table(0xe4)
-        if (map <= 0 || map + 4 > ifo.size) return emptyList()
-        val length = long(map) + 1
-        if (length !in 8..(ifo.size - map).toLong() || length % 4 != 0L) return emptyList()
-        val starts = (map + 4 until map + length.toInt() step 4).map { long(it) * 2048 }
-        if (starts.zipWithNext().any { (a, b) -> b <= a }) return emptyList()
-        var virtual = 0L
+        val entries = entries(0xe4, 4, 4) ?: return emptyList()
+        val sectors = entries.map { long(it) * 2048 }
+        if (sectors.zipWithNext().any { (a, b) -> b <= a }) return emptyList()
         val result = mutableListOf<DvdProxy.Segment>()
-        for ((index, cell) in title.cells.withIndex()) {
-            val bytes = cell.last - cell.first + 1
-            val duration = title.cellUs[index]
-            var start = cell.first
-            var time = 0L
-            var i = starts.binarySearch(start)
-            if (i < 0 || duration <= 0) return emptyList()
-            while (++i < starts.size && starts[i] in cell) {
-                val next = starts[i]
-                val nextTime = (duration.toDouble() * (next - cell.first) / bytes).toLong()
-                if (nextTime - time < 4_000_000 && next - start < 6 * 1024 * 1024) continue
-                result.add(DvdProxy.Segment(virtual + start - cell.first, virtual + next - cell.first, nextTime - time, index > 0 && start == cell.first))
-                start = next
-                time = nextTime
+        var virtual = 0L
+        for (cell in title.playback) {
+            val starts = ArrayList<Long>()
+            for (range in cell.ranges) {
+                var index = sectors.binarySearch(range.first)
+                if (index < 0) return emptyList()
+                while (index < sectors.size && sectors[index] <= range.last) {
+                    starts.add(virtual + (sectors[index++] - range.first))
+                }
+                virtual += range.last - range.first + 1
             }
-            result.add(DvdProxy.Segment(virtual + start - cell.first, virtual + bytes, duration - time, index > 0 && start == cell.first))
-            virtual += bytes
+            // The IFO times the cell, not individual VOBUs. Use their count to
+            // estimate EXTINF on VBR titles, with every cut on an actual NAV sector.
+            val count = starts.size
+            if (count == 0 || cell.durationUs <= 0) return emptyList()
+            starts.add(virtual) // exclusive last sector of the last selected extent
+            var first = 0
+            for (i in 1..count) {
+                val duration = cell.durationUs * i / count - cell.durationUs * first / count
+                val bytes = starts[i] - starts[first]
+                if (i < count && duration < 4_000_000 && bytes < 6L * 1024 * 1024) continue
+                if (bytes > 12L * 1024 * 1024 || duration <= 0) return emptyList()
+                result.add(DvdProxy.Segment(starts[first], starts[i], duration, first == 0 && cell.discontinuity))
+                first = i
+            }
         }
-        return result.takeIf { list -> list.all { it.end - it.start in 1..12L * 1024 * 1024 && it.durationUs > 0 } }.orEmpty()
+        return result
     }
 
     fun info(title: Title, sample: ByteArray, bytes: Long, fallbackHint: String = ""): Map<String, Any> {
@@ -234,6 +266,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
     }
 
     companion object {
+        const val INDEX_VERSION = 1
         private val MPEG1_LAYER2 =
             intArrayOf(0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384)
         private val MPEG2_LAYER2 =
