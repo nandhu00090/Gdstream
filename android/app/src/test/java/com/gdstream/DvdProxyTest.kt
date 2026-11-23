@@ -24,12 +24,44 @@ class DvdProxyTest {
         val mux = DvdTsMux()
         // Two-byte lengths on samples, separate SPS and PPS in avcC.
         mux.video(0, byteArrayOf(1, 66, 0, 30, -3, -31, 0, 2, 0x67, 66, 1, 0, 2, 0x68, 1), true)
-        mux.video(1_000_000, byteArrayOf(0, 2, 0x65, 42))
+        mux.video(90_000, byteArrayOf(0, 2, 0x65, 42))
         val bytes = mux.finish()
         val expected = listOf(9, 0xf0, 0x67, 66, 0x68, 1, 0x65, 42).chunked(2)
             .flatMap { listOf(0, 0, 0, 1) + it }.map(Int::toByte).toByteArray()
         assertArrayEquals(expected, bytes.takeLast(expected.size).toByteArray())
         assertEquals(1, mux.frames)
+    }
+
+    @Test fun warmSegmentsRetainBothAnnexBParameterSetsAndTheSharedPesClock() {
+        val mux = DvdTsMux()
+        val config = byteArrayOf(0, 0, 1, 0x67, 66, 0, 0, 1, 0x68, 1)
+        mux.video(0, config, true) // One INFO_OUTPUT_FORMAT_CHANGED for two segments.
+        val clock = DvdPesClock(DvdCellClock(0xfffffff0L, 90_000), 0xfffffff0L)
+        fun segment(audio: Long, video: Long, expected: List<Long>) {
+            mux.beginSegment()
+            mux.audio(clock.ticks(audio) * 1000 / 90, byteArrayOf(0x0b, 0x77))
+            mux.video(clock.ticks(video), byteArrayOf(0, 0, 1, 0x65, 42))
+            val ts = mux.finish()
+            val timestamps = mutableListOf<Long>()
+            for (p in ts.indices step 188) {
+                val pid = ((ts[p + 1].toInt() and 31) shl 8) or (ts[p + 2].toInt() and 255)
+                if (pid !in 257..258) continue
+                val pes = p + 5 + (ts[p + 4].toInt() and 255)
+                val t = pes + 9
+                fun u(i: Int) = ts[t + i].toLong() and 255
+                timestamps += ((u(0) and 14) shl 29) or (u(1) shl 22) or ((u(2) and 254) shl 14) or
+                    (u(3) shl 7) or (u(4) shr 1)
+                if (pid == 257) assertArrayEquals(
+                    byteArrayOf(0,0,0,1,9,-16, 0,0,0,1,0x67,66, 0,0,0,1,0x68,1, 0,0,0,1,0x65,42),
+                    ts.copyOfRange(pes + 14, p + 188))
+            }
+            assertEquals(expected, timestamps)
+        }
+        clock.vobu(0xfffffff0L, 0x8c90)
+        segment(0x1ffffffe0, 0x100000000, listOf(89_984, 90_016))
+        // Next VOBU resets its PTM. Preserve the audio lead over video.
+        clock.vobu(1_000, 37_000)
+        segment(984, 1000, listOf(125_984, 126_000))
     }
 
     @Test fun segmentOpensWithValidPatAndPmtAndKeepsAc3Bytes() {
@@ -38,7 +70,7 @@ class DvdProxyTest {
         mux.audio(1_200_000, audio)
         mux.video(0, byteArrayOf(0, 0, 1, 0x67, 66), true)
         mux.video(0, byteArrayOf(0, 0, 1, 0x68, 1), true)
-        mux.video(1_210_000, byteArrayOf(0, 0, 0, 1, 0x65, 1))
+        mux.video(108_900, byteArrayOf(0, 0, 0, 1, 0x65, 1))
         val bytes = mux.finish()
         assertEquals(0, bytes.size % 188)
         val streams = BluRayPsi.streams(bytes)

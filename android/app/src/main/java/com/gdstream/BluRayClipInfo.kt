@@ -5,6 +5,14 @@ import org.json.JSONObject
 
 /** Positions are in the proxy's 188-byte TS address space, never ISO sectors or 192-byte SPNs. */
 data class BluRayPoint(val timeUs: Long, val position: Long)
+internal fun audioChannelLabel(channels: Int) = when (channels) {
+    1 -> "Mono"
+    2 -> "Stereo"
+    6 -> "5.1"
+    8 -> "7.1"
+    else -> if (channels > 0) "$channels ch" else ""
+}
+
 data class BluRayAudio(val pid: Int, val type: Int, val language: String) {
     val codecName: String get() = when (type) {
         0x80 -> "LPCM"

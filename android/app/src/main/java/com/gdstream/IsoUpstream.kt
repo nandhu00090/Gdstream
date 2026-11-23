@@ -339,14 +339,16 @@ internal class M2tsReadCursor {
         return true
     }
 
-    fun seekBlocks(target: Long, size: Long, throttled: Boolean = false): List<LongRange> {
+    fun seekBlocks(target: Long, size: Long): List<LongRange> {
         val block = IsoChunkCache.BLOCK_BYTES.toLong()
         val start = target / block * block
-        val blockCount = if (throttled) 2 else 3
-        val ahead = (0 until blockCount).map { start + it * block }.filter { it < size }.toMutableList()
-        // The previous block contains the beginning of the PCR search window near a boundary.
-        if (!throttled && start > 0 && target - start < 600 * 192) ahead.add(start - block)
-        return ahead.map { it until minOf(it + block, size) }
+        return listOf(start, start + block).filter { it < size }.map { it until minOf(it + block, size) }
+    }
+
+    fun playbackWindow(position: Long, size: Long): LongRange {
+        val block = IsoChunkCache.BLOCK_BYTES.toLong()
+        val start = (position / block + 1) * block
+        return start until minOf(size, start + 3 * block)
     }
 }
 

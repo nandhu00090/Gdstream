@@ -699,6 +699,9 @@ void mpeg2_header_picture_finalize (mpeg2dec_t * mpeg2dec, uint32_t accels)
 	    other += 2;
 	mpeg2dec->picture = picture;
 	*picture = mpeg2dec->new_picture;
+        mpeg2dec->displayed[picture - mpeg2dec->pictures] = 0;
+        /* The paired slot can still contain a field from the previous GOP. */
+        picture[1].nb_fields = 0;
 
 	if (!old_type_b) {
 	    mpeg2dec->fbuf[2] = mpeg2dec->fbuf[1];
@@ -962,6 +965,29 @@ mpeg2_state_t mpeg2_header_end (mpeg2dec_t * mpeg2dec)
 	mpeg2dec->info.discard_fbuf = mpeg2dec->fbuf[b_type];
     mpeg2dec->action = seek_sequence;
     return STATE_END;
+}
+
+/* Claim the reordered display buffer exactly once. In particular, header_end
+ * may expose the paired slot even when the input ended between fields. */
+unsigned int mpeg2_take_display_fields (mpeg2dec_t * mpeg2dec)
+{
+    const mpeg2_picture_t * first = mpeg2dec->info.display_picture;
+    const mpeg2_picture_t * second = mpeg2dec->info.display_picture_2nd;
+    if (!first || !mpeg2dec->info.display_fbuf || (first->flags & PIC_FLAG_SKIP))
+        return 0;
+    unsigned int fields = first->nb_fields;
+    if (fields == 1) {
+        if (second != first + 1 || second->nb_fields != 1 ||
+            second->temporal_reference != first->temporal_reference ||
+            (second->flags & PIC_FLAG_SKIP) ||
+            !((first->flags ^ second->flags) & PIC_FLAG_TOP_FIELD_FIRST))
+            return 0;
+        fields = 2;
+    }
+    uint8_t * displayed = &mpeg2dec->displayed[first - mpeg2dec->pictures];
+    if (*displayed) return 0;
+    *displayed = 1;
+    return fields;
 }
 
 /* After a caller-inserted sequence end at a VOBU boundary, retain both

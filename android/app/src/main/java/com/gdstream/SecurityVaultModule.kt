@@ -154,6 +154,27 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 DvdProxy.estimatedSegments(uncompressedSize, (seconds * 1_000_000).toLong())
             } else emptyList()
         }
+        // The IFO durations within a cell are byte estimates. Only its actual start
+        // and total duration anchor the timestamp mapping, including on random seeks.
+        private val dvdCells by lazy {
+            var cell = 0 to 90_000L // leave room for AC-3 frames leading the first video PTS
+            var elapsedUs = 0L
+            dvdSegments.mapIndexed { i, segment ->
+                if (segment.discontinuity) cell = i to (90_000L + elapsedUs * 9 / 100)
+                elapsedUs += segment.durationUs
+                cell
+            }
+        }
+        private val cellClocks = mutableMapOf<Int, DvdCellClock?>()
+        fun cellClock(index: Int, readSector: (Long) -> ByteArray): DvdCellClock? {
+            val (first, ticks) = dvdCells.getOrNull(index) ?: return null
+            if (first !in cellClocks) {
+                val start = DvdProxy.navStart(readSector(dvdSegments[first].start))
+                cellClocks[first] = start?.let { DvdCellClock(it, ticks) }
+            }
+            return cellClocks[first]
+        }
+
         val dvdEncoder by lazy {
             val audio = resolvedInfo?.get("audioTracks") as? List<*>
             val supportedAudio = audio.isNullOrEmpty() || audio.any { (it as? Map<*, *>)?.get("codec") == "AC-3" }
@@ -1214,7 +1235,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             try {
                                 DvdProxy.transcode(data, checkNotNull(entry.resolvedInfo), checkNotNull(entry.dvdEncoder),
                                     session, entry.id, dvdIndex, nextVobu != null,
-                                    dvdIndex == entry.dvdPlaylist.lastIndex) {
+                                    dvdIndex == entry.dvdPlaylist.lastIndex, entry.cellClock(dvdIndex) { offset ->
+                                        if (offset == start) data else file.readRaw(offset, 2048, ::fetch)
+                                    }) {
                                     entry.dvdSequenceHeader ?: DvdProxy.sequenceHeader(
                                         file.readRaw(0, minOf(file.size, 512L * 1024).toInt(), ::fetch)
                                     )?.also { entry.dvdSequenceHeader = it }
@@ -1243,7 +1266,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 } else if (hls == null) {
                     val direct = entry.standalone && entry.isBdavM2ts
-                    val throttled = direct && IsoHostPolicy.throttled(entry.archiveUrl)
                     var first = true
                     var warmAt = 0L
                     file.serve(method, rangeHeader, "video/MP2T".takeIf { entry.isBdavM2ts } ?: mimeType,
@@ -1254,19 +1276,19 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         if (!direct) return@serve readTs(start, length)
                         val target = start / 188 * 192
                         val block = IsoChunkCache.BLOCK_BYTES.toLong()
-                        if (first && entry.directCursor.begin(session.id, start)) {
-                            val ranges = entry.directCursor.seekBlocks(target, entry.sourceSize, throttled)
+                        val seekHead = first && entry.directCursor.begin(session.id, start)
+                        if (seekHead) {
+                            val ranges = entry.directCursor.seekBlocks(target, entry.sourceSize)
                             appendDebugLog("M2TS_SEEK_PREFETCH", "targetByte=$start blocks=${ranges.map { it.first / block }}")
                             isoChunkCache.prefetch(ranges, entry.sourceSize, session, priority = true, fetch = ::upstream)
-                            warmAt = ranges.maxOf { it.last } + 1 - block
                         }
                         first = false
                         val data = readTs(start, length)
                         val next = (start + length) / 188 * 192
-                        if (entry.directCursor.advance(session.id, start + length) && next >= warmAt) {
-                            warmAt = (next / block + 1) * block
-                            val end = minOf(entry.sourceSize, warmAt + (if (throttled) 1 else 3) * block)
-                            if (warmAt < end) isoChunkCache.prefetch(listOf(warmAt until end), entry.sourceSize, session, fetch = ::upstream)
+                        if (entry.directCursor.advance(session.id, start + length) && !seekHead && next >= warmAt) {
+                            val window = entry.directCursor.playbackWindow(next, entry.sourceSize)
+                            warmAt = window.first
+                            if (!window.isEmpty()) isoChunkCache.prefetch(listOf(window), entry.sourceSize, session, fetch = ::upstream)
                         }
                         data
                     }

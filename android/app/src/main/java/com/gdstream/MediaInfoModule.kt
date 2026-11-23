@@ -59,7 +59,8 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         val tracks: List<MkvTrack>,
         val hasDoviRecord: Boolean,
         val dvProfile: Int,
-        val dvHasHdr10Base: Boolean
+        val dvHasHdr10Base: Boolean,
+        val transportStream: Boolean = false
     )
 
     private class BitReader(private val data: ByteArray, startByte: Int, private val limitByte: Int) {
@@ -1131,14 +1132,15 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                             }
                             2 -> { // Audio Track (Pure Bitstream & Container Specs Only!)
                                 val rawLang = t.languageIetf.ifBlank { t.language }
-                                val langName = formatLanguageName(rawLang, t.name)
-                                audioLanguages.add(langName)
+                                val unnamed = parsed.transportStream && (rawLang.isBlank() || rawLang == "und")
+                                val langName = if (unnamed) "Audio ${audioList.size() + 1}" else formatLanguageName(rawLang, t.name)
+                                if (!unnamed) audioLanguages.add(langName)
 
                                 val codecName = formatRealAudioCodec(t)
                                 if (t.bitstreamHasAtmos) {
                                     hasAtmos = true
                                 }
-                                val channelStr = formatChannelLayout(t.channels)
+                                val channelStr = if (unnamed) audioChannelLabel(t.channels) else formatChannelLayout(t.channels)
                                 val bitrateStr = formatBitrate(t.realBitrateBps)
                                 val bitrateKbps = (t.realBitrateBps / 1000L).toInt()
 
@@ -1205,14 +1207,16 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                                 val rawLang = if (format.containsKey(MediaFormat.KEY_LANGUAGE)) {
                                     format.getString(MediaFormat.KEY_LANGUAGE)
                                 } else null
-                                val hint = if (audioList.size() == 0 && originalLanguage.isNotBlank())
-                                    inferLanguageCodeFromName(fileName).ifBlank { originalLanguage } else "eng"
-                                val langName = formatLanguageName(rawLang?.takeUnless { it.isBlank() || it == "und" } ?: hint)
-                                audioLanguages.add(langName)
+                                val bdav = fileName.endsWith(".m2ts", true)
+                                val primaryHint = if (audioList.size() == 0 && (bdav || originalLanguage.isNotBlank())) inferLanguageCodeFromName(fileName).ifBlank { originalLanguage } else ""
+                                val lang = rawLang?.takeUnless { it.isBlank() || it == "und" } ?: primaryHint
+                                val unnamed = bdav && lang.isBlank()
+                                val langName = if (unnamed) "Audio ${audioList.size() + 1}" else formatLanguageName(lang)
+                                if (!unnamed) audioLanguages.add(langName)
                                 val ch = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
                                     format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                                 } else 0
-                                val chStr = formatChannelLayout(ch)
+                                val chStr = if (unnamed) audioChannelLabel(ch) else formatChannelLayout(ch)
                                 val brBps = if (format.containsKey(MediaFormat.KEY_BIT_RATE)) {
                                     format.getInteger(MediaFormat.KEY_BIT_RATE).toLong()
                                 } else 0L
@@ -1224,6 +1228,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                                     }
                                     mime.contains("eac3") -> "Dolby Digital Plus (DD+)"
                                     mime.contains("ac3") -> "Dolby Digital (AC3)"
+                                    mime.contains("dts") -> if (mime.endsWith(".hd")) "DTS-HD" else "DTS"
                                     mime.contains("mp4a") || mime.contains("aac") -> "AAC"
                                     else -> "Audio"
                                 }
@@ -1933,7 +1938,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
 
                         val decodedHint = try { java.net.URLDecoder.decode(urlStr, "UTF-8") } catch (_: Throwable) { urlStr }
                         val hintLang = inferLanguageCodeFromName(decodedHint)
-                        var langCode = hintLang
+                        var langCode = ""
                         var regTag = ""
                         var dp = descStart
                         while (dp + 2 <= descEnd) {
@@ -2047,7 +2052,8 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             tracks = tracks,
             hasDoviRecord = hasDovi,
             dvProfile = dvProf,
-            dvHasHdr10Base = hasDovi
+            dvHasHdr10Base = hasDovi,
+            transportStream = true
         )
     }
 

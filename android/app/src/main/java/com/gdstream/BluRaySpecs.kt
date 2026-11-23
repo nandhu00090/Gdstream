@@ -92,7 +92,7 @@ internal fun BluRayProfile.mediaInfo(totalBytes: Long): Map<String, Any> {
             if (stream.kbps > 0) "Lossless (${stream.kbps} kbps core)" else "Lossless"
         } else if (stream.kbps > 0) "${stream.kbps} kbps" else ""
         mapOf("language" to displayLang, "codec" to stream.codec, "channels" to channels, "bitrateKbps" to stream.kbps,
-            "summary" to listOf(displayLang, stream.codec, channels, rate).filter { it.isNotEmpty() }.joinToString(" • "))
+            "summary" to listOf(displayLang, stream.codec, if (resolvedLang == "Unknown") channels.removeSuffix(" ch") else channels, rate).filter { it.isNotEmpty() }.joinToString(" • "))
     }
     val subInfo = streams.filter { it.type == 0x90 }.distinctBy { it.pid }.mapIndexed { index, stream ->
         val resolvedLang = bluRayLanguage(stream.language)
