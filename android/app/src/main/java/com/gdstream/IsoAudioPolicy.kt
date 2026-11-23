@@ -22,8 +22,8 @@ internal class IsoClockProgress(private val now: () -> Long) {
     fun reset() { lastAdvance = now() }
     fun stalled(position: Long, bufferedMs: Long, playing: Boolean, renderedFrame: Boolean): Boolean {
         val time = now()
-        if (!playing || !renderedFrame || bufferedMs < 1500 || position != lastPosition) lastAdvance = time
+        if (!playing || !renderedFrame || bufferedMs <= 4000 || position != lastPosition) lastAdvance = time
         lastPosition = position
-        return playing && renderedFrame && bufferedMs >= 1500 && time - lastAdvance >= 2500
+        return playing && renderedFrame && bufferedMs > 4000 && time - lastAdvance >= 2500
     }
 }

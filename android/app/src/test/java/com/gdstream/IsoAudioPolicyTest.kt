@@ -19,20 +19,20 @@ class IsoAudioPolicyTest {
     @Test fun clockFallbackRequiresRenderedVideoAndBufferedDataAndNeverTriggersForPauseOrNetworkStarvation() {
         var now = 0L
         val clock = IsoClockProgress { now }
-        assertFalse(clock.stalled(0, 2000, true, true))
+        assertFalse(clock.stalled(0, 4001, true, true))
         now = 2499
-        assertFalse(clock.stalled(0, 2000, true, true))
+        assertFalse(clock.stalled(0, 4001, true, true))
         now = 2500
-        assertTrue(clock.stalled(0, 2000, true, true))
+        assertTrue(clock.stalled(0, 4001, true, true))
         clock.reset()
         now += 2499
-        assertFalse(clock.stalled(0, 2000, true, true))
-        assertFalse(clock.stalled(100, 2000, true, true))
+        assertFalse(clock.stalled(0, 4001, true, true))
+        assertFalse(clock.stalled(100, 4001, true, true))
         now += 10000
-        assertFalse(clock.stalled(100, 1000, true, true))
+        assertFalse(clock.stalled(100, 4000, true, true))
         now += 10000
-        assertFalse(clock.stalled(100, 2000, false, true))
+        assertFalse(clock.stalled(100, 4001, false, true))
         now += 10000
-        assertFalse(clock.stalled(100, 2000, true, false))
+        assertFalse(clock.stalled(100, 4001, true, false))
     }
 }

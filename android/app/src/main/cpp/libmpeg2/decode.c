@@ -203,7 +203,10 @@ mpeg2_state_t mpeg2_parse (mpeg2dec_t * mpeg2dec)
     case 0xb3:
     case 0xb7:
     case 0xb8:
-	return (mpeg2dec->state == STATE_SLICE) ? STATE_SLICE : STATE_INVALID;
+	/* A truncated field pair may still release a complete, delayed
+         * reference picture when the caller flushes at a VOBU boundary. */
+        if (mpeg2dec->state == STATE_SLICE_1ST) return STATE_SLICE_1ST;
+        return (mpeg2dec->state == STATE_SLICE) ? STATE_SLICE : STATE_INVALID;
     default:
 	mpeg2dec->action = seek_chunk;
 	return STATE_INVALID;

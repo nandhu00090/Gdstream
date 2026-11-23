@@ -1,5 +1,7 @@
 package com.gdstream
 
+import androidx.media3.common.Format
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.C
 import androidx.media3.common.Tracks
 import androidx.media3.common.TrackSelectionOverride
@@ -12,11 +14,29 @@ internal object AudioTrackCatalog {
     private fun entries(tracks: Tracks) = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
         .flatMap { group -> (0 until group.length).map { Entry(group, it) } }
 
+    private fun title(format: Format, index: Int): String? {
+        val label = format.label
+        if (format.containerMimeType != MimeTypes.VIDEO_MP2T ||
+            !label.isNullOrBlank() && !label.equals("Unknown", true)) return label
+        val codec = when (format.sampleMimeType) {
+            MimeTypes.AUDIO_DTS -> "DTS"
+            MimeTypes.AUDIO_DTS_HD -> "DTS-HD"
+            MimeTypes.AUDIO_AC3 -> "AC-3"
+            MimeTypes.AUDIO_E_AC3 -> "E-AC-3"
+            MimeTypes.AUDIO_TRUEHD -> "TrueHD"
+            MimeTypes.AUDIO_RAW -> "LPCM"
+            MimeTypes.AUDIO_AAC -> "AAC"
+            else -> ""
+        }
+        val name = bluRayLanguage(format.language.orEmpty()).takeUnless { it == "Unknown" } ?: "Audio ${index + 1}"
+        return listOf(name, codec, audioChannelLabel(format.channelCount)).filter { it.isNotEmpty() }.joinToString(" • ")
+    }
+
     fun list(tracks: Tracks): ArrayList<Track> = ArrayList(entries(tracks).mapIndexed { flatIndex, entry ->
         val format = entry.group.getTrackFormat(entry.index)
         Track().apply {
             index = flatIndex
-            title = format.label
+            title = title(format, flatIndex)
             mimeType = format.sampleMimeType
             language = format.language
             bitrate = maxOf(0, format.bitrate)
@@ -48,7 +68,7 @@ internal object AudioTrackCatalog {
             val format = entry.group.getTrackFormat(entry.index)
             when (type) {
                 "index" -> index == value?.toIntOrNull()
-                "title" -> format.label == value
+                "title" -> title(format, index) == value
                 "language" -> format.language == value
                 else -> false
             }

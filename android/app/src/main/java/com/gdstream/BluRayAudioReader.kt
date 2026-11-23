@@ -52,7 +52,7 @@ internal abstract class BluRayAudioReader(private val tracks: List<BluRayAudio>,
             require(frame.consumed in 1..length)
             while (timestamps.isNotEmpty() && timestamps.first.first <= absoluteStart) timeUs = timestamps.removeFirst().second
             if (frame.data.isNotEmpty()) {
-                val channels = when (frame.format.channelCount) { 1 -> "Mono"; 2 -> "Stereo"; 6 -> "5.1"; 8 -> "7.1"; else -> "${frame.format.channelCount} ch" }
+                val channels = audioChannelLabel(frame.format.channelCount)
                 val label = track?.displayLabel(trackIndex, channels)
                 val resolvedLang = (track?.language?.takeIf { it.isNotBlank() && it != "und" } ?: language?.takeIf { it.isNotBlank() && it != "und" })
                 val format = frame.format.buildUpon().setId(id).setLanguage(resolvedLang)
@@ -60,7 +60,7 @@ internal abstract class BluRayAudioReader(private val tracks: List<BluRayAudio>,
                 if (format != lastFormat) {
                     output.format(format)
                     lastFormat = format
-                    DebugLogger.log("ISO_AUDIO_FORMAT", "pid=$id mime=${format.sampleMimeType} channels=${format.channelCount} rate=${format.sampleRate} language=${format.language}")
+                    DebugLogger.log("ISO_AUDIO_FORMAT", "pid=$id mime=${format.sampleMimeType} channels=${format.channelCount} rate=${format.sampleRate} language=${format.language} label=${format.label}")
                 }
                 if (timeUs != C.TIME_UNSET) {
                     output.sampleData(ParsableByteArray(frame.data), frame.data.size)

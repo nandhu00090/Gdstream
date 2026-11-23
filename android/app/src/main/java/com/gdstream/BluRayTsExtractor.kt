@@ -84,13 +84,13 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
                 return object : TrackOutput by target {
                     override fun format(format: androidx.media3.common.Format) {
                         val enriched = if (audio != null && type == C.TRACK_TYPE_AUDIO) {
-                            val ch = when (format.channelCount) { 1 -> "Mono"; 2 -> "Stereo"; 6 -> "5.1"; 8 -> "7.1"; else -> "" }
+                            val ch = audioChannelLabel(format.channelCount)
                             val lang = audio.language.takeIf { it.isNotBlank() && it != "und" } ?: format.language
                             format.buildUpon().setLanguage(lang)
                                 .setLabel(audio.copy(language = lang.orEmpty()).displayLabel(audioIdx, ch)).build()
                         } else format
                         if (type == C.TRACK_TYPE_AUDIO) DebugLogger.log("ISO_AUDIO_FORMAT",
-                            "pid=$id id=${enriched.id} mime=${enriched.sampleMimeType} channels=${enriched.channelCount} rate=${enriched.sampleRate} language=${enriched.language}")
+                            "pid=$id id=${enriched.id} mime=${enriched.sampleMimeType} channels=${enriched.channelCount} rate=${enriched.sampleRate} language=${enriched.language} label=${enriched.label}")
                         if (type == C.TRACK_TYPE_VIDEO) {
                             val mode = if (enriched.sampleMimeType == "video/dolby-vision") "DV"
                                 else if (enriched.colorInfo?.colorTransfer in listOf(C.COLOR_TRANSFER_ST2084, C.COLOR_TRANSFER_HLG)) "HDR10" else "SDR"

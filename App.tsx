@@ -1915,7 +1915,7 @@ const App = () => {
           continue;
         }
         const discProbe = standaloneProbeCandidate(fileObj);
-        const cacheKey = discProbe ? `mediainfo_v10_${getStreamUrl(fileObj)}_${fileObj.size || 0}` : `mediainfo_v8_${fName}`;
+        const cacheKey = discProbe ? `mediainfo_v11_${getStreamUrl(fileObj)}_${fileObj.size || 0}` : `mediainfo_v8_${fName}`;
         try {
           const cached = await AsyncStorage.getItem(cacheKey);
           if (cached) {
@@ -3239,7 +3239,7 @@ const App = () => {
                   }}>
                   <Icon name="check" size={20} color="#E50914" style={{ opacity: isSelected ? 1 : 0 }} />
                   <Text style={styles.menuItemText} numberOfLines={1}>
-                    {track.title && /\.m2ts(?:$|[?#])/i.test(playbackSource.uri) ? track.title :
+                    {track.title && (isAudio && isIsoPlayback || /\.m2ts(?:$|[?#])/i.test(playbackSource.uri)) ? track.title :
                       label}
                   </Text>
                 </FocusableButton>

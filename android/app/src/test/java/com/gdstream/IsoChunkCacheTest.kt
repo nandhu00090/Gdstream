@@ -164,6 +164,28 @@ class IsoChunkCacheTest {
         } finally { cache.clear() }
     }
 
+    @Test fun threePlaybackBlocksStartTogetherWhenOneRangeStalls() {
+        val cache = IsoChunkCache()
+        val client = IsoReadSession()
+        val release = CountDownLatch(1)
+        val started = CountDownLatch(3)
+        val window = M2tsReadCursor().playbackWindow(5 * block + 192, 12 * block)
+        try {
+            val futures = cache.prefetch(listOf(window), 12 * block, client) { from, to, _ ->
+                started.countDown()
+                if (from == window.first) assertTrue(release.await(5, TimeUnit.SECONDS))
+                ByteArray((to - from + 1).toInt())
+            }
+            assertTrue(started.await(3, TimeUnit.SECONDS))
+            futures.drop(1).forEach { assertEquals(block, it.get(3, TimeUnit.SECONDS).size.toLong()) }
+            assertFalse(futures.first().isDone)
+        } finally {
+            release.countDown()
+            client.cancel()
+            cache.clear()
+        }
+    }
+
     @Test fun m2tsCursorUsesDeliveredOffsetsAndClipsPriorityWindowAtEof() {
         val cursor = M2tsReadCursor()
         assertFalse(cursor.begin(1, 0))
@@ -173,9 +195,10 @@ class IsoChunkCacheTest {
         assertFalse(cursor.advance(2, block))
         val size = 7 * block + 512
         assertEquals(listOf(5 * block until 6 * block, 6 * block until 7 * block),
-            cursor.seekBlocks(5 * block + 192, size, throttled = true))
-        assertEquals(listOf(5 * block until 6 * block, 6 * block until 7 * block, 7 * block until size,
-            4 * block until 5 * block), cursor.seekBlocks(5 * block + 192, size))
+            cursor.seekBlocks(5 * block + 192, size))
+        assertEquals(6 * block until size, cursor.playbackWindow(5 * block + 192, size))
+        assertEquals(2 * block until 5 * block, cursor.playbackWindow(block, size))
+        assertTrue(cursor.playbackWindow(7 * block, size).isEmpty())
     }
 
     @Test fun cacheIsLruBoundedCopySafeAndDoesNotRetainFailures() {

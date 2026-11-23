@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include "dvd_yuv.h"
 #include <memory>
 #include <vector>
@@ -22,7 +23,10 @@ struct Session {
     bool ended = false;
     // Half-period units of the MPEG 27 MHz clock retain fractional 90 kHz ticks.
     int64_t nextClock = -1;
-    unsigned pending = 0;
+    int64_t lastVideoPts = -1;
+    // Baseline AVC has no B pictures. Match each access unit to its source
+    // display PTS even on encoders that rebase output timestamps at startup.
+    std::deque<int64_t> pendingPts90k;
     using SetParameters = media_status_t (*)(AMediaCodec *, const AMediaFormat *);
     SetParameters setParameters = reinterpret_cast<SetParameters>(dlsym(RTLD_DEFAULT, "AMediaCodec_setParameters"));
 
@@ -66,8 +70,14 @@ struct Session {
                 static_cast<size_t>(info.offset) + info.size <= capacity);
             if (valid && info.size > 0) {
                 bool config = (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) != 0;
-                valid = deliver(bytes + info.offset, info.size, info.presentationTimeUs, config);
-                if (!config && pending) --pending;
+                if (config) {
+                    valid = deliver(bytes + info.offset, info.size, 0, true);
+                } else if (pendingPts90k.empty()) {
+                    valid = false;
+                } else {
+                    valid = deliver(bytes + info.offset, info.size, pendingPts90k.front(), false);
+                    pendingPts90k.pop_front();
+                }
             }
             ended = (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
             AMediaCodec_releaseOutputBuffer(encoder, index, false);
@@ -77,7 +87,7 @@ struct Session {
     }
 
     bool queuePlanes(JNIEnv *env, jobject mux, jmethodID emit,
-                     const mpeg2_fbuf_t *frame, const mpeg2_sequence_t *seq, int64_t ptsUs, bool blend = false) {
+                     const mpeg2_fbuf_t *frame, const mpeg2_sequence_t *seq, int64_t pts90k, bool blend = false) {
         using namespace std::chrono;
         const auto deadline = steady_clock::now() + seconds(10);
         while (steady_clock::now() < deadline) {
@@ -94,8 +104,9 @@ struct Session {
             const auto size = dvd::pack420(dst, capacity, color, stride, sliceHeight, width, height,
                                            frame->buf[0], seq->width, frame->buf[1], frame->buf[2], seq->chroma_width, blend);
             if (!size) return false;
-            ++pending;
-            return AMediaCodec_queueInputBuffer(encoder, index, 0, size, ptsUs, 0) == AMEDIA_OK;
+            if (AMediaCodec_queueInputBuffer(encoder, index, 0, size, pts90k * 1000 / 90, 0) != AMEDIA_OK) return false;
+            pendingPts90k.push_back(pts90k);
+            return true;
         }
         return false;
     }
@@ -158,7 +169,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_gdstream_DvdProxy_open(JNIEnv *env, 
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_encode(JNIEnv *env, jobject, jlong handle,
-                                                                    jbyteArray input, jlong pts, jobject mux, jboolean boundary, jboolean last) {
+                                                                    jbyteArray input, jlong pts, jlong fallback90k, jobject mux, jboolean boundary, jboolean last) {
     auto &s = *reinterpret_cast<Session *>(handle);
     auto emit = env->GetMethodID(env->GetObjectClass(mux), "video", "(J[BZ)V");
     if (!emit) return;
@@ -188,35 +199,38 @@ extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_encode(JNIEnv *env,
                 if (!seq || seq->picture_width != s.width || seq->picture_height != s.height ||
                     seq->chroma_width * 2 != seq->width || seq->chroma_height * 2 != seq->height) return false;
             }
-            if (state != STATE_SLICE && state != STATE_END && state != STATE_INVALID_END) continue;
+            if (state != STATE_SLICE_1ST && state != STATE_SLICE && state != STATE_END && state != STATE_INVALID_END) continue;
             const auto *picture = info->display_picture;
             const auto *frame = info->display_fbuf;
             if (!input && !last && state == STATE_END) mpeg2_resume_vobu(s.decoder);
-            if (!frame || !picture || !seq || (picture->flags & PIC_FLAG_SKIP)) continue;
-            const int64_t time = (picture->flags & PIC_FLAG_TAGS)
-                ? static_cast<int64_t>((static_cast<uint64_t>(picture->tag2) << 32) | picture->tag) : -1;
-            if (time >= 0) {
-                constexpr int64_t wrap = 1LL << 33;
-                const auto epoch = (s.nextClock / 600 + wrap / 2 - time) / wrap;
-                s.nextClock = (time + epoch * wrap) * 600;
-            } else if (s.nextClock < 0) {
-                s.nextClock = 0;
+            const auto fields = mpeg2_take_display_fields(s.decoder);
+            if (!fields || !seq) continue;
+            const auto *tagged = picture;
+            int64_t fieldOffset = 0;
+            if (!(picture->flags & PIC_FLAG_TAGS) && picture->nb_fields == 1) {
+                tagged = info->display_picture_2nd;
+                fieldOffset = picture->frame_period;
             }
+            if (tagged->flags & PIC_FLAG_TAGS) {
+                // DvdProxy already mapped this tag onto the copied AC-3 clock.
+                const int64_t ticks = (static_cast<int64_t>(tagged->tag2) << 32) | tagged->tag;
+                const int64_t clock = ticks * 600 - fieldOffset;
+                if (clock / 600 > s.lastVideoPts) s.nextClock = clock;
+            }
+            if (s.nextClock < 0) s.nextClock = fallback90k * 600;
             const int64_t videoPts90k = s.nextClock / 600;
-            const int fields = picture->nb_fields + (info->display_picture_2nd ? info->display_picture_2nd->nb_fields : 0);
-            // libmpeg2 derives nb_fields from repeat_first_field, top_field_first
-            // and progressive_sequence. Field pictures share a displayed frame.
+            s.lastVideoPts = videoPts90k;
             s.nextClock += static_cast<int64_t>(picture->frame_period) * fields;
-            if (!s.queuePlanes(env, mux, emit, frame, seq, videoPts90k * 1000 / 90,
+            if (!s.queuePlanes(env, mux, emit, frame, seq, videoPts90k,
                                !(picture->flags & PIC_FLAG_PROGRESSIVE_FRAME))) return false;
         }
         if (input) return true;
         if (last && !s.queuePlanes(env, mux, emit, nullptr, nullptr, 0)) return false;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(last ? 10000 : 350);
-        while ((last ? !s.ended : s.pending != 0) && std::chrono::steady_clock::now() < deadline)
+        while ((last ? !s.ended : !s.pendingPts90k.empty()) && std::chrono::steady_clock::now() < deadline)
             if (!s.drain(env, mux, emit, 10000)) return false;
-        if (last) return s.ended;
-        if (s.pending != 0) return false;
+        if (last) return s.ended && s.pendingPts90k.empty();
+        if (!s.pendingPts90k.empty()) return false;
         if (!s.setParameters) return true;
         auto params = AMediaFormat_new();
         if (!params) return false;

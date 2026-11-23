@@ -44,9 +44,9 @@ class BluRayExtractorTest {
         val mux = DvdTsMux()
         mux.video(0, hex("000000016742c00ad9096c0440000003004000000c83c48992"), true)
         mux.video(0, hex("0000000168cb83cb20"), true)
-        mux.video(1_000_000, hex("000000016588840bf2628000abcc9d75e0"))
-        mux.video(1_040_000, hex("00000001419a3817e580"))
-        mux.video(1_080_000, hex("00000001419a54057960"))
+        mux.video(90_000, hex("000000016588840bf2628000abcc9d75e0"))
+        mux.video(93_600, hex("00000001419a3817e580"))
+        mux.video(97_200, hex("00000001419a54057960"))
         val bytes = mux.finish()
         val ts = androidx.media3.extractor.ts.TsExtractor(androidx.media3.extractor.ts.TsExtractor.MODE_HLS,
             androidx.media3.common.util.TimestampAdjuster(0), androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory())
@@ -175,6 +175,22 @@ class BluRayExtractorTest {
         extractor.seek(access.position, 9995_000_000)
         readAt(access.position) // One direct reopen at the EP; zero follow-up binary-search reopens.
         extractor.release()
+    }
+
+    @Test fun unlabelledSecondaryDtsHasTheSameNameInCatalogAndMediaInfo() {
+        fun group(mime: String, language: String?) = androidx.media3.common.Tracks.Group(
+            androidx.media3.common.TrackGroup(mime, Format.Builder().setContainerMimeType("video/mp2t")
+                .setSampleMimeType(mime).setChannelCount(6).setLanguage(language).build()),
+            false, intArrayOf(C.FORMAT_HANDLED), booleanArrayOf(false))
+        val catalog = AudioTrackCatalog.list(androidx.media3.common.Tracks(listOf(
+            group("audio/ac3", "tam"), group("audio/vnd.dts", null))))
+        assertNull(catalog[1].language)
+        assertEquals("Audio 2 • DTS • 5.1", catalog[1].title)
+        val profile = BluRayProfile(1, emptyList(), emptyList(), listOf(
+            BluRayStream(4352, 0x81, language = "tam"), BluRayStream(4353, 0x82, layout = "5.1 ch")))
+        val info = profile.mediaInfo(1)
+        assertEquals(listOf("Tamil"), info["languages"])
+        assertEquals(catalog[1].title, ((info["audioTracks"] as List<*>)[1] as Map<*, *>)["summary"])
     }
 
     @Test fun selectorListsAndSwitchesAudioAcrossSoftwareAndPlatformRenderers() {
