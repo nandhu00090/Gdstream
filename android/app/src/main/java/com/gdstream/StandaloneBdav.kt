@@ -7,18 +7,43 @@ internal object StandaloneBdav {
     fun matches(head: ByteArray) = head.size >= 3 * 192 &&
         (0..2).all { head[it * 192 + 4] == 0x47.toByte() }
 
-    fun profile(head: ByteArray, tail: ByteArray, label: String, rawSize: Long = 0, originalLanguage: String = ""): BluRayProfile {
-        require(matches(head))
+    fun transportPackets(head: ByteArray): ByteArray {
         val ts = ByteArray(head.size / 192 * 188)
         for (packet in 0 until ts.size / 188) {
             head.copyInto(ts, packet * 188, packet * 192 + 4, (packet + 1) * 192)
         }
+        return ts
+    }
+
+    /** Physical ranges for the block containing this segment and the next two blocks. */
+    fun readAhead(position: Long, rawSize: Long): LongRange {
+        val block = IsoChunkCache.BLOCK_BYTES.toLong()
+        val start = position / 188 * 192 / block * block
+        return start until minOf(rawSize, start + 3 * block)
+    }
+
+    fun ac3Segment(segment: BluRayHls.Segment, dtsPrefix: ByteArray, ac3Prefix: ByteArray,
+                   pid: Int, size: Long, dir: java.io.File, session: IsoReadSession,
+                   read: (Long, Int) -> ByteArray): ByteArray {
+        val dts = segment.audioBytes(dtsPrefix, pid, completePesUntil = size, read = read)
+        if (dts.size == dtsPrefix.size) return ac3Prefix
+        return FfmpegBridge.ac3(dts, ac3Prefix, pid, dir, session)
+    }
+
+    fun profile(head: ByteArray, tail: ByteArray, label: String, rawSize: Long = 0, originalLanguage: String = ""): BluRayProfile {
+        require(matches(head))
+        val ts = transportPackets(head)
         val inferredLang = inferLanguageCodeFromName(label).ifBlank {
             runCatching { java.util.Locale.forLanguageTag(originalLanguage).isO3Language }.getOrDefault("")
         }
         var firstAudio = true
         val program = BluRayPsi.program(ts)
-        val streams = DiscAudio.inspectM2ts(head, program?.streams.orEmpty()).map { stream ->
+        val probed = DiscAudio.inspectM2ts(head, program?.streams.orEmpty())
+        val missing = probed.filter { it.audio && it.layout.isEmpty() }
+        val tailAudio = if (missing.isEmpty()) emptyMap() else DiscAudio.inspectM2ts(tail, missing)
+            .filter { it.layout.isNotEmpty() }.associateBy { it.pid }
+        val streams = probed.map { fromHead ->
+            val stream = tailAudio[fromHead.pid] ?: fromHead
             val primary = stream.audio && firstAudio
             if (stream.audio) firstAudio = false
             if (primary && (stream.language.isBlank() || stream.language == "und") && inferredLang.isNotEmpty()) {
@@ -39,7 +64,7 @@ internal object StandaloneBdav {
             else null
         val duration = if (ptsDuration > 0) ptsDuration else index?.spanUs ?: 0
         return BluRayProfile(duration, emptyList(),
-            streams.filter { it.audio }.map { BluRayAudio(it.pid, it.type, it.language) }, streams, label, pcrIndex = index, primaryLanguageHint = inferredLang)
+            streams.filter { it.audio }.map { BluRayAudio(it.pid, it.type, it.language) }, streams, label, pcrIndex = index, primaryLanguageHint = inferredLang).also { it.program = program }
     }
 
     private fun timestamps(data: ByteArray): Map<Int, LongRange> {
@@ -120,6 +145,19 @@ class StandalonePcrIndex private constructor(private val pid: Int, private val o
             return BluRayPoint(us, pos)
         }
         return null
+    }
+
+    /** Freeze the PCR samples when constructing a VOD playlist. Both renditions use this map. */
+    @Synchronized internal fun playlistClock(size: Long): (Long) -> Long {
+        val times = java.util.TreeMap<Long, Long>()
+        anchors.forEach { (us, pos) -> if (us < spanUs) times[pos] = us }
+        times[size] = spanUs
+        return { position ->
+            val a = checkNotNull(times.floorEntry(position))
+            val b = times.higherEntry(position)
+            if (b == null) a.value else a.value +
+                ((position - a.key).toDouble() / (b.key - a.key) * (b.value - a.value)).toLong()
+        }
     }
 
     @Synchronized internal fun estimate(timeUs: Long): BluRayPoint {

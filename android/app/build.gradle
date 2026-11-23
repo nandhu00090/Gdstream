@@ -61,6 +61,7 @@ dependencies {
     implementation("com.facebook.react:react-android")
     implementation("androidx.media3:media3-exoplayer:1.8.0") // Match react-native-video 6.19.x.
     implementation("org.jellyfin.media3:media3-ffmpeg-decoder:1.8.0+1") // Software DTS/HD decoder; see THIRD_PARTY_NOTICES.md.
+    implementation("com.moizhassan.ffmpeg:ffmpeg-kit-16kb:6.1.1") // External HLS DTS to AC-3 encoder.
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.mockito:mockito-core:5.20.0")
     testImplementation("org.robolectric:robolectric:4.16.1")

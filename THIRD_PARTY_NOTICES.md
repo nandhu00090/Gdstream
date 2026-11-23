@@ -18,6 +18,14 @@ The app's HDMV LPCM packet reader converts big-endian samples, padding channels,
 and Blu-ray channel order to raw PCM for Media3's audio sink. It does not send
 HDMV LPCM packets to a nonexistent Android MediaCodec decoder.
 
+## External HLS audio encoder
+
+Standalone BDAV DTS renditions use the FFmpegKit Android distribution
+`com.moizhassan.ffmpeg:ffmpeg-kit-16kb:6.1.1` for software decoding, resampling
+and AC-3 encoding. The published native build enables GPL components and ships
+the GPL-3.0 text and component notices in its Android resources.
+[Publisher, sources and build instructions](https://github.com/moizhassankh/ffmpeg-kit-android-16KB)
+
 ## Dolby Vision RPU conversion and test vectors
 
 `DolbyVisionRpu.kt` adapts the Profile 7/8 RPU syntax and mode 2 conversion

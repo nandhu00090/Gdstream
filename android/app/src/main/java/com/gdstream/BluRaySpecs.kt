@@ -8,6 +8,7 @@ data class BluRayStream(val pid: Int, val type: Int, val format: Int = 0, val ra
     val height: Int get() = when (format) { 1, 3 -> 480; 2, 7 -> 576; 4, 6 -> 1080; 5 -> 720; 8 -> 2160; else -> 0 }
     val video: Boolean get() = type in listOf(1, 2, 0x1b, 0x20, 0x24, 0xea)
     val audio: Boolean get() = type in listOf(3, 4, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0xa1, 0xa2)
+    val dts: Boolean get() = type == 0x82 || type == 0x85 || type == 0x86
     val codec: String get() = when (type) {
         0x24 -> "HEVC"; 0x1b -> "AVC"; 1, 2 -> "MPEG-2"; 0xea -> "VC-1"
         0x80 -> "LPCM"; 0x81 -> "AC-3"; 0x82 -> "DTS"; 0x83 -> "TrueHD"

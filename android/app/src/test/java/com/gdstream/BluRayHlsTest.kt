@@ -24,6 +24,42 @@ class BluRayHlsTest {
         assertTrue(hls.segments.all { it.start % 188 == 0L && it.end % 188 == 0L })
         assertTrue(playlist.contains("#EXTINF:0.123456,"))
     }
+    @Test fun standaloneDtsUsesMatchingAc3PlaylistAndPmtAndOwnsCompletePesAtAByteCut() {
+        val bytes = javaClass.getResourceAsStream("/bluray/hdmv.ts.bin")!!.readBytes()
+        val program = BluRayPsi.program(bytes)!!
+        val pid = 4353
+        fun packetPid(data: ByteArray, p: Int) = ((data[p + 1].toInt() and 31) shl 8) or (data[p + 2].toInt() and 255)
+        val profile = BluRayProfile(8_000_000, emptyList(), emptyList(), program.streams)
+        val hls = BluRayHls.create(profile, bytes.size.toLong(), standalone = true, convertDts = true)!!
+        assertTrue(String(hls.master()).contains("CODECS=\"avc1,ac-3\""))
+        assertTrue(String(hls.master()).contains("audio_4353.m3u8"))
+        val prefix = hls.prefix(program, program.streams, pid)
+        assertSame(prefix, hls.prefix(program, program.streams, pid))
+        val ac3 = BluRayPsi.program(prefix)!!
+        assertEquals(pid, ac3.pcrPid)
+        assertEquals(listOf(pid to 0x81), ac3.streams.map { it.pid to it.type })
+        val video = BluRayPsi.program(hls.prefix(program, program.streams, null))!!
+        assertTrue(video.streams.any { it.video })
+        assertFalse(video.streams.any { it.audio })
+
+        // Force the cut into a DTS PES. Drop the synthesized adaptation-only PCRs when
+        // comparing: the two inputs together must contain each source payload packet once.
+        val cut = (bytes.indices step 188).first { packetPid(bytes, it) == pid && bytes[it+1].toInt() and 64 == 0 }.toLong()
+        fun payload(data: ByteArray) = (data.indices step 188).filter {
+            packetPid(data, it) == pid && data[it+3].toInt() and 16 != 0
+        }.flatMap { data.copyOfRange(it, it+188).asList() }
+        val input = listOf(0L to cut, cut to bytes.size.toLong()).flatMap { (start, end) ->
+            val segment = BluRayHls.Segment(start, end, 1)
+            payload(segment.audioBytes(byteArrayOf(), pid, 0x82, bytes.size.toLong()) { pos, n ->
+                bytes.copyOfRange(pos.toInt(), pos.toInt() + n)
+            })
+        }
+        assertEquals(payload(bytes), input)
+        val passthrough = BluRayHls.create(profile, bytes.size.toLong(), standalone = true)!!
+        assertFalse(passthrough.transcodes(pid))
+        assertEquals(0x82, BluRayPsi.program(passthrough.prefix(program, program.streams, pid))!!.streams.single().type)
+    }
+
     @Test fun absentOrInvalidClpiRequiresRawTsFallback() {
         assertNull(BluRayHls.create(null, 18800))
         for (points in listOf(emptyList(), listOf(BluRayPoint(0, 0)), listOf(BluRayPoint(0, 0), BluRayPoint(2, 189)),

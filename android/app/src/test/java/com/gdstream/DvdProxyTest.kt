@@ -91,6 +91,54 @@ class DvdProxyTest {
         }
     }
 
+    @Test fun warmPcrIgnoresSmallAudioSeamsAndSlewsLargeOnesWithoutResettingCounters() {
+        val mux = DvdTsMux()
+        mux.video(0, byteArrayOf(0, 0, 1, 0x67, 66, 0, 0, 1, 0x68, 1), true)
+        var lastCc = -1
+        fun segment(start: Long): List<Long> {
+            mux.beginSegment()
+            repeat(4) { mux.video(start + it * 3600, byteArrayOf(0, 0, 1, if (it == 0) 0x65 else 0x41, 42)) }
+            val ts = mux.finish(start, start + 14400)
+            return (ts.indices step 188).filter { ts[it + 2] == 1.toByte() }.map { p ->
+                fun u(i: Int) = ts[p + i].toLong() and 255
+                assertEquals((lastCc + 1) and 15, u(3).toInt() and 15)
+                lastCc++
+                (u(6) shl 25) or (u(7) shl 17) or (u(8) shl 9) or (u(9) shl 1) or (u(10) ushr 7)
+            }
+        }
+        assertEquals(100_800L, segment(90_000).last())
+        assertEquals(listOf(104_400L, 108_000L, 111_600L, 115_200L), segment(106_000))
+        assertEquals(listOf(118_800L, 122_625L, 126_450L, 130_275L), segment(128_800))
+    }
+
+    @Test fun speculativeSuccessIsReusedAndFailureIsRetriedOnDemand() {
+        val cache = DvdSegmentCache()
+        val session = IsoReadSession()
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val prefetched = byteArrayOf(1)
+        fun load(index: Int, owner: IsoReadSession): ByteArray {
+            if (index == 1) {
+                entered.countDown()
+                assertTrue(release.await(2, java.util.concurrent.TimeUnit.SECONDS))
+            }
+            owner.checkActive()
+            return if (index == 1) prefetched else byteArrayOf(0)
+        }
+        cache.segment("dvd", 0, 2, session, true, ::load)
+        assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS))
+        // The in-flight next segment must never hold the completed-cache lock.
+        assertArrayEquals(byteArrayOf(0), cache.segment("dvd", 0, 2, session, false, ::load))
+        release.countDown()
+        val attempted = java.util.concurrent.CountDownLatch(1)
+        assertSame(prefetched, cache.segment("dvd", 1, 2, session, true) { _, _ ->
+            attempted.countDown()
+            throw java.io.IOException("transient")
+        })
+        assertTrue(attempted.await(2, java.util.concurrent.TimeUnit.SECONDS))
+        assertArrayEquals(byteArrayOf(2), cache.segment("dvd", 2, 2, session, false) { _, _ -> byteArrayOf(2) })
+    }
+
     @Test fun segmentOpensWithValidPatAndPmtAndKeepsAc3Bytes() {
         val mux = DvdTsMux()
         val audio = ByteArray(1024) { it.toByte() }
