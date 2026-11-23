@@ -8,6 +8,13 @@ import java.io.IOException
 internal class BluRayHls private constructor(val segments: List<Segment>, val audio: List<BluRayStream>,
     private val convertDts: Boolean = false, private val videoCodec: String? = null) {
     fun transcodes(pid: Int) = convertDts && audio.any { it.pid == pid && it.dts }
+    private var lastVideoRequest = -1
+    @Synchronized fun videoSeek(index: Int): Boolean {
+        val seek = lastVideoRequest < 0 || index != lastVideoRequest && index != lastVideoRequest + 1
+        lastVideoRequest = index
+        return seek
+    }
+
     private val prefixes = mutableMapOf<Int?, ByteArray>()
     @Synchronized fun prefix(program: BluRayPsi.Program, streams: List<BluRayStream>, pid: Int?): ByteArray =
         prefixes.getOrPut(pid) { program.prefix(streams, pid, audio.isNotEmpty() && pid == null, pid != null && transcodes(pid)) }
@@ -183,7 +190,11 @@ internal class BluRayHls private constructor(val segments: List<Segment>, val au
         audio.forEachIndexed { i, track ->
             val language = track.language.takeIf { it.length == 3 && it.all { c -> c in 'a'..'z' } && it != "und" } ?: "und"
             val langName = bluRayLanguage(language)
-            val codecLabel = if (track.type == 0x83 || transcodes(track.pid)) "AC-3" else track.codec
+            val codecLabel = when {
+                transcodes(track.pid) -> "${track.codec} -> AC-3"
+                track.type == 0x83 -> "AC-3"
+                else -> track.codec
+            }
             val displayName = if (langName == "Unknown") {
                 "Audio ${i + 1} • $codecLabel"
             } else {
@@ -195,7 +206,7 @@ internal class BluRayHls private constructor(val segments: List<Segment>, val au
         val peak = segments.maxOf { ((it.end - it.start) * 8.0e6 / it.durationUs).toLong() }.coerceAtLeast(1)
         append("#EXT-X-STREAM-INF:BANDWIDTH=$peak")
         if (audio.isNotEmpty()) append(",AUDIO=\"audio\"")
-        if (convertDts && videoCodec != null && audio.any { transcodes(it.pid) }) {
+        if (videoCodec != null) {
             val codecs = audio.map { track -> when {
                 transcodes(track.pid) || track.type in listOf(0x81, 0x83) -> "ac-3"
                 track.type in listOf(0x84, 0xa1) -> "ec-3"
@@ -254,19 +265,18 @@ internal class BluRayHls private constructor(val segments: List<Segment>, val au
             val supportedAudio = profile.streams.filter { it.audio && it.type in HLS_SUPPORTED_AUDIO_TYPES }.distinctBy { it.pid }
             if (standalone && profile.points.isEmpty()) {
                 val packets = size / 188
-                val bySize = 1 + (packets - 1) / StandaloneBdav.HLS_TARGET_PACKETS
-                val byTime = 1 + (profile.durationUs - 1) / 4_000_000
-                val count = Math.toIntExact(minOf(packets, maxOf(bySize, byTime)))
+                val target = StandaloneBdav.HLS_TARGET_PACKETS.toLong()
+                val count = Math.toIntExact(1 + (packets - 1) / target)
                 val clock = profile.pcrIndex?.playlistClock(size) ?: { position: Long ->
                     (position.toDouble() / size * profile.durationUs).toLong()
                 }
                 val segments = (0 until count).map { i ->
-                    val start = (packets / count * i + packets % count * i / count) * 188
-                    val end = (packets / count * (i + 1) + packets % count * (i + 1) / count) * 188
+                    val start = i * target * 188
+                    val end = minOf(size, start + target * 188)
                     Segment(start, end, clock(end) - clock(start))
                 }
                 val videoCodec = when (profile.streams.firstOrNull { it.video && it.pid != 0x1015 }?.type) {
-                    0x1b -> "avc1"
+                    0x1b -> profile.avc?.codec
                     0x24 -> "hvc1"
                     2 -> "mp2v"
                     else -> null

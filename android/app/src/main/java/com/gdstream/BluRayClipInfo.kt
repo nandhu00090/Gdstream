@@ -35,6 +35,8 @@ data class BluRayProfile(val durationUs: Long, val points: List<BluRayPoint>, va
     val streams: List<BluRayStream> = emptyList(), val discLabel: String = "", val dolbyVision: Boolean = false,
     val pcrIndex: StandalonePcrIndex? = null, val primaryLanguageHint: String = "") {
     internal var program: BluRayPsi.Program? = null
+    internal val mainAvcPid get() = streams.firstOrNull { it.video && it.pid != 0x1015 }?.takeIf { it.type == 0x1b }?.pid
+    internal var avc: StandaloneBdav.Avc? = null
 
     fun toJson() = JSONObject().put("durationUs", durationUs)
         .put("streams", JSONArray().apply { streams.forEach { put(it.json()) } })

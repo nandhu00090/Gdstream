@@ -13,9 +13,14 @@ internal class DvdTsMux(private val audioLanguageCode: String = "") {
     var frames = 0
         private set
 
-    fun beginSegment() {
+    fun beginSegment(newEncoder: Boolean = false) {
         frames = 0
-        // SPS/PPS and the NAL length size belong to the warm codec, across segment boundaries.
+        samples.clear()
+        if (newEncoder) {
+            sps = null
+            pps = null
+            lengthBytes = 4
+        }
     }
 
     // Called by name from MediaCodec JNI. Format changes can deliver csd-0 and csd-1 separately.
@@ -104,50 +109,47 @@ internal class DvdTsMux(private val audioLanguageCode: String = "") {
         samples.add(UnitData(false, (ptsUs * 9 + 50) / 100, bytes))
     }
 
-    private var nextVideoPts90k: Long? = null
+    data class Timing(val firstVideo: Long, val lastVideo: Long, val nextVideo: Long,
+                      val firstAudio: Long?, val nextAudio: Long?)
+    var timing: Timing? = null
+        private set
+    private var audioPhase: Long? = null
     private val cc = IntArray(8192)
 
-    private fun fitVideoClock(segmentStart: Long, segmentEnd: Long, hasNav: Boolean) {
+    fun finish(sourceStart: Long, nativeEnd: Long, navDuration: Long = 0): ByteArray {
+        if (frames == 0) throw IOException("DVD segment produced 0 decodable AVC frames (no IDR)")
         val video = samples.filter { it.video }
-        val audio = samples.filter { !it.video }.sortedBy { it.ticks }
-        val audioStart = audio.firstOrNull()?.ticks ?: segmentStart
-        val audioEnd = audio.lastOrNull()?.let { it.ticks + 2880 } ?: segmentEnd
-        val overlapStart = maxOf(segmentStart, audioStart)
-        val overlapEnd = minOf(segmentEnd, audioEnd)
-        val useOverlap = hasNav && overlapEnd - overlapStart >= frames
-        val start = if (useOverlap) overlapStart else audioStart
-        val span = (if (useOverlap) overlapEnd else audioEnd) - start
-        if (span < frames) throw IOException("Invalid DVD segment clock")
+        val audio = samples.filter { !it.video } // Ac3Reader emits complete frames in decode order.
+        val start = timing?.nextVideo ?: sourceStart
+        val firstAudio = audio.firstOrNull()?.let { sample ->
+            // Only the first audio PES establishes A/V phase. Unwrap its 33-bit PTS
+            // relative to the first video PES, including audio just before rollover.
+            val halfWrap = 1L shl 32
+            val offset = ((sample.ticks - sourceStart + halfWrap) and 0x1ffffffffL) - halfWrap
+            timing?.nextAudio ?: (start + offset)
+        }
+        val phase = audioPhase ?: firstAudio?.minus(start)
+        val audioEnd = firstAudio?.let { first ->
+            audio.forEachIndexed { i, sample -> sample.ticks = first + i * 2880L }
+            first + audio.size * 2880L // DVD AC-3: 1536 samples at 48 kHz
+        }
 
         val first = video.first().ticks
-        val lastStep = if (frames > 1) video.last().ticks - video[frames - 2].ticks else span
-        val sourceSpan = video.last().ticks - first + lastStep
-        // Some interlaced titles signal twice as many display pictures as the PCI duration allows.
-        // In that case retain their relative spacing on the measured presentation timeline.
-        val scaleCadence = sourceSpan > 0 && kotlin.math.abs(sourceSpan - span) > maxOf(4500, span / 10)
-        var pts = nextVideoPts90k ?: first.takeIf { kotlin.math.abs(it - start) <= 4500 } ?: start
+        val nativeSpan = nativeEnd - first
+        if (nativeSpan < frames) throw IOException("Invalid DVD display cadence")
+        // Keep the native field cadence, including repeat-first-field. Some discs
+        // report twice the display duration. Fit those pictures to the copied
+        // audio frames (or PCI duration for silent video), on our output clock.
+        val reference = if (audioEnd != null && phase != null) audioEnd - phase - start else navDuration
+        val span = if (reference >= frames && kotlin.math.abs(nativeSpan - reference) > 4500) reference else nativeSpan
+        val end = start + span
+        var previous = start - 1
         video.forEachIndexed { i, sample ->
-            val delta = sample.ticks - first
-            val nextDelta = video.getOrNull(i + 1)?.let { it.ticks - first } ?: sourceSpan
-            val step = if (scaleCadence) nextDelta * span / sourceSpan - delta * span / sourceSpan
-                else nextDelta - delta
-            // Follow the copied AC-3 PES clock inside each VOBU. Each 48 kHz AC-3
-            // frame spans 2880 ticks. Interpolate within it instead of snapping video to it.
-            val expected = start + if (sourceSpan > 0) delta * span / sourceSpan else span * i / frames
-            val offset = expected - audioStart
-            val audioFrame = (offset / 2880).takeIf { it in 0L until audio.size.toLong() }
-            val reference = audioFrame?.let { audio[it.toInt()].ticks + offset % 2880 } ?: expected
-            val drift = reference - pts
-            val slew = if (kotlin.math.abs(drift) > 4500) drift.coerceIn(-step / 16, step / 16) else 0
-            sample.ticks = pts
-            pts += (step + slew).coerceAtLeast(1)
+            val fitted = start + (sample.ticks - first) * span / nativeSpan
+            sample.ticks = fitted.coerceIn(previous + 1, end - (frames - i))
+            previous = sample.ticks
         }
-        nextVideoPts90k = pts
-    }
-
-    fun finish(segmentStart: Long? = null, segmentEnd: Long? = null, hasNav: Boolean = true): ByteArray {
-        if (frames == 0) throw IOException("DVD segment produced 0 decodable AVC frames (no IDR)")
-        if (segmentStart != null && segmentEnd != null) fitVideoClock(segmentStart, segmentEnd, hasNav)
+        val next = Timing(start, video.last().ticks, end, firstAudio, audioEnd ?: timing?.nextAudio)
         val out = ByteArrayOutputStream()
         fun packets(pid: Int, data: ByteArray, clock: Long? = null) {
             var pos = 0
@@ -204,6 +206,8 @@ internal class DvdTsMux(private val audioLanguageCode: String = "") {
             packets(if (sample.video) 257 else 258, header + sample.data, ticks.takeIf { sample.video })
         }
         samples.clear()
+        timing = next
+        audioPhase = phase
         return out.toByteArray()
     }
 }

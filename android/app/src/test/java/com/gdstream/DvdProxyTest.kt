@@ -17,7 +17,7 @@ class DvdProxyTest {
         mux.audio(0, ByteArray(100))
         mux.video(0, byteArrayOf(0, 0, 1, 0x67, 66), true)
         assertEquals(0, mux.frames)
-        assertThrows(java.io.IOException::class.java) { mux.finish() }
+        assertThrows(java.io.IOException::class.java) { mux.finish(0, 3600) }
     }
 
     @Test fun avcConfigurationRecordAndLengthPrefixedSlicesBecomeAnnexB() {
@@ -25,90 +25,101 @@ class DvdProxyTest {
         // Two-byte lengths on samples, separate SPS and PPS in avcC.
         mux.video(0, byteArrayOf(1, 66, 0, 30, -3, -31, 0, 2, 0x67, 66, 1, 0, 2, 0x68, 1), true)
         mux.video(90_000, byteArrayOf(0, 2, 0x65, 42))
-        val bytes = mux.finish()
+        val bytes = mux.finish(90_000, 93_600)
         val expected = listOf(9, 0xf0, 0x67, 66, 0x68, 1, 0x65, 42).chunked(2)
             .flatMap { listOf(0, 0, 0, 1) + it }.map(Int::toByte).toByteArray()
         assertArrayEquals(expected, bytes.takeLast(expected.size).toByteArray())
         assertEquals(1, mux.frames)
     }
 
-    @Test fun warmSegmentsRetainBothAnnexBParameterSetsAndTheSharedPesClock() {
-        val mux = DvdTsMux()
-        val config = byteArrayOf(0, 0, 1, 0x67, 66, 0, 0, 1, 0x68, 1)
-        mux.video(0, config, true) // One INFO_OUTPUT_FORMAT_CHANGED for two segments.
-        val clock = DvdPesClock(DvdCellClock(0xfffffff0L, 90_000), 0xfffffff0L)
-        fun segment(audio: Long, video: Long, expected: List<Long>) {
-            mux.beginSegment()
-            mux.audio(clock.ticks(audio) * 1000 / 90, byteArrayOf(0x0b, 0x77))
-            mux.video(clock.ticks(video), byteArrayOf(0, 0, 1, 0x65, 42))
-            val ts = mux.finish()
-            val timestamps = mutableListOf<Long>()
-            for (p in ts.indices step 188) {
-                val pid = ((ts[p + 1].toInt() and 31) shl 8) or (ts[p + 2].toInt() and 255)
-                if (pid !in 257..258) continue
-                val pes = p + 5 + (ts[p + 4].toInt() and 255)
-                val t = pes + 9
-                fun u(i: Int) = ts[t + i].toLong() and 255
-                timestamps += ((u(0) and 14) shl 29) or (u(1) shl 22) or ((u(2) and 254) shl 14) or
-                    (u(3) shl 7) or (u(4) shr 1)
-                if (pid == 257) assertArrayEquals(
-                    byteArrayOf(0,0,0,1,9,-16, 0,0,0,1,0x67,66, 0,0,0,1,0x68,1, 0,0,0,1,0x65,42),
-                    ts.copyOfRange(pes + 14, p + 188))
-            }
-            assertEquals(expected, timestamps)
+    private fun timestamps(ts: ByteArray, pid: Int): List<Long> = (ts.indices step 188).mapNotNull { p ->
+        fun u(i: Int) = ts[p + i].toLong() and 255
+        if ((u(1) and 0x40) == 0L || (u(1) and 31) * 256 + u(2) != pid.toLong()) return@mapNotNull null
+        val pes = 4 + if (u(3) and 32 != 0L) 1 + u(4).toInt() else 0
+        val t = pes + 9
+        val pts = ((u(t) and 14) shl 29) or (u(t + 1) shl 22) or ((u(t + 2) and 254) shl 14) or
+            (u(t + 3) shl 7) or (u(t + 4) shr 1)
+        if (pid == 257) {
+            val pcr = (u(6) shl 25) or (u(7) shl 17) or (u(8) shl 9) or (u(9) shl 1) or (u(10) shr 7)
+            assertEquals(pts, pcr)
         }
-        clock.vobu(0xfffffff0L, 0x8c90)
-        segment(0x1ffffffe0, 0x100000000, listOf(89_984, 90_016))
-        // Next VOBU resets its PTM. Preserve the audio lead over video.
-        clock.vobu(1_000, 37_000)
-        segment(984, 1000, listOf(125_984, 126_000))
+        pts
+    }
+
+    private val config = byteArrayOf(0, 0, 1, 0x67, 66, 0, 0, 1, 0x68, 1)
+    private fun picture(idr: Boolean) = byteArrayOf(0, 0, 1, if (idr) 0x65 else 0x41, 42)
+
+    @Test fun mynaaPesOverlapsAndGapCannotMoveEitherWarmOutputClock() {
+        val mux = DvdTsMux()
+        val source = listOf(90_000L..648_558, 461_657L..1_047_242, 860_244L..1_198_081, 1_257_940L..1_595_778)
+        var nextVideo = source.first().first
+        var nextAudio = nextVideo - 900
+        var lastCc = -1
+        source.forEachIndexed { index, raw ->
+            // Reopening an encoder for EOS fallback must also retain the mux timeline.
+            val newEncoder = index == 0 || index == 2
+            mux.beginSegment(newEncoder)
+            if (newEncoder) mux.video(0, config, true)
+            val frames = listOf(155, 163, 94, 94)[index]
+            val audioFrames = listOf(194, 204, 117, 118)[index]
+            repeat(frames) { mux.video(raw.first + it * 3600, picture(it == 0)) }
+            repeat(audioFrames) { mux.audio((raw.first - 900 + it * 2880) * 1000 / 90, byteArrayOf(11, 119)) }
+            val ts = mux.finish(raw.first, raw.first + frames * 3600, raw.last - raw.first)
+            assertEquals((0 until frames).map { nextVideo + it * 3600 }, timestamps(ts, 257))
+            assertEquals((0 until audioFrames).map { nextAudio + it * 2880 }, timestamps(ts, 258))
+            for (p in ts.indices step 188) if (ts[p + 2] == 1.toByte()) {
+                assertEquals((++lastCc) and 15, ts[p + 3].toInt() and 15)
+            }
+            nextVideo += frames * 3600
+            nextAudio += audioFrames * 2880
+            assertEquals(nextVideo, mux.timing!!.nextVideo)
+            assertEquals(nextAudio, mux.timing!!.nextAudio)
+        }
+    }
+
+    @Test fun coldSeekUsesFirstVideoPesAndUnwrapsAudioAcrossThe33BitBoundary() {
+        val vob = javaClass.getResourceAsStream("/dvd/interlaced.vob.bin")!!.readBytes()
+        assertEquals(48_600L, DvdProxy.sourceTiming(vob, -1).basePts)
+        val mux = DvdTsMux()
+        val wrap = 1L shl 33
+        mux.video(0, config, true)
+        mux.video(16, picture(true))
+        mux.audio((wrap - 16) * 1000 / 90, byteArrayOf(11, 119))
+        var ts = mux.finish(16, 3616)
+        assertEquals(listOf(16L), timestamps(ts, 257))
+        assertEquals(listOf(wrap - 16), timestamps(ts, 258))
+        mux.beginSegment()
+        mux.video(3616, picture(true))
+        mux.audio(100_000, byteArrayOf(11, 119))
+        ts = mux.finish(90_000, 7216)
+        assertEquals(listOf(3616L), timestamps(ts, 257))
+        assertEquals(listOf(2864L), timestamps(ts, 258))
     }
 
     @Test fun videoOverrunningTwoSequentialAudioWindowsIsScaledBeforeWritingPesAndPcr() {
         val mux = DvdTsMux()
-        mux.video(0, byteArrayOf(0, 0, 1, 0x67, 66, 0, 0, 1, 0x68, 1), true)
+        mux.video(0, config, true)
         for (segment in 0..1) {
             val start = 90_000L + segment * 360_000
             mux.beginSegment()
             repeat(125) { mux.audio((start + it * 2880) * 1000 / 90, byteArrayOf(11, 119)) }
             val count = if (segment == 0) 240 else 225
-            repeat(count) {
-                mux.video(start + 1_080_000 + it * 3600, byteArrayOf(0, 0, 1, if (it == 0) 0x65 else 0x41, 42))
-            }
-            val ts = mux.finish(start, start + 360_000)
-            val timestamps = mutableListOf<Long>()
-            for (p in ts.indices step 188) {
-                fun u(i: Int) = ts[p + i].toLong() and 255
-                if (u(1) != 0x41L || u(2) != 1L) continue
-                val pcr = (u(6) shl 25) or (u(7) shl 17) or (u(8) shl 9) or (u(9) shl 1) or (u(10) ushr 7)
-                val t = 14 + u(4).toInt()
-                val pts = ((u(t) and 14) shl 29) or (u(t + 1) shl 22) or ((u(t + 2) and 254) shl 14) or
-                    (u(t + 3) shl 7) or (u(t + 4) shr 1)
-                assertEquals(pts, pcr)
-                timestamps += pts
-            }
-            assertEquals((0 until count).map { start + 360_000L * it / count }, timestamps)
+            val native = start + 1_080_000
+            repeat(count) { mux.video(native + it * 3600, picture(it == 0)) }
+            val ts = mux.finish(start, native + count * 3600L)
+            assertEquals((0 until count).map { start + 360_000L * it / count }, timestamps(ts, 257))
         }
     }
 
-    @Test fun warmPcrIgnoresSmallAudioSeamsAndSlewsLargeOnesWithoutResettingCounters() {
+    @Test fun finalRepeatFieldDeterminesTheNextVideoPtsEvenWithoutAudio() {
         val mux = DvdTsMux()
-        mux.video(0, byteArrayOf(0, 0, 1, 0x67, 66, 0, 0, 1, 0x68, 1), true)
-        var lastCc = -1
-        fun segment(start: Long): List<Long> {
-            mux.beginSegment()
-            repeat(4) { mux.video(start + it * 3600, byteArrayOf(0, 0, 1, if (it == 0) 0x65 else 0x41, 42)) }
-            val ts = mux.finish(start, start + 14400)
-            return (ts.indices step 188).filter { ts[it + 2] == 1.toByte() }.map { p ->
-                fun u(i: Int) = ts[p + i].toLong() and 255
-                assertEquals((lastCc + 1) and 15, u(3).toInt() and 15)
-                lastCc++
-                (u(6) shl 25) or (u(7) shl 17) or (u(8) shl 9) or (u(9) shl 1) or (u(10) ushr 7)
-            }
-        }
-        assertEquals(100_800L, segment(90_000).last())
-        assertEquals(listOf(104_400L, 108_000L, 111_600L, 115_200L), segment(106_000))
-        assertEquals(listOf(118_800L, 122_625L, 126_450L, 130_275L), segment(128_800))
+        mux.video(0, config, true)
+        mux.video(1000, picture(true))
+        mux.video(4600, picture(false))
+        mux.finish(1000, 10_000)
+        mux.beginSegment()
+        mux.video(10_000, picture(true))
+        assertEquals(listOf(10_000L), timestamps(mux.finish(500_000, 13_600), 257))
     }
 
     @Test fun speculativeSuccessIsReusedAndFailureIsRetriedOnDemand() {
@@ -117,7 +128,8 @@ class DvdProxyTest {
         val entered = java.util.concurrent.CountDownLatch(1)
         val release = java.util.concurrent.CountDownLatch(1)
         val prefetched = byteArrayOf(1)
-        fun load(index: Int, owner: IsoReadSession): ByteArray {
+        fun load(index: Int, owner: IsoReadSession, sequence: Long): ByteArray {
+            assertTrue(sequence > 0)
             if (index == 1) {
                 entered.countDown()
                 assertTrue(release.await(2, java.util.concurrent.TimeUnit.SECONDS))
@@ -131,12 +143,26 @@ class DvdProxyTest {
         assertArrayEquals(byteArrayOf(0), cache.segment("dvd", 0, 2, session, false, ::load))
         release.countDown()
         val attempted = java.util.concurrent.CountDownLatch(1)
-        assertSame(prefetched, cache.segment("dvd", 1, 2, session, true) { _, _ ->
+        assertSame(prefetched, cache.segment("dvd", 1, 2, session, true) { _, _, _ ->
             attempted.countDown()
             throw java.io.IOException("transient")
         })
         assertTrue(attempted.await(2, java.util.concurrent.TimeUnit.SECONDS))
-        assertArrayEquals(byteArrayOf(2), cache.segment("dvd", 2, 2, session, false) { _, _ -> byteArrayOf(2) })
+        assertArrayEquals(byteArrayOf(2), cache.segment("dvd", 2, 2, session, false) { _, _, _ -> byteArrayOf(2) })
+    }
+
+    @Test fun aSeekToACachedSegmentStartsANewTimeline() {
+        val cache = DvdSegmentCache()
+        val session = IsoReadSession()
+        fun request(index: Int) = cache.segment("dvd", index, 20, session, false) { _, _, sequence ->
+            byteArrayOf(sequence.toByte())
+        }
+        val first = request(5)
+        assertArrayEquals(first, request(6))
+        val back = request(5)
+        assertFalse(first.contentEquals(back))
+        assertSame(back, request(5))
+        assertArrayEquals(back, request(6))
     }
 
     @Test fun segmentOpensWithValidPatAndPmtAndKeepsAc3Bytes() {
@@ -146,7 +172,7 @@ class DvdProxyTest {
         mux.video(0, byteArrayOf(0, 0, 1, 0x67, 66), true)
         mux.video(0, byteArrayOf(0, 0, 1, 0x68, 1), true)
         mux.video(108_900, byteArrayOf(0, 0, 0, 1, 0x65, 1))
-        val bytes = mux.finish()
+        val bytes = mux.finish(108_900, 112_500)
         assertEquals(0, bytes.size % 188)
         val streams = BluRayPsi.streams(bytes)
         assertEquals(listOf(0x1b, 0x81), streams.map { it.type })

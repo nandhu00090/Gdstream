@@ -191,6 +191,69 @@ class DiscPlaybackTest {
         assertEquals(DiscAudio("7.1 ch", 640), DiscAudio.probe(ac3 + major, 0x83))
     }
 
+    @Test fun titleCadtAndVobuMapPartitionTheSelectedVobSectorsExactlyOnce() {
+        val ifo = ByteArray(5 * 2048)
+        fun put(p: Int, value: Int, n: Int) {
+            repeat(n) { ifo[p + it] = (value ushr ((n - it - 1) * 8)).toByte() }
+        }
+        "DVDVIDEO-VTS".toByteArray().copyInto(ifo)
+        put(0xc8, 1, 4)
+        put(0xcc, 2, 4)
+        put(0xe0, 3, 4)
+        put(0xe4, 4, 4)
+        put(2048, 1, 2)
+        put(2052, 15, 4)
+        put(2056, 12, 4)
+        put(2060, 1, 2)
+        put(2062, 1, 2)
+        put(4096, 1, 2)
+        put(4108, 16, 4)
+        val pgc = 4112
+        put(pgc + 2, 1, 1)
+        put(pgc + 3, 1, 1)
+        put(pgc + 230, 236, 2)
+        put(pgc + 232, 240, 2)
+        put(pgc + 234, 264, 2)
+        put(pgc + 236, 1, 1)
+        put(pgc + 244, 0x00000840, 4) // 8 s PAL
+        val layer = 1 shl 21 // exercise DVD9 offsets above 4 GiB
+        put(pgc + 248, layer + 100, 4)
+        put(pgc + 260, layer + 155, 4)
+        put(pgc + 264, 9, 2)
+        put(pgc + 267, 2, 1)
+        val cadt = 3 * 2048
+        put(cadt, 2, 2)
+        put(cadt + 4, 8 + 3 * 12 - 1, 4)
+        fun address(index: Int, vob: Int, start: Int, last: Int) {
+            val p = cadt + 8 + index * 12
+            put(p, vob, 2)
+            put(p + 2, 2, 1)
+            put(p + 4, layer + start, 4)
+            put(p + 8, layer + last, 4)
+        }
+        address(0, 9, 100, 119)
+        address(1, 8, 120, 129) // different VOB with the same cell ID
+        address(2, 9, 130, 155)
+        val starts = listOf(90, 100, 101, 105, 110, 113, 115, 116, 118, 120, 125, 130, 131, 135, 140, 145, 148, 151, 153, 156)
+        put(8192, 4 + starts.size * 4 - 1, 4)
+        starts.forEachIndexed { i, sector -> put(8196 + i * 4, layer + sector, 4) }
+        val parser = DvdTitleInfo.parse(ifo)
+        val title = parser.main()
+        val segments = parser.segments(title)
+        assertEquals(listOf(DvdProxy.Segment(0, 20L * 2048, 4_000_000),
+            DvdProxy.Segment(20L * 2048, 46L * 2048, 4_000_000)), segments)
+        // Map each virtual range back through a VOB-file boundary into disc sectors.
+        val sources = DvdTitleInfo.extents(title.cells, listOf(0L to (layer + 112L) * 2048, (layer + 1000L) * 2048 to 100L * 2048))
+        val file = IsoVirtualFile(sources, false)
+        val sectors = segments.flatMap { segment ->
+            file.mappedRanges(segment.start, (segment.end - segment.start).toInt()).flatMap { bytes ->
+                (bytes.first / 2048..bytes.last / 2048).toList()
+            }
+        }
+        val expected = (100L..111).toList() + (1000L..1007).toList() + (1018L..1043).toList()
+        assertEquals(expected.map { layer + it }, sectors)
+    }
+
     @Test
     fun dvdTitleReferencesCellsAndUsesActiveStreamMappings() {
         val ifo = ByteArray(6144)
