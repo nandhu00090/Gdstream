@@ -21,6 +21,11 @@ class MainApplication : Application(), ReactApplication {
     )
   }
 
+  override fun onTrimMemory(level: Int) {
+    super.onTrimMemory(level)
+    SecurityVaultModule.evictIsoChunks()
+  }
+
   override fun onCreate() {
     super.onCreate()
     loadReactNative(this)

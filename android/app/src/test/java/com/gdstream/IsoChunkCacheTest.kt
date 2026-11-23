@@ -35,6 +35,24 @@ class IsoChunkCacheTest {
         } finally { caches.clear() }
     }
 
+    @Test fun discsShareSixSlotsAndTrimDuringAFetchPreventsReadmission() {
+        val caches = IsoChunkCaches()
+        val session = IsoReadSession()
+        val discs = listOf("a", "b").map { caches.acquire("https://origin/$it", session) }
+        try {
+            repeat(8) { i ->
+                val start = i * 1024L
+                discs[i % 2].read(start, start, 0, 8191, session, blockBytes = 1024) { _, _, _ -> ByteArray(1024) }
+            }
+            assertEquals(6 * 1024, discs.sumOf { it.cachedBytes() })
+            discs.first().read(0, 0, 0, 99, session) { _, _, _ ->
+                caches.evict()
+                ByteArray(100)
+            }
+            assertEquals(0, discs.sumOf { it.cachedBytes() })
+        } finally { session.cancel(); caches.clear() }
+    }
+
     @Test fun segmentReadAheadStartsFourWorkersAndSharesAll32MiBWithDemandReads() {
         val cache = IsoChunkCache()
         val size = 32L * 1024 * 1024

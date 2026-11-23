@@ -31,6 +31,7 @@ const readStoragePairs = async (keys: string[]) => {
 const standaloneProbeCandidate = (file: any) => !file.isZipEntry && (!/\.(mkv|mp4|avi|mov|webm|m4v|iso)$/i.test(file.name) || /mp2t/i.test(file.mimeType || ''));
 
 let directoryAttempt = 0;
+let navigationWrite = Promise.resolve();
 
 interface ParsedMediaInfo {
   rawName: string;
@@ -515,6 +516,10 @@ const App = () => {
   const [showHdrChoiceModal, setShowHdrChoiceModal] = useState(false);
   const [playerInstanceKey, setPlayerInstanceKey] = useState(0);
 
+  const archiveListing = useRef<{ path: string; url: string; size: number } | null>(null);
+  const deferredDirectory = useRef<string | null>(null);
+  const [navigationReady, setNavigationReady] = useState(false);
+  const navigationKey = () => JSON.stringify(['navigation_v1', vaultRef.current.baseUrl, vaultRef.current.username]);
   const [selectedFile, setSelectedFile] = useState<any>(null);
 
   
@@ -1176,6 +1181,7 @@ const App = () => {
       }
     });
 
+    let mounted = true;
     const initVaultAndFetch = async () => {
       try {
         if (SecurityVault?.getVaultConfig) {
@@ -1186,14 +1192,76 @@ const App = () => {
             password: cfg?.c || cfg?.password || '', tmdbKey: cfg?.d || cfg?.tmdbKey || '',
           };
         }
+        await navigationWrite;
+        const raw = await AsyncStorage.getItem(navigationKey()).catch(() => null);
+        if (!mounted) return;
+        let saved: any;
+        try { saved = raw && JSON.parse(raw); } catch {}
+        const validPath = (path: unknown) => typeof path === 'string' && path.startsWith('/0:/') && path.endsWith('/');
+        const restored = validPath(saved?.currentPath) && Array.isArray(saved?.pathStack) &&
+          saved.pathStack[0] === '/0:/' && saved.pathStack.every(validPath);
+        const path = restored ? saved.currentPath : '/0:/';
+        const item = restored && saved.screen === 'details' && typeof saved.item?.name === 'string' ? saved.item : null;
         setVaultReady(true);
-        fetchDirectory('/0:/', false);
+        if (item && saved.metadata) setMetadataMap(prev => ({ ...prev, [item.name]: saved.metadata }));
+        if (restored) {
+          setPathStack(saved.pathStack);
+          setCurrentPath(path);
+          setSeasonFolders(saved.seasons || []);
+          setActiveSeason(saved.season || null);
+          setSeriesParentTitle(saved.title || '');
+        }
+        const listing = restored && saved.archiveListing?.path === path ? saved.archiveListing : null;
+        if (listing) {
+          // Every archive entry points to a process-local HTTP listener.
+          archiveListing.current = listing;
+          if (item) openFile({ ...item, isZipEntry: true, isoPending: true });
+          const reload = async () => {
+            const request = ++archiveOpenRequestRef.current;
+            setOpeningIso(!!item);
+            setIsoInspectionError(null);
+            try {
+              const entries = JSON.parse(await fetchZipRawJsonFast(listing.url, listing.size));
+              if (!mounted || archiveListing.current !== listing) return;
+              setFolderFiles(entries);
+              if (request !== archiveOpenRequestRef.current) return;
+              if (item) {
+                const fresh = entries.find((entry: any) => entry.name === item.name);
+                if (!fresh) throw new Error('The selected title is missing from this archive.');
+                openFile(fresh);
+                setVersionGroup(entries.filter((entry: any) => entry === fresh || saved.versions?.some((v: any) => v.name === entry.name)));
+              }
+            } catch (error) {
+              if (request !== archiveOpenRequestRef.current) return;
+              if (item) setIsoInspectionError(String(error));
+              else Alert.alert('Archive Error', String(error));
+            } finally {
+              if (request === archiveOpenRequestRef.current) { setOpeningIso(false); setLoading(false); }
+            }
+          };
+          retryInspection.current = reload;
+          void reload();
+        } else if (item) {
+          if (/\.iso$/i.test(item.name) && !item.isZipEntry) {
+            void openZipArchiveFile(item, path);
+          } else {
+            openFile(item);
+            setVersionGroup(saved.versions?.length ? saved.versions : [item]);
+          }
+        }
+        setNavigationReady(true);
+        if (!listing) {
+          if (item && /\.iso$/i.test(item.name)) deferredDirectory.current = path;
+          else void fetchDirectory(path, false, !!saved?.season);
+        }
       } catch {
-        setLoading(false);
+        if (mounted) { setNavigationReady(true); setLoading(false); }
       }
     };
     initVaultAndFetch();
     return () => {
+      mounted = false;
+      archiveOpenRequestRef.current++;
       directoryRequest.current++;
       dlSub.remove();
       appStateSub.remove();
@@ -1279,6 +1347,10 @@ const App = () => {
 
   const closeInternalPlayer = useCallback((cancelProxy: unknown = true) => {
     setIsPaused(true);
+    // clearSrc stops ExoPlayer and clears its media items before the view drops.
+    videoRef.current?.setSource?.();
+    externalAudioRef.current?.setSource?.();
+    VideoPlayerManager?.releasePlaybackAudioSession?.();
     if (cancelProxy !== false) SecurityVault?.stopArchivePlayback?.(playbackSource.uri);
     if (selectedFile?.name && currentTimeRef.current > 3) {
       persistPlaybackProgress(selectedFile.name, currentTimeRef.current, durationRef.current);
@@ -1448,7 +1520,11 @@ const App = () => {
 
   const standaloneSources = useRef(new Map<string, Promise<string>>());
   const resolvePlaybackUrl = useCallback(async (file: any) => {
-    const url = getStreamUrl(file);
+    const listedUrl = getStreamUrl(file);
+    const signedDisc = !file?.isZipEntry && /\/download\.aspx(?:[?#]|$)/i.test(listedUrl) &&
+      (/\.(m2ts|vob)$/i.test(file?.name || '') || /mp2t/i.test(file?.mimeType || ''));
+    const url = signedDisc && vaultRef.current.baseUrl
+      ? `${vaultRef.current.baseUrl.replace(/\/$/, '')}${currentPath}${encodeURIComponent(file.name)}` : listedUrl;
     if (file?.isZipEntry || !/^(https?|file):/i.test(url) || !SecurityVault?.resolveStandaloneDisc) return url;
     const name = String(file?.name || '');
     // Opaque download endpoints sometimes have no extension in either the path or title.
@@ -1468,7 +1544,7 @@ const App = () => {
       if (namedDisc) throw error;
       return url;
     }
-  }, [getStreamUrl, metadataMap, fetchSingleMetadata]);
+  }, [getStreamUrl, currentPath, metadataMap, fetchSingleMetadata]);
   useEffect(() => {
     if (!activeRawFiles.length || !vaultReady || selectedFile || playMode !== null) return;
     let cancelled = false;
@@ -1763,13 +1839,37 @@ const App = () => {
   const archiveOpenRequestRef = useRef(0);
   const [openingIso, setOpeningIso] = useState(false);
   const [isoInspectionError, setIsoInspectionError] = useState<string | null>(null);
-  const isoRetryRef = useRef<any>(null);
+  const outerIso = useRef<any>(null);
+  const retryInspection = useRef<(() => void) | null>(null);
+  const selectedMetadata = metadataMap[selectedFile?.name];
+  useEffect(() => {
+    if (!navigationReady) return;
+    // ISO proxy ports and entry IDs belong to the native process. Save the
+    // outer catalog item so a recreated activity can register a fresh entry.
+    const outer = selectedFile?.archiveFormat === 'ISO' && /\.iso$/i.test(selectedFile.name)
+      ? outerIso.current : null;
+    const snapshot = { screen: selectedFile ? 'details' : 'home', currentPath, pathStack,
+      item: outer || (selectedFile?.isZipEntry ? { name: selectedFile.name, archiveFormat: selectedFile.archiveFormat, mediaInfo: selectedFile.mediaInfo } : selectedFile),
+      versions: outer ? [] : versionGroup.map(v => v.isZipEntry ? { name: v.name } : v),
+      archiveListing: archiveListing.current?.path === currentPath ? archiveListing.current : null,
+      metadata: selectedMetadata,
+      title: seriesParentTitle, seasons: seasonFolders, season: activeSeason };
+    const key = navigationKey();
+    navigationWrite = navigationWrite.then(() => AsyncStorage.setItem(key, JSON.stringify(snapshot))).catch(() => {});
+  }, [navigationReady, currentPath, pathStack, selectedFile, versionGroup, selectedMetadata, seriesParentTitle, seasonFolders, activeSeason]);
+
   const closeDetails = () => {
     archiveOpenRequestRef.current++;
     setOpeningIso(false);
     setIsoInspectionError(null);
     setSelectedFile(null);
+    if (archiveListing.current) setLoading(false);
+    outerIso.current = null;
+    retryInspection.current = null;
     setVersionGroup([]);
+    const path = deferredDirectory.current;
+    deferredDirectory.current = null;
+    if (path) void fetchDirectory(path, false, !!activeSeason);
   };
 
   const openZipArchiveFile = async (zipItem: any, basePathOverride?: string) => {
@@ -1797,7 +1897,8 @@ const App = () => {
       setOpeningIso(isIso);
       setIsoInspectionError(null);
       if (isIso) {
-        isoRetryRef.current = zipItem;
+        outerIso.current = zipItem;
+        retryInspection.current = () => { void openZipArchiveFile(zipItem, effectiveBasePath); };
         const pending = { ...zipItem, archiveFormat: 'ISO', isoPending: true };
         setVersionGroup([pending]);
         openFile(pending); // No await: render the card's artwork and metadata immediately.
@@ -1847,6 +1948,7 @@ const App = () => {
           return;
         }
         if (entries.length > 0 && !isIso) {
+          archiveListing.current = { path: virtualZipPath, url: zipUrl, size: sizeHint };
           setFolderFiles(entries);
           setFolderLoading(false);
           return;
@@ -2378,6 +2480,7 @@ const App = () => {
     const { baseUrl } = vaultRef.current;
     if (!baseUrl) { setLoading(false); setFolderLoading(false); return; }
     const isRoot = path === '/0:/';
+    archiveListing.current = null;
     const generation = ++directoryRequest.current;
     const current = () => generation === directoryRequest.current;
     const key = directoryKey(path);
@@ -2475,6 +2578,7 @@ const App = () => {
             const entries = rawJson ? JSON.parse(rawJson) : [];
             if (Array.isArray(entries) && entries.length > 0) {
               const rawFolderTitle = decodeURIComponent(path.split('/').filter(Boolean).pop() || '');
+              archiveListing.current = { path, url: namedArchiveUrl, size: Number(archItem.size || 0) };
               remember(incomingFiles); // Archive proxy URLs are scoped to the running process.
               setSeriesParentTitle(parseMediaFilename(rawFolderTitle, true).cleanTitle);
               setFolderFiles(entries);
@@ -2645,6 +2749,7 @@ const App = () => {
       lastFolderCardIdRef.current = 'fcard_0';
       const newPath = `${currentPath}${encodeURIComponent(item.name)}/`;
       setPathStack([...pathStack, newPath]);
+      setCurrentPath(newPath);
       fetchDirectory(newPath, false, false);
     } else {
       const vers = item._versions && item._versions.length > 1 ? item._versions : [item];
@@ -2676,6 +2781,7 @@ const App = () => {
       const newStack = pathStack.slice(0, -1);
       const targetPath = newStack[newStack.length - 1];
       setPathStack(newStack);
+      setCurrentPath(targetPath);
       setSeasonFolders([]);
       setActiveSeason(null);
       setSeriesParentTitle('');
@@ -2926,21 +3032,7 @@ const App = () => {
       return;
     }
     closeInternalPlayer();
-    setSelectedFile(null);
-    setVersionGroup([]);
   };
-
-  if (securityCompromised) {
-    return (
-      <View style={styles.securityAlertScreen}>
-        <Icon name="security" size={58} color="#E50914" />
-        <Text style={styles.securityAlertTitle}>Security Shield Active</Text>
-        <Text style={styles.securityAlertSub}>
-          Debugger or hooking environment detected. Please close any debugging or packet inspection tools and restart GDStream.
-        </Text>
-      </View>
-    );
-  }
 
   const renderSeasonModal = () => {
     if (!showSeasonModal || seasonFolders.length === 0) return null;
@@ -3696,7 +3788,7 @@ const App = () => {
 
           {!!isoInspectionError && <Text accessibilityRole="alert" style={{ color: '#FCA5A5', marginBottom: 12 }}>{isoInspectionError}</Text>}
           <View style={styles.detailActionButtons}>
-            <FocusableButton focusId="detail_play_btn" hasTVPreferredFocus={true} style={styles.primaryPlayButton} disabled={openingIso} onPress={() => isoInspectionError ? openZipArchiveFile(isoRetryRef.current) : handlePlayInAppPress(selectedFile)}>
+            <FocusableButton focusId="detail_play_btn" hasTVPreferredFocus={true} style={styles.primaryPlayButton} disabled={openingIso} onPress={() => isoInspectionError ? retryInspection.current?.() : handlePlayInAppPress(selectedFile)}>
               <Icon name="play-arrow" size={26} color="white" />
               <Text style={styles.primaryPlayButtonText}>
                 {openingIso ? 'Inspecting Blu-ray disc...' : isoInspectionError ? 'Retry disc inspection' : savedSec > 3
@@ -4270,6 +4362,20 @@ const App = () => {
       </View>
     );
   };
+
+  if (securityCompromised) {
+    return (
+      <View style={styles.securityAlertScreen}>
+        <Icon name="security" size={58} color="#E50914" />
+        <Text style={styles.securityAlertTitle}>Security Shield Active</Text>
+        <Text style={styles.securityAlertSub}>
+          Debugger or hooking environment detected. Please close any debugging or packet inspection tools and restart GDStream.
+        </Text>
+      </View>
+    );
+  }
+
+  if (!navigationReady) return <View style={styles.container}><ActivityIndicator size="large" /></View>;
 
   const isCatalogCovered = !!selectedFile || playMode === 'internal' || activeTab === 'downloads';
 

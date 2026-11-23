@@ -222,7 +222,9 @@ internal class BluRayHls private constructor(val segments: List<Segment>, val au
             val supportedAudio = profile.streams.filter { it.audio && it.type in HLS_SUPPORTED_AUDIO_TYPES }.distinctBy { it.pid }
             if (standalone && profile.points.isEmpty()) {
                 val packets = size / 188
-                val count = minOf(packets, (profile.durationUs + 3_999_999) / 4_000_000).toInt()
+                val bySize = 1 + (packets - 1) / StandaloneBdav.HLS_TARGET_PACKETS
+                val byTime = 1 + (profile.durationUs - 1) / 4_000_000
+                val count = Math.toIntExact(minOf(packets, maxOf(bySize, byTime)))
                 val segments = (0 until count).map { i ->
                     val start = (packets / count * i + packets % count * i / count) * 188
                     val end = (packets / count * (i + 1) + packets % count * (i + 1) / count) * 188

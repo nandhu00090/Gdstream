@@ -418,12 +418,23 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
     }
 
     @ReactMethod
+    fun releasePlaybackAudioSession() {
+        synchronized(Companion) {
+            loudnessEnhancer?.release()
+            loudnessEnhancer = null
+            currentAudioSessionId = 0
+            enhancerSessionId = -1
+        }
+    }
+
+    @ReactMethod
     fun stopExternalStreamBridge() {
         ArchiveStreamService.setAppForeground(true)
     }
 
     @ReactMethod
     fun setArchiveBridgeAppForeground(foreground: Boolean) {
+        if (foreground) SecurityVaultModule.evictIsoChunks()
         ArchiveStreamService.setAppForeground(foreground)
     }
 

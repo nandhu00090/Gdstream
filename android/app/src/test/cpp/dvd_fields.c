@@ -25,20 +25,22 @@ int main(void) {
 
     mpeg2dec_t *decoder = mpeg2_init();
     assert(decoder);
-    mpeg2_buffer(decoder, stream, stream + sizeof(stream));
-    unsigned frames = 0;
-    mpeg2_state_t state;
-    while ((state = mpeg2_parse(decoder)) != STATE_BUFFER) {
-        if (state != STATE_SLICE_1ST && state != STATE_SLICE && state != STATE_END && state != STATE_INVALID_END) continue;
-        unsigned fields = mpeg2_take_display_fields(decoder);
-        if (fields == 0) continue;
-        const mpeg2_picture_t *picture = mpeg2_info(decoder)->display_picture;
-        assert(fields == 2 && picture->temporal_reference == frames);
-        assert((uint64_t)picture->frame_period * fields / 600 == 3600);
-        assert(mpeg2_take_display_fields(decoder) == 0);
-        ++frames;
+    for (int segment = 0; segment < 2; ++segment) {
+        mpeg2_buffer(decoder, stream, stream + sizeof(stream));
+        unsigned frames = 0;
+        mpeg2_state_t state;
+        while ((state = mpeg2_parse(decoder)) != STATE_BUFFER) {
+            if (state == STATE_END && segment == 0) mpeg2_resume_vobu(decoder);
+            unsigned fields = mpeg2_take_display_fields(decoder, state);
+            if (fields == 0) continue;
+            const mpeg2_picture_t *picture = mpeg2_info(decoder)->display_picture;
+            assert(fields == 2 && picture->temporal_reference == frames);
+            assert((uint64_t)picture->frame_period * fields / 600 == 3600);
+            assert(mpeg2_take_display_fields(decoder, STATE_END) == 0);
+            ++frames;
+        }
+        assert(frames == 120);
     }
-    assert(frames == 120);
     mpeg2_close(decoder);
     return 0;
 }

@@ -165,7 +165,7 @@ class IsoUpstreamTest {
         })
         assertEquals(listOf(start, start + 2, start + 4, start + 6), positions)
         assertArrayEquals(ByteArray(8) { it.toByte() }, result)
-        for (status in listOf(200, 404, 416, 503)) {
+        for (status in listOf(200, 403, 404, 410, 416, 503)) {
             var attempts = 0
             val failures = ArrayList<IsoRangeException>()
             assertThrows(IsoRangeException::class.java) {
@@ -173,8 +173,47 @@ class IsoUpstreamTest {
                     open = { _, _ -> attempts++; Connection(status, null, ByteArray(0)) },
                     onFailure = { failures.add(it) }, pause = {})
             }
-            assertEquals(if (status == 404 || status == 503) 4 else 1, attempts)
+            assertEquals(if (status == 503) 4 else 1, attempts)
             assertTrue(failures.all { it.status == status && it.start == start })
+        }
+    }
+
+    @Test fun expiredDownloadRestartsAtOriginOnceWithTheSameRangeAndNoBackoff() {
+        for (expired in listOf(403, 404, 410)) for (recovers in listOf(true, false)) {
+            val requests = mutableListOf<String>()
+            val server = ServerSocket(0)
+            server.soTimeout = 3000
+            val pool = Executors.newSingleThreadExecutor()
+            val job = pool.submit {
+                repeat(4) { index ->
+                    server.accept().use { socket ->
+                        val reader = socket.getInputStream().bufferedReader()
+                        val path = reader.readLine().split(' ')[1]
+                        val headers = generateSequence { reader.readLine() }.takeWhile { it.isNotEmpty() }.toList()
+                        requests += "$path ${headers.single { it.startsWith("Range:", true) }.substringAfter(':').trim()}"
+                        val reply = when (index) {
+                            0, 2 -> "302 Found\r\nLocation: /download.aspx?v=${index + 1}\r\nContent-Length: 0\r\n\r\n"
+                            3 -> if (recovers) "206 Partial Content\r\nContent-Range: bytes 3-3/4\r\nContent-Length: 1\r\n\r\n*"
+                                 else "$expired Expired\r\nContent-Length: 0\r\n\r\n"
+                            else -> "$expired Expired\r\nContent-Length: 0\r\n\r\n"
+                        }
+                        socket.getOutputStream().write("HTTP/1.1 $reply".toByteArray())
+                    }
+                }
+            }
+            val session = IsoReadSession()
+            try {
+                val connections = RangeConnections({ emptyMap() })
+                val url = "http://127.0.0.1:${server.localPort}/movie"
+                fun fetch() = IsoRangeReader.readFully(url, 3, 3,
+                    open = { a, b -> connections.openIsoRange(url, a, b, session) },
+                    pause = { error("Expired link entered backoff") }, session = session)
+                if (recovers) assertArrayEquals(byteArrayOf(42), fetch())
+                else assertEquals(expired, assertThrows(IsoRangeException::class.java) { fetch() }.status)
+                job.get(3, TimeUnit.SECONDS)
+                assertEquals(listOf("/movie", "/download.aspx?v=1", "/movie", "/download.aspx?v=3")
+                    .map { "$it bytes=3-3" }, requests)
+            } finally { session.cancel(); server.close(); pool.shutdownNow() }
         }
     }
 

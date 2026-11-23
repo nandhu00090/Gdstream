@@ -2,6 +2,8 @@ package com.gdstream
 
 /** Endpoints are aligned to the same BDAV packet grid before inspecting PES timestamps. */
 internal object StandaloneBdav {
+    const val HLS_TARGET_PACKETS = 4 * 1024 * 1024 / 188
+
     fun matches(head: ByteArray) = head.size >= 3 * 192 &&
         (0..2).all { head[it * 192 + 4] == 0x47.toByte() }
 

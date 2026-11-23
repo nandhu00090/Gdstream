@@ -98,8 +98,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     @Volatile
     private var cachedSslFactory: SSLSocketFactory? = null
 
-    private val isoChunkCaches = IsoChunkCaches()
-
     data class DirectTrailerStream(
         val label: String,
         val height: Int,
@@ -206,7 +204,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     private val archiveProxyLock = Any()
 
     companion object {
-        @Volatile private var clearIsoChunks: ((Boolean) -> Unit)? = null
+        private val isoChunkCaches = IsoChunkCaches()
+        internal fun evictIsoChunks() = isoChunkCaches.evict()
         @Volatile private var bluRayProfile: ((String) -> BluRayProfile?)? = null
         internal fun bluRayProfile(url: String): BluRayProfile? = ArchiveProxyStreams.streamId(url)?.let { bluRayProfile?.invoke(it) }
         @Volatile private var isoMediaInfo: ((String) -> Map<String, Any>?)? = null
@@ -229,7 +228,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         internal fun stopArchiveStreams(reason: String, resumable: Boolean = false) {
             ArchiveProxyStreams.registry.stopAll(reason)
             IsoRangeReader.cancelAll(reason)
-            clearIsoChunks?.invoke(resumable)
+            isoChunkCaches.clear()
+            DvdProxy.stop()
             if (resumable) ArchiveProxyStreams.registry.resume()
             DebugLogger.log("ARCHIVE_PROXY_STOP_ALL", reason)
         }
@@ -252,10 +252,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     init {
         DebugLogger.initialize(reactContext)
-        clearIsoChunks = { resumable ->
-            if (resumable) isoChunkCaches.cancelFlights() else isoChunkCaches.clear()
-            DvdProxy.stop()
-        }
         archiveFormat = { id -> archiveEntryRegistry[id]?.archiveFormat }
         externalIsoUrl = { url, player ->
             val entry = ArchiveProxyStreams.streamId(url)?.let { archiveEntryRegistry[it] }
@@ -278,7 +274,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     try {
                         val file = IsoVirtualFile(entry.segments, entry.isBdavM2ts)
                         val cache = isoChunkCaches.acquire(entry.archiveUrl, warmSession, entry.sourceSize)
-                        val length = minOf(file.size, 32L * 1024 * 1024).toInt()
+                        val firstSegment = if (entry.standalone) entry.hls?.segments?.firstOrNull() else null
+                        val length = minOf(file.size, firstSegment?.end ?: (32L * 1024 * 1024)).toInt()
                         val flights = cache.prefetch(file.mappedRanges(0L, length), entry.sourceSize, warmSession) { from, to, owner ->
                             if (entry.standalone) readStandalone(entry.archiveUrl, from, to, owner)
                             else fetchIsoByteRange(entry.archiveUrl, from, to, owner)
@@ -423,7 +420,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun stopArchivePlayback(url: String, promise: Promise) {
         ArchiveProxyStreams.stop(url)
-        ArchiveProxyStreams.streamId(url)?.let { id -> DvdProxy.stop(id) }
+        ArchiveProxyStreams.streamId(url)?.let { id ->
+            DvdProxy.stop(id)
+            isoChunkCaches.evict()
+        }
         promise.resolve(true)
     }
 
@@ -838,16 +838,17 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         var conn = openRangeConnectionInternal(urlStr, rangeHeader)
         val cType = (conn.contentType ?: "").lowercase(Locale.ROOT)
         var code = conn.responseCode
-        // If Cloudflare Worker returned an HTML login page or 401/403 instead of binary bytes, re-login immediately and retry!
-        if (code == 401 || code == 403 || cType.contains("text/html")) {
+        if (expiredDownloadStatus(code)) return conn
+        // Renew the library session if the worker serves a login page.
+        if (code == 401 || cType.contains("text/html")) {
             conn.disconnect()
             nativeSessionLoggedIn = false
             ensureVaultSessionReady()
             conn = openRangeConnectionInternal(urlStr, rangeHeader)
             code = conn.responseCode
         }
-        // If cold Worker isolate returned 404/5xx on direct file path, warm parent folder cache and retry once!
-        if (code == 404 || code in 500..504) {
+        // If cold Worker isolate returned 5xx on direct file path, warm parent folder cache and retry once!
+        if (code in 500..504) {
             conn.disconnect()
             try {
                 val seed = verifyCertificateAndEnv()
@@ -918,7 +919,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 ensureVaultSessionReady()
                 session.checkActive()
                 var conn = rangeConnections.openIsoRange(isoUrl, from, to, session)
-                if (conn.responseCode == 401 || conn.responseCode == 403) {
+                if (conn.responseCode == 401) {
                     session.log("ISO_UPSTREAM_AUTH", "HTTP=${conn.responseCode} physical=$from-$to; refreshing session and source redirect once")
                     session.disconnect(conn)
                     nativeSessionLoggedIn = false
@@ -941,6 +942,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     private fun standaloneSize(url: String): Long {
         val conn = if (librarySource(url)) openRangeConnection(url, "bytes=0-1") else publicRanges.open(url, "bytes=0-1")
         try {
+            if (expiredDownloadStatus(conn.responseCode)) throw java.io.IOException("Source size probe HTTP ${conn.responseCode}")
             val size = conn.getHeaderField("Content-Range")?.substringAfterLast('/')?.toLongOrNull()
             return size?.takeIf { it > 0 } ?: throw java.io.IOException("Source does not advertise a byte length")
         } finally { conn.disconnect() }
@@ -962,6 +964,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     private fun detectRemoteFileSize(archiveUrl: String): Long {
         val conn = openRangeConnection(archiveUrl, "bytes=0-1")
         try {
+            if (expiredDownloadStatus(conn.responseCode)) throw java.io.IOException("Source size probe HTTP ${conn.responseCode}")
             val contentRange = conn.getHeaderField("Content-Range") ?: conn.getHeaderField("content-range") ?: ""
             if (contentRange.contains("/")) {
                 val slashVal = contentRange.substringAfterLast("/").trim()
@@ -1237,7 +1240,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                                     session, entry.id, dvdIndex, nextVobu != null,
                                     dvdIndex == entry.dvdPlaylist.lastIndex, entry.cellClock(dvdIndex) { offset ->
                                         if (offset == start) data else file.readRaw(offset, 2048, ::fetch)
-                                    }) {
+                                    }, segment.durationUs) {
                                     entry.dvdSequenceHeader ?: DvdProxy.sequenceHeader(
                                         file.readRaw(0, minOf(file.size, 512L * 1024).toInt(), ::fetch)
                                     )?.also { entry.dvdSequenceHeader = it }
@@ -1305,7 +1308,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         if (method != "GET" || entry.sourceSize <= 0 || position >= file.size) return
                         val next = nextWarm.get()
                         if (position < next || !nextWarm.compareAndSet(next, position + 8L * 1024 * 1024)) return
-                        val length = minOf(file.size - position, 48L * 1024 * 1024).toInt()
+                        val limit = if (entry.standalone) segment.end else file.size
+                        val length = minOf(limit - position, 48L * 1024 * 1024).toInt()
                         isoChunkCache.prefetch(file.mappedRanges(position, length), entry.sourceSize, session, fetch = ::upstream)
                     }
                     warm(segment.start)

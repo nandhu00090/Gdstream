@@ -5,7 +5,7 @@ import java.io.IOException
 
 /** Each segment starts with PSI and an IDR. PCR uses the video timeline. */
 internal class DvdTsMux(private val audioLanguageCode: String = "") {
-    private data class UnitData(val video: Boolean, val ticks: Long, val data: ByteArray)
+    private data class UnitData(val video: Boolean, var ticks: Long, val data: ByteArray)
     private val samples = ArrayList<UnitData>()
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
@@ -104,8 +104,33 @@ internal class DvdTsMux(private val audioLanguageCode: String = "") {
         samples.add(UnitData(false, (ptsUs * 9 + 50) / 100, bytes))
     }
 
-    fun finish(): ByteArray {
+    // Keep source cadence when it fits. If the decoder clock drifts outside
+    // the copied AC-3/PCI window, distribute the pictures over that window
+    // instead of stacking late frames at its final timestamp.
+    private fun fitVideoClock(segmentStart: Long, segmentEnd: Long, hasNav: Boolean) {
+        val audio = samples.filter { !it.video }
+        // DVD AC-3 uses 1536 samples at 48 kHz, or 2880 ticks per frame.
+        val audioStart = audio.minOfOrNull { it.ticks } ?: segmentStart
+        val audioEnd = audio.maxOfOrNull { it.ticks + 2880 } ?: segmentEnd
+        val video = samples.filter { it.video }
+        val overlapStart = maxOf(segmentStart, audioStart)
+        val overlapEnd = minOf(segmentEnd, audioEnd)
+        val useOverlap = hasNav && overlapEnd - overlapStart >= video.size
+        val start = if (useOverlap) overlapStart else audioStart
+        val end = if (useOverlap) overlapEnd else audioEnd
+        if (end - start < video.size) throw IOException("Invalid DVD segment audio clock")
+        var previous = start - 1
+        if (video.all { sample ->
+                val valid = sample.ticks > previous && sample.ticks < end
+                previous = sample.ticks
+                valid
+            }) return
+        video.forEachIndexed { index, sample -> sample.ticks = start + (end - start) * index / video.size }
+    }
+
+    fun finish(segmentStart: Long? = null, segmentEnd: Long? = null, hasNav: Boolean = true): ByteArray {
         if (frames == 0) throw IOException("DVD segment produced 0 decodable AVC frames (no IDR)")
+        if (segmentStart != null && segmentEnd != null) fitVideoClock(segmentStart, segmentEnd, hasNav)
         val out = ByteArrayOutputStream()
         val cc = IntArray(8192)
         fun packets(pid: Int, data: ByteArray, clock: Long? = null) {
