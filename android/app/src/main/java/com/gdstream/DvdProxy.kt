@@ -84,8 +84,8 @@ internal object DvdProxy {
 
     @Synchronized fun transcode(data: ByteArray, info: Map<String, Any>, encoder: Encoder,
                   session: IsoReadSession, streamId: String, segment: Int, boundary: Boolean, last: Boolean,
-                  cellClock: DvdCellClock?, sequenceHeader: () -> ByteArray?): ByteArray {
-        if (warm?.id != streamId || warm?.next != segment || warm?.clock?.cell != cellClock) release()
+                  cellClock: DvdCellClock?, durationUs: Long, sequenceHeader: () -> ByteArray?): ByteArray {
+        if (warm?.id != streamId || warm?.next != segment) release()
         fun convert(finish: Boolean): ByteArray {
             val fresh = warm == null
             val state = warm ?: run {
@@ -98,7 +98,10 @@ internal object DvdProxy {
             val header = if (fresh) sequenceHeader else { -> null }
             val audioId = (info["ac3Substream"] as? Number)?.toInt() ?: -1
             val startPts = startClock(data, audioId)
-            val clock = state.clock ?: DvdPesClock(cellClock, startPts).also { state.clock = it }
+            val cellChanged = state.clock?.cell != cellClock
+            if (cellChanged) state.audio.seek()
+            val clock = state.clock?.takeUnless { cellChanged } ?: DvdPesClock(cellClock, startPts).also { state.clock = it }
+            clock.beginSegment()
             val fallback = clock.ticks(startPts)
             demux(data, audioId, header, state.audio, clock) { pts, sample ->
                 session.checkActive()
@@ -106,7 +109,9 @@ internal object DvdProxy {
             }
             encode(state.handle, null, -1, fallback, state.mux, boundary, finish)
             val frames = state.mux.frames
-            val result = state.mux.finish()
+            val start = clock.segmentStart ?: fallback
+            val end = clock.segmentEnd ?: (start + durationUs * 9 / 100)
+            val result = state.mux.finish(start, end, clock.segmentEnd != null)
             state.next = segment + 1
             if (finish) release() else {
                 idleClose?.cancel(false)
@@ -114,7 +119,7 @@ internal object DvdProxy {
                     synchronized(this) { if (warm === state && state.next == segment + 1) release() }
                 }, 30, java.util.concurrent.TimeUnit.SECONDS)
             }
-            DebugLogger.log("DVD_SEG_OK", "seg=$segment frames=$frames bytes=${result.size} warm=${!fresh}")
+            DebugLogger.log("DVD_SEG_OK", "seg=$segment frames=$frames bytes=${result.size} warm=${!fresh} pts90k=$start..$end")
             return result
         }
         val wasWarm = warm != null
@@ -324,6 +329,16 @@ internal class DvdPesClock(val cell: DvdCellClock?, firstPts: Long) {
     private var base = cell ?: DvdCellClock(firstPts, firstPts)
     private var previousEnd: Long? = null
 
+    var segmentStart: Long? = null
+        private set
+    var segmentEnd: Long? = null
+        private set
+
+    fun beginSegment() {
+        segmentStart = null
+        segmentEnd = null
+    }
+
     fun ticks(pts: Long) = base.ticks(pts)
 
     fun vobu(start: Long, end: Long) {
@@ -333,6 +348,8 @@ internal class DvdPesClock(val cell: DvdCellClock?, firstPts: Long) {
         if (duration <= 0) return
         val next = previousEnd
         if (next != null && start != next) base = DvdCellClock(start, ticks(next))
+        if (segmentStart == null) segmentStart = ticks(start)
+        segmentEnd = ticks(end)
         previousEnd = end
     }
 }

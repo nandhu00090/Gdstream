@@ -199,11 +199,10 @@ extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_encode(JNIEnv *env,
                 if (!seq || seq->picture_width != s.width || seq->picture_height != s.height ||
                     seq->chroma_width * 2 != seq->width || seq->chroma_height * 2 != seq->height) return false;
             }
-            if (state != STATE_SLICE_1ST && state != STATE_SLICE && state != STATE_END && state != STATE_INVALID_END) continue;
             const auto *picture = info->display_picture;
             const auto *frame = info->display_fbuf;
             if (!input && !last && state == STATE_END) mpeg2_resume_vobu(s.decoder);
-            const auto fields = mpeg2_take_display_fields(s.decoder);
+            const auto fields = mpeg2_take_display_fields(s.decoder, state);
             if (!fields || !seq) continue;
             const auto *tagged = picture;
             int64_t fieldOffset = 0;

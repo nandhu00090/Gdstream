@@ -76,6 +76,7 @@ uint8_t mpeg2_scan_alt[64] ATTR_ALIGN(16) = {
 
 void mpeg2_header_state_init (mpeg2dec_t * mpeg2dec)
 {
+    memset (mpeg2dec->display_state, 0, sizeof (mpeg2dec->display_state));
     if (mpeg2dec->sequence.width != (unsigned)-1) {
 	int i;
 
@@ -699,7 +700,7 @@ void mpeg2_header_picture_finalize (mpeg2dec_t * mpeg2dec, uint32_t accels)
 	    other += 2;
 	mpeg2dec->picture = picture;
 	*picture = mpeg2dec->new_picture;
-        mpeg2dec->displayed[picture - mpeg2dec->pictures] = 0;
+        mpeg2dec->display_state[picture - mpeg2dec->pictures] = PICTURE_DECODING;
         /* The paired slot can still contain a field from the previous GOP. */
         picture[1].nb_fields = 0;
 
@@ -969,8 +970,18 @@ mpeg2_state_t mpeg2_header_end (mpeg2dec_t * mpeg2dec)
 
 /* Claim the reordered display buffer exactly once. In particular, header_end
  * may expose the paired slot even when the input ended between fields. */
-unsigned int mpeg2_take_display_fields (mpeg2dec_t * mpeg2dec)
+unsigned int mpeg2_take_display_fields (mpeg2dec_t * mpeg2dec, mpeg2_state_t state)
 {
+    if (state != STATE_SLICE && state != STATE_SLICE_1ST &&
+        state != STATE_END && state != STATE_INVALID_END)
+        return 0;
+    /* A slice callback can display a different, reordered picture. Only a
+     * completed frame or second field makes the current slot eligible. */
+    if (state == STATE_SLICE && mpeg2dec->info.current_picture) {
+        unsigned slot = mpeg2dec->info.current_picture - mpeg2dec->pictures;
+        if (mpeg2dec->display_state[slot] == PICTURE_DECODING)
+            mpeg2dec->display_state[slot] = PICTURE_COMPLETE;
+    }
     const mpeg2_picture_t * first = mpeg2dec->info.display_picture;
     const mpeg2_picture_t * second = mpeg2dec->info.display_picture_2nd;
     if (!first || !mpeg2dec->info.display_fbuf || (first->flags & PIC_FLAG_SKIP))
@@ -984,9 +995,9 @@ unsigned int mpeg2_take_display_fields (mpeg2dec_t * mpeg2dec)
             return 0;
         fields = 2;
     }
-    uint8_t * displayed = &mpeg2dec->displayed[first - mpeg2dec->pictures];
-    if (*displayed) return 0;
-    *displayed = 1;
+    unsigned slot = first - mpeg2dec->pictures;
+    if (mpeg2dec->display_state[slot] != PICTURE_COMPLETE) return 0;
+    mpeg2dec->display_state[slot] = PICTURE_EMITTED;
     return fields;
 }
 

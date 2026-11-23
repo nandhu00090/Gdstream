@@ -64,6 +64,33 @@ class DvdProxyTest {
         segment(984, 1000, listOf(125_984, 126_000))
     }
 
+    @Test fun videoOverrunningTwoSequentialAudioWindowsIsScaledBeforeWritingPesAndPcr() {
+        val mux = DvdTsMux()
+        mux.video(0, byteArrayOf(0, 0, 1, 0x67, 66, 0, 0, 1, 0x68, 1), true)
+        for (segment in 0..1) {
+            val start = 90_000L + segment * 360_000
+            mux.beginSegment()
+            repeat(125) { mux.audio((start + it * 2880) * 1000 / 90, byteArrayOf(11, 119)) }
+            val count = if (segment == 0) 240 else 225
+            repeat(count) {
+                mux.video(start + 1_080_000 + it * 3600, byteArrayOf(0, 0, 1, if (it == 0) 0x65 else 0x41, 42))
+            }
+            val ts = mux.finish(start, start + 360_000)
+            val timestamps = mutableListOf<Long>()
+            for (p in ts.indices step 188) {
+                fun u(i: Int) = ts[p + i].toLong() and 255
+                if (u(1) != 0x41L || u(2) != 1L) continue
+                val pcr = (u(6) shl 25) or (u(7) shl 17) or (u(8) shl 9) or (u(9) shl 1) or (u(10) ushr 7)
+                val t = 14 + u(4).toInt()
+                val pts = ((u(t) and 14) shl 29) or (u(t + 1) shl 22) or ((u(t + 2) and 254) shl 14) or
+                    (u(t + 3) shl 7) or (u(t + 4) shr 1)
+                assertEquals(pts, pcr)
+                timestamps += pts
+            }
+            assertEquals((0 until count).map { start + 360_000L * it / count }, timestamps)
+        }
+    }
+
     @Test fun segmentOpensWithValidPatAndPmtAndKeepsAc3Bytes() {
         val mux = DvdTsMux()
         val audio = ByteArray(1024) { it.toByte() }

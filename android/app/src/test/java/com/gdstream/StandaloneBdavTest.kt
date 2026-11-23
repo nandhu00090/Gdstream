@@ -56,6 +56,7 @@ class StandaloneBdavTest {
         val size = 188L * 111111111
         val duration = 60123456L
         val hls = BluRayHls.create(BluRayProfile(duration, emptyList(), emptyList()), size, true)!!
+        assertTrue(hls.segments.all { it.end - it.start in 188L..4L * 1024 * 1024 })
         assertEquals(duration, hls.segments.sumOf { it.durationUs })
         assertEquals(size, hls.segments.sumOf { it.end - it.start })
         assertTrue(hls.segments.zipWithNext().all { (a,b) -> a.end == b.start && b.start % 188 == 0L })

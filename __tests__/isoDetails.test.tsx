@@ -133,3 +133,32 @@ test('a warm homepage renders its last listing while the worker is still pending
   await Renderer.act(async () => refresh(JSON.stringify({ data: { files: [] } })));
   expect(renderer.root.findAllByProps({ focusId: 'card_0' })).toHaveLength(0);
 });
+
+test('recreation restores ISO details in its original folder and Back persists the folder', async () => {
+  const vault = NativeModules.SecurityVault;
+  const folder = { name: 'Tamil Films', mimeType: 'application/vnd.google-apps.folder' };
+  const iso = { id: 'outer', name: 'Example.2009.iso', size: '50000000000', modifiedTime: '2010-01-01' };
+  vault.securePostDirectory.mockImplementation(async (path: string) => JSON.stringify({
+    data: { files: path === '/0:/' ? [folder] : [iso, { name: 'Another.mp4', modifiedTime: '2000-01-01' }] },
+  }));
+  const feature = (port: number) => JSON.stringify([{ name: 'feature.vob', link: `http://127.0.0.1:${port}/zip/id/feature.vob` }]);
+  vault.listZipMediaEntries.mockResolvedValue(feature(99));
+  await mount();
+  await Renderer.act(async () => renderer.root.findByProps({ focusId: 'card_0' }).props.onPress());
+  await Renderer.act(async () => renderer.root.findByProps({ focusId: 'fcard_0' }).props.onPress());
+  await Renderer.act(async () => renderer.unmount());
+  vault.listZipMediaEntries.mockClear().mockResolvedValue(feature(111));
+  await mount();
+  expect(vault.listZipMediaEntries).toHaveBeenCalledWith('https://library/0:/Tamil%20Films/Example.2009.iso#name=Example.2009.iso', Number(iso.size));
+  await Renderer.act(async () => {
+    const launch = renderer.root.findByProps({ focusId: 'detail_ext_btn' }).props.onPress();
+    jest.advanceTimersByTime(32);
+    await launch;
+  });
+  expect(NativeModules.VideoPlayerManager.playVideo).toHaveBeenCalledWith('http://127.0.0.1:111/zip/id/feature.vob', expect.anything());
+  await Renderer.act(async () => renderer.root.findByProps({ focusId: 'detail_back_btn' }).props.onPress());
+  await Renderer.act(async () => renderer.unmount());
+  await mount();
+  expect(renderer.root.findAllByProps({ focusId: 'detail_play_btn' })).toHaveLength(0);
+  expect(renderer.root.findByProps({ focusId: 'fcard_0' })).toBeTruthy();
+});

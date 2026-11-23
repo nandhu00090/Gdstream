@@ -197,7 +197,7 @@ struct mpeg2dec_s {
     mpeg2_gop_t gop;
     mpeg2_picture_t new_picture;
     mpeg2_picture_t pictures[4];
-    uint8_t displayed[4];
+    enum { PICTURE_DECODING, PICTURE_COMPLETE, PICTURE_EMITTED } display_state[4];
     mpeg2_picture_t * picture;
     /*const*/ mpeg2_fbuf_t * fbuf[3];	/* 0: current fbuf, 1-2: prediction fbufs */
 
