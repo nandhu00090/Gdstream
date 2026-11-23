@@ -387,8 +387,6 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
                     SecurityVaultModule.prefetchExternalLaunch(url)
                 }
                 val intent = externalVideoIntent(uri)
-                if (component != null && uri.lastPathSegment == "dvd.m3u8")
-                    intent.setDataAndType(uri, "application/vnd.apple.mpegurl")
                 if (component != null) intent.component = component else intent.setPackage(player)
                 DebugLogger.log("EXTERNAL_PLAYER_LAUNCH", "uri=${safeStreamUrl(uri.toString())} player=$player")
                 reactApplicationContext.startActivity(if (player != null) intent else

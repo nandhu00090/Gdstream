@@ -18,15 +18,14 @@ data class BluRayAudio(val pid: Int, val type: Int, val language: String) {
     }
     fun displayLabel(trackIndex: Int, channels: String = ""): String {
         val name = bluRayLanguage(language)
-        if (name == "Unknown") return listOf("Audio ${trackIndex + 1} • $codecName", channels).filter { it.isNotEmpty() }.joinToString(" ")
-        val prefix = "$name $codecName"
-        return if (channels.isNotEmpty()) "$prefix • $channels" else prefix
+        val title = if (name == "Unknown") "Audio ${trackIndex + 1}" else name
+        return listOf(title, codecName, channels).filter { it.isNotEmpty() }.joinToString(" • ")
     }
     val label: String get() = displayLabel(0)
 }
 data class BluRayProfile(val durationUs: Long, val points: List<BluRayPoint>, val audio: List<BluRayAudio>,
     val streams: List<BluRayStream> = emptyList(), val discLabel: String = "", val dolbyVision: Boolean = false,
-    val pcrIndex: StandalonePcrIndex? = null) {
+    val pcrIndex: StandalonePcrIndex? = null, val primaryLanguageHint: String = "") {
     fun toJson() = JSONObject().put("durationUs", durationUs)
         .put("streams", JSONArray().apply { streams.forEach { put(it.json()) } })
         .put("discLabel", discLabel).put("dolbyVision", dolbyVision)

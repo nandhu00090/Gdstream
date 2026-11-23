@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /** Cancellation owns sockets AND permits; Future.cancel alone cannot interrupt an Android HTTP read. */
-internal class IsoReadSession(val publishPrefix: ((ByteArray, Int) -> Unit)? = null) {
+internal class IsoReadSession(val pcrProbe: Boolean = false, val publishPrefix: ((ByteArray, Int) -> Unit)? = null) {
     companion object {
         private val ids = AtomicLong()
         private val socketClosers = java.util.concurrent.Executors.newCachedThreadPool { task ->
@@ -34,6 +34,13 @@ internal class IsoReadSession(val publishPrefix: ((ByteArray, Int) -> Unit)? = n
     fun log(tag: String, message: String) = DebugLogger.log(tag, "request=$id $message")
     fun checkActive() {
         if (isCancelled || Thread.currentThread().isInterrupted) throw InterruptedIOException("ISO request $id cancelled")
+    }
+
+    fun awaitRetry(millis: Long) {
+        val wake = java.util.concurrent.CountDownLatch(1)
+        val registration = onCancel { wake.countDown() }
+        try { wake.await(millis, TimeUnit.MILLISECONDS); checkActive() }
+        finally { registration.close() }
     }
 
     fun acquire(semaphore: Semaphore): Permit {

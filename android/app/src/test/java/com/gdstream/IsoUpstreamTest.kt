@@ -44,7 +44,8 @@ class IsoUpstreamTest {
             }
         }, onFailure = { failures.add(it) }, pause = { pauses.add(it) })
         assertArrayEquals(byteArrayOf(1, 2, 3, 4), data)
-        assertEquals(listOf(150L, 300L, 450L), pauses)
+        assertEquals(3, pauses.size)
+        assertTrue(pauses.all { it in 250L..900L })
         assertEquals(listOf(206, 206, 206), failures.map { it.status })
         assertTrue(isoFailureDetails(failures[0]).contains("java.net.SocketException: Connection reset"))
         assertFalse(isoFailureDetails(failures[0]).contains("token=secret"))
@@ -89,23 +90,23 @@ class IsoUpstreamTest {
         val release = CountDownLatch(1)
         val delivered = CountDownLatch(1)
         val positions = java.util.concurrent.CopyOnWriteArrayList<Long>()
-        // Seek late in a physical block. The first GET starts at the packet being requested.
+        // Seek late in a physical block. The first GET starts at the block boundary.
         val size = 16_384L
         val target = 12_288L
-        val body = ByteArray((size - target).toInt()) { (it % 251).toByte() }
+        val body = ByteArray(size.toInt()) { (it % 251).toByte() }
         val output = ByteArrayOutputStream()
         try {
             val stream = pool.submit<Boolean> {
                 IsoVirtualFile(listOf(0L to size), false).serve("GET", "bytes=$target-", "video/mp2t",
                     output, pool, session, maxReadBytes = 256, pipelineDepth = 1,
                     onStreamStart = { delivered.countDown() }) { pos, count ->
-                    cache.read(pos, pos + count - 1, 0, size - 1, session, suffixStart = target) { from, to, owner ->
+                    cache.read(pos, pos + count - 1, 0, size - 1, session) { from, to, owner ->
                         IsoRangeReader.readFully("http://origin/download.aspx", from, to, open = { a, b ->
                             positions.add(a)
-                            object : Connection(206, "bytes $a-$b/$size", body.copyOfRange((a - target).toInt(), body.size)) {
+                            object : Connection(206, "bytes $a-$b/$size", body.copyOfRange(a.toInt(), body.size)) {
                                 override fun getInputStream(): InputStream {
-                                    if (a != target) return super.getInputStream()
-                                    return object : ByteArrayInputStream(body, 0, 256) {
+                                    if (a != 0L) return super.getInputStream()
+                                    return object : ByteArrayInputStream(body, 0, target.toInt() + 256) {
                                         override fun read(dst: ByteArray, off: Int, len: Int): Int {
                                             if (available() > 0) return super.read(dst, off, len)
                                             check(release.await(5, TimeUnit.SECONDS))
@@ -123,8 +124,9 @@ class IsoUpstreamTest {
             assertEquals(0, cache.cachedBytes())
             release.countDown()
             assertTrue(stream.get(5, TimeUnit.SECONDS))
-            assertEquals(listOf(target, target + 256), positions)
-            assertArrayEquals(body, output.toByteArray().takeLast(body.size).toByteArray())
+            assertEquals(listOf(0L, target + 256), positions)
+            assertArrayEquals(body.copyOfRange(target.toInt(), body.size),
+                output.toByteArray().takeLast(body.size - target.toInt()).toByteArray())
         } finally { release.countDown(); session.cancel(); cache.clear(); pool.shutdownNow() }
     }
 

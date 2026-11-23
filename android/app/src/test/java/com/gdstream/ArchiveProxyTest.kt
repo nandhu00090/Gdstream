@@ -297,7 +297,7 @@ class ArchiveProxyTest {
         }.getInputStream().use { it.readBytes() }
         try {
             module.resolveStandaloneDisc("http://127.0.0.1:${origin.localPort}/download.aspx?file=opaque",
-                "Untitled feature", raw.size.toDouble(), promise)
+                "Untitled feature", raw.size.toDouble(), "ta", promise)
             val url = ready.get(10, TimeUnit.SECONDS)
             assertTrue(SecurityVaultModule.isIsoStream(url))
             assertArrayEquals(ts, get(url))
@@ -308,6 +308,9 @@ class ArchiveProxyTest {
             assertEquals("warm reopen contacted origin", initialRequests, requests.get())
             val profile = SecurityVaultModule.bluRayProfile(url)!!
             assertTrue(profile.durationUs > 0)
+            assertEquals("tam", profile.audio.first().language)
+            assertTrue(profile.audio.drop(1).all { it.language != "tam" })
+            assertEquals("Tamil", (SecurityVaultModule.isoMediaInfo(url)!!["languages"] as List<*>).first())
             assertTrue(profile.streams.any { it.audio && it.kbps > 0 })
             assertTrue((SecurityVaultModule.isoMediaInfo(url)!!["videoBitrateMbps"] as Double) > 0)
             val master = SecurityVaultModule.externalPlayerUrl(url)

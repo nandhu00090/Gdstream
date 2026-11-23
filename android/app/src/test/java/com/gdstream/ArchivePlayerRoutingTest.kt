@@ -24,7 +24,7 @@ class ArchivePlayerRoutingTest {
     }
 
     @Test fun allExternalPlayerIntentsMatchVideoHandlersIncludingLocalHls() {
-        for (path in listOf("hls/disc/index.m3u8", "zip/disc/movie.ts", "zip/disc/movie.m2ts", "movie.mp4")) {
+        for (path in listOf("hls/disc/dvd.m3u8", "hls/disc/index.m3u8", "zip/disc/movie.ts", "zip/disc/movie.m2ts", "movie.mp4")) {
             val uri = Uri.parse("http://127.0.0.1:9090/$path")
             val intent = externalVideoIntent(uri)
             assertEquals(Intent.ACTION_VIEW, intent.action)
@@ -72,14 +72,15 @@ class ArchivePlayerRoutingTest {
         assertTrue(frames > 0)
     }
 
-    @Test fun dvdTranscoderDemuxesInterlacedPicturesAtSectorBoundaries() {
+    @Test fun dvdDemuxPreservesOnlyOriginalPesTimestamps() {
         val data = javaClass.getResourceAsStream("/dvd/interlaced.vob.bin")!!.readBytes()
         val frames = mutableListOf<ByteArray>()
-        DvdProxy.demux(data, -1) { video, time, bytes ->
-            assertTrue(video)
-            assertTrue(time >= 0)
+        val timestamps = mutableListOf<Long>()
+        DvdProxy.demux(data, -1) { time, bytes ->
+            timestamps.add(time)
             frames.add(bytes)
         }
+        assertEquals(listOf(48_600L, C.TIME_UNSET, C.TIME_UNSET, 52_200L), timestamps)
         assertTrue(frames.size >= 3)
         assertTrue(frames.first().size > 4)
     }
@@ -92,9 +93,9 @@ class ArchivePlayerRoutingTest {
             if (data[i] == 0.toByte() && data[i+1] == 0.toByte() && data[i+2] == 1.toByte() &&
                 data[i+3] == 0xb3.toByte()) data[i+3] = 0xb2.toByte()
         }
-        var pictures = 0
-        DvdProxy.demux(data, -1, { header }) { video, _, _ -> if (video) pictures++ }
-        assertTrue(pictures >= 3)
+        var first: ByteArray? = null
+        DvdProxy.demux(data, -1, { header }) { _, bytes -> if (first == null) first = bytes }
+        assertArrayEquals(header, first)
     }
 
     @Test fun dvdProgramStreamsAndBlurayTransportStreamsChooseTheirOwnExtractors() {

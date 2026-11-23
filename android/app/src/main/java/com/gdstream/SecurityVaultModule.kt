@@ -83,6 +83,7 @@ import javax.net.ssl.X509TrustManager
 class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
+    private val pcrProbes = Executors.newFixedThreadPool(6)
     private val ioExecutor = Executors.newCachedThreadPool()
 
     @Volatile
@@ -230,7 +231,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     init {
         DebugLogger.initialize(reactContext)
-        clearIsoChunks = { resumable -> if (resumable) isoChunkCaches.cancelFlights() else isoChunkCaches.clear() }
+        clearIsoChunks = { resumable ->
+            if (resumable) isoChunkCaches.cancelFlights() else isoChunkCaches.clear()
+            DvdProxy.stop()
+        }
         archiveFormat = { id -> archiveEntryRegistry[id]?.archiveFormat }
         externalIsoUrl = { url, player ->
             val entry = ArchiveProxyStreams.streamId(url)?.let { archiveEntryRegistry[it] }
@@ -305,7 +309,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
-    fun resolveStandaloneDisc(url: String, name: String, sizeHint: Double, promise: Promise) {
+    fun resolveStandaloneDisc(url: String, name: String, sizeHint: Double, originalLanguage: String, promise: Promise) {
         ioExecutor.submit {
             try {
                 val local = if (url.startsWith("file:")) java.io.File(requireNotNull(android.net.Uri.parse(url).path)) else null
@@ -333,22 +337,30 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
                 val (head, tail) = sample(65536)
                 if (!StandaloneBdav.matches(head)) { promise.resolve(url); return@submit }
-                var profile = StandaloneBdav.profile(head, tail, name, alignedEnd)
+                var profile = StandaloneBdav.profile(head, tail, name, alignedEnd, originalLanguage)
                 if (profile.durationUs == 0L || profile.pcrIndex == null || profile.streams.isEmpty() ||
                     profile.streams.any { it.audio && it.layout.isEmpty() }) {
                     val (largerHead, largerTail) = sample(2 * 1024 * 1024)
-                    profile = StandaloneBdav.profile(largerHead, largerTail, name, alignedEnd)
+                    profile = StandaloneBdav.profile(largerHead, largerTail, name, alignedEnd, originalLanguage)
                 }
-                // Three small interior samples in one round-trip window. The endpoints already
-                // bracket the full file and remain usable when an optional sample is unavailable.
+                // The head and tail bracket fifteen interior PCR samples on the BDAV packet grid.
                 profile.pcrIndex?.let { index ->
-                    val length = 192 * 3072
-                    if (alignedEnd >= 8L * length) (1..3).map { quarter ->
-                        val from = alignedEnd / 192 / 4 * quarter * 192
-                        ioExecutor.submit {
+                    val length = 64 * 1024
+                    if (alignedEnd >= 16L * length) (1 until 16).map { point ->
+                        val from = alignedEnd / 192 * point / 16 * 192
+                        pcrProbes.submit {
                             try {
-                                val bytes = readStandalone(url, from, from + length - 1, IsoReadSession(), cancelWithPlayback = false)
-                                index.sample(bytes, 192, from / 192 * 188)
+                                // A 64 KiB probe can fall between PCR packets at high bitrates.
+                                val strideBytes = length / 192 * 192L
+                                val limit = minOf(alignedEnd, from + 8 * strideBytes, alignedEnd / 192 * (point + 1) / 16 * 192)
+                                var offset = from
+                                val probe = IsoReadSession(pcrProbe = true)
+                                while (offset < limit) {
+                                    val end = minOf(offset + length, alignedEnd) - 1
+                                    val bytes = readStandalone(url, offset, end, probe, cancelWithPlayback = false)
+                                    if (index.sample(bytes, 192, offset / 192 * 188) != null) break
+                                    offset += strideBytes
+                                }
                             } catch (e: java.io.IOException) { appendDebugLog("BDAV_PCR_PROBE", isoFailureDetails(e)) }
                         }
                     }.forEach { it.get() }
@@ -390,6 +402,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun stopArchivePlayback(url: String, promise: Promise) {
         ArchiveProxyStreams.stop(url)
+        ArchiveProxyStreams.streamId(url)?.let { id -> DvdProxy.stop(id) }
         promise.resolve(true)
     }
 
@@ -533,12 +546,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         urlStr: String,
         bodyBytes: ByteArray,
         contentType: String,
-        shieldToken: String
+        shieldToken: String,
+        session: IsoReadSession? = null
     ): String {
+        session?.checkActive()
         val url = URL(urlStr)
         val conn = (url.openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
-            connectTimeout = 12000
-            readTimeout = 15000
+            connectTimeout = if (session != null) 10000 else 12000
+            readTimeout = if (session != null) 10000 else 15000
             requestMethod = "POST"
             doInput = true
             doOutput = true
@@ -556,6 +571,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
 
         try {
+            session?.track(conn)
+            session?.checkActive()
             conn.outputStream.use { os ->
                 os.write(bodyBytes)
                 os.flush()
@@ -570,15 +587,16 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             }
 
             val code = conn.responseCode
+            if (session != null && (code == 429 || code >= 500)) throw java.io.IOException("Directory HTTP $code")
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             if (stream == null) return ""
             return BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
         } finally {
-            conn.disconnect()
+            if (session == null) conn.disconnect() else session.disconnect(conn)
         }
     }
 
-    private fun performNativeLogin(baseUrl: String, seed: Int, shieldToken: String) {
+    private fun performNativeLogin(baseUrl: String, seed: Int, shieldToken: String, session: IsoReadSession? = null) {
         val user = nSync(2, seed)
         val pass = nSync(3, seed)
         if (user.isEmpty() || pass.isEmpty()) throw SecurityException("Sync check failed")
@@ -588,13 +606,22 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             "$baseUrl/login",
             formBody.toByteArray(Charsets.UTF_8),
             "application/x-www-form-urlencoded",
-            shieldToken
+            shieldToken, session
         )
         nativeSessionLoggedIn = true
     }
 
+    private val directoryReads = ConcurrentHashMap<String, IsoReadSession>()
+
     @ReactMethod
-    fun securePostDirectory(path: String, pageIndex: Int, promise: Promise) {
+    fun cancelDirectoryRequest(id: String) {
+        directoryReads.remove(id)?.let { session -> ioExecutor.execute { session.cancel("directory timeout") } }
+    }
+
+    @ReactMethod
+    fun securePostDirectory(path: String, pageIndex: Int, id: String, promise: Promise) {
+        val session = IsoReadSession()
+        directoryReads[id] = session
         ioExecutor.submit {
             try {
                 val seed = verifyCertificateAndEnv()
@@ -612,7 +639,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 cachedShieldToken = shieldToken
 
                 if (!nativeSessionLoggedIn) {
-                    performNativeLogin(baseUrl, seed, shieldToken)
+                    performNativeLogin(baseUrl, seed, shieldToken, session)
                 }
 
                 val jsonPayload = "{\"page_index\":$pageIndex}".toByteArray(Charsets.UTF_8)
@@ -620,16 +647,16 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     "$baseUrl$path",
                     jsonPayload,
                     "application/json",
-                    shieldToken
+                    shieldToken, session
                 )
 
                 if (!responseText.contains("\"files\"")) {
-                    performNativeLogin(baseUrl, seed, shieldToken)
+                    performNativeLogin(baseUrl, seed, shieldToken, session)
                     responseText = executePinnedPost(
                         "$baseUrl$path",
                         jsonPayload,
                         "application/json",
-                        shieldToken
+                        shieldToken, session
                     )
                 }
 
@@ -651,12 +678,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             "$baseUrl$path",
                             nextPayloadObj.toString().toByteArray(Charsets.UTF_8),
                             "application/json",
-                            shieldToken
+                            shieldToken, session
                         )
-                        if (!nextRespText.contains("\"files\"")) break
+                        if (!nextRespText.contains("\"files\"")) throw java.io.IOException("Invalid directory page")
                         val nextRoot = JSONObject(nextRespText)
                         val nextData = nextRoot.optJSONObject("data")
-                        val nextFiles = nextData?.optJSONArray("files") ?: break
+                        val nextFiles = nextData?.optJSONArray("files") ?: throw java.io.IOException("Invalid directory listing")
                         if (nextFiles.length() == 0) break
                         for (i in 0 until nextFiles.length()) {
                             filesArr.put(nextFiles.get(i))
@@ -668,12 +695,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                     promise.resolve(rootObj.toString())
                     return@submit
-                } catch (_: Throwable) {}
+                } catch (_: org.json.JSONException) { throw java.io.IOException("Invalid directory response") }
 
-                promise.resolve(responseText)
             } catch (e: Exception) {
                 promise.reject("E_NET", e.message ?: "Network error")
-            }
+            } finally { directoryReads.remove(id, session) }
         }
     }
 
@@ -1153,11 +1179,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 fun upstream(from: Long, to: Long, owner: IsoReadSession): ByteArray =
                     if (entry.standalone) readStandalone(entry.archiveUrl, from, to, owner)
                     else fetchIsoByteRange(entry.archiveUrl, from, to, owner)
-                var seekSuffix = -1L
                 fun fetch(start: Long, end: Long): ByteArray {
                     val extent = if (entry.sourceSize > 0) 0L to entry.sourceSize else entry.segments!!.first { (offset, length) -> offset >= 0 && start >= offset && end < offset + length }
                     return isoChunkCache.read(start, end, extent.first, extent.first + extent.second - 1, session,
-                        borrowFullBlock = true, suffixStart = seekSuffix, fetch = ::upstream)
+                        borrowFullBlock = true, fetch = ::upstream)
                 }
                 fun rawTs(start: Long, length: Int) = file.read(start, length, ::fetch) { _, _ -> }
                 val program by lazy {
@@ -1182,11 +1207,14 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         dvdChunks[key] ?: run {
                             val segment = entry.dvdPlaylist[dvdIndex]
                             val estimate = entry.standalone || entry.dvdSegments.isEmpty()
-                            val start = if (estimate) DvdProxy.navBoundary(file, segment.start, ::fetch) else segment.start
-                            val end = if (estimate) DvdProxy.navBoundary(file, segment.end, ::fetch) else segment.end
+                            val start = if (estimate) DvdProxy.navBoundary(file, segment.start, ::fetch) ?: segment.start else segment.start
+                            val nextVobu = if (estimate) DvdProxy.navBoundary(file, segment.end, ::fetch) else segment.end
+                            val end = nextVobu ?: segment.end
                             val data = file.readRaw(start, Math.toIntExact(end - start), ::fetch)
                             try {
-                                DvdProxy.transcode(data, checkNotNull(entry.resolvedInfo), checkNotNull(entry.dvdEncoder), session, dvdIndex) {
+                                DvdProxy.transcode(data, checkNotNull(entry.resolvedInfo), checkNotNull(entry.dvdEncoder),
+                                    session, entry.id, dvdIndex, nextVobu != null,
+                                    dvdIndex == entry.dvdPlaylist.lastIndex) {
                                     entry.dvdSequenceHeader ?: DvdProxy.sequenceHeader(
                                         file.readRaw(0, minOf(file.size, 512L * 1024).toInt(), ::fetch)
                                     )?.also { entry.dvdSequenceHeader = it }
@@ -1226,14 +1254,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         if (!direct) return@serve readTs(start, length)
                         val target = start / 188 * 192
                         val block = IsoChunkCache.BLOCK_BYTES.toLong()
-                        if (first) {
-                            // PMT rewriting may need 64 preceding packets, including across a block boundary.
-                            seekSuffix = if (externalTs) maxOf(0L, target - 64 * 192) else target
-                        }
                         if (first && entry.directCursor.begin(session.id, start)) {
                             val ranges = entry.directCursor.seekBlocks(target, entry.sourceSize, throttled)
                             appendDebugLog("M2TS_SEEK_PREFETCH", "targetByte=$start blocks=${ranges.map { it.first / block }}")
-                            isoChunkCache.prefetch(ranges, entry.sourceSize, session, priority = true, suffixStart = seekSuffix, fetch = ::upstream)
+                            isoChunkCache.prefetch(ranges, entry.sourceSize, session, priority = true, fetch = ::upstream)
                             warmAt = ranges.maxOf { it.last } + 1 - block
                         }
                         first = false
@@ -1749,7 +1773,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 } else null
                 val dvdSegments = o.optJSONArray("dvdSegments")?.let { array ->
                     (0 until array.length()).map { array.getJSONArray(it).let { row ->
-                        DvdProxy.Segment(row.getLong(0), row.getLong(1), row.getLong(2))
+                        DvdProxy.Segment(row.getLong(0), row.getLong(1), row.getLong(2), row.optBoolean(3, true))
                     } }
                 }.orEmpty()
                 val entry = ArchiveEntryTarget(
@@ -1822,7 +1846,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                     t.bluRay?.let { put("bluRay", it.toJson()) }
                     if (t.dvdSegments.isNotEmpty()) put("dvdSegments", JSONArray().apply {
-                        t.dvdSegments.forEach { put(JSONArray().put(it.start).put(it.end).put(it.durationUs)) }
+                        t.dvdSegments.forEach { put(JSONArray().put(it.start).put(it.end).put(it.durationUs).put(it.discontinuity)) }
                     })
                     if (t.isBdavM2ts) {
                         put("isBdavM2ts", true)

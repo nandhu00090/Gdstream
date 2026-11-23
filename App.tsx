@@ -6,7 +6,7 @@ import {
   StatusBar, RefreshControl, AppState,
 } from 'react-native';
 import Video from 'react-native-video';
-import axios from 'axios';
+import { catalogRequest, catalogJson, inCatalogSlot } from './catalogRequests';
 import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -28,6 +28,10 @@ const readStoragePairs = async (keys: string[]) => {
   return keys.map(key => [key, values[key]] as const);
 };
 
+const standaloneProbeCandidate = (file: any) => !file.isZipEntry && (!/\.(mkv|mp4|avi|mov|webm|m4v|iso)$/i.test(file.name) || /mp2t/i.test(file.mimeType || ''));
+
+let directoryAttempt = 0;
+
 interface ParsedMediaInfo {
   rawName: string;
   cleanTitle: string;
@@ -48,6 +52,7 @@ interface ParsedMediaInfo {
 interface MediaMetadata {
   title?: string;
   tmdbId?: number;
+  originalLanguage?: string;
   poster?: string;
   backdrop?: string;
   rating?: string;
@@ -467,6 +472,7 @@ const App = () => {
   const [securityCompromised, setSecurityCompromised] = useState(false);
 
   // Separate Home Catalog vs Series/Subfolder Files so Home FlatList never unmounts or loses scroll position!
+  const directoryRequest = useRef(0);
   const [homeFiles, setHomeFiles] = useState<any[]>([]);
   const [folderFiles, setFolderFiles] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -624,7 +630,7 @@ const App = () => {
         const tmdbKey = vaultRef.current?.tmdbKey || '';
         if (tmdbKey && !IS_TV) {
           const sUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(searchName)}`;
-          const sData = await fetch(sUrl).then(r => r.json());
+          const sData = await catalogJson(sUrl);
           const sList: any[] = sData?.results || [];
           const first = sList.find((r: any) => String(r?.name || r?.original_name || '').toLowerCase().trim() === searchName.toLowerCase()) || sList[0];
           const voteAvg = Number(first?.vote_average || 0);
@@ -751,14 +757,14 @@ const App = () => {
             const codeStr = `S${String(sNum).padStart(2, '0')}E${String(eNum).padStart(2, '0')}`;
 
             const tvSearchUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(searchTitle)}`;
-            const tvRes = await fetch(tvSearchUrl).then(r => r.json());
+            const tvRes = await catalogJson(tvSearchUrl);
             const tvHit = tvRes?.results?.[0];
             const tvId = tvHit?.id;
 
             if (tvId && !cancelled) {
               try {
                 const epUrl = `https://api.themoviedb.org/3/tv/${tvId}/season/${sNum}/episode/${eNum}?api_key=${encodeURIComponent(tmdbKey)}`;
-                const epData = await fetch(epUrl).then(r => r.json());
+                const epData = await catalogJson(epUrl);
                 if (!cancelled && epData && (epData.vote_average || epData.overview || epData.name)) {
                   setEpisodeTmdbMeta({
                     rating: epData.vote_average > 0 ? Number(epData.vote_average).toFixed(1) : null,
@@ -771,7 +777,7 @@ const App = () => {
 
               try {
                 const tvDetailUrl = `https://api.themoviedb.org/3/tv/${tvId}?api_key=${encodeURIComponent(tmdbKey)}&append_to_response=videos,external_ids&include_video_language=en,ta,ml,hi,te,kn,ja,ko,null`;
-                const tvDetail = await fetch(tvDetailUrl).then(r => r.json());
+                const tvDetail = await catalogJson(tvDetailUrl);
                 const origLang = String(tvDetail?.original_language || tvHit?.original_language || parsed.langCode || '').toLowerCase();
                 imdbId = `${tvId}|tv|${origLang}`;
                 const vids = (tvDetail?.videos?.results || []).filter(
@@ -798,14 +804,14 @@ const App = () => {
             }
           } else {
             const mvSearchUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(searchTitle)}${year ? '&year=' + year : ''}`;
-            const mvRes = await fetch(mvSearchUrl).then(r => r.json());
+            const mvRes = await catalogJson(mvSearchUrl);
             const mvResults: any[] = mvRes?.results || [];
             const mvHit = (parsed.langCode ? mvResults.find(r => r.original_language === parsed.langCode) : null) || mvResults[0];
             const movieId = mvHit?.id;
             if (movieId && !cancelled) {
               try {
                 const mvDetailUrl = `https://api.themoviedb.org/3/movie/${movieId}?api_key=${encodeURIComponent(tmdbKey)}&append_to_response=videos,external_ids&include_video_language=en,ta,ml,hi,te,kn,ja,ko,null`;
-                const mvDetail = await fetch(mvDetailUrl).then(r => r.json());
+                const mvDetail = await catalogJson(mvDetailUrl);
                 const origLang = String(mvDetail?.original_language || mvHit?.original_language || parsed.langCode || '').toLowerCase();
                 imdbId = `${movieId}|movie|${origLang}`;
                 const vids = (mvDetail?.videos?.results || []).filter(
@@ -908,8 +914,8 @@ const App = () => {
     if (!isIso && zipRawJsonCacheRef.current[key]) {
       return zipRawJsonCacheRef.current[key];
     }
-    const request: Promise<string> = SecurityVault.listZipMediaEntries(url, sizeHint);
-    const rawJson = await (isIso ? withArchiveTimeout(request) : request);
+    const scan = (): Promise<string> => SecurityVault.listZipMediaEntries(url, sizeHint);
+    const rawJson = isIso ? await withArchiveTimeout(scan()) : await inCatalogSlot(scan);
     if (typeof rawJson === 'string' && rawJson.startsWith('[') && rawJson.length > 2) {
       zipRawJsonCacheRef.current[key] = rawJson;
     }
@@ -956,26 +962,6 @@ const App = () => {
     return `${baseUrl}${currentPath}${encodeURIComponent(file.name)}`;
   }, [downloads, currentPath]);
 
-  const standaloneSources = useRef(new Map<string, Promise<string>>());
-  const resolvePlaybackUrl = useCallback(async (file: any) => {
-    const url = getStreamUrl(file);
-    if (file?.isZipEntry || !/^(https?|file):/i.test(url) || !SecurityVault?.resolveStandaloneDisc) return url;
-    const name = String(file?.name || '');
-    // Opaque download endpoints sometimes have no extension in either the path or title.
-    const namedDisc = /\.(m2ts|vob)(?:$|[?#&])/i.test(url) || /\.(m2ts|vob)$/i.test(name);
-    if (!namedDisc && !/mp2t/i.test(file?.mimeType || '') && /\.(mkv|mp4|avi|mov|webm|m4v|iso)$/i.test(name)) return url;
-    const key = JSON.stringify([url, file?.size, name]);
-    let pending = standaloneSources.current.get(key);
-    if (!pending) {
-      pending = SecurityVault.resolveStandaloneDisc(url, name, Number(file?.size || 0)) as Promise<string>;
-      standaloneSources.current.set(key, pending);
-      pending.catch(() => standaloneSources.current.delete(key));
-    }
-    try { return await pending; } catch (error) {
-      if (namedDisc) throw error;
-      return url;
-    }
-  }, [getStreamUrl]);
   const [preparedUrl, setPreparedUrl] = useState('');
   const playbackIdentity = playMode === 'internal'
     ? `${selectedFile?.id || selectedFile?.name || ''}:${playerInstanceKey}` : null;
@@ -1192,7 +1178,6 @@ const App = () => {
 
     const initVaultAndFetch = async () => {
       try {
-        await restoreAllSavedWatchHistory();
         if (SecurityVault?.getVaultConfig) {
           const cfg = await SecurityVault.getVaultConfig();
           if (cfg?.s || cfg?.compromised) { setSecurityCompromised(true); setLoading(false); return; }
@@ -1209,6 +1194,7 @@ const App = () => {
     };
     initVaultAndFetch();
     return () => {
+      directoryRequest.current++;
       dlSub.remove();
       appStateSub.remove();
     };
@@ -1247,7 +1233,7 @@ const App = () => {
     try {
       const timeKeys = items.map(f => `time_${f.name}`);
       const durKeys = items.map(f => `dur_${f.name}`);
-      const miKeys = items.map(f => `mediainfo_v8_${f.name}`);
+      const miKeys = items.filter(f => !standaloneProbeCandidate(f)).map(f => `mediainfo_v8_${f.name}`);
       const [timePairs, durPairs, miPairs] = await Promise.all([
         readStoragePairs(timeKeys),
         readStoragePairs(durKeys),
@@ -1357,11 +1343,14 @@ const App = () => {
     return () => backHandler.remove();
   }, [playMode, selectedFile, pathStack, activeMenu, showHdrChoiceModal, showSeasonModal, isLocked, activeTab, closeInternalPlayer]);
 
-  const fetchSingleMetadata = useCallback(async (info: ParsedMediaInfo): Promise<MediaMetadata | null> => {
-    const cacheKey = `meta_v8_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
+  const fetchSingleMetadata = useCallback(async (info: ParsedMediaInfo, needLanguage = false): Promise<MediaMetadata | null> => {
+    const cacheKey = `meta_${/\.m2ts$/i.test(info.rawName) ? 'v9' : 'v8'}_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
     try {
       const cached = await AsyncStorage.getItem(cacheKey);
-      if (cached) return JSON.parse(cached);
+      if (cached) {
+        const previous = JSON.parse(cached);
+        if (!needLanguage || previous.originalLanguage !== undefined) return previous;
+      }
     } catch {}
 
     const targetLower = info.searchTitle.toLowerCase().trim();
@@ -1374,8 +1363,8 @@ const App = () => {
         const isTvQuery = Boolean(info.seasonEpisode || info.seasonNum > 0 || info.isFolder);
         const endpoint = isTvQuery ? 'tv' : 'multi';
         const multiUrl = `https://api.themoviedb.org/3/search/${endpoint}?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}`;
-        const res = await axios.get(multiUrl, { timeout: 6000 });
-        const results: any[] = (res.data?.results || []).filter((r: any) => r.media_type !== 'person' && r.poster_path);
+        const res = await catalogJson(multiUrl);
+        const results: any[] = (res?.results || []).filter((r: any) => r.media_type !== 'person' && r.poster_path);
         const normTitle = (r: any) => String(r.title || r.name || r.original_title || r.original_name || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
         const cleanTarget = targetLower.replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
 
@@ -1392,8 +1381,8 @@ const App = () => {
 
         if (!match && infoYearNum > 0 && !info.seasonEpisode) {
           const yearUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}&primary_release_year=${info.year}`;
-          const yearRes = await axios.get(yearUrl, { timeout: 6000 });
-          const yearList: any[] = (yearRes.data?.results || []).filter((r: any) => r.poster_path);
+          const yearRes = await catalogJson(yearUrl);
+          const yearList: any[] = (yearRes?.results || []).filter((r: any) => r.poster_path);
           if (yearList.length > 0) {
             match =
               (info.langCode ? yearList.find((r: any) => r.original_language === info.langCode) : null) ||
@@ -1413,6 +1402,7 @@ const App = () => {
           const meta: MediaMetadata = {
             title: match.title || match.name,
             tmdbId: match.id,
+            originalLanguage: match.original_language,
             poster: match.poster_path ? `https://image.tmdb.org/t/p/w342${match.poster_path}` : undefined,
             backdrop: match.backdrop_path ? `https://image.tmdb.org/t/p/w780${match.backdrop_path}` : undefined,
             rating: match.vote_average && match.vote_average > 0 ? Number(match.vote_average).toFixed(1) : undefined,
@@ -1427,13 +1417,14 @@ const App = () => {
       } catch {}
     }
 
+    if (needLanguage) return null;
     try {
       const query = `${info.searchTitle} ${info.year}`.trim();
       const cleanQ = query.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
       const firstChar = cleanQ.charAt(0) || 'a';
       const imdbUrl = `https://v3.sg.media-imdb.com/suggestion/${firstChar}/${encodeURIComponent(cleanQ.slice(0, 35))}.json`;
-      const res = await axios.get(imdbUrl, { timeout: 6000 });
-      const list: any[] = res.data?.d || [];
+      const res = await catalogJson(imdbUrl);
+      const list: any[] = res?.d || [];
       const validItems = list.filter((item: any) => item?.id && String(item.id).startsWith('tt') && item?.i?.imageUrl);
       const match =
         validItems.find((item: any) => infoYearNum > 0 && item.y && Math.abs(Number(item.y) - infoYearNum) <= 1) ||
@@ -1455,6 +1446,29 @@ const App = () => {
     return null;
   }, []);
 
+  const standaloneSources = useRef(new Map<string, Promise<string>>());
+  const resolvePlaybackUrl = useCallback(async (file: any) => {
+    const url = getStreamUrl(file);
+    if (file?.isZipEntry || !/^(https?|file):/i.test(url) || !SecurityVault?.resolveStandaloneDisc) return url;
+    const name = String(file?.name || '');
+    // Opaque download endpoints sometimes have no extension in either the path or title.
+    const namedDisc = /\.(m2ts|vob)(?:$|[?#&])/i.test(url) || /\.(m2ts|vob)$/i.test(name);
+    if (!namedDisc && !/mp2t/i.test(file?.mimeType || '') && /\.(mkv|mp4|avi|mov|webm|m4v|iso)$/i.test(name)) return url;
+    const meta = file?.metadata ?? metadataMap[name];
+    const originalLanguage = meta?.originalLanguage ?? (name.toLowerCase().endsWith('.m2ts') || /mp2t/i.test(file?.mimeType || '')
+      ? (await fetchSingleMetadata(parseMediaFilename(name), true))?.originalLanguage : '') ?? '';
+    const key = JSON.stringify([url, file?.size, name, originalLanguage]);
+    let pending = standaloneSources.current.get(key);
+    if (!pending) {
+      pending = SecurityVault.resolveStandaloneDisc(url, name, Number(file?.size || 0), originalLanguage) as Promise<string>;
+      standaloneSources.current.set(key, pending);
+      pending.catch(() => standaloneSources.current.delete(key));
+    }
+    try { return await pending; } catch (error) {
+      if (namedDisc) throw error;
+      return url;
+    }
+  }, [getStreamUrl, metadataMap, fetchSingleMetadata]);
   useEffect(() => {
     if (!activeRawFiles.length || !vaultReady || selectedFile || playMode !== null) return;
     let cancelled = false;
@@ -1476,7 +1490,7 @@ const App = () => {
         if (fetchedKeysRef.current.has(itemKey)) continue;
         const isFolder = isSeriesContainerItem(item);
         const info = parseMediaFilename(itemKey, isFolder);
-        const cacheKey = `meta_v8_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
+        const cacheKey = `meta_${/\.m2ts$/i.test(info.rawName) ? 'v9' : 'v8'}_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
         pendingItems.push({ itemKey, info, cacheKey });
       }
 
@@ -1528,7 +1542,7 @@ const App = () => {
       };
 
       let cursor = 0;
-      const CONCURRENCY = 6;
+      const CONCURRENCY = 3;
       const runWorker = async () => {
         while (!cancelled && cursor < uncachedQueue.length) {
           if (selectedFileRef.current) break;
@@ -1582,7 +1596,7 @@ const App = () => {
       try {
         const primaryShow = epEntries[0].showTitle;
         const tvSearchUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(primaryShow)}`;
-        const tvRes = await fetch(tvSearchUrl).then(r => r.json());
+        const tvRes = await catalogJson(tvSearchUrl);
         const tvId = tvRes?.results?.[0]?.id;
         if (!tvId || cancelled) return;
 
@@ -1593,7 +1607,7 @@ const App = () => {
           if (cancelled) break;
           try {
             const sUrl = `https://api.themoviedb.org/3/tv/${tvId}/season/${sNum}?api_key=${encodeURIComponent(tmdbKey)}`;
-            const sData = await fetch(sUrl).then(r => r.json());
+            const sData = await catalogJson(sUrl);
             const eps: any[] = Array.isArray(sData?.episodes) ? sData.episodes : [];
             for (const ep of eps) {
               const epNo = Number(ep?.episode_number || 0);
@@ -1759,6 +1773,7 @@ const App = () => {
   };
 
   const openZipArchiveFile = async (zipItem: any, basePathOverride?: string) => {
+    directoryRequest.current++;
     const requestId = ++archiveOpenRequestRef.current;
     lastFolderCardIdRef.current = 'fcard_0';
     const effectiveBasePath = basePathOverride || (currentPath.startsWith('/0:/') ? currentPath : '/0:/');
@@ -1873,6 +1888,13 @@ const App = () => {
 
 
   useEffect(() => {
+    if (playMode === null && selectedFile && !selectedFile.isZipEntry &&
+        (/\.m2ts$/i.test(selectedFile.name) || /mp2t/i.test(selectedFile.mimeType || ''))) {
+      void resolvePlaybackUrl(selectedFile).catch(() => {});
+    }
+  }, [selectedFile, playMode, resolvePlaybackUrl]);
+
+  useEffect(() => {
     if (!selectedFile || selectedFile.isoPending || playMode !== null) return;
     const targets = versionGroup.length > 1 ? versionGroup : [selectedFile];
     let cancelled = false;
@@ -1892,8 +1914,8 @@ const App = () => {
           }
           continue;
         }
-        const discProbe = !fileObj.isZipEntry && (!/\.(mkv|mp4|avi|mov|webm|m4v|iso)$/i.test(fName) || /mp2t/i.test(fileObj.mimeType || ''));
-        const cacheKey = discProbe ? `mediainfo_v9_${getStreamUrl(fileObj)}_${fileObj.size || 0}` : `mediainfo_v8_${fName}`;
+        const discProbe = standaloneProbeCandidate(fileObj);
+        const cacheKey = discProbe ? `mediainfo_v10_${getStreamUrl(fileObj)}_${fileObj.size || 0}` : `mediainfo_v8_${fName}`;
         try {
           const cached = await AsyncStorage.getItem(cacheKey);
           if (cached) {
@@ -1914,7 +1936,8 @@ const App = () => {
         if (fName === selectedFile.name) setScanningMediaInfo(true);
         try {
           const streamUrl = await resolvePlaybackUrl(fileObj);
-          const res: RealMediaInfo = await MediaInfoModule.inspectMedia(streamUrl, fName);
+          const originalLanguage = discProbe ? fileObj.metadata?.originalLanguage ?? metadataMap[fName]?.originalLanguage ?? '' : '';
+          const res: RealMediaInfo = await MediaInfoModule.inspectMedia(streamUrl, fName, originalLanguage);
           if (res && !cancelled && (res.width > 0 || res.audioTracks?.length > 0 || (discProbe && res.durationSec > 0 && !!res.videoCodec))) {
             setMediaInfoMap(prev => ({ ...prev, [fName]: res }));
             if (res.durationSec > 0) {
@@ -1933,7 +1956,7 @@ const App = () => {
     };
     const miTimer = setTimeout(runMultiMediaInfo, 350);
     return () => { cancelled = true; clearTimeout(miTimer); };
-  }, [selectedFile, versionGroup, playMode, mediaInfoMap, getStreamUrl, resolvePlaybackUrl]);
+  }, [selectedFile, versionGroup, playMode, mediaInfoMap, metadataMap, getStreamUrl, resolvePlaybackUrl]);
 
   const seekBothPlayers = useCallback((targetTime: number) => {
     videoRef.current?.seek(targetTime);
@@ -2334,30 +2357,62 @@ const App = () => {
     return () => sub.remove();
   }, [playMode, showControls, activeMenu, triggerStepSeek]);
 
-  const requestRawDirectory = async (path: string) => {
-    if (SecurityVault?.securePostDirectory) {
-      const rawJson = await SecurityVault.securePostDirectory(path, 0);
-      if (rawJson) {
-        const parsed = JSON.parse(rawJson);
-        return parsed?.data?.files || [];
-      }
-      return [];
+  const directoryKey = (path: string) =>
+    JSON.stringify(['directory_v1', vaultRef.current.baseUrl, vaultRef.current.username, path]);
+
+  const requestRawDirectory = (path: string) => catalogRequest<any[]>(directoryKey(path), async signal => {
+    const id = String(++directoryAttempt);
+    const abort = () => SecurityVault.cancelDirectoryRequest(id);
+    signal.addEventListener('abort', abort);
+    try {
+      const raw = await SecurityVault.securePostDirectory(path, 0, id);
+      const files = JSON.parse(raw)?.data?.files;
+      if (!Array.isArray(files)) throw new Error('Invalid folder listing');
+      return files;
+    } finally {
+      signal.removeEventListener('abort', abort);
     }
-    return [];
-  };
+  });
 
   const fetchDirectory = async (path: string, isPullRefresh = false, isSeasonSwitch = false) => {
     const { baseUrl } = vaultRef.current;
     if (!baseUrl) { setLoading(false); setFolderLoading(false); return; }
     const isRoot = path === '/0:/';
+    const generation = ++directoryRequest.current;
+    const current = () => generation === directoryRequest.current;
+    const key = directoryKey(path);
+    let showingCache = false;
+    const remember = (files: any[], displayPath = path, seasons: SeasonFolderItem[] = [],
+      season: SeasonFolderItem | null = null, title = '') => {
+      void AsyncStorage.setItem(key, JSON.stringify({ files, displayPath, seasons, season, title })).catch(() => {});
+    };
 
     if (isPullRefresh) setRefreshing(true);
     else if (isRoot) setLoading(true);
     else setFolderLoading(true);
 
     try {
-      await restoreAllSavedWatchHistory();
+      try {
+        const raw = await AsyncStorage.getItem(key);
+        if (!current()) return;
+        const cache = raw && JSON.parse(raw);
+        if (Array.isArray(cache?.files)) {
+          if (isRoot) setHomeFiles(cache.files);
+          else setFolderFiles(cache.files);
+          if (!isSeasonSwitch) {
+            setSeasonFolders(cache.seasons);
+            setActiveSeason(cache.season);
+            setSeriesParentTitle(cache.title);
+          }
+          setCurrentPath(cache.displayPath);
+          setLoading(false);
+          setFolderLoading(false);
+          showingCache = true;
+        }
+      } catch {}
+      if (!current()) return;
       const incomingFiles = await requestRawDirectory(path);
+      if (!current()) return;
 
       if (!isSeasonSwitch && !isRoot) {
         const subFolders = incomingFiles.filter((f: any) => f.mimeType?.includes('folder'));
@@ -2385,11 +2440,13 @@ const App = () => {
           const rawFolderTitle = decodeURIComponent(path.split('/').filter(Boolean).pop() || '');
           const cleanSeriesName = parseMediaFilename(rawFolderTitle, true).cleanTitle;
 
+          const seasonEpisodes = await requestRawDirectory(targetSeason.path);
+          if (!current()) return;
+          remember(seasonEpisodes, targetSeason.path, detectedSeasons, targetSeason, cleanSeriesName);
           setSeriesParentTitle(cleanSeriesName);
           setSeasonFolders(detectedSeasons);
           setActiveSeason(targetSeason);
 
-          const seasonEpisodes = await requestRawDirectory(targetSeason.path);
           setFolderFiles(seasonEpisodes);
           setCurrentPath(targetSeason.path);
           if (!isPullRefresh) setSearchQuery('');
@@ -2414,9 +2471,11 @@ const App = () => {
             const archUrl = archiveSourceUrl(archItem.name, baseUrl, path, listedUrl);
             const namedArchiveUrl = `${archUrl.split('#')[0]}#name=${encodeURIComponent(archItem.name)}`;
             const rawJson = await fetchZipRawJsonFast(namedArchiveUrl, Number(archItem.size || 0));
+            if (!current()) return;
             const entries = rawJson ? JSON.parse(rawJson) : [];
             if (Array.isArray(entries) && entries.length > 0) {
               const rawFolderTitle = decodeURIComponent(path.split('/').filter(Boolean).pop() || '');
+              remember(incomingFiles); // Archive proxy URLs are scoped to the running process.
               setSeriesParentTitle(parseMediaFilename(rawFolderTitle, true).cleanTitle);
               setFolderFiles(entries);
               setCurrentPath(path);
@@ -2425,16 +2484,20 @@ const App = () => {
             }
           } catch (_archErr) {}
         }
+        if (!current()) return;
         setFolderFiles(incomingFiles);
       }
+      remember(incomingFiles);
       setCurrentPath(path);
       if (!isPullRefresh) setSearchQuery('');
     } catch (error) {
-      Alert.alert('Error', `Folder load aagala! (${(error as any)?.message || 'Network'})`);
+      if (current() && !showingCache) Alert.alert('Error', `Folder load aagala! (${(error as any)?.message || 'Network'})`);
     } finally {
-      setLoading(false);
-      setFolderLoading(false);
-      setRefreshing(false);
+      if (current()) {
+        setLoading(false);
+        setFolderLoading(false);
+        setRefreshing(false);
+      }
     }
   };
 
@@ -2593,6 +2656,9 @@ const App = () => {
 
   // Instant Back from Series to Homepage: Home FlatList stays mounted at exact scroll position!
   const goBack = () => {
+    directoryRequest.current++;
+    setRefreshing(false);
+    setFolderLoading(false);
     archiveOpenRequestRef.current++;
     if (zipParentBackupRef.current) {
       const prev = zipParentBackupRef.current;
@@ -2809,7 +2875,7 @@ const App = () => {
         setSelectedAudio({ type: 'index', value: String(selectedIdx >= 0 ? selectedIdx : 0) });
       }
     }
-    if (meta.textTracks) setTextTracks(meta.textTracks);
+    setTextTracks(Array.isArray(meta.textTracks) ? meta.textTracks : []);
     if (hasRestoredResumeRef.current) return;
     hasRestoredResumeRef.current = true;
     try {
@@ -3156,6 +3222,9 @@ const App = () => {
             )}
             {tracks.map((track, index) => {
               const indexStr = String(index);
+              const title = track.language?.trim().toUpperCase() || `Track ${index + 1}`;
+              const detail = track.title?.trim() || 'Default';
+              const label = title.toLowerCase() === detail.toLowerCase() ? title : `${title} • ${detail}`;
               const isSelected = isAudio
                 ? (selectedAudio?.type === 'index' ? String(selectedAudio.value) === indexStr : !selectedAudio && !!track.selected)
                 : selectedText?.type === 'index' && String(selectedText?.value) === indexStr;
@@ -3171,7 +3240,7 @@ const App = () => {
                   <Icon name="check" size={20} color="#E50914" style={{ opacity: isSelected ? 1 : 0 }} />
                   <Text style={styles.menuItemText} numberOfLines={1}>
                     {track.title && /\.m2ts(?:$|[?#])/i.test(playbackSource.uri) ? track.title :
-                      `${track.language ? track.language.toUpperCase() : `Track ${index + 1}`} • ${track.title || 'Default'}`}
+                      label}
                   </Text>
                 </FocusableButton>
               );
@@ -3224,7 +3293,7 @@ const App = () => {
           }}
           onTextTracks={(data: any) => {
             const list = Array.isArray(data) ? data : data?.textTracks;
-            if (list && list.length) setTextTracks(list);
+            if (Array.isArray(list)) setTextTracks(list);
           }}
           onProgress={(p: any) => {
             if (p.currentTime !== currentTimeRef.current) isoProgressAtRef.current = Date.now();
