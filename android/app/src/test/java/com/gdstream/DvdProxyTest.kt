@@ -4,6 +4,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DvdProxyTest {
+    @Test fun playlistRemainsContinuousInsideACellAndOmitsSubtitleRenditions() {
+        val playlist = String(DvdProxy.playlist(listOf(DvdProxy.Segment(0, 2048, 4000000),
+            DvdProxy.Segment(2048, 4096, 4000000), DvdProxy.Segment(4096, 6144, 4000000, true))))
+        assertTrue(playlist.contains("#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n"))
+        assertEquals(1, playlist.lines().count { it == "#EXT-X-DISCONTINUITY" })
+        assertFalse(playlist.contains("SUBTITLES"))
+    }
+
     @Test fun audioAndCodecConfigurationAloneCannotProduceASegment() {
         val mux = DvdTsMux()
         mux.audio(0, ByteArray(100))

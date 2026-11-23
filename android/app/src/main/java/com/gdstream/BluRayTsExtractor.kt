@@ -41,15 +41,17 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
     private val pidReaders = ArrayList<BluRayPidReader>()
     private val audioTracks = profile?.audio.orEmpty().associateByTo(linkedMapOf()) { it.pid }
     private val streams = profile?.streams.orEmpty().associateByTo(linkedMapOf()) { it.pid }
-    private val filenameLanguage = inferLanguageCodeFromName(profile?.discLabel.orEmpty())
+    private val primaryLanguage = profile?.primaryLanguageHint.orEmpty().ifBlank {
+        inferLanguageCodeFromName(profile?.discLabel.orEmpty())
+    }
     private val fallback = DefaultTsPayloadReaderFactory(DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)
     private val payloads = object : TsPayloadReader.Factory {
         override fun createInitialPayloadReaders() = fallback.createInitialPayloadReaders()
         override fun createPayloadReader(streamType: Int, esInfo: TsPayloadReader.EsInfo): TsPayloadReader =
             BluRayPidReader(profile?.audio.orEmpty(), streamType, dv != null) { pid, resolved ->
                 val stream = streams[pid] ?: BluRayStream(pid, resolved)
-                val lang = sequenceOf(audioTracks[pid]?.language, stream.language, esInfo.language,
-                    filenameLanguage.takeIf { stream.audio && (audioTracks.keys.firstOrNull() ?: pid) == pid })
+                val lang = sequenceOf(esInfo.language, audioTracks[pid]?.language, stream.language,
+                    primaryLanguage.takeIf { stream.audio && (audioTracks.keys.firstOrNull() ?: pid) == pid })
                     .firstOrNull { !it.isNullOrBlank() && it != "und" }
                 streams[pid] = stream.copy(language = lang.orEmpty())
                 if (stream.audio) audioTracks[pid] = BluRayAudio(pid, resolved, lang.orEmpty())

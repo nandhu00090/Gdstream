@@ -73,7 +73,7 @@ internal class RangeConnections(
                     limited = true
                     IsoHostPolicy.remember(rawUrl)
                 }
-                session?.track(conn, if (limited) IsoHostPolicy.slots else null)
+                session?.let { it.track(conn, if (limited && !it.pcrProbe) IsoHostPolicy.slots else null) }
                 session?.checkActive()
                 session?.log("ISO_UPSTREAM_REQUEST", "range=$range url=${safeStreamUrl(current.toString())} redirect=$redirect")
                 conn.connectTimeout = connectTimeout
@@ -195,7 +195,7 @@ internal object IsoRangeReader {
         end: Long,
         open: (Long, Long) -> HttpURLConnection,
         onFailure: (IsoRangeException) -> Unit = {},
-        pause: (Long) -> Unit = { Thread.sleep(it) },
+        pause: ((Long) -> Unit)? = null,
         session: IsoReadSession = IsoReadSession(),
         cancelWithPlayback: Boolean = true
     ): ByteArray {
@@ -211,7 +211,7 @@ internal object IsoRangeReader {
         end: Long,
         open: (Long, Long) -> HttpURLConnection,
         onFailure: (IsoRangeException) -> Unit = {},
-        pause: (Long) -> Unit = { Thread.sleep(it) },
+        pause: ((Long) -> Unit)? = null,
         session: IsoReadSession = IsoReadSession()
     ): ByteArray {
         require(start >= 0 && end >= start && end - start < Int.MAX_VALUE)
@@ -268,8 +268,9 @@ internal object IsoRangeReader {
             }
             if (retry) {
                 session.checkActive()
-                session.log("ISO_UPSTREAM_RETRY", "physical=$next-$windowEnd backoffMs=${150L * failures}")
-                try { pause(150L * failures) } catch (interrupted: InterruptedException) {
+                val delay = kotlin.random.Random.nextLong(250, 901)
+                session.log("ISO_UPSTREAM_RETRY", "physical=$next-$windowEnd backoffMs=$delay")
+                try { if (pause != null) pause(delay) else session.awaitRetry(delay) } catch (interrupted: InterruptedException) {
                     Thread.currentThread().interrupt()
                     throw InterruptedIOException("ISO retry cancelled").apply { initCause(interrupted) }
                 }
@@ -357,6 +358,9 @@ internal class IsoChunkCache(
     companion object {
         const val BLOCK_BYTES = 8 * 1024 * 1024
         const val METADATA_BLOCK_BYTES = 2 * 1024 * 1024
+        private val orphanTimer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { task ->
+            Thread(task, "ISOIdleRange").apply { isDaemon = true }
+        }
         private val warmWorkers = java.util.concurrent.Executors.newFixedThreadPool(4) { task ->
             Thread(task, "ISOReadAhead").apply { isDaemon = true }
         }
@@ -378,6 +382,7 @@ internal class IsoChunkCache(
         }
         lateinit var task: java.util.concurrent.FutureTask<ByteArray>
         var readers = 0
+        var idleGeneration = 0L
         val warmers = HashMap<IsoReadSession, AutoCloseable>()
         var scheduled = false
         var foreground = false
@@ -393,14 +398,14 @@ internal class IsoChunkCache(
     private var window = emptyList<LongRange>()
 
     fun prefetch(ranges: List<LongRange>, sourceSize: Long, session: IsoReadSession,
-                 priority: Boolean = false, suffixStart: Long = -1, fetch: (Long, Long, IsoReadSession) -> ByteArray): List<java.util.concurrent.Future<ByteArray>> {
+                 priority: Boolean = false, fetch: (Long, Long, IsoReadSession) -> ByteArray): List<java.util.concurrent.Future<ByteArray>> {
         val target = ranges.firstOrNull()?.first ?: return emptyList()
         val desired = LinkedHashSet<Key>()
         for (range in ranges) {
             var start = range.first / BLOCK_BYTES * BLOCK_BYTES
             while (start <= range.last && start < sourceSize) {
                 val full = Key(start, minOf(start + BLOCK_BYTES, sourceSize) - 1)
-                desired.add(synchronized(lock) { seekKey(full, suffixStart) })
+                desired.add(full)
                 start += BLOCK_BYTES
             }
         }
@@ -424,14 +429,6 @@ internal class IsoChunkCache(
                 flight.task
             }
         }
-    }
-
-    private fun seekKey(full: Key, suffixStart: Long): Key {
-        if (suffixStart <= full.start || suffixStart > full.end || full in cached) return full
-        val suffix = Key(suffixStart, full.end)
-        if (suffix in flights || suffix in cached) return suffix
-        // Reuse a prefix that already covers the seek instead of starting a second GET.
-        return if ((flights[full]?.available ?: 0) > suffixStart - full.start) full else suffix
     }
 
     // Called under lock. Keep a progressive download alive between consecutive socket writes.
@@ -476,6 +473,12 @@ internal class IsoChunkCache(
                     }
                     data
                 }) {
+                    override fun setException(error: Throwable) {
+                        // Future.get() may return before done() runs. A retry must see a new flight.
+                        synchronized(lock) { flights.remove(key, created) }
+                        super.setException(error)
+                    }
+
                     override fun done() {
                         synchronized(created.progress) { created.progress.notifyAll() }
                         synchronized(lock) {
@@ -489,16 +492,22 @@ internal class IsoChunkCache(
         }
 
     private fun release(key: Key, flight: Flight, warmer: IsoReadSession?) {
-        val orphan = synchronized(lock) {
+        synchronized(lock) {
             if (warmer == null) flight.readers-- else flight.warmers.remove(warmer)
-            flight.readers == 0 && flight.warmers.isEmpty() && flights.remove(key, flight)
+            if (flight.readers != 0 || flight.warmers.isNotEmpty() || flights[key] !== flight) return
+            val generation = ++flight.idleGeneration
+            orphanTimer.schedule({
+                val orphan = synchronized(lock) {
+                    generation == flight.idleGeneration && flight.readers == 0 &&
+                        flight.warmers.isEmpty() && flights.remove(key, flight)
+                }
+                if (orphan) flight.abort("last proxy client closed")
+            }, 1500, java.util.concurrent.TimeUnit.MILLISECONDS)
         }
-        if (orphan) flight.abort("last proxy client closed")
     }
 
     fun read(start: Long, end: Long, extentStart: Long, extentEnd: Long,
              session: IsoReadSession, blockBytes: Int = BLOCK_BYTES, borrowFullBlock: Boolean = false,
-             suffixStart: Long = -1,
              fetch: (Long, Long, IsoReadSession) -> ByteArray): ByteArray {
         require(start >= extentStart && end >= start && end <= extentEnd && end - start < Int.MAX_VALUE)
         if (borrowFullBlock && (start - extentStart) % blockBytes == 0L &&
@@ -512,7 +521,7 @@ internal class IsoChunkCache(
             session.checkActive()
             val from = extentStart + ((cursor - extentStart) / blockBytes) * blockBytes
             val to = from + minOf(blockBytes.toLong() - 1, extentEnd - from)
-            val key = synchronized(lock) { seekKey(Key(from, to), suffixStart.takeIf { it <= cursor } ?: -1) }
+            val key = Key(from, to)
             val required = (minOf(end, to) - key.start + 1).toInt()
             val data = block(key, required, session, fetch)
             session.checkActive()

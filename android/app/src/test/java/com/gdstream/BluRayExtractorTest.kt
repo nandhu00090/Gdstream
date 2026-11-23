@@ -56,6 +56,7 @@ class BluRayExtractorTest {
         val input = DefaultExtractorInput(stream::read, 0, C.LENGTH_UNSET.toLong())
         while (ts.read(input, PositionHolder()) != Extractor.RESULT_END_OF_INPUT) { }
         assertTrue(capture.formats.any { it.sampleMimeType == "video/avc" && it.width == 32 })
+        assertFalse(capture.formats.any { it.sampleMimeType == "application/cea-608" })
         assertEquals(listOf(0L, 40_000L), capture.samples.take(2).map { it.time })
         ts.release()
     }
@@ -83,7 +84,7 @@ class BluRayExtractorTest {
         frame.forEach { reader.consume(ParsableByteArray(byteArrayOf(it))) }
         assertEquals("audio/raw", capture.formats.single().sampleMimeType)
         assertEquals("ta", capture.formats.single().language)
-        assertEquals("Tamil LPCM • 5.1", capture.formats.single().label)
+        assertEquals("Tamil • LPCM • 5.1", capture.formats.single().label)
         assertEquals(6, capture.formats.single().channelCount)
         assertEquals(C.ENCODING_PCM_16BIT, capture.formats.single().pcmEncoding)
         assertEquals(listOf(Sample(1_000_000, 12)), capture.samples)
@@ -118,7 +119,7 @@ class BluRayExtractorTest {
         assertArrayEquals(combined, capture.data.toByteArray())
         assertEquals("audio/vnd.dts.hd", capture.formats.single().sampleMimeType)
         assertEquals(6, capture.formats.single().channelCount)
-        assertEquals("Tamil DTS-HD MA • 5.1", capture.formats.single().label)
+        assertEquals("Tamil • DTS-HD MA • 5.1", capture.formats.single().label)
         // A core-only HD frame is emitted at EOF, not silently discarded waiting for EXTSS.
         reader.consume(ParsableByteArray(core())); reader.packetFinished(true)
         assertEquals(2, capture.samples.size)

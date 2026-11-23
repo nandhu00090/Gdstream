@@ -96,11 +96,11 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
                 val next = starts[i]
                 val nextTime = (duration.toDouble() * (next - cell.first) / bytes).toLong()
                 if (nextTime - time < 4_000_000 && next - start < 6 * 1024 * 1024) continue
-                result.add(DvdProxy.Segment(virtual + start - cell.first, virtual + next - cell.first, nextTime - time))
+                result.add(DvdProxy.Segment(virtual + start - cell.first, virtual + next - cell.first, nextTime - time, index > 0 && start == cell.first))
                 start = next
                 time = nextTime
             }
-            result.add(DvdProxy.Segment(virtual + start - cell.first, virtual + bytes, duration - time))
+            result.add(DvdProxy.Segment(virtual + start - cell.first, virtual + bytes, duration - time, index > 0 && start == cell.first))
             virtual += bytes
         }
         return result.takeIf { list -> list.all { it.end - it.start in 1..12L * 1024 * 1024 && it.durationUs > 0 } }.orEmpty()

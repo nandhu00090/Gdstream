@@ -993,7 +993,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         return null
     }
 
-    private fun fetchAndParseHeader(urlStr: String, fileNameHint: String = ""): HeaderParseResult {
+    private fun fetchAndParseHeader(urlStr: String, fileNameHint: String, originalLanguage: String): HeaderParseResult {
         val isLocalProxy = urlStr.contains("127.0.0.1") || urlStr.contains("localhost")
         val maxHeaderBytes = if (isLocalProxy) 512 * 1024 else 1024 * 1024 // 1 MB covers EBML Header + Tracks + First Cluster packets
         val tailBytesSize = 64 * 1024    // 64 KB at end of file covers mkvmerge Tags (BPS)
@@ -1015,7 +1015,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             } catch (_: Exception) {}
             val mkvRes = parseMkvHeaderAndClusters(headBuf, tailBuf, len)
             if (mkvRes.tracks.isNotEmpty()) return mkvRes
-            val tsRes = parseMpegTsHeader(headBuf, tailBuf, len, if (fileNameHint.isNotEmpty()) fileNameHint else urlStr)
+            val tsRes = parseMpegTsHeader(headBuf, tailBuf, len, fileNameHint.ifBlank { urlStr }, originalLanguage)
             if (tsRes.tracks.isNotEmpty()) return tsRes
             return mkvRes
         }
@@ -1073,7 +1073,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
 
             val mkvRes = parseMkvHeaderAndClusters(headBytes, tailBytes, totalBytes)
             if (mkvRes.tracks.isNotEmpty()) return mkvRes
-            val tsRes = parseMpegTsHeader(headBytes, tailBytes, totalBytes, if (fileNameHint.isNotEmpty()) fileNameHint else urlStr)
+            val tsRes = parseMpegTsHeader(headBytes, tailBytes, totalBytes, fileNameHint.ifBlank { urlStr }, originalLanguage)
             if (tsRes.tracks.isNotEmpty()) return tsRes
             return mkvRes
         } catch (_: Exception) {
@@ -1084,14 +1084,14 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
-    fun inspectMedia(url: String, fileName: String, promise: Promise) {
+    fun inspectMedia(url: String, fileName: String, originalLanguage: String, promise: Promise) {
         SecurityVaultModule.isoMediaInfo(url)?.let {
             promise.resolve(Arguments.makeNativeMap(it))
             return
         }
         inspectorPool.submit {
             try {
-                val parsed = fetchAndParseHeader(url, fileName)
+                val parsed = fetchAndParseHeader(url, fileName, originalLanguage)
 
                 var width = 0
                 var height = 0
@@ -1204,8 +1204,10 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                             } else if (mime.startsWith("audio/")) {
                                 val rawLang = if (format.containsKey(MediaFormat.KEY_LANGUAGE)) {
                                     format.getString(MediaFormat.KEY_LANGUAGE)
-                                } else "eng"
-                                val langName = formatLanguageName(rawLang)
+                                } else null
+                                val hint = if (audioList.size() == 0 && originalLanguage.isNotBlank())
+                                    inferLanguageCodeFromName(fileName).ifBlank { originalLanguage } else "eng"
+                                val langName = formatLanguageName(rawLang?.takeUnless { it.isBlank() || it == "und" } ?: hint)
                                 audioLanguages.add(langName)
                                 val ch = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
                                     format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
@@ -1845,7 +1847,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
     // =========================================================================
     // BLU-RAY BDAV (.M2TS) & MPEG-2 TRANSPORT STREAM (.TS) PAT/PMT PARSER
     // =========================================================================
-    private fun parseMpegTsHeader(buf: ByteArray, tailBuf: ByteArray?, totalBytes: Long, urlStr: String): HeaderParseResult {
+    private fun parseMpegTsHeader(buf: ByteArray, tailBuf: ByteArray?, totalBytes: Long, urlStr: String, originalLanguage: String): HeaderParseResult {
         if (buf.size < 192 * 10) return HeaderParseResult(totalBytes, 0.0, emptyList(), false, -1, false)
 
         // Detect 192-byte BDAV M2TS (sync 0x47 at +4) vs 188-byte TS (sync 0x47 at +0)
@@ -1991,7 +1993,9 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                                         trackNumber = trkNum++,
                                         trackType = 2,
                                         codecId = cId as String,
-                                        language = langCode,
+                                        language = if ((langCode.isBlank() || langCode == "und") && tracks.none { it.trackType == 2 }) {
+                                            hintLang.ifBlank { originalLanguage }
+                                        } else langCode,
                                         channels = ch as Int,
                                         bitstreamHasAtmos = atmos as Boolean,
                                         bitstreamSubCodec = subC as String

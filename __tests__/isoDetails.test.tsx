@@ -121,3 +121,15 @@ test('external DVD chooser gets the virtual VOB after ISO resolution', async () 
   expect(NativeModules.VideoPlayerManager.playVideo).toHaveBeenCalledWith(direct, expect.any(String));
   expect(NativeModules.SecurityVault.dvdPlaybackUrl).not.toHaveBeenCalled();
 });
+
+test('a warm homepage renders its last listing while the worker is still pending', async () => {
+  await mount();
+  expect(renderer.root.findByProps({ focusId: 'card_0' })).toBeTruthy();
+  await Renderer.act(async () => renderer.unmount());
+  let refresh!: (value: string) => void;
+  NativeModules.SecurityVault.securePostDirectory.mockImplementationOnce(() => new Promise<string>(resolve => { refresh = resolve; }));
+  await Renderer.act(async () => { renderer = Renderer.create(<App />); });
+  expect(renderer.root.findByProps({ focusId: 'card_0' })).toBeTruthy();
+  await Renderer.act(async () => refresh(JSON.stringify({ data: { files: [] } })));
+  expect(renderer.root.findAllByProps({ focusId: 'card_0' })).toHaveLength(0);
+});

@@ -5,13 +5,15 @@ internal object StandaloneBdav {
     fun matches(head: ByteArray) = head.size >= 3 * 192 &&
         (0..2).all { head[it * 192 + 4] == 0x47.toByte() }
 
-    fun profile(head: ByteArray, tail: ByteArray, label: String, rawSize: Long = 0): BluRayProfile {
+    fun profile(head: ByteArray, tail: ByteArray, label: String, rawSize: Long = 0, originalLanguage: String = ""): BluRayProfile {
         require(matches(head))
         val ts = ByteArray(head.size / 192 * 188)
         for (packet in 0 until ts.size / 188) {
             head.copyInto(ts, packet * 188, packet * 192 + 4, (packet + 1) * 192)
         }
-        val inferredLang = inferLanguageCodeFromName(label)
+        val inferredLang = inferLanguageCodeFromName(label).ifBlank {
+            runCatching { java.util.Locale.forLanguageTag(originalLanguage).isO3Language }.getOrDefault("")
+        }
         var firstAudio = true
         val program = BluRayPsi.program(ts)
         val streams = DiscAudio.inspectM2ts(head, program?.streams.orEmpty()).map { stream ->
@@ -35,7 +37,7 @@ internal object StandaloneBdav {
             else null
         val duration = if (ptsDuration > 0) ptsDuration else index?.spanUs ?: 0
         return BluRayProfile(duration, emptyList(),
-            streams.filter { it.audio }.map { BluRayAudio(it.pid, it.type, it.language) }, streams, label, pcrIndex = index)
+            streams.filter { it.audio }.map { BluRayAudio(it.pid, it.type, it.language) }, streams, label, pcrIndex = index, primaryLanguageHint = inferredLang)
     }
 
     private fun timestamps(data: ByteArray): Map<Int, LongRange> {

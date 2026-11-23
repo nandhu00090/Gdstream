@@ -578,6 +578,7 @@ int mpeg2_header_picture (mpeg2dec_t * mpeg2dec)
 	}
     }
     picture->nb_fields = 2;
+    picture->frame_period = mpeg2dec->sequence.frame_period;
     picture->display_offset[0].x = picture->display_offset[1].x =
 	picture->display_offset[2].x = mpeg2dec->display_offset_x;
     picture->display_offset[0].y = picture->display_offset[1].y =
@@ -961,4 +962,14 @@ mpeg2_state_t mpeg2_header_end (mpeg2dec_t * mpeg2dec)
 	mpeg2dec->info.discard_fbuf = mpeg2dec->fbuf[b_type];
     mpeg2dec->action = seek_sequence;
     return STATE_END;
+}
+
+/* After a caller-inserted sequence end at a VOBU boundary, retain both
+ * references for leading B pictures in the next open GOP. The delayed
+ * reference was already displayed by header_end. */
+void mpeg2_resume_vobu (mpeg2dec_t * mpeg2dec)
+{
+    mpeg2dec->first = 1;
+    mpeg2dec->code = 0xb4;
+    mpeg2dec->action = mpeg2_seek_header;
 }

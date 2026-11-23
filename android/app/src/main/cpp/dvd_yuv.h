@@ -11,7 +11,7 @@ constexpr int NV12 = 21;
 // All strides are in bytes. libmpeg2 returns planar 4:2:0 in macroblock-padded planes.
 inline size_t pack420(uint8_t *dst, size_t capacity, int color, int stride, int sliceHeight,
                       int width, int height, const uint8_t *y, int yStride,
-                      const uint8_t *u, const uint8_t *v, int chromaStride) {
+                      const uint8_t *u, const uint8_t *v, int chromaStride, bool blend = false) {
     if (!dst || stride < width || sliceHeight < height || ((stride | sliceHeight) & 1) ||
         (color != I420 && color != NV12)) return 0;
     const size_t ySize = static_cast<size_t>(stride) * sliceHeight;
@@ -21,22 +21,27 @@ inline size_t pack420(uint8_t *dst, size_t capacity, int color, int stride, int 
         memset(dst, 16, ySize);
         memset(dst + ySize, 128, ySize / 2);
     }
-    for (int row = 0; row < height; ++row)
-        memcpy(dst + row * stride, y + row * yStride, width);
-    uint8_t *chroma = dst + ySize;
-    for (int row = 0; row < height / 2; ++row) {
-        if (color == I420) {
-            memcpy(chroma + row * (stride / 2), u, width / 2);
-            memcpy(chroma + ySize / 4 + row * (stride / 2), v, width / 2);
-        } else {
-            for (int x = 0; x < width / 2; ++x) {
-                chroma[row * stride + 2 * x] = u[x];
-                chroma[row * stride + 2 * x + 1] = v[x];
+    auto plane = [blend](uint8_t *out, int outStride, int step, const uint8_t *src,
+                         int srcStride, int columns, int rows) {
+        for (int row = 0; row < rows; ++row, src += srcStride, out += outStride) {
+            if (blend) {
+                const auto *above = row > 0 ? src - srcStride : src;
+                const auto *below = row + 1 < rows ? src + srcStride : src;
+                for (int x = 0; x < columns; ++x)
+                    out[x * step] = (above[x] + 2 * src[x] + below[x]) >> 2;
+            } else if (step == 1) {
+                memcpy(out, src, columns);
+            } else {
+                for (int x = 0; x < columns; ++x) out[x * step] = src[x];
             }
         }
-        u += chromaStride;
-        v += chromaStride;
-    }
+    };
+    plane(dst, stride, 1, y, yStride, width, height);
+    const int step = color == I420 ? 1 : 2;
+    const int uvStride = stride / 2 * step;
+    plane(dst + ySize, uvStride, step, u, chromaStride, width / 2, height / 2);
+    plane(dst + ySize + (color == I420 ? ySize / 4 : 1), uvStride, step,
+          v, chromaStride, width / 2, height / 2);
     return size;
 }
 }

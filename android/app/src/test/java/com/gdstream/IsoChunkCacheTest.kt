@@ -90,7 +90,7 @@ class IsoChunkCacheTest {
         } finally { release.countDown(); cache.clear(); workers.shutdownNow(); consumers.shutdownNow() }
     }
 
-    @Test fun seekAfterLastReaderClosesStartsANewUpstreamRequest() {
+    @Test fun seekAfterLastReaderClosesAttachesToTheOriginalRequest() {
         val workers = Executors.newSingleThreadExecutor()
         val consumers = Executors.newCachedThreadPool()
         val cache = IsoChunkCache(executor = workers)
@@ -116,7 +116,7 @@ class IsoChunkCacheTest {
             awaitReaders(cache, 1)
             release.countDown()
             assertArrayEquals(byteArrayOf(9, 9), next.get(3, TimeUnit.SECONDS))
-            assertEquals(2, calls.get())
+            assertEquals(1, calls.get())
         } finally { release.countDown(); cache.clear(); workers.shutdownNow(); consumers.shutdownNow() }
     }
 
