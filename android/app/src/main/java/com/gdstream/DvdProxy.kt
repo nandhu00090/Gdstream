@@ -319,6 +319,58 @@ internal object DvdProxy {
     }
 }
 
+/** One encoder serves both HTTP demand and look-ahead. Completed hits never acquire its lock. */
+internal class DvdSegmentCache {
+    private val encoder = Any()
+    private val cache = object : LinkedHashMap<Pair<String, Int>, ByteArray>(4, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Pair<String, Int>, ByteArray>?) = size > 2
+    }
+    private val worker = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
+        Thread(task, "DVDPretranscode").apply { isDaemon = true }
+    }
+    private var pending: Pair<Pair<String, Int>, IsoReadSession>? = null
+
+    fun segment(id: String, index: Int, last: Int, session: IsoReadSession, prefetch: Boolean,
+                load: (Int, IsoReadSession) -> ByteArray): ByteArray {
+        fun get(n: Int, owner: IsoReadSession): ByteArray {
+            val key = id to n
+            synchronized(cache) { cache[key]?.let { return it } }
+            return synchronized(encoder) {
+                owner.checkActive()
+                synchronized(cache) { cache[key] } ?: load(n, owner).also { bytes ->
+                    owner.checkActive()
+                    synchronized(cache) { cache[key] = bytes }
+                }
+            }
+        }
+        val key = id to index
+        val next = id to index + 1
+        synchronized(cache) {
+            pending?.takeIf { it.first != key && it.first != next && key !in cache }?.second
+        }?.cancel("DVD seek")
+        val body = get(index, session)
+        if (prefetch && index < last) synchronized(cache) {
+            session.checkActive()
+            if (next !in cache && pending?.first != next) {
+                val owner = IsoReadSession()
+                val lease = ArchiveProxyStreams.registry.register(id, false, owner::cancel)
+                pending = next to owner
+                worker.execute {
+                    try { get(index + 1, owner) }
+                    catch (error: Exception) {
+                        if (!owner.isCancelled) DebugLogger.log("DVD_PREFETCH_ERR", "seg=${index + 1} ${isoFailureDetails(error)}")
+                    } finally {
+                        synchronized(cache) { if (pending?.second === owner) pending = null }
+                        lease.close()
+                        owner.cancel()
+                    }
+                }
+            }
+        }
+        return body
+    }
+}
+
 /** Apply the same cell offset to both elementary streams before decoding/reordering.
  * Signed modulo-2^32 distance handles PCI rollover and audio leading the first video frame. */
 internal data class DvdCellClock(val sourceStart: Long, val titleStart: Long) {

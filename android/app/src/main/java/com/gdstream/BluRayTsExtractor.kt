@@ -1,5 +1,7 @@
 package com.gdstream
 
+import androidx.media3.common.Format
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.C
 import androidx.media3.common.util.TimestampAdjuster
 import androidx.media3.extractor.*
@@ -48,7 +50,7 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
     private val payloads = object : TsPayloadReader.Factory {
         override fun createInitialPayloadReaders() = fallback.createInitialPayloadReaders()
         override fun createPayloadReader(streamType: Int, esInfo: TsPayloadReader.EsInfo): TsPayloadReader =
-            BluRayPidReader(profile?.audio.orEmpty(), streamType, dv != null) { pid, resolved ->
+            BluRayPidReader(profile?.audio.orEmpty(), streamType, dv != null, ::pmtAudioFormat) { pid, resolved ->
                 val stream = streams[pid] ?: BluRayStream(pid, resolved)
                 val lang = sequenceOf(esInfo.language, audioTracks[pid]?.language, stream.language,
                     primaryLanguage.takeIf { stream.audio && (audioTracks.keys.firstOrNull() ?: pid) == pid })
@@ -69,6 +71,21 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
             else -> fallback.createPayloadReader(streamType, esInfo)
         }
     }
+    private fun pmtAudioFormat(pid: Int, type: Int, formatId: String): Format? {
+        val mime = when (type) {
+            0x81 -> MimeTypes.AUDIO_AC3
+            0x82 -> MimeTypes.AUDIO_DTS
+            0x83 -> MimeTypes.AUDIO_TRUEHD
+            0x84, 0xa1 -> MimeTypes.AUDIO_E_AC3
+            0x85, 0x86 -> MimeTypes.AUDIO_DTS_HD
+            else -> return null
+        }
+        val layout = streams[pid]?.layout.orEmpty().substringBefore(' ').split('.')
+        val channels = layout.mapNotNull { it.toIntOrNull() }.sum()
+        return Format.Builder().setId(formatId).setContainerMimeType(MimeTypes.VIDEO_MP2T)
+            .setSampleMimeType(mime).setChannelCount(channels.takeIf { it > 0 } ?: Format.NO_VALUE).build()
+    }
+
     private var subtitles: androidx.media3.extractor.text.SubtitleTranscodingExtractorOutput? = null
     private val delegate = TsExtractor(TsExtractor.MODE_SINGLE_PMT, TsExtractor.FLAG_EMIT_RAW_SUBTITLE_DATA,
         DefaultSubtitleParserFactory(), TimestampAdjuster(0), payloads, 600 * 188)
@@ -82,7 +99,7 @@ internal class BluRayTsExtractor(private val profile: BluRayProfile?, dolbyVisio
                 val audioIdx = audioTracks.keys.indexOf(id)
                 val audio = audioTracks[id]
                 return object : TrackOutput by target {
-                    override fun format(format: androidx.media3.common.Format) {
+                    override fun format(format: Format) {
                         val enriched = if (audio != null && type == C.TRACK_TYPE_AUDIO) {
                             val ch = audioChannelLabel(format.channelCount)
                             val lang = audio.language.takeIf { it.isNotBlank() && it != "und" } ?: format.language
@@ -214,6 +231,7 @@ internal class EndOfInputPayloadReader(private val reader: TsPayloadReader) : Ts
 /** Resolve private/incorrect PMT audio types from CLPI only after Media3 supplies the actual PID. */
 internal class BluRayPidReader(
     private val audio: List<BluRayAudio>, private val advertisedType: Int, private val dualPidDv: Boolean,
+    private val pmtFormat: (Int, Int, String) -> Format?,
     private val create: (Int, Int) -> TsPayloadReader?
 ) : TsPayloadReader {
     private var reader: TsPayloadReader? = null
@@ -224,6 +242,9 @@ internal class BluRayPidReader(
             else audio.firstOrNull { it.pid == pid && pid in 0x1100..0x111f }?.type ?: advertisedType
         val freshIds = TsPayloadReader.TrackIdGenerator(ids.formatId.substringBefore('/', "").toIntOrNull() ?: Int.MIN_VALUE, pid, 8192)
         reader = create(pid, type)
+        // Publish the PMT format before endTracks, even when the first audio PES is far away.
+        // The elementary reader refines the same track and format ID when its first frame arrives.
+        pmtFormat(pid, type, ids.formatId)?.let { output.track(pid, C.TRACK_TYPE_AUDIO).format(it) }
         reader?.init(adjuster, output, freshIds)
         if (pid in 0x1100..0x111f) DebugLogger.log("ISO_AUDIO_BIND", "pid=$pid type=$type active=${reader != null}")
     }

@@ -104,35 +104,51 @@ internal class DvdTsMux(private val audioLanguageCode: String = "") {
         samples.add(UnitData(false, (ptsUs * 9 + 50) / 100, bytes))
     }
 
-    // Keep source cadence when it fits. If the decoder clock drifts outside
-    // the copied AC-3/PCI window, distribute the pictures over that window
-    // instead of stacking late frames at its final timestamp.
+    private var nextVideoPts90k: Long? = null
+    private val cc = IntArray(8192)
+
     private fun fitVideoClock(segmentStart: Long, segmentEnd: Long, hasNav: Boolean) {
-        val audio = samples.filter { !it.video }
-        // DVD AC-3 uses 1536 samples at 48 kHz, or 2880 ticks per frame.
-        val audioStart = audio.minOfOrNull { it.ticks } ?: segmentStart
-        val audioEnd = audio.maxOfOrNull { it.ticks + 2880 } ?: segmentEnd
         val video = samples.filter { it.video }
+        val audio = samples.filter { !it.video }.sortedBy { it.ticks }
+        val audioStart = audio.firstOrNull()?.ticks ?: segmentStart
+        val audioEnd = audio.lastOrNull()?.let { it.ticks + 2880 } ?: segmentEnd
         val overlapStart = maxOf(segmentStart, audioStart)
         val overlapEnd = minOf(segmentEnd, audioEnd)
-        val useOverlap = hasNav && overlapEnd - overlapStart >= video.size
+        val useOverlap = hasNav && overlapEnd - overlapStart >= frames
         val start = if (useOverlap) overlapStart else audioStart
-        val end = if (useOverlap) overlapEnd else audioEnd
-        if (end - start < video.size) throw IOException("Invalid DVD segment audio clock")
-        var previous = start - 1
-        if (video.all { sample ->
-                val valid = sample.ticks > previous && sample.ticks < end
-                previous = sample.ticks
-                valid
-            }) return
-        video.forEachIndexed { index, sample -> sample.ticks = start + (end - start) * index / video.size }
+        val span = (if (useOverlap) overlapEnd else audioEnd) - start
+        if (span < frames) throw IOException("Invalid DVD segment clock")
+
+        val first = video.first().ticks
+        val lastStep = if (frames > 1) video.last().ticks - video[frames - 2].ticks else span
+        val sourceSpan = video.last().ticks - first + lastStep
+        // Some interlaced titles signal twice as many display pictures as the PCI duration allows.
+        // In that case retain their relative spacing on the measured presentation timeline.
+        val scaleCadence = sourceSpan > 0 && kotlin.math.abs(sourceSpan - span) > maxOf(4500, span / 10)
+        var pts = nextVideoPts90k ?: first.takeIf { kotlin.math.abs(it - start) <= 4500 } ?: start
+        video.forEachIndexed { i, sample ->
+            val delta = sample.ticks - first
+            val nextDelta = video.getOrNull(i + 1)?.let { it.ticks - first } ?: sourceSpan
+            val step = if (scaleCadence) nextDelta * span / sourceSpan - delta * span / sourceSpan
+                else nextDelta - delta
+            // Follow the copied AC-3 PES clock inside each VOBU. Each 48 kHz AC-3
+            // frame spans 2880 ticks. Interpolate within it instead of snapping video to it.
+            val expected = start + if (sourceSpan > 0) delta * span / sourceSpan else span * i / frames
+            val offset = expected - audioStart
+            val audioFrame = (offset / 2880).takeIf { it in 0L until audio.size.toLong() }
+            val reference = audioFrame?.let { audio[it.toInt()].ticks + offset % 2880 } ?: expected
+            val drift = reference - pts
+            val slew = if (kotlin.math.abs(drift) > 4500) drift.coerceIn(-step / 16, step / 16) else 0
+            sample.ticks = pts
+            pts += (step + slew).coerceAtLeast(1)
+        }
+        nextVideoPts90k = pts
     }
 
     fun finish(segmentStart: Long? = null, segmentEnd: Long? = null, hasNav: Boolean = true): ByteArray {
         if (frames == 0) throw IOException("DVD segment produced 0 decodable AVC frames (no IDR)")
         if (segmentStart != null && segmentEnd != null) fitVideoClock(segmentStart, segmentEnd, hasNav)
         val out = ByteArrayOutputStream()
-        val cc = IntArray(8192)
         fun packets(pid: Int, data: ByteArray, clock: Long? = null) {
             var pos = 0
             while (pos < data.size) {
@@ -141,8 +157,7 @@ internal class DvdTsMux(private val audioLanguageCode: String = "") {
                 packet[1] = ((pid shr 8) or if (pos == 0) 64 else 0).toByte()
                 packet[2] = pid.toByte()
                 val pcr = clock?.takeIf { pos == 0 }
-                // A cached or independently requested segment can follow a different
-                // encoder session. Signal the counter restart once per PID.
+                // Signal a counter restart only on the first packet of a cold encoder session.
                 val firstPacket = cc[pid] == 0
                 val count = minOf(data.size - pos, if (pcr != null) 176 else if (firstPacket) 182 else 184)
                 val pad = 184 - count

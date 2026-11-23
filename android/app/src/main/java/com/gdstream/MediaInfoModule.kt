@@ -1038,12 +1038,29 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
             }
 
             val out = ByteArrayOutputStream()
-            conn.inputStream.use { input ->
-                val tmp = ByteArray(16 * 1024)
-                var read = 0
-                while (out.size() < maxHeaderBytes && input.read(tmp).also { read = it } != -1) {
-                    out.write(tmp, 0, read)
+            try {
+                conn.inputStream.use { input ->
+                    val tmp = ByteArray(16 * 1024)
+                    var checkTablesAt = tmp.size
+                    var read = 0
+                    while (out.size() < maxHeaderBytes && input.read(tmp).also { read = it } != -1) {
+                        out.write(tmp, 0, read)
+                        if (out.size() >= checkTablesAt) {
+                            val head = out.toByteArray()
+                            val bdav = StandaloneBdav.matches(head)
+                            val transport = bdav || head.size >= 377 && (0..2).all { head[it * 188] == 0x47.toByte() }
+                            if (!transport) checkTablesAt = Int.MAX_VALUE
+                            else {
+                                val packets = if (bdav) StandaloneBdav.transportPackets(head) else head
+                                if (BluRayPsi.program(packets) != null) break
+                                checkTablesAt *= 2
+                            }
+                        }
+                    }
                 }
+            } catch (error: java.io.IOException) {
+                // A later socket failure does not invalidate the PAT/PMT already received.
+                if (out.size() < 3 * 188) throw error
             }
             val headBytes = out.toByteArray()
 
@@ -1853,181 +1870,110 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
     // BLU-RAY BDAV (.M2TS) & MPEG-2 TRANSPORT STREAM (.TS) PAT/PMT PARSER
     // =========================================================================
     private fun parseMpegTsHeader(buf: ByteArray, tailBuf: ByteArray?, totalBytes: Long, urlStr: String, originalLanguage: String): HeaderParseResult {
-        if (buf.size < 192 * 10) return HeaderParseResult(totalBytes, 0.0, emptyList(), false, -1, false)
-
-        // Detect 192-byte BDAV M2TS (sync 0x47 at +4) vs 188-byte TS (sync 0x47 at +0)
-        var stride = 0
-        var syncOffset = 0
-        if ((buf[4].toInt() and 0xFF) == 0x47 && (buf[4 + 192].toInt() and 0xFF) == 0x47 && (buf[4 + 384].toInt() and 0xFF) == 0x47) {
-            stride = 192
-            syncOffset = 4
-        } else if ((buf[0].toInt() and 0xFF) == 0x47 && (buf[188].toInt() and 0xFF) == 0x47 && (buf[376].toInt() and 0xFF) == 0x47) {
-            stride = 188
-            syncOffset = 0
-        } else {
-            return HeaderParseResult(totalBytes, 0.0, emptyList(), false, -1, false)
-        }
-
-        var pmtPid = -1
+        val bdav = StandaloneBdav.matches(buf)
+        val ts = if (bdav) StandaloneBdav.transportPackets(buf) else buf
+        val pmt = BluRayPsi.program(ts)?.pmt
+            ?: return HeaderParseResult(totalBytes, 0.0, emptyList(), false, -1, false)
         val tracks = mutableListOf<MkvTrack>()
         var hasDovi = false
         var dvProf = -1
-        var pmtParsed = false
+        val progInfoLen = ((pmt[10].toInt() and 15) shl 8) or (pmt[11].toInt() and 255)
+        var ep = 12 + progInfoLen
+        val sEnd = pmt.size - 4
+        var trkNum = 1
+        while (ep + 5 <= sEnd) {
+            val streamType = pmt[ep].toInt() and 0xFF
+            val esInfoLen = ((pmt[ep + 3].toInt() and 0x0F) shl 8) or (pmt[ep + 4].toInt() and 0xFF)
+            val descStart = ep + 5
+            val descEnd = minOf(sEnd, descStart + esInfoLen)
 
-        var pos = syncOffset
-        while (pos + 188 <= buf.size && !pmtParsed) {
-            if ((buf[pos].toInt() and 0xFF) != 0x47) {
-                pos += stride
-                continue
-            }
-            val pusi = ((buf[pos + 1].toInt() and 0x40) != 0)
-            val pid = ((buf[pos + 1].toInt() and 0x1F) shl 8) or (buf[pos + 2].toInt() and 0xFF)
-            val afc = (buf[pos + 3].toInt() and 0x30) ushr 4
-
-            var payOff = pos + 4
-            if (afc == 2 || afc == 0) {
-                pos += stride
-                continue
-            }
-            if (afc == 3) {
-                if (payOff >= pos + 188) { pos += stride; continue }
-                val afLen = buf[payOff].toInt() and 0xFF
-                payOff += 1 + afLen
-            }
-            if (pusi && payOff < pos + 188) {
-                val ptrField = buf[payOff].toInt() and 0xFF
-                payOff += 1 + ptrField
-            }
-            val pktEnd = pos + 188
-            if (payOff + 8 > pktEnd) {
-                pos += stride
-                continue
-            }
-
-            if (pid == 0 && pusi && pmtPid < 0) {
-                val tableId = buf[payOff].toInt() and 0xFF
-                if (tableId == 0x00) {
-                    val secLen = ((buf[payOff + 1].toInt() and 0x0F) shl 8) or (buf[payOff + 2].toInt() and 0xFF)
-                    var sp = payOff + 8
-                    val sEnd = minOf(pktEnd, payOff + 3 + secLen - 4)
-                    while (sp + 4 <= sEnd) {
-                        val progNum = ((buf[sp].toInt() and 0xFF) shl 8) or (buf[sp + 1].toInt() and 0xFF)
-                        val candidatePid = ((buf[sp + 2].toInt() and 0x1F) shl 8) or (buf[sp + 3].toInt() and 0xFF)
-                        if (progNum != 0 && candidatePid > 0) {
-                            pmtPid = candidatePid
-                            break
-                        }
-                        sp += 4
-                    }
+            val decodedHint = try { java.net.URLDecoder.decode(urlStr, "UTF-8") } catch (_: Throwable) { urlStr }
+            val hintLang = inferLanguageCodeFromName(decodedHint)
+            var langCode = ""
+            var regTag = ""
+            var dp = descStart
+            while (dp + 2 <= descEnd) {
+                val dTag = pmt[dp].toInt() and 0xFF
+                val dLen = pmt[dp + 1].toInt() and 0xFF
+                if (dp + 2 + dLen > descEnd) break
+                if (dTag == 0x0A && dLen >= 3) {
+                    langCode = String(pmt, dp + 2, 3, Charsets.US_ASCII).lowercase(Locale.ROOT)
+                } else if (dTag == 0x05 && dLen >= 4) {
+                    regTag = String(pmt, dp + 2, 4, Charsets.US_ASCII)
+                } else if (dTag == 0xB0 && dLen >= 5) {
+                    hasDovi = true
+                    dvProf = ((pmt[dp + 4].toInt() and 0xFF) shr 1) and 0x7F
                 }
-            } else if (pmtPid > 0 && pid == pmtPid && pusi) {
-                val tableId = buf[payOff].toInt() and 0xFF
-                if (tableId == 0x02) {
-                    val secLen = ((buf[payOff + 1].toInt() and 0x0F) shl 8) or (buf[payOff + 2].toInt() and 0xFF)
-                    val progInfoLen = ((buf[payOff + 10].toInt() and 0x0F) shl 8) or (buf[payOff + 11].toInt() and 0xFF)
-                    var ep = payOff + 12 + progInfoLen
-                    val sEnd = minOf(pktEnd, payOff + 3 + secLen - 4)
-                    var trkNum = 1
+                dp += 2 + dLen
+            }
 
-                    while (ep + 5 <= sEnd) {
-                        val streamType = buf[ep].toInt() and 0xFF
-                        val esPid = ((buf[ep + 1].toInt() and 0x1F) shl 8) or (buf[ep + 2].toInt() and 0xFF)
-                        val esInfoLen = ((buf[ep + 3].toInt() and 0x0F) shl 8) or (buf[ep + 4].toInt() and 0xFF)
-                        val descStart = ep + 5
-                        val descEnd = minOf(sEnd, descStart + esInfoLen)
+            val decodedName = try { java.net.URLDecoder.decode(urlStr, "UTF-8") } catch (_: Throwable) { urlStr }
+            val isUhd = Regex("\\b(2160p|4K|UHD)\\b", RegexOption.IGNORE_CASE).containsMatchIn(decodedName)
 
-                        val decodedHint = try { java.net.URLDecoder.decode(urlStr, "UTF-8") } catch (_: Throwable) { urlStr }
-                        val hintLang = inferLanguageCodeFromName(decodedHint)
-                        var langCode = ""
-                        var regTag = ""
-                        var dp = descStart
-                        while (dp + 2 <= descEnd) {
-                            val dTag = buf[dp].toInt() and 0xFF
-                            val dLen = buf[dp + 1].toInt() and 0xFF
-                            if (dp + 2 + dLen > descEnd) break
-                            if (dTag == 0x0A && dLen >= 3) {
-                                langCode = String(buf, dp + 2, 3, Charsets.US_ASCII).lowercase(Locale.ROOT)
-                            } else if (dTag == 0x05 && dLen >= 4) {
-                                regTag = String(buf, dp + 2, 4, Charsets.US_ASCII)
-                            } else if (dTag == 0xB0 && dLen >= 5) {
-                                hasDovi = true
-                                dvProf = ((buf[dp + 4].toInt() and 0xFF) shr 1) and 0x7F
-                            }
-                            dp += 2 + dLen
-                        }
-
-                        val decodedName = try { java.net.URLDecoder.decode(urlStr, "UTF-8") } catch (_: Throwable) { urlStr }
-                        val isUhd = Regex("\\b(2160p|4K|UHD)\\b", RegexOption.IGNORE_CASE).containsMatchIn(decodedName)
-
-                        when (streamType) {
-                            0x1B, 0x24, 0x02 -> {
-                                val t = MkvTrack(
-                                    trackNumber = trkNum++,
-                                    trackType = 1,
-                                    codecId = when (streamType) {
-                                        0x24 -> "V_MPEGH/ISO/HEVC"
-                                        0x1B -> "V_MPEG4/ISO/AVC"
-                                        else -> "V_MPEG2"
-                                    },
-                                    pixelWidth = if (isUhd) 3840 else 1920,
-                                    pixelHeight = if (isUhd) 2160 else 1080,
-                                    defaultDurationNs = 41_708_333L
-                                )
-                                if (regTag == "DOVI" || hasDovi) {
-                                    hasDovi = true
-                                    t.hasDoviConfig = true
-                                    t.dvProfile = if (dvProf > 0) dvProf else 7
-                                    t.dvHasHdr10Base = true
-                                }
-                                tracks.add(t)
-                            }
-                            0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x0F, 0x03, 0x04 -> {
-                                val (cId, ch, atmos, subC) = when (streamType) {
-                                    0x83 -> listOf("A_TRUEHD", 8, true, "")
-                                    0x86 -> listOf("A_DTS", 8, false, "DTS-HD MA")
-                                    0x85 -> listOf("A_DTS", 8, false, "DTS-HD HR")
-                                    0x82 -> listOf("A_DTS", 6, false, "DTS")
-                                    0x84, 0xA1 -> listOf("A_EAC3", 6, false, "")
-                                    0x81 -> listOf("A_AC3", 6, false, "")
-                                    0x80 -> listOf("A_PCM/INT/LIT", 6, false, "LPCM")
-                                    0x0F -> listOf("A_AAC", 2, false, "")
-                                    else -> listOf("A_MPEG/L3", 2, false, "")
-                                }
-                                tracks.add(
-                                    MkvTrack(
-                                        trackNumber = trkNum++,
-                                        trackType = 2,
-                                        codecId = cId as String,
-                                        language = if ((langCode.isBlank() || langCode == "und") && tracks.none { it.trackType == 2 }) {
-                                            hintLang.ifBlank { originalLanguage }
-                                        } else langCode,
-                                        channels = ch as Int,
-                                        bitstreamHasAtmos = atmos as Boolean,
-                                        bitstreamSubCodec = subC as String
-                                    )
-                                )
-                            }
-                            0x90 -> {
-                                tracks.add(
-                                    MkvTrack(
-                                        trackNumber = trkNum++,
-                                        trackType = 17,
-                                        codecId = "S_HDMV/PGS",
-                                        language = langCode
-                                    )
-                                )
-                            }
-                        }
-                        ep = descEnd
+            when (streamType) {
+                0x1B, 0x24, 0x02 -> {
+                    val t = MkvTrack(
+                        trackNumber = trkNum++,
+                        trackType = 1,
+                        codecId = when (streamType) {
+                            0x24 -> "V_MPEGH/ISO/HEVC"
+                            0x1B -> "V_MPEG4/ISO/AVC"
+                            else -> "V_MPEG2"
+                        },
+                        pixelWidth = if (isUhd) 3840 else 1920,
+                        pixelHeight = if (isUhd) 2160 else 1080,
+                        defaultDurationNs = 41_708_333L
+                    )
+                    if (regTag == "DOVI" || hasDovi) {
+                        hasDovi = true
+                        t.hasDoviConfig = true
+                        t.dvProfile = if (dvProf > 0) dvProf else 7
+                        t.dvHasHdr10Base = true
                     }
-                    if (tracks.isNotEmpty()) pmtParsed = true
+                    tracks.add(t)
+                }
+                0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x0F, 0x03, 0x04 -> {
+                    val (cId, ch, atmos, subC) = when (streamType) {
+                        0x83 -> listOf("A_TRUEHD", 8, true, "")
+                        0x86 -> listOf("A_DTS", 8, false, "DTS-HD MA")
+                        0x85 -> listOf("A_DTS", 8, false, "DTS-HD HR")
+                        0x82 -> listOf("A_DTS", 6, false, "DTS")
+                        0x84, 0xA1 -> listOf("A_EAC3", 6, false, "")
+                        0x81 -> listOf("A_AC3", 6, false, "")
+                        0x80 -> listOf("A_PCM/INT/LIT", 6, false, "LPCM")
+                        0x0F -> listOf("A_AAC", 2, false, "")
+                        else -> listOf("A_MPEG/L3", 2, false, "")
+                    }
+                    tracks.add(
+                        MkvTrack(
+                            trackNumber = trkNum++,
+                            trackType = 2,
+                            codecId = cId as String,
+                            language = if ((langCode.isBlank() || langCode == "und") && tracks.none { it.trackType == 2 }) {
+                                hintLang.ifBlank { originalLanguage }
+                            } else langCode,
+                            channels = ch as Int,
+                            bitstreamHasAtmos = atmos as Boolean,
+                            bitstreamSubCodec = subC as String
+                        )
+                    )
+                }
+                0x90 -> {
+                    tracks.add(
+                        MkvTrack(
+                            trackNumber = trkNum++,
+                            trackType = 17,
+                            codecId = "S_HDMV/PGS",
+                            language = langCode
+                        )
+                    )
                 }
             }
-            pos += stride
+            ep = descEnd
         }
 
         var parsedDurSec = 0.0
-        if (stride == 192 && tailBuf != null && StandaloneBdav.matches(buf)) {
+        if (bdav && tailBuf != null) {
             val alignedTailOffset = (tailBuf.size % 192)
             val alignedTail = if (alignedTailOffset == 0) tailBuf else tailBuf.copyOfRange(alignedTailOffset, tailBuf.size)
             runCatching {

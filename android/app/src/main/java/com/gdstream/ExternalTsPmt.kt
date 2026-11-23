@@ -20,7 +20,8 @@ internal object ExternalTsPmt {
         streams: List<BluRayStream> = emptyList(),
         audioPid: Int? = null,
         offline: Boolean = false,
-        videoOnly: Boolean = false
+        videoOnly: Boolean = false,
+        transcodeAc3: Boolean = false
     ): ByteArray? {
         fun u(i: Int) = section[i].toInt() and 255
         if (section.size < 16 || u(0) != 2 || crc(section) != 0) return null
@@ -64,7 +65,7 @@ internal object ExternalTsPmt {
             if (include && !(videoOnly && (stream ?: BluRayStream(pid, type)).audio)) {
                 val language = stream?.takeIf { it.audio || type == 0x90 }?.language
                     ?.takeIf { it.length == 3 && it.all { c -> c in 'a'..'z' } && it != "und" }
-                val outType = when (type) {
+                val outType = if (transcodeAc3 && pid == audioPid) 0x81 else when (type) {
                     0x85, 0x86 -> if (offline) type else 0x82
                     0x83 -> 0x81
                     else -> type
@@ -80,7 +81,7 @@ internal object ExternalTsPmt {
                     val next = at + 2 + u(at + 1)
                     if (next > pos + size) return null
                     // A TrueHD registration/codec descriptor contradicts the exposed AC-3 core.
-                    val drop = (language != null && tag == 10) ||
+                    val drop = (transcodeAc3 && tag != 10) || (language != null && tag == 10) ||
                         (type == 0x83 && tag in listOf(5, 0x81, 0x83)) ||
                         (audioPid != null && tag == 5)
                     if (!drop) {

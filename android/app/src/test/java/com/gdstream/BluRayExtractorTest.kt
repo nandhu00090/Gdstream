@@ -75,6 +75,25 @@ class BluRayExtractorTest {
         extractor.release()
     }
 
+    @Test fun secondaryDtsGetsAFormatFromPmtWithoutAnyPesOrProfileAudioCatalog() {
+        val bytes = javaClass.getResourceAsStream("/bluray/hdmv.ts.bin")!!.readBytes()
+        val psi = BluRayPsi.program(bytes)!!
+        // Keep only segment-zero PAT/PMT packets. No DTS reader can discover a frame.
+        val tables = bytes.asList().chunked(188).filter { packet ->
+            val pid = ((packet[1].toInt() and 31) shl 8) or (packet[2].toInt() and 255)
+            pid == 0 || pid == 0x100
+        }.flatten().toByteArray()
+        val streams = psi.streams.map { if (it.pid == 4353) it.copy(layout = "5.1 ch") else it }
+        val extractor = BluRayTsExtractor(BluRayProfile(120_000, emptyList(), emptyList(), streams))
+        val capture = Capture()
+        extractor.init(capture)
+        val input = DefaultExtractorInput(tables.inputStream()::read, 0, C.LENGTH_UNSET.toLong())
+        while (extractor.read(input, PositionHolder()) != Extractor.RESULT_END_OF_INPUT) { }
+        assertTrue(capture.samples.isEmpty())
+        assertTrue(capture.formats.any { it.sampleMimeType == "audio/vnd.dts" && it.label == "Audio 2 • DTS • 5.1" })
+        extractor.release()
+    }
+
     @Test fun fragmentedLpcmPesExposesTamilRawTrackWithExactSamplesAndPts() {
         val capture = Capture()
         val reader = HdmvPcmReader(listOf(BluRayAudio(0x1100, 0x80, "tam")), null)

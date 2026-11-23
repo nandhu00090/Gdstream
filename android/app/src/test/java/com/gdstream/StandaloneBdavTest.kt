@@ -46,10 +46,22 @@ class StandaloneBdavTest {
         val middle = 188L * 500
         assertNull(index.sample(pcr(15, 0x1002), 192, middle))
         assertEquals(BluRayPoint(20_000_000L, middle), index.sample(pcr(20), 192, middle))
+        val profile = BluRayProfile(100_000_000L, emptyList(), emptyList(), pcrIndex = index)
+        val segments = BluRayHls.create(profile, 188L * 1001, standalone = true)!!.segments
+        assertEquals(1_600_000L, segments.first().durationUs)
+        assertEquals(100_000_000L, segments.sumOf { it.durationUs })
+        assertTrue(segments.last().durationUs > segments.first().durationUs * 3)
         assertEquals(BluRayPoint(60_000_000L, 188L * 750), index.estimate(61_000_000))
         assertNull(index.sample(pcr(10), 192, middle + 188))
         assertEquals(BluRayPoint(70_000_000, 188L * 825),
             index.sample(pcr(70).copyOfRange(4, 192), 188, 188L * 825))
+    }
+
+    @Test fun externalSeekWarmsExactlyThreePhysicalBlocksAndClipsAtEof() {
+        val block = IsoChunkCache.BLOCK_BYTES.toLong()
+        val position = (10 * block + block / 2) / 192 * 188
+        assertEquals(10 * block until 13 * block, StandaloneBdav.readAhead(position, 20 * block))
+        assertEquals(10 * block until 11 * block + 192, StandaloneBdav.readAhead(position, 11 * block + 192))
     }
 
     @Test fun virtualPlaylistCoversEveryPacketOfLargeVariableDurationFile() {

@@ -23,7 +23,6 @@ struct Session {
     bool ended = false;
     // Half-period units of the MPEG 27 MHz clock retain fractional 90 kHz ticks.
     int64_t nextClock = -1;
-    int64_t lastVideoPts = -1;
     // Baseline AVC has no B pictures. Match each access unit to its source
     // display PTS even on encoders that rebase output timestamps at startup.
     std::deque<int64_t> pendingPts90k;
@@ -210,15 +209,13 @@ extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_encode(JNIEnv *env,
                 tagged = info->display_picture_2nd;
                 fieldOffset = picture->frame_period;
             }
-            if (tagged->flags & PIC_FLAG_TAGS) {
+            if (s.nextClock < 0 && tagged && (tagged->flags & PIC_FLAG_TAGS)) {
                 // DvdProxy already mapped this tag onto the copied AC-3 clock.
                 const int64_t ticks = (static_cast<int64_t>(tagged->tag2) << 32) | tagged->tag;
-                const int64_t clock = ticks * 600 - fieldOffset;
-                if (clock / 600 > s.lastVideoPts) s.nextClock = clock;
+                s.nextClock = ticks * 600 - fieldOffset;
             }
             if (s.nextClock < 0) s.nextClock = fallback90k * 600;
             const int64_t videoPts90k = s.nextClock / 600;
-            s.lastVideoPts = videoPts90k;
             s.nextClock += static_cast<int64_t>(picture->frame_period) * fields;
             if (!s.queuePlanes(env, mux, emit, frame, seq, videoPts90k,
                                !(picture->flags & PIC_FLAG_PROGRESSIVE_FRAME))) return false;
