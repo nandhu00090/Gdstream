@@ -97,7 +97,7 @@ internal class IsoChunkCache(
         private val orphanTimer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { task ->
             Thread(task, "ISOIdleRange").apply { isDaemon = true }
         }
-        private val warmWorkers = java.util.concurrent.Executors.newFixedThreadPool(4) { task ->
+        private val warmWorkers = java.util.concurrent.Executors.newFixedThreadPool(IsoRangeReader.MAX_CONCURRENT_READS) { task ->
             Thread(task, "ISOReadAhead").apply { isDaemon = true }
         }
         private val sharedExecutor = java.util.concurrent.Executors.newFixedThreadPool(IsoRangeReader.MAX_CONCURRENT_READS) { task ->
@@ -105,6 +105,10 @@ internal class IsoChunkCache(
         }
     }
     private fun key(start: Long, end: Long) = IsoBlockKey(this, start, end)
+
+    /** Share the exact probe window with other inspections and playback of the same source. */
+    fun readProbe(start: Long, end: Long, session: IsoReadSession, fetch: (Long, Long, IsoReadSession) -> ByteArray) =
+        read(start, end, start, end, session, borrowFullBlock = true, fetch = fetch)
     private class Flight {
         val progress = Object()
         var buffer: ByteArray? = null

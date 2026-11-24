@@ -47,7 +47,7 @@ class BluRayExtractorTest {
     @Test fun hlsReaderCommitsDvdIdrAndSubsequentFramesWithPresentationTimes() {
         // Three real baseline 32x32 access units from libx264, stripped of AUD and SEI.
         fun hex(text: String) = text.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-        val mux = DvdTsMux()
+        val mux = DvdTsMux("tam", 6)
         mux.video(0, hex("000000016742c00ad9096c0440000003004000000c83c48992"), true)
         mux.video(0, hex("0000000168cb83cb20"), true)
         mux.video(90_000, hex("000000016588840bf2628000abcc9d75e0"))
@@ -62,8 +62,15 @@ class BluRayExtractorTest {
         val input = DefaultExtractorInput(stream::read, 0, C.LENGTH_UNSET.toLong())
         while (ts.read(input, PositionHolder()) != Extractor.RESULT_END_OF_INPUT) { }
         assertTrue(capture.formats.any { it.sampleMimeType == "video/avc" && it.width == 32 })
+        val audio = capture.formats.single { it.sampleMimeType == "audio/ac3" }
+        assertEquals(48_000, audio.sampleRate)
+        assertEquals(6, audio.channelCount)
+        assertEquals("ta", audio.language)
         assertFalse(capture.formats.any { it.sampleMimeType == "application/cea-608" })
-        assertEquals(listOf(0L, 40_000L), capture.samples.take(2).map { it.time })
+        // HLS mode keys samples by stream type. Both readers commit from the first segment.
+        assertEquals(2, capture.samplesByPid[0x1b])
+        assertEquals(4, capture.samplesByPid[0x81])
+        assertEquals(listOf(0L, 0L, 32_000L, 40_000L, 64_000L, 96_000L), capture.samples.map { it.time }.sorted())
         ts.release()
     }
 

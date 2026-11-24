@@ -52,7 +52,8 @@ internal class RangeConnections(
         val original = URL(rawUrl.substringBefore('#'))
         val first = openOnce(original, range, connectTimeout, readTimeout, session, false)
         val status = first.responseCode
-        if (!expiredDownloadStatus(status) || first.url.toExternalForm() == original.toExternalForm() ||
+        // The ranged reader reopens the original URL on 404 with its shared backoff budget.
+        if ((session != null && status == 404) || !expiredDownloadStatus(status) || first.url.toExternalForm() == original.toExternalForm() ||
             !first.url.path.substringAfterLast('/').equals("download.aspx", true)) return first
 
         // Each open starts at the library URL. Never keep a signed Location,
@@ -91,7 +92,7 @@ internal class RangeConnections(
                     limited = true
                     IsoHostPolicy.remember(rawUrl)
                 }
-                session?.let { it.track(conn, if (limited && !it.pcrProbe) IsoHostPolicy.slots else null) }
+                session?.let { it.track(conn, if (limited) IsoHostPolicy.slots else null) }
                 session?.checkActive()
                 session?.log("ISO_UPSTREAM_REQUEST", "range=$range url=${safeStreamUrl(current.toString())} redirect=$redirect")
                 conn.connectTimeout = connectTimeout
@@ -149,6 +150,15 @@ internal class IsoRangeException(
     cause: Throwable
 ) : IOException("ISO upstream bytes=$start-$end HTTP ${status ?: "unavailable"} attempt=$attempt url=${safeStreamUrl(endpoint)}", cause)
 
+internal fun Throwable.isoRangeFailure() = generateSequence(this) { it.cause }.take(12).filterIsInstance<IsoRangeException>().firstOrNull()
+
+internal fun isoProxyErrorStatus(failure: Throwable): String = when (failure.isoRangeFailure()?.status) {
+    404 -> "404 Not Found"
+    429 -> "429 Too Many Requests"
+    503 -> "503 Service Unavailable"
+    else -> "502 Bad Gateway"
+}
+
 internal fun isoFailureDetails(error: Throwable): String = generateSequence(error) { it.cause }.take(12).joinToString(" <- ") {
     val message = (it.message ?: "<no message>").replace(Regex("https?://[^\\s]+")) { match -> safeStreamUrl(match.value) }
     "${it.javaClass.name}: $message"
@@ -156,9 +166,10 @@ internal fun isoFailureDetails(error: Throwable): String = generateSequence(erro
 
 internal object IsoRangeReader {
     internal const val WINDOW_BYTES = 8 * 1024 * 1024
-    internal const val MAX_CONCURRENT_READS = 6
+    internal const val MAX_CONCURRENT_READS = 3
     internal const val READ_STALL_MS = 25_000
     private val upstreamSlots = Semaphore(MAX_CONCURRENT_READS, true)
+    private val retryDelaysMs = longArrayOf(400, 1000, 2000)
     private val activeReads = java.util.concurrent.ConcurrentHashMap<Any, IsoReadSession>()
     fun cancelAll(reason: String) { activeReads.values.toSet().forEach { it.cancel(reason) } }
 
@@ -278,16 +289,16 @@ internal object IsoRangeReader {
                 session.log("ISO_UPSTREAM_ERR", isoFailureDetails(failure))
                 onFailure(failure)
                 val causes = generateSequence<Throwable>(e) { it.cause }.take(12).toList()
-                if (expiredDownloadStatus(failure.status)) throw failure
-                retry = failure.status in listOf(408, 429, 500, 502, 503, 504) ||
+                if (failure.status == 403 || failure.status == 410) throw failure
+                retry = failure.status in listOf(404, 408, 429, 500, 502, 503, 504) ||
                     causes.any { it is SocketException || it is SocketTimeoutException || it is EOFException || it is UnknownHostException }
-                if (!retry || failures >= 4 || requests > 4096) throw failure
+                if (!retry || failures > retryDelaysMs.size || requests > 4096) throw failure
             } finally {
                 try { conn?.let { session.disconnect(it) } } finally { permit?.close() }
             }
             if (retry) {
                 session.checkActive()
-                val delay = kotlin.random.Random.nextLong(250, 901)
+                val delay = retryDelaysMs[failures - 1]
                 session.log("ISO_UPSTREAM_RETRY", "physical=$next-$windowEnd backoffMs=$delay")
                 try { if (pause != null) pause(delay) else session.awaitRetry(delay) } catch (interrupted: InterruptedException) {
                     Thread.currentThread().interrupt()

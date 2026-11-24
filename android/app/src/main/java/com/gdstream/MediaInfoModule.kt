@@ -973,6 +973,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         var currentUrl = urlStr
         var redirects = 0
         while (redirects < 5) {
+            if (ArchiveProxyStreams.skipDvdTrackProbe(urlStr)) return null
             val conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
                 connectTimeout = 15000
                 readTimeout = 15000
@@ -1109,6 +1110,10 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
         }
         inspectorPool.submit {
             try {
+                if (ArchiveProxyStreams.skipDvdTrackProbe(url)) {
+                    promise.resolve(null)
+                    return@submit
+                }
                 val parsed = fetchAndParseHeader(url, fileName, originalLanguage)
 
                 var width = 0
@@ -1190,6 +1195,10 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                     }
                 } else {
                     // Fallback for MP4 containers via MediaExtractor
+                    if (ArchiveProxyStreams.skipDvdTrackProbe(url)) {
+                        promise.resolve(null)
+                        return@submit
+                    }
                     val extractor = MediaExtractor()
                     try {
                         if (url.startsWith("file://") || url.startsWith("/")) {
@@ -1776,7 +1785,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
 
         latestPreviewTargetMs.set(targetMs)
         inspectorPool.submit {
-            if (latestPreviewTargetMs.get() != targetMs) {
+            if (latestPreviewTargetMs.get() != targetMs || ArchiveProxyStreams.skipDvdTrackProbe(url)) {
                 promise.resolve(null); return@submit
             }
             try {
@@ -1791,6 +1800,7 @@ class MediaInfoModule(reactContext: ReactApplicationContext) :
                 }
 
                 // Fallback for MP4/MOV via MediaExtractor + Hardware MediaCodec
+                if (ArchiveProxyStreams.skipDvdTrackProbe(url)) { promise.resolve(null); return@submit }
                 val ext = MediaExtractor()
                 try {
                     if (url.startsWith("file://") || url.startsWith("/")) ext.setDataSource(url.removePrefix("file://"))

@@ -20,6 +20,9 @@ android {
         applicationId "com.gdstream"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
+        ndk {
+            abiFilters "arm64-v8a", "armeabi-v7a"
+        }
         versionCode 2
         versionName "2.0"
     }
@@ -60,6 +63,7 @@ android {
 dependencies {
     implementation("com.facebook.react:react-android")
     implementation("androidx.media3:media3-exoplayer:1.8.0") // Match react-native-video 6.19.x.
+    implementation("androidx.media3:media3-datasource-okhttp:1.8.0")
     implementation("org.jellyfin.media3:media3-ffmpeg-decoder:1.8.0+1") // Software DTS/HD decoder; see THIRD_PARTY_NOTICES.md.
     implementation("com.moizhassan.ffmpeg:ffmpeg-kit-16kb:6.1.1") // External HLS DTS to AC-3 encoder.
     testImplementation("androidx.media3:media3-exoplayer-hls:1.8.0")

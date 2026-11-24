@@ -91,8 +91,11 @@ internal object DvdProxy {
                   discontinuity: Boolean, sequenceHeader: () -> ByteArray?): ByteArray {
         if (warm?.id != streamId || warm?.sequence != sequence || warm?.next != segment) release()
         val sequential = warm != null
-        val state = warm ?: Warm(streamId, sequence, segment, DvdTsMux((info["audioLanguageCode"] as? String).orEmpty())).also { warm = it }
         val audioId = (info["ac3Substream"] as? Number)?.toInt() ?: -1
+        val state = warm ?: Warm(streamId, sequence, segment, DvdTsMux(
+            (info["audioLanguageCode"] as? String).orEmpty(),
+            (info["ac3Channels"] as? Number)?.toInt() ?: if (audioId in 0x80..0x87) 2 else 0
+        )).also { warm = it }
         val source = sourceTiming(data, audioId)
         fun convertVideo(finish: Boolean): Long {
             val fresh = state.handle == 0L

@@ -11,7 +11,7 @@ import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { usePlaybackSource } from './playbackSession';
-import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration, archiveSourceUrl, isoMovieDetails, sameShowEpisodes } from './archivePlayback';
+import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration, playbackErrorMessage, getPlayableUrl, encodeLibraryName, archiveSourceUrl, isoMovieDetails, sameShowEpisodes } from './archivePlayback';
 
 import { linkedWatchKeys, watchAliases } from './watchHistory';
 
@@ -617,7 +617,7 @@ const App = () => {
       try {
         if (itemObj?.mimeType?.includes('folder') && itemObj?.name) {
           const baseFolderPath = currentPath.startsWith('/0:/') ? currentPath : '/0:/';
-          const subPath = `${baseFolderPath}${encodeURIComponent(itemObj.name)}/`;
+          const subPath = `${baseFolderPath}${encodeLibraryName(itemObj.name)}/`;
           const subFiles = await requestRawDirectory(subPath);
           if (Array.isArray(subFiles) && subFiles.length > 0) {
             for (const sf of subFiles) {
@@ -963,8 +963,7 @@ const App = () => {
     const completedDl = downloads.find(d => d.fileName === file.name && d.status === 'completed' && d.filePath);
     if (completedDl) return `file://${completedDl.filePath}`;
     const baseUrl = vaultRef.current.baseUrl;
-    if (file.link) return file.link.startsWith('http') ? file.link : `${baseUrl}${file.link.startsWith('/') ? '' : '/'}${file.link}`;
-    return `${baseUrl}${currentPath}${encodeURIComponent(file.name)}`;
+    return getPlayableUrl(baseUrl, currentPath, file.name, file.link);
   }, [downloads, currentPath]);
 
   const [preparedUrl, setPreparedUrl] = useState('');
@@ -1233,7 +1232,7 @@ const App = () => {
               }
             } catch (error) {
               if (request !== archiveOpenRequestRef.current) return;
-              if (item) setIsoInspectionError(String(error));
+              if (item) setIsoInspectionError(playbackErrorMessage(error, String(error)));
               else Alert.alert('Archive Error', String(error));
             } finally {
               if (request === archiveOpenRequestRef.current) { setOpeningIso(false); setLoading(false); }
@@ -1524,7 +1523,7 @@ const App = () => {
     const signedDisc = !file?.isZipEntry && /\/download\.aspx(?:[?#]|$)/i.test(listedUrl) &&
       (/\.(m2ts|vob)$/i.test(file?.name || '') || /mp2t/i.test(file?.mimeType || ''));
     const url = signedDisc && vaultRef.current.baseUrl
-      ? `${vaultRef.current.baseUrl.replace(/\/$/, '')}${currentPath}${encodeURIComponent(file.name)}` : listedUrl;
+      ? getPlayableUrl(vaultRef.current.baseUrl, currentPath, file.name) : listedUrl;
     if (file?.isZipEntry || !/^(https?|file):/i.test(url) || !SecurityVault?.resolveStandaloneDisc) return url;
     const name = String(file?.name || '');
     // Opaque download endpoints sometimes have no extension in either the path or title.
@@ -1891,7 +1890,7 @@ const App = () => {
       const rawZipUrl = archiveSourceUrl(String(zipItem.name || ''), vaultRef.current.baseUrl, effectiveBasePath, getStreamUrl(zipItem));
       const zipUrl = zipItem?.name ? `${rawZipUrl.split("#")[0]}#name=${encodeURIComponent(zipItem.name)}` : rawZipUrl;
       const sizeHint = Number(zipItem.size || 0);
-      const virtualZipPath = `${effectiveBasePath}${encodeURIComponent(zipItem.name)}/`;
+      const virtualZipPath = `${effectiveBasePath}${encodeLibraryName(zipItem.name)}/`;
 
       const isIso = /\.iso$/i.test(zipItem.name);
       setOpeningIso(isIso);
@@ -1969,7 +1968,7 @@ const App = () => {
     } catch (e: any) {
       if (requestId !== archiveOpenRequestRef.current) return;
       if (/\.iso$/i.test(zipItem.name)) {
-        setIsoInspectionError(String(e?.message || 'Could not inspect this Blu-ray disc.'));
+        setIsoInspectionError(playbackErrorMessage(e, e?.message || 'Could not inspect this Blu-ray disc.'));
         SecurityVault?.writeDebugLog?.('APP_ARCHIVE_ERR', `${zipItem.name}: ${e?.message || e}`);
         return;
       }
@@ -2038,8 +2037,9 @@ const App = () => {
         if (fName === selectedFile.name) setScanningMediaInfo(true);
         try {
           const streamUrl = await resolvePlaybackUrl(fileObj);
+          if (cancelled) break;
           const originalLanguage = discProbe ? fileObj.metadata?.originalLanguage ?? metadataMap[fName]?.originalLanguage ?? '' : '';
-          const res: RealMediaInfo = await MediaInfoModule.inspectMedia(streamUrl, fName, originalLanguage);
+          const res: RealMediaInfo | null = await MediaInfoModule.inspectMedia(streamUrl, fName, originalLanguage);
           if (res && !cancelled && (res.width > 0 || res.audioTracks?.length > 0 || (discProbe && res.durationSec > 0 && !!res.videoCodec))) {
             setMediaInfoMap(prev => ({ ...prev, [fName]: res }));
             if (res.durationSec > 0) {
@@ -2462,19 +2462,23 @@ const App = () => {
   const directoryKey = (path: string) =>
     JSON.stringify(['directory_v1', vaultRef.current.baseUrl, vaultRef.current.username, path]);
 
-  const requestRawDirectory = (path: string) => catalogRequest<any[]>(directoryKey(path), async signal => {
-    const id = String(++directoryAttempt);
-    const abort = () => SecurityVault.cancelDirectoryRequest(id);
-    signal.addEventListener('abort', abort);
-    try {
-      const raw = await SecurityVault.securePostDirectory(path, 0, id);
-      const files = JSON.parse(raw)?.data?.files;
-      if (!Array.isArray(files)) throw new Error('Invalid folder listing');
-      return files;
-    } finally {
-      signal.removeEventListener('abort', abort);
-    }
-  });
+  const requestRawDirectory = (path: string, refreshAt?: number) => {
+    const key = directoryKey(path) + (refreshAt === undefined ? '' : '/refresh');
+    return catalogRequest<any[]>(key, async signal => {
+      const id = String(++directoryAttempt);
+      const abort = () => SecurityVault.cancelDirectoryRequest(id);
+      signal.addEventListener('abort', abort);
+      try {
+        const url = refreshAt === undefined ? path : `${path}${path.includes('?') ? '&' : '?'}_t=${refreshAt}`;
+        const raw = await SecurityVault.securePostDirectory(url, 0, id);
+        const files = JSON.parse(raw)?.data?.files;
+        if (!Array.isArray(files)) throw new Error('Invalid folder listing');
+        return files;
+      } finally {
+        signal.removeEventListener('abort', abort);
+      }
+    });
+  };
 
   const fetchDirectory = async (path: string, isPullRefresh = false, isSeasonSwitch = false) => {
     const { baseUrl } = vaultRef.current;
@@ -2514,7 +2518,8 @@ const App = () => {
         }
       } catch {}
       if (!current()) return;
-      const incomingFiles = await requestRawDirectory(path);
+      const refreshAt = isPullRefresh ? Date.now() : undefined;
+      const incomingFiles = await requestRawDirectory(path, refreshAt);
       if (!current()) return;
 
       if (!isSeasonSwitch && !isRoot) {
@@ -2529,7 +2534,7 @@ const App = () => {
               seasonNum: sNum,
               label: `Season ${sNum}`,
               folderName: sf.name,
-              path: `${path}${encodeURIComponent(sf.name)}/`,
+              path: `${path}${encodeLibraryName(sf.name)}/`,
             });
           }
         }
@@ -2543,7 +2548,7 @@ const App = () => {
           const rawFolderTitle = decodeURIComponent(path.split('/').filter(Boolean).pop() || '');
           const cleanSeriesName = parseMediaFilename(rawFolderTitle, true).cleanTitle;
 
-          const seasonEpisodes = await requestRawDirectory(targetSeason.path);
+          const seasonEpisodes = await requestRawDirectory(targetSeason.path, refreshAt);
           if (!current()) return;
           remember(seasonEpisodes, targetSeason.path, detectedSeasons, targetSeason, cleanSeriesName);
           setSeriesParentTitle(cleanSeriesName);
@@ -2568,9 +2573,7 @@ const App = () => {
         if (archiveFiles.length === 1 && normalVideos.length === 0 && SecurityVault?.listZipMediaEntries) {
           try {
             const archItem = archiveFiles[0];
-            const listedUrl = archItem.link
-              ? (archItem.link.startsWith('http') ? archItem.link : `${baseUrl}${archItem.link.startsWith('/') ? '' : '/'}${archItem.link}`)
-              : `${baseUrl}${path}${encodeURIComponent(archItem.name)}`;
+            const listedUrl = getPlayableUrl(baseUrl, path, archItem.name, archItem.link);
             const archUrl = archiveSourceUrl(archItem.name, baseUrl, path, listedUrl);
             const namedArchiveUrl = `${archUrl.split('#')[0]}#name=${encodeURIComponent(archItem.name)}`;
             const rawJson = await fetchZipRawJsonFast(namedArchiveUrl, Number(archItem.size || 0));
@@ -2622,8 +2625,7 @@ const App = () => {
   const getRemoteDownloadUrl = (file: any) => {
     if (!file) return '';
     const baseUrl = vaultRef.current.baseUrl;
-    if (file.link) return file.link.startsWith('http') ? file.link : `${baseUrl}${file.link.startsWith('/') ? '' : '/'}${file.link}`;
-    return `${baseUrl}${currentPath}${encodeURIComponent(file.name)}`;
+    return getPlayableUrl(baseUrl, currentPath, file.name, file.link);
   };
 
   const openFile = (file: any) => {
@@ -2662,7 +2664,7 @@ const App = () => {
       setPreparedUrl(url);
     } catch (error) {
       if ((error as any)?.code === 'DVD_MPEG2_UNSUPPORTED') { showDvdFallback(file); return; }
-      Alert.alert('Playback error', error instanceof Error ? error.message : 'Could not open the stream.');
+      Alert.alert('Playback error', playbackErrorMessage(error, error instanceof Error ? error.message : 'Could not open the stream.'));
       return;
     }
     hasRestoredResumeRef.current = false;
@@ -2747,7 +2749,7 @@ const App = () => {
     }
     if (item.mimeType?.includes('folder')) {
       lastFolderCardIdRef.current = 'fcard_0';
-      const newPath = `${currentPath}${encodeURIComponent(item.name)}/`;
+      const newPath = `${currentPath}${encodeLibraryName(item.name)}/`;
       setPathStack([...pathStack, newPath]);
       setCurrentPath(newPath);
       fetchDirectory(newPath, false, false);
@@ -2809,7 +2811,7 @@ const App = () => {
     } catch (error) {
       setPlayMode(null);
       if ((error as any)?.code === 'DVD_MPEG2_UNSUPPORTED') { showDvdFallback(targetFile); return; }
-      Alert.alert('External player error', error instanceof Error ? error.message : 'Could not open the player.');
+      Alert.alert('External player error', playbackErrorMessage(error, error instanceof Error ? error.message : 'Could not open the player.'));
     }
   };
 
@@ -3419,7 +3421,10 @@ const App = () => {
             const errDetail = JSON.stringify(err?.error || err || 'Unknown playback error');
             SecurityVault?.writeDebugLog?.('EXO_PLAY_ERR', `${selectedFile?.name || ''}: ${errDetail}`);
             if (isIsoPlayback) {
-              failIsoPlayback('The disc could not be played. Reopen it to retry, or check that its audio and video formats are supported.');
+              failIsoPlayback(playbackErrorMessage(err, 'The disc could not be played. Reopen it to retry, or check that its audio and video formats are supported.'));
+            } else {
+              closeInternalPlayer();
+              Alert.alert('Playback error', playbackErrorMessage(err, err?.error?.errorString || 'Could not play the stream. Please try again.'));
             }
           }}
           selectedAudioTrack={isExternalAudioSelected ? { type: 'disabled' } : selectedAudio}
@@ -4403,7 +4408,7 @@ const App = () => {
                 <View style={styles.dlBadgeDot}><Text style={styles.dlBadgeDotText}>{downloads.length}</Text></View>
               )}
             </FocusableButton>
-            <FocusableButton focusId="hdr_refresh" isHeaderControl={true} style={styles.headerIconBtn} onPress={handleRefresh}>
+            <FocusableButton focusId="hdr_refresh" accessibilityLabel="Refresh Library" isHeaderControl={true} style={styles.headerIconBtn} onPress={handleRefresh}>
               <Icon name="refresh" size={21} color="white" />
             </FocusableButton>
             <FocusableButton focusId="hdr_view" isHeaderControl={true} style={styles.headerIconBtn} onPress={() => setViewMode(prev => (prev === 'grid' ? 'list' : 'grid'))}>

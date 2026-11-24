@@ -92,12 +92,34 @@ internal object ArchiveProxyStreams {
     } catch (_: Exception) { null }
 
     private var lastPlayback: String? = null
+    @Volatile private var dvdHlsEntry: String? = null
+
+    fun skipDvdTrackProbe(url: String): Boolean {
+        val active = dvdHlsEntry ?: return false
+        if (streamId(url) != active) return false
+        val path = java.net.URI(url).rawPath
+        return path.startsWith("/zip/$active/") && path.endsWith(".vob", true)
+    }
+
     @Synchronized fun prepare(url: String) {
         registry.resume()
         val next = streamId(url)
         lastPlayback?.takeIf { it != next }?.let { registry.cancelStream(it, "playback source changed") }
         next?.let { registry.cancelStream(it, "new playback / external handoff") }
         lastPlayback = next
+        dvdHlsEntry = next?.takeIf { java.net.URI(url).rawPath == "/hls/$it/dvd.m3u8" }
     }
-    fun stop(url: String) { streamId(url)?.let { registry.cancelStream(it, "player stopped") } }
+    @Synchronized fun stop(url: String) {
+        val id = streamId(url) ?: return
+        if (id == lastPlayback) {
+            lastPlayback = null
+            dvdHlsEntry = null
+        }
+        registry.cancelStream(id, "player stopped")
+    }
+    @Synchronized fun stopAll(reason: String) {
+        dvdHlsEntry = null
+        lastPlayback = null
+        registry.stopAll(reason)
+    }
 }

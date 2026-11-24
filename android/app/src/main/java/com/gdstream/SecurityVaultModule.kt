@@ -83,7 +83,7 @@ import javax.net.ssl.X509TrustManager
 class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
-    private val pcrProbes = Executors.newFixedThreadPool(6)
+    private val pcrProbes = Executors.newFixedThreadPool(IsoRangeReader.MAX_CONCURRENT_READS)
     private val ioExecutor = Executors.newCachedThreadPool()
 
     @Volatile
@@ -206,7 +206,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         internal fun isIsoStream(url: String): Boolean =
             ArchiveProxyStreams.streamId(url)?.let { archiveFormat?.invoke(it) } == "ISO"
         internal fun stopArchiveStreams(reason: String, resumable: Boolean = false) {
-            ArchiveProxyStreams.registry.stopAll(reason)
+            ArchiveProxyStreams.stopAll(reason)
             IsoRangeReader.cancelAll(reason)
             isoChunkCaches.clear()
             DvdProxy.stop()
@@ -279,7 +279,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val link = if (active?.isBdavM2ts == true) "http://127.0.0.1:$port${uri.rawPath}" else {
                 val descriptor = uri.rawFragment.orEmpty()
                 val source = java.net.URLDecoder.decode(descriptor.substringAfter(':'), "UTF-8")
-                val size = descriptor.substringBefore(':').toLongOrNull()?.takeIf { it > 0 } ?: detectRemoteFileSize(source)
+                val size = descriptor.substringBefore(':').toLongOrNull()?.takeIf { it > 0 } ?: discSize(source, library = true)
                 val restored = isoDiskCache.get(source, size)?.let { restoreArchiveFromDisk(it, source) }
                 val item = if (restored != null) JSONArray(restored).getJSONObject(0) else
                     parseIsoDiscEntries(source, size, port, null).first.single()
@@ -309,16 +309,21 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun resolveStandaloneDisc(url: String, name: String, sizeHint: Double, originalLanguage: String, promise: Promise) {
         ioExecutor.submit {
+            val inspection = IsoReadSession()
             try {
                 val local = if (url.startsWith("file:")) java.io.File(requireNotNull(android.net.Uri.parse(url).path)) else null
-                val size = local?.length() ?: sizeHint.toLong().takeIf { it > 0 } ?: standaloneSize(url)
+                val size = local?.length() ?: sizeHint.toLong().takeIf { it > 0 } ?: discSize(url)
                 val vob = name.endsWith(".vob", true) || URL(url).path.endsWith(".vob", true)
                 val stride = if (vob) 2048 else 192
                 val alignedEnd = size / stride * stride
                 if (alignedEnd < stride * 3L) { promise.resolve(url); return@submit }
+                val cache = isoChunkCaches.acquire(url, inspection, size)
+                fun probe(from: Long, to: Long) = cache.readProbe(from, to, inspection) { first, last, owner ->
+                    readStandalone(url, first, last, owner, cancelWithPlayback = false)
+                }
                 fun sample(window: Int): Pair<ByteArray, ByteArray> {
                     val length = minOf(alignedEnd, window.toLong() / stride * stride)
-                    fun read(from: Long) = readStandalone(url, from, from + length - 1, IsoReadSession(), cancelWithPlayback = false)
+                    fun read(from: Long) = probe(from, from + length - 1)
                     if (alignedEnd == length) return read(0).let { it to it }
                     val tail = ioExecutor.submit<ByteArray> { read(alignedEnd - length) }
                     val head = read(0)
@@ -356,7 +361,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 if (avcPid != null && profile.avc == null && alignedEnd > 2L * 1024 * 1024 / 192 * 192) {
                     val length = minOf(alignedEnd, StandaloneBdav.HLS_TARGET_PACKETS * 192L)
                     try {
-                        val opening = readStandalone(url, 0, length - 1, IsoReadSession(), cancelWithPlayback = false)
+                        val opening = probe(0, length - 1)
                         profile.avc = StandaloneBdav.avcConfig(StandaloneBdav.transportPackets(opening), avcPid)
                     } catch (error: java.io.IOException) {
                         appendDebugLog("BDAV_PROBE", "Opening AVC probe failed: ${isoFailureDetails(error)}")
@@ -373,10 +378,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                                 val strideBytes = length / 192 * 192L
                                 val limit = minOf(alignedEnd, from + 8 * strideBytes, alignedEnd / 192 * (point + 1) / 16 * 192)
                                 var offset = from
-                                val probe = IsoReadSession(pcrProbe = true)
                                 while (offset < limit) {
                                     val end = minOf(offset + length, alignedEnd) - 1
-                                    val bytes = readStandalone(url, offset, end, probe, cancelWithPlayback = false)
+                                    val bytes = probe(offset, end)
                                     if (index.sample(bytes, 192, offset / 192 * 188) != null) break
                                     offset += strideBytes
                                 }
@@ -389,6 +393,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     ensureArchiveProxyRunning(), "video/mp2t", bluRay = profile, standalone = true)
                 promise.resolve(item.getString("link"))
             } catch (error: Exception) { promise.reject("E_BDAV_PROBE", error) }
+            finally { inspection.cancel() }
         }
     }
 
@@ -576,7 +581,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             requestMethod = "POST"
             doInput = true
             doOutput = true
-            useCaches = false
+            useCaches = session != null && contentType == "application/json"
             setRequestProperty("Content-Type", contentType)
             setRequestProperty("User-Agent", "GDStream-Native-Engine/3.0")
             setRequestProperty("X-GD-Shield", shieldToken)
@@ -908,25 +913,26 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    private fun openLibraryIsoRange(url: String, from: Long, to: Long, session: IsoReadSession): HttpURLConnection {
+        session.checkActive()
+        ensureVaultSessionReady()
+        var conn = rangeConnections.openIsoRange(url, from, to, session)
+        if (conn.responseCode == 401) {
+            session.log("ISO_UPSTREAM_AUTH", "HTTP=401 physical=$from-$to; refreshing session and source redirect once")
+            session.disconnect(conn)
+            nativeSessionLoggedIn = false
+            ensureVaultSessionReady()
+            conn = rangeConnections.openIsoRange(url, from, to, session)
+        }
+        return conn
+    }
+
     private fun fetchIsoByteRange(isoUrl: String, start: Long, endInclusive: Long,
                                   session: IsoReadSession = IsoReadSession(), cancelWithPlayback: Boolean = true): ByteArray =
-        IsoRangeReader.readFully(isoUrl, start, endInclusive,
-            open = { from, to ->
-                if (cancelWithPlayback) ArchiveProxyStreams.registry.checkActive()
-                session.checkActive()
-                ensureVaultSessionReady()
-                session.checkActive()
-                var conn = rangeConnections.openIsoRange(isoUrl, from, to, session)
-                if (conn.responseCode == 401) {
-                    session.log("ISO_UPSTREAM_AUTH", "HTTP=${conn.responseCode} physical=$from-$to; refreshing session and source redirect once")
-                    session.disconnect(conn)
-                    nativeSessionLoggedIn = false
-                    ensureVaultSessionReady()
-                    session.checkActive()
-                    conn = rangeConnections.openIsoRange(isoUrl, from, to, session)
-                }
-                conn
-            }, session = session, cancelWithPlayback = cancelWithPlayback)
+        IsoRangeReader.readFully(isoUrl, start, endInclusive, open = { from, to ->
+            if (cancelWithPlayback) ArchiveProxyStreams.registry.checkActive()
+            openLibraryIsoRange(isoUrl, from, to, session)
+        }, session = session, cancelWithPlayback = cancelWithPlayback)
 
     private val publicRanges = RangeConnections({ emptyMap() })
     private fun librarySource(url: String): Boolean {
@@ -937,13 +943,18 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         return base.scheme.equals(source.protocol, true) && base.rawAuthority.equals(source.authority, true)
     }
 
-    private fun standaloneSize(url: String): Long {
-        val conn = if (librarySource(url)) openRangeConnection(url, "bytes=0-1") else publicRanges.open(url, "bytes=0-1")
+    private fun discSize(url: String, library: Boolean = librarySource(url)): Long {
+        val session = IsoReadSession()
+        var size: Long? = null
         try {
-            if (expiredDownloadStatus(conn.responseCode)) throw java.io.IOException("Source size probe HTTP ${conn.responseCode}")
-            val size = conn.getHeaderField("Content-Range")?.substringAfterLast('/')?.toLongOrNull()
-            return size?.takeIf { it > 0 } ?: throw java.io.IOException("Source does not advertise a byte length")
-        } finally { conn.disconnect() }
+            IsoRangeReader.readFully(url, 0, 1, open = { from, to ->
+                val conn = if (library) openLibraryIsoRange(url, from, to, session)
+                    else publicRanges.openIsoRange(url, from, to, session)
+                size = conn.getHeaderField("Content-Range")?.substringAfterLast('/')?.toLongOrNull()
+                conn
+            }, session = session, cancelWithPlayback = false)
+            return checkNotNull(size) // readFully validated the 206 and its Content-Range.
+        } finally { session.cancel() }
     }
 
     private fun readStandalone(url: String, start: Long, end: Long, session: IsoReadSession,
@@ -1248,7 +1259,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     } catch (error: java.io.IOException) {
                         session.checkActive()
                         appendDebugLog("DVD_SEG_ERR", "seg=$dvdIndex ${isoFailureDetails(error)}")
-                        out.write("HTTP/1.1 502 DVD transcode failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                        out.write("HTTP/1.1 ${isoProxyErrorStatus(error)}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
                         out.flush()
                         return
                     }
@@ -1512,7 +1523,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         } catch (e: Exception) {
             if (isoSession?.isCancelled == true) return
             val mapping = if (e is IsoProxyReadException && e.count > 0) isoFile?.physicalRanges(e.start, e.count) else null
-            val upstream = generateSequence<Throwable>(e) { it.cause }.take(12).filterIsInstance<IsoRangeException>().firstOrNull()
+            val upstream = e.isoRangeFailure()
+            // HLS can read PSI or build a rendition before IsoVirtualFile.serve commits headers.
+            if (upstream != null && e !is IsoProxyReadException) {
+                val out = proxyOutput(socket)
+                out.write("HTTP/1.1 ${isoProxyErrorStatus(e)}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                out.flush()
+            }
             appendDebugLog("ARCHIVE_PROXY_ERR", "$requestDetails mappedPhysical=${mapping ?: "unavailable"} upstreamHTTP=${upstream?.status ?: "unavailable"} ${isoFailureDetails(e)}")
         } finally {
             clientWatch?.close()
@@ -1932,7 +1949,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val hintedName = try { java.net.URLDecoder.decode(zipUrl.substringAfter("#name=", ""), "UTF-8") } catch (_: IllegalArgumentException) { "" }
             val iso = zipUrl.substringBefore('#').substringBefore('?').endsWith(".iso", true) || hintedName.endsWith(".iso", true)
             val sourceSize = try {
-                if (iso && fileSizeHint <= 0) isoDiskCache.lastKnownSize(zipUrl) ?: detectRemoteFileSize(zipUrl) else fileSizeHint.toLong()
+                if (iso && fileSizeHint <= 0) isoDiskCache.lastKnownSize(zipUrl) ?: discSize(zipUrl, library = true) else fileSizeHint.toLong()
             } catch (error: Exception) {
                 promise.reject("E_ISO_SIZE", error.message, error)
                 return@submit

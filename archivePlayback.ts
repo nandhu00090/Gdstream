@@ -1,3 +1,37 @@
+/** File names from the directory may already contain percent-escaped bytes. */
+export function encodeLibraryName(name: string): string {
+  return encodeURIComponent(name).replace(/%25([\da-f]{2})/gi, '%$1');
+}
+
+export function getPlayableUrl(base: string, directory: string, name: string, link?: string): string {
+  const path = link || `${directory.replace(/\/$/, '')}/${encodeLibraryName(name)}`;
+  let url = /^(https?|file|content):/i.test(path) ? path
+    : `${base.replace(/\/$/, '')}/${path.replace(/^\//, '')}`;
+  // Listings can return an unescaped file name. Its known final segment
+  // disambiguates a literal # or ? from the link's optional suffix.
+  if (link && name && /[?#]/.test(name) && /^https?:\/\//i.test(url)) {
+    const at = url.indexOf('/' + name, url.indexOf('://') + 3);
+    const suffix = url.slice(at + 1 + name.length);
+    if (at >= 0 && !/[?#]/.test(url.slice(0, at)) && (!suffix || /^[?#]/.test(suffix))) {
+      url = url.slice(0, at + 1) + encodeLibraryName(name) + suffix;
+    }
+  }
+  // Keep authority, signed query and fragment verbatim. Preserve RFC 3986 path
+  // delimiters (including the Worker's /0:/) and existing percent escapes.
+  return url.replace(/^(https?:\/\/[^/?#]+)([^?#]*)/i, (_, origin: string, pathname: string) =>
+    origin + pathname.replace(/%(?![\da-f]{2})|[^\w.!~*'()$&+,;=:@/%-]+/gi, encodeURIComponent));
+}
+
+export const FILE_NOT_FOUND_MESSAGE = 'File not found on server (404) — it may have been removed or the index cache is stale. Tap Refresh Library and try again.';
+
+export function playbackErrorMessage(error: any, fallback: string): string {
+  const detail = error?.error ?? error;
+  const messages = [detail?.message, detail?.errorString, detail?.errorException, detail?.errorStackTrace, detail];
+  return Number(detail?.status ?? detail?.statusCode ?? detail?.responseCode) === 404 ||
+    messages.some(value => typeof value === 'string' && /\b(?:HTTP(?:\/\d\.\d)?|response code|status code)[:=\s]+404\b/i.test(value))
+    ? FILE_NOT_FOUND_MESSAGE : fallback;
+}
+
 /** The native index restores process-local proxy registrations; ISO links must go through it on reopen. */
 export function isIsoArchiveUrl(url: string): boolean {
   const [path, fragment = ''] = url.split('#');
@@ -35,7 +69,7 @@ export function playbackDuration(file: { archiveFormat?: string; durationSec?: n
 export function archiveSourceUrl(name: string, baseUrl: string, parentPath: string, fallback: string): string {
   if (!/\.iso$/i.test(name) || !/^https?:\/\//i.test(baseUrl) ||
       !/^\/\d+:\//.test(parentPath) || /^(file|content):/i.test(fallback)) return fallback;
-  return `${baseUrl.replace(/\/$/, '')}${parentPath.replace(/\/$/, '')}/${encodeURIComponent(name)}`;
+  return getPlayableUrl(baseUrl, parentPath, name);
 }
 
 /** An ISO resolves to one feature. Preserve the outer card identity for artwork and resume. */

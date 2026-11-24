@@ -1,4 +1,23 @@
-import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration, archiveSourceUrl, isoMovieDetails } from '../archivePlayback';
+import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration, archiveSourceUrl, isoMovieDetails,
+  getPlayableUrl, FILE_NOT_FOUND_MESSAGE, playbackErrorMessage } from '../archivePlayback';
+
+test('encodes library names and listed paths once while retaining signed query bytes', () => {
+  const base = 'https://library';
+  expect(getPlayableUrl(base, '/0:/My Films/', 'A%20B #1? 50%.mkv')).toBe(
+    'https://library/0:/My%20Films/A%20B%20%231%3F%2050%25.mkv');
+  expect(getPlayableUrl(base, '/', 'Film #2?.mp4', '/0:/Film #2?.mp4?sig=x+y')).toBe(
+    'https://library/0:/Film%20%232%3F.mp4?sig=x+y');
+  for (const link of ['/0:/Tamil சினிமா/A%2FB 1.mp4', 'https://library/0:/Tamil சினிமா/A%2FB 1.mp4']) {
+    expect(getPlayableUrl(base, '/', '', link + '?sig=a%2Fb+c#name=1')).toBe(
+      base + '/0:/Tamil%20' + encodeURIComponent('சினிமா') + '/A%2FB%201.mp4?sig=a%2Fb+c#name=1');
+  }
+});
+
+test('shows Refresh Library for terminal native and player HTTP 404 errors', () => {
+  expect(playbackErrorMessage({ error: { errorCode: '22004', errorStackTrace: 'Caused by: InvalidResponseCodeException: Response code: 404' } }, 'failed')).toBe(FILE_NOT_FOUND_MESSAGE);
+  expect(playbackErrorMessage(new Error('ISO upstream bytes=0-1 HTTP 404 attempt=4'), 'failed')).toBe(FILE_NOT_FOUND_MESSAGE);
+  expect(playbackErrorMessage({ error: { errorStackTrace: 'Load failed at Player.java:404' } }, 'failed')).toBe('failed');
+});
 
 test('selected feature duration overrides disclaimer probes and stale cached runtime', () => {
   const feature = { archiveFormat: 'ISO', durationSec: 9995 };
