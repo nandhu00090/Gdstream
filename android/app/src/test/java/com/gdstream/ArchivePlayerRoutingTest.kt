@@ -15,6 +15,22 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE, sdk = [28])
 class ArchivePlayerRoutingTest {
+    @Test fun dvdProbeSuppressionFollowsTheSelectedEntryAndPlaybackLifetime() {
+        val base = "http://127.0.0.1:9090"
+        val vob = "$base/zip/disc/%5BDVD%20Main%5D.vob"
+        val hls = "$base/hls/disc/dvd.m3u8"
+        try {
+            ArchiveProxyStreams.prepare(hls)
+            assertTrue(ArchiveProxyStreams.skipDvdTrackProbe(vob))
+            assertFalse(ArchiveProxyStreams.skipDvdTrackProbe(vob.replace("/disc/", "/other/")))
+            ArchiveProxyStreams.prepare(vob)
+            assertFalse(ArchiveProxyStreams.skipDvdTrackProbe(vob))
+            ArchiveProxyStreams.prepare(hls)
+            ArchiveProxyStreams.stop(hls)
+            assertFalse(ArchiveProxyStreams.skipDvdTrackProbe(vob))
+        } finally { ArchiveProxyStreams.stop(hls) }
+    }
+
     @Test fun externalDvdLaunchUsesDirectVobFromEitherEntryPoint() {
         val base = "http://127.0.0.1:9090"
         val direct = "$base/zip/disc/Arundhati%20%5BDVD%20Main%5D.vob"

@@ -4,7 +4,20 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 
 /** Each segment starts with PSI and an IDR. PCR uses the video timeline. */
-internal class DvdTsMux(private val audioLanguageCode: String = "") {
+internal class DvdTsMux(private val audioLanguageCode: String = "", private val ac3Channels: Int = 0) {
+    private companion object {
+        const val AUDIO_PID = 0x0101
+        const val VIDEO_PID = 0x0102
+        const val AC3_FRAME_TICKS = 2880L // 1536 samples at 48 kHz
+    }
+
+    // One complete CRC-protected syncframe per layout, encoded from 1536 zero
+    // samples with FFmpeg's AC-3 encoder. Reuse the payload on each 32 ms PES.
+    private val silence by lazy {
+        val channels = ac3Channels.takeIf { it in 1..6 } ?: 2
+        DvdTsMux::class.java.getResourceAsStream("/dvd/silence-$channels.ac3")?.use { it.readBytes() }
+            ?: throw IOException("Missing DVD AC-3 silence frame for $channels channels")
+    }
     private data class UnitData(val video: Boolean, var ticks: Long, val data: ByteArray)
     private val samples = ArrayList<UnitData>()
     private var sps: ByteArray? = null
@@ -130,8 +143,8 @@ internal class DvdTsMux(private val audioLanguageCode: String = "") {
         }
         val phase = audioPhase ?: firstAudio?.minus(start)
         val audioEnd = firstAudio?.let { first ->
-            audio.forEachIndexed { i, sample -> sample.ticks = first + i * 2880L }
-            first + audio.size * 2880L // DVD AC-3: 1536 samples at 48 kHz
+            audio.forEachIndexed { i, sample -> sample.ticks = first + i * AC3_FRAME_TICKS }
+            first + audio.size * AC3_FRAME_TICKS
         }
 
         val first = video.first().ticks
@@ -149,7 +162,20 @@ internal class DvdTsMux(private val audioLanguageCode: String = "") {
             sample.ticks = fitted.coerceIn(previous + 1, end - (frames - i))
             previous = sample.ticks
         }
-        val next = Timing(start, video.last().ticks, end, firstAudio, audioEnd ?: timing?.nextAudio)
+        var outputFirstAudio = firstAudio
+        var nextAudio = audioEnd ?: timing?.nextAudio
+        if (ac3Channels > 0 && audio.isEmpty()) {
+            // Fit silence to the finished video window. Carry the partial frame at
+            // the boundary so rounding cannot accumulate across silent cells.
+            var tick = nextAudio ?: start
+            while (tick < end) {
+                if (outputFirstAudio == null) outputFirstAudio = tick
+                samples.add(UnitData(false, tick, silence))
+                tick += AC3_FRAME_TICKS
+            }
+            nextAudio = tick
+        }
+        val next = Timing(start, video.last().ticks, end, outputFirstAudio, nextAudio)
         val out = ByteArrayOutputStream()
         fun packets(pid: Int, data: ByteArray, clock: Long? = null) {
             var pos = 0
@@ -182,10 +208,10 @@ internal class DvdTsMux(private val audioLanguageCode: String = "") {
             packets(pid, byteArrayOf(0) + body + ByteArray(4) { (crc ushr (24 - it * 8)).toByte() })
         }
         psi(0, byteArrayOf(0, 0xb0.toByte(), 0, 0, 1, 0xc1.toByte(), 0, 0, 0, 1, 0xe1.toByte(), 0))
-        val pmtBase = byteArrayOf(2, 0xb0.toByte(), 0, 0, 1, 0xc1.toByte(), 0, 0, 0xe1.toByte(), 1, 0xf0.toByte(), 0,
+        val pmtBase = byteArrayOf(2, 0xb0.toByte(), 0, 0, 1, 0xc1.toByte(), 0, 0, 0xe1.toByte(), VIDEO_PID.toByte(), 0xf0.toByte(), 0,
             // No caption services are present in the transcoded AVC. An explicit empty
             // caption_service_descriptor prevents Media3 from inventing a CEA-608 track.
-            0x1b, 0xe1.toByte(), 1, 0xf0.toByte(), 3, 0x86.toByte(), 1, 0xe0.toByte())
+            0x1b, 0xe1.toByte(), VIDEO_PID.toByte(), 0xf0.toByte(), 3, 0x86.toByte(), 1, 0xe0.toByte())
         val audioDesc = ByteArrayOutputStream().apply {
             write(byteArrayOf(0x05, 0x04, 'A'.code.toByte(), 'C'.code.toByte(), '-'.code.toByte(), '3'.code.toByte()))
             write(byteArrayOf(0x6A, 0x01, 0x00))
@@ -195,15 +221,15 @@ internal class DvdTsMux(private val audioLanguageCode: String = "") {
                 write(0)
             }
         }.toByteArray()
-        val pmtAudio = byteArrayOf(0x81.toByte(), 0xe1.toByte(), 2, (0xf0 or (audioDesc.size ushr 8)).toByte(), audioDesc.size.toByte()) + audioDesc
-        psi(256, if (samples.any { !it.video }) pmtBase + pmtAudio else pmtBase)
+        val pmtAudio = byteArrayOf(0x81.toByte(), 0xe1.toByte(), AUDIO_PID.toByte(), (0xf0 or (audioDesc.size ushr 8)).toByte(), audioDesc.size.toByte()) + audioDesc
+        psi(256, if (ac3Channels > 0 || audio.isNotEmpty()) pmtBase + pmtAudio else pmtBase)
         for (sample in samples.sortedBy { it.ticks }) {
             val ticks = sample.ticks
             val size = if (sample.video) 0 else sample.data.size + 8
             val header = byteArrayOf(0, 0, 1, (if (sample.video) 0xe0 else 0xbd).toByte(), (size shr 8).toByte(), size.toByte(),
                 0x80.toByte(), 0x80.toByte(), 5, (33 or ((ticks ushr 29).toInt() and 14)).toByte(),
                 (ticks ushr 22).toByte(), ((ticks ushr 14) or 1).toByte(), (ticks ushr 7).toByte(), ((ticks shl 1) or 1).toByte())
-            packets(if (sample.video) 257 else 258, header + sample.data, ticks.takeIf { sample.video })
+            packets(if (sample.video) VIDEO_PID else AUDIO_PID, header + sample.data, ticks.takeIf { sample.video })
         }
         samples.clear()
         timing = next

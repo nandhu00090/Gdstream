@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /** Cancellation owns sockets AND permits; Future.cancel alone cannot interrupt an Android HTTP read. */
-internal class IsoReadSession(val pcrProbe: Boolean = false, val publishPrefix: ((ByteArray, Int) -> Unit)? = null) {
+internal class IsoReadSession(val publishPrefix: ((ByteArray, Int) -> Unit)? = null) {
     companion object {
         private val ids = AtomicLong()
         private val socketClosers = java.util.concurrent.Executors.newCachedThreadPool { task ->
@@ -95,22 +95,19 @@ internal class IsoReadSession(val pcrProbe: Boolean = false, val publishPrefix: 
     }
 
     fun cancel(reason: String = "response finished") {
-        val resources = synchronized(lock) {
+        val (reading, sockets, callbacks) = synchronized(lock) {
             if (isCancelled) return
             isCancelled = true
-            Triple(leases.toList(), connections.keys.toList(), cancellations.values.toList()).also {
-                leases.clear(); cancellations.clear()
+            Triple(leases.isNotEmpty(), connections.keys.toList(), cancellations.values.toList()).also {
+                cancellations.clear()
             }
         }
         log("ISO_REQUEST_CLOSE", reason)
-        // Release independently of HttpURLConnection teardown, which can contend with a blocked read.
-        // Worker finally blocks also close these leases; each lease releases exactly once.
-        resources.first.forEach { it.close() }
-        resources.third.forEach { it() }
-        // Android disconnect can contend with responseCode. Let sibling flights release their
-        // permits immediately even if this socket is still unwinding on another thread.
-        resources.second.forEach { conn ->
-            if (resources.first.isEmpty()) disconnect(conn) else socketClosers.execute { disconnect(conn) }
+        callbacks.forEach { it() }
+        // Disconnect off-thread if a range is blocked. Its worker releases the
+        // upstream permit in finally, after the connection has unwound.
+        sockets.forEach { conn ->
+            if (reading) socketClosers.execute { disconnect(conn) } else disconnect(conn)
         }
     }
 }

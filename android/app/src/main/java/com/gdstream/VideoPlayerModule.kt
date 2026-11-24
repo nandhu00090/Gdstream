@@ -19,8 +19,11 @@ import android.view.ViewGroup
 import androidx.media3.common.C
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Tracks
+import androidx.media3.common.util.Util
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.HttpDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import androidx.media3.exoplayer.analytics.AnalyticsListener
@@ -35,8 +38,14 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.UiThreadUtil
 import com.facebook.react.modules.core.DeviceEventManagerModule
+import com.facebook.react.modules.network.OkHttpClientProvider
+import okhttp3.Call
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.json.JSONObject
 import java.io.File
+import java.io.InterruptedIOException
+import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 
 class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
@@ -65,6 +74,21 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
         private var loudnessEnhancer: LoudnessEnhancer? = null
         private var enhancerSessionId: Int = -1
 
+        private val directClient by lazy {
+            OkHttpClientProvider.getOkHttpClient().newBuilder()
+                .connectTimeout(25, TimeUnit.SECONDS).readTimeout(25, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(false)
+                .addInterceptor(DirectMediaRetryInterceptor())
+                .addNetworkInterceptor { chain ->
+                    val response = chain.proceed(chain.request())
+                    // OkHttp otherwise follows a 503 with Retry-After: 0 internally,
+                    // before the application interceptor can count or delay it.
+                    if (response.code == 503 && response.header("Retry-After")?.toLongOrNull() == 0L)
+                        response.newBuilder().removeHeader("Retry-After").build() else response
+                }
+                .build()
+        }
+
         @androidx.annotation.Keep
         @JvmStatic
         fun audioTrackCatalog(rawPlayer: Any): java.util.ArrayList<com.brentvatne.common.api.Track> =
@@ -79,12 +103,20 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
         @JvmStatic
         fun archiveHttp(url: String, headers: Map<String, String>, retryCount: Int):
             android.util.Pair<DataSource.Factory, LoadErrorHandlingPolicy>? {
-            if (!SecurityVaultModule.isIsoStream(url)) return null
+            if (!SecurityVaultModule.isIsoStream(url)) {
+                val uri = Uri.parse(url)
+                if (uri.scheme !in listOf("http", "https") || ArchiveProxyStreams.streamId(url) != null ||
+                    Util.inferContentType(uri) != C.CONTENT_TYPE_OTHER) return null
+                val http = OkHttpDataSource.Factory(directClient).setDefaultRequestProperties(headers)
+                if (headers.keys.none { it.equals("User-Agent", true) }) http.setUserAgent("GDStream")
+                return android.util.Pair(http, DirectMediaLoadPolicy())
+            }
             val http = DefaultHttpDataSource.Factory().setConnectTimeoutMs(25_000).setReadTimeoutMs(25_000)
                 .setUserAgent("GDStream").setDefaultRequestProperties(headers)
             val retry = object : DefaultLoadErrorHandlingPolicy(retryCount) {
                 override fun getRetryDelayMsFor(info: LoadErrorHandlingPolicy.LoadErrorInfo): Long =
-                    if (super.getRetryDelayMsFor(info) == C.TIME_UNSET) C.TIME_UNSET else 150L
+                    if ((info.exception as? HttpDataSource.InvalidResponseCodeException)?.responseCode in setOf(404, 429, 503) ||
+                        super.getRetryDelayMsFor(info) == C.TIME_UNSET) C.TIME_UNSET else 150L
             }
             return android.util.Pair(http, retry)
         }
@@ -382,7 +414,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
             try {
                 val uri = resolvePlayableUri(SecurityVaultModule.externalPlayerUrl(url, player))
                 if (uri.host == "127.0.0.1" || uri.host == "localhost") {
-                    ArchiveProxyStreams.prepare(url)
+                    ArchiveProxyStreams.prepare(uri.toString())
                     ArchiveStreamService.start(reactApplicationContext)
                     SecurityVaultModule.prefetchExternalLaunch(url)
                 }
@@ -577,6 +609,53 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
 }
 
 private val Uri.videoExtension get() = lastPathSegment?.substringAfterLast('.')?.lowercase()
+
+private val directRetryDelaysMs = longArrayOf(400, 1000, 2200, 4000)
+
+internal class DirectMediaRetryInterceptor(
+    private val pause: (Call, Long) -> Unit = { call, delay ->
+        // OkHttp cancels a call on seek without interrupting its dispatcher thread.
+        var remaining = delay
+        while (remaining > 0 && !call.isCanceled()) {
+            val step = minOf(remaining, 100L)
+            Thread.sleep(step)
+            remaining -= step
+        }
+    }
+) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val initial = chain.request()
+        var response = chain.proceed(initial)
+        if (initial.method != "GET" && initial.method != "HEAD") return response
+        for (delay in directRetryDelaysMs) {
+            if (response.code !in retryableStatus) break
+            response.close()
+            try {
+                pause(chain.call(), delay)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw InterruptedIOException("Media retry interrupted").apply { initCause(e) }
+            }
+            if (chain.call().isCanceled()) throw InterruptedIOException("Media request cancelled")
+            response = chain.proceed(initial.newBuilder().header("Cache-Control", "no-cache").build())
+        }
+        return response
+    }
+
+    private companion object {
+        val retryableStatus = setOf(404, 408, 429, 500, 502, 503, 504)
+    }
+}
+
+internal class DirectMediaLoadPolicy : DefaultLoadErrorHandlingPolicy(directRetryDelaysMs.size) {
+    override fun getRetryDelayMsFor(info: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
+        // HTTP responses have already spent their retry budget in OkHttp. Media3 can
+        // resume an interrupted body at its last byte using a new range request.
+        if (info.exception is HttpDataSource.InvalidResponseCodeException ||
+            super.getRetryDelayMsFor(info) == C.TIME_UNSET) return C.TIME_UNSET
+        return directRetryDelaysMs.getOrNull(info.errorCount - 1) ?: C.TIME_UNSET
+    }
+}
 
 internal fun isoExtractors(uri: Uri, profile: BluRayProfile?, dv: Boolean): ExtractorsFactory = when (uri.videoExtension) {
     "vob" -> PsExtractor.FACTORY

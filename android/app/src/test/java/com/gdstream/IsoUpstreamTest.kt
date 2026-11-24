@@ -44,8 +44,7 @@ class IsoUpstreamTest {
             }
         }, onFailure = { failures.add(it) }, pause = { pauses.add(it) })
         assertArrayEquals(byteArrayOf(1, 2, 3, 4), data)
-        assertEquals(3, pauses.size)
-        assertTrue(pauses.all { it in 250L..900L })
+        assertEquals(listOf(400L, 1000L, 2000L), pauses)
         assertEquals(listOf(206, 206, 206), failures.map { it.status })
         assertTrue(isoFailureDetails(failures[0]).contains("java.net.SocketException: Connection reset"))
         assertFalse(isoFailureDetails(failures[0]).contains("token=secret"))
@@ -81,6 +80,36 @@ class IsoUpstreamTest {
                 job.get(1, TimeUnit.SECONDS)
             } finally { session.cancel(); pool.shutdownNow() }
         }
+    }
+
+    @Test fun coalescedRangeRecoversAfter404Then429Then503WithoutReopeningForEachReader() {
+        val cache = IsoChunkCache()
+        val waiting = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val pool = Executors.newFixedThreadPool(2)
+        val attempts = AtomicInteger()
+        val pauses = mutableListOf<Long>()
+        val end = start + 3
+        fun fetch(first: Long, last: Long, owner: IsoReadSession) = IsoRangeReader.readFully(
+            "https://worker/disc.iso", first, last, open = { a, b ->
+                assertEquals(start, a)
+                assertEquals(end, b)
+                when (val status = listOf(404, 429, 503, 206)[attempts.getAndIncrement()]) {
+                    206 -> Connection(status, "bytes $a-$b/90000000000", byteArrayOf(1, 2, 3, 4))
+                    else -> Connection(status, null, ByteArray(0))
+                }
+            }, pause = { pauses += it; waiting.countDown(); assertTrue(release.await(3, TimeUnit.SECONDS)) },
+            session = owner)
+        try {
+            val probe = pool.submit<ByteArray> { cache.readProbe(start, end, IsoReadSession(), ::fetch) }
+            assertTrue(waiting.await(2, TimeUnit.SECONDS))
+            val player = pool.submit<ByteArray> { cache.read(start, end, start, end, IsoReadSession(), fetch = ::fetch) }
+            release.countDown()
+            assertArrayEquals(byteArrayOf(1, 2, 3, 4), probe.get(3, TimeUnit.SECONDS))
+            assertArrayEquals(probe.get(), player.get(3, TimeUnit.SECONDS))
+            assertEquals(listOf(400L, 1000L, 2000L), pauses)
+            assertEquals(4, attempts.get())
+        } finally { release.countDown(); cache.clear(); pool.shutdownNow() }
     }
 
     @Test fun seekDeliversPrefixBeforeOriginFinishesAndRetriesOnlyTheMissingSuffix() {
@@ -165,7 +194,7 @@ class IsoUpstreamTest {
         })
         assertEquals(listOf(start, start + 2, start + 4, start + 6), positions)
         assertArrayEquals(ByteArray(8) { it.toByte() }, result)
-        for (status in listOf(200, 403, 404, 410, 416, 503)) {
+        for (status in listOf(200, 403, 404, 410, 416, 429, 503)) {
             var attempts = 0
             val failures = ArrayList<IsoRangeException>()
             assertThrows(IsoRangeException::class.java) {
@@ -173,13 +202,13 @@ class IsoUpstreamTest {
                     open = { _, _ -> attempts++; Connection(status, null, ByteArray(0)) },
                     onFailure = { failures.add(it) }, pause = {})
             }
-            assertEquals(if (status == 503) 4 else 1, attempts)
+            assertEquals(if (status in listOf(404, 429, 503)) 4 else 1, attempts)
             assertTrue(failures.all { it.status == status && it.start == start })
         }
     }
 
     @Test fun expiredDownloadRestartsAtOriginOnceWithTheSameRangeAndNoBackoff() {
-        for (expired in listOf(403, 404, 410)) for (recovers in listOf(true, false)) {
+        for (expired in listOf(403, 410)) for (recovers in listOf(true, false)) {
             val requests = mutableListOf<String>()
             val server = ServerSocket(0)
             server.soTimeout = 3000
@@ -217,21 +246,22 @@ class IsoUpstreamTest {
         }
     }
 
-    @Test fun parallelProbesNeverExceedSixUpstreamReads() {
-        val pool = Executors.newFixedThreadPool(8)
-        val entered = CountDownLatch(6)
+    @Test fun parallelProbesNeverExceedThreeUpstreamReads() {
+        val pool = Executors.newFixedThreadPool(10)
+        val entered = CountDownLatch(3)
         val release = CountDownLatch(1)
         val active = AtomicInteger()
         val peak = AtomicInteger()
         try {
-            val jobs = (1..8).map {
+            val jobs = (0 until 10).map { index ->
                 pool.submit<ByteArray> {
-                    IsoRangeReader.readFully("http://origin/download.aspx", start, start + 3, open = { from, to ->
+                    val offset = 89_000_000_000L + index * 4
+                    IsoRangeReader.readFully("http://origin/download.aspx", offset, offset + 3, open = { from, to ->
                         val count = active.incrementAndGet()
                         peak.updateAndGet { maxOf(it, count) }
                         entered.countDown()
                         assertTrue(release.await(5, TimeUnit.SECONDS))
-                        object : Connection(206, "bytes $from-$to/50000000000", ByteArray(4)) {
+                        object : Connection(206, "bytes $from-$to/90000000000", ByteArray(4)) {
                             override fun disconnect() {
                                 if (!closed) active.decrementAndGet()
                                 super.disconnect()
@@ -241,10 +271,10 @@ class IsoUpstreamTest {
                 }
             }
             assertTrue(entered.await(5, TimeUnit.SECONDS))
-            assertEquals(6, peak.get())
+            assertEquals(3, peak.get())
             release.countDown()
             jobs.forEach { assertEquals(4, it.get(5, TimeUnit.SECONDS).size) }
-            assertEquals(6, peak.get()); assertEquals(0, active.get())
+            assertEquals(3, peak.get()); assertEquals(0, active.get())
         } finally { release.countDown(); pool.shutdownNow() }
     }
 
@@ -308,6 +338,13 @@ class IsoUpstreamTest {
             assertEquals("$start-${start + 191},${start + 500}-${start + 691}", file.physicalRanges(error.start, error.count))
             assertTrue(isoFailureDetails(error).contains("HTTP 206"))
             assertTrue(isoFailureDetails(error).contains("java.net.SocketException: ECONNRESET"))
+            val unavailable = ByteArrayOutputStream()
+            assertThrows(IsoProxyReadException::class.java) {
+                file.serve("GET", "bytes=187-200", "video/mp2t", unavailable, pool) { _, _ ->
+                    throw IsoRangeException(start, start + 191, 404, "http://worker/movie", 4, IOException())
+                }
+            }
+            assertTrue(unavailable.toString("US-ASCII").startsWith("HTTP/1.1 404 Not Found\r\n"))
         } finally { pool.shutdownNow() }
     }
 
@@ -333,20 +370,20 @@ class IsoUpstreamTest {
         assertTrue(connections.all { it.closed })
     }
 
-    @Test fun abortedClientSocketsDisconnectBlockedReadsAndImmediatelyReleaseAllSixPermits() {
+    @Test fun abortedClientSocketsDisconnectBlockedReadsAndImmediatelyReleaseAllThreePermits() {
         assertCancelledProbes { clients -> clients.forEach { it.close() } }
     }
 
-    @Test fun serviceShutdownClosesProxySocketsAndReleasesAllFourUpstreamPermits() {
+    @Test fun serviceShutdownClosesProxySocketsAndReleasesAllThreeUpstreamPermits() {
         try { assertCancelledProbes { SecurityVaultModule.stopArchiveStreams("Recents or idle timeout") } }
         finally { ArchiveProxyStreams.registry.resume() }
     }
 
     private fun assertCancelledProbes(abort: (List<java.net.Socket>) -> Unit) {
         val pool = Executors.newCachedThreadPool()
-        val entered = CountDownLatch(6)
-        val disconnected = CountDownLatch(6)
-        val sessions = List(6) { IsoReadSession() }
+        val entered = CountDownLatch(3)
+        val disconnected = CountDownLatch(3)
+        val sessions = List(3) { IsoReadSession() }
         val clients = ArrayList<java.net.Socket>()
         val accepted = ArrayList<java.net.Socket>()
         val watches = ArrayList<IsoClientWatch>()
@@ -393,8 +430,8 @@ class IsoUpstreamTest {
                 }
                 assertArrayEquals(byteArrayOf(1, 2, 3, 4), next.get(1, TimeUnit.SECONDS))
                 assertTrue(connections.all { it.closed })
-                // Also proves cancelled workers did not double-release and raise the six-request limit.
-                parallelProbesNeverExceedSixUpstreamReads()
+                // Also proves cancelled workers did not double-release and raise the three-request limit.
+                parallelProbesNeverExceedThreeUpstreamReads()
             } finally {
                 sessions.forEach { it.cancel("test cleanup") }
                 watches.forEach { it.close() }

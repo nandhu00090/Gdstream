@@ -321,6 +321,11 @@ class DiscPlaybackTest {
                 0,
             ) + ByteArray(30)
         val info = specs.info(title, pes, 50_000_000)
+        // The opening PGC has all audio controls disabled. A later PGC
+        // selects physical AC-3 stream 1 for logical VTS audio attribute 0.
+        val silentOpening = specs.info(title.copy(programChains = listOf(5200) + title.programChains), ByteArray(0), 50_000_000)
+        assertEquals(0x81, silentOpening["ac3Substream"])
+        assertEquals(6, silentOpening["ac3Channels"])
         assertEquals("MPEG-2", info["videoCodec"])
         assertEquals(
             "Tamil • AC-3 • 5.1 ch • 384 kbps",

@@ -226,7 +226,7 @@ internal class IsoVirtualFile(
             return false
         } catch (e: Exception) {
             if (session.isCancelled) return false
-            if (!sentHeaders) try { error("502 Bad Gateway") } catch (_: IsoClientDisconnected) { }
+            if (!sentHeaders) try { error(isoProxyErrorStatus(e)) } catch (_: IsoClientDisconnected) { }
             throw IsoProxyReadException(pendingStart, pendingCount, e)
         } finally {
             session.cancel()

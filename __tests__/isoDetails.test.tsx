@@ -134,6 +134,14 @@ test('a warm homepage renders its last listing while the worker is still pending
   expect(renderer.root.findAllByProps({ focusId: 'card_0' })).toHaveLength(0);
 });
 
+test('only an explicit refresh bypasses the library edge cache', async () => {
+  const list = NativeModules.SecurityVault.securePostDirectory;
+  await mount();
+  expect(list.mock.calls.map(([path]: [string]) => path)).toEqual(['/0:/']);
+  await Renderer.act(async () => renderer.root.findByProps({ focusId: 'hdr_refresh' }).props.onPress());
+  expect(list.mock.calls.map(([path]: [string]) => path)).toEqual(['/0:/', expect.stringMatching(/^\/0:\/\?_t=\d+$/)]);
+});
+
 test('recreation restores ISO details in its original folder and Back persists the folder', async () => {
   const vault = NativeModules.SecurityVault;
   const folder = { name: 'Tamil Films', mimeType: 'application/vnd.google-apps.folder' };

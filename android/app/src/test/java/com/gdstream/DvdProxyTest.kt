@@ -39,7 +39,7 @@ class DvdProxyTest {
         val t = pes + 9
         val pts = ((u(t) and 14) shl 29) or (u(t + 1) shl 22) or ((u(t + 2) and 254) shl 14) or
             (u(t + 3) shl 7) or (u(t + 4) shr 1)
-        if (pid == 257) {
+        if (pid == 0x0102) {
             val pcr = (u(6) shl 25) or (u(7) shl 17) or (u(8) shl 9) or (u(9) shl 1) or (u(10) shr 7)
             assertEquals(pts, pcr)
         }
@@ -48,6 +48,34 @@ class DvdProxyTest {
 
     private val config = byteArrayOf(0, 0, 1, 0x67, 66, 0, 0, 1, 0x68, 1)
     private fun picture(idr: Boolean) = byteArrayOf(0, 0, 1, if (idr) 0x65 else 0x41, 42)
+
+    @Test fun silentOpeningCellsKeepOneAc3TrackAndHandOffToCopiedFramesOnTheSameClock() {
+        val mux = DvdTsMux("tam", 6)
+        val sourceFrame = javaClass.getResourceAsStream("/bluray/silent.ac3.bin")!!.use {
+            it.readBytes().copyOfRange(0, 768) // One source AC-3 syncframe
+        }
+        var start = 115_000_000L
+        var audio = start
+        repeat(5) { seg ->
+            mux.beginSegment()
+            if (seg == 0) mux.video(0, config, true)
+            val pictures = if (seg == 4) 1 else 3
+            val duration = pictures * 3600L
+            repeat(pictures) { mux.video(start + it * 3600, picture(it == 0)) }
+            if (seg == 4) mux.audio(115_686_798 * 1000L / 90, sourceFrame)
+            val ts = mux.finish(start, start + duration)
+            val streams = BluRayPsi.streams(ts)
+            assertEquals(listOf(0x1b to 0x0102, 0x81 to 0x0101), streams.map { it.type to it.pid })
+            assertEquals("tam", streams.last().language)
+            val expected = if (seg == 4) listOf(audio) else
+                generateSequence(audio) { it + 2880 }.takeWhile { it < start + duration }.toList()
+            assertEquals(expected, timestamps(ts, 0x0101))
+            assertEquals(List(pictures) { start + it * 3600 }, timestamps(ts, 0x0102))
+            if (seg == 4) assertArrayEquals(sourceFrame, audioPayload(ts).drop(14).toByteArray())
+            audio += expected.size * 2880
+            start += duration
+        }
+    }
 
     @Test fun mynaaPesOverlapsAndGapCannotMoveEitherWarmOutputClock() {
         val mux = DvdTsMux()
@@ -65,9 +93,9 @@ class DvdProxyTest {
             repeat(frames) { mux.video(raw.first + it * 3600, picture(it == 0)) }
             repeat(audioFrames) { mux.audio((raw.first - 900 + it * 2880) * 1000 / 90, byteArrayOf(11, 119)) }
             val ts = mux.finish(raw.first, raw.first + frames * 3600, raw.last - raw.first)
-            assertEquals((0 until frames).map { nextVideo + it * 3600 }, timestamps(ts, 257))
-            assertEquals((0 until audioFrames).map { nextAudio + it * 2880 }, timestamps(ts, 258))
-            for (p in ts.indices step 188) if (ts[p + 2] == 1.toByte()) {
+            assertEquals((0 until frames).map { nextVideo + it * 3600 }, timestamps(ts, 0x0102))
+            assertEquals((0 until audioFrames).map { nextAudio + it * 2880 }, timestamps(ts, 0x0101))
+            for (p in ts.indices step 188) if (ts[p + 2] == 2.toByte()) {
                 assertEquals((++lastCc) and 15, ts[p + 3].toInt() and 15)
             }
             nextVideo += frames * 3600
@@ -86,14 +114,14 @@ class DvdProxyTest {
         mux.video(16, picture(true))
         mux.audio((wrap - 16) * 1000 / 90, byteArrayOf(11, 119))
         var ts = mux.finish(16, 3616)
-        assertEquals(listOf(16L), timestamps(ts, 257))
-        assertEquals(listOf(wrap - 16), timestamps(ts, 258))
+        assertEquals(listOf(16L), timestamps(ts, 0x0102))
+        assertEquals(listOf(wrap - 16), timestamps(ts, 0x0101))
         mux.beginSegment()
         mux.video(3616, picture(true))
         mux.audio(100_000, byteArrayOf(11, 119))
         ts = mux.finish(90_000, 7216)
-        assertEquals(listOf(3616L), timestamps(ts, 257))
-        assertEquals(listOf(2864L), timestamps(ts, 258))
+        assertEquals(listOf(3616L), timestamps(ts, 0x0102))
+        assertEquals(listOf(2864L), timestamps(ts, 0x0101))
     }
 
     @Test fun videoOverrunningTwoSequentialAudioWindowsIsScaledBeforeWritingPesAndPcr() {
@@ -107,7 +135,7 @@ class DvdProxyTest {
             val native = start + 1_080_000
             repeat(count) { mux.video(native + it * 3600, picture(it == 0)) }
             val ts = mux.finish(start, native + count * 3600L)
-            assertEquals((0 until count).map { start + 360_000L * it / count }, timestamps(ts, 257))
+            assertEquals((0 until count).map { start + 360_000L * it / count }, timestamps(ts, 0x0102))
         }
     }
 
@@ -116,10 +144,11 @@ class DvdProxyTest {
         mux.video(0, config, true)
         mux.video(1000, picture(true))
         mux.video(4600, picture(false))
-        mux.finish(1000, 10_000)
+        val videoOnly = mux.finish(1000, 10_000)
+        assertEquals(listOf(0x1b), BluRayPsi.streams(videoOnly).map { it.type })
         mux.beginSegment()
         mux.video(10_000, picture(true))
-        assertEquals(listOf(10_000L), timestamps(mux.finish(500_000, 13_600), 257))
+        assertEquals(listOf(10_000L), timestamps(mux.finish(500_000, 13_600), 0x0102))
     }
 
     @Test fun speculativeSuccessIsReusedAndFailureIsRetriedOnDemand() {
@@ -176,13 +205,17 @@ class DvdProxyTest {
         assertEquals(0, bytes.size % 188)
         val streams = BluRayPsi.streams(bytes)
         assertEquals(listOf(0x1b, 0x81), streams.map { it.type })
+        assertArrayEquals(audio, audioPayload(bytes).copyOfRange(14, 14 + audio.size))
+    }
+
+    private fun audioPayload(bytes: ByteArray): ByteArray {
         val payload = java.io.ByteArrayOutputStream()
         for (p in bytes.indices step 188) {
             assertEquals(0x47, bytes[p].toInt())
-            if (((bytes[p+1].toInt() and 31) shl 8) + (bytes[p+2].toInt() and 255) != 258) continue
+            if (((bytes[p+1].toInt() and 31) shl 8) + (bytes[p+2].toInt() and 255) != 0x0101) continue
             val at = p + 4 + if (bytes[p+3].toInt() and 32 != 0) 1 + (bytes[p+4].toInt() and 255) else 0
             payload.write(bytes, at, p + 188 - at)
         }
-        assertArrayEquals(audio, payload.toByteArray().copyOfRange(14, 14 + audio.size))
+        return payload.toByteArray()
     }
 }

@@ -53,10 +53,10 @@ class IsoChunkCacheTest {
         } finally { session.cancel(); caches.clear() }
     }
 
-    @Test fun segmentReadAheadStartsFourWorkersAndSharesAll32MiBWithDemandReads() {
+    @Test fun segmentReadAheadUsesThreeWorkersAndSharesAll32MiBWithDemandReads() {
         val cache = IsoChunkCache()
         val size = 32L * 1024 * 1024
-        val entered = CountDownLatch(4)
+        val entered = CountDownLatch(3)
         val release = CountDownLatch(1)
         val done = CountDownLatch((size / block).toInt())
         val calls = AtomicInteger()
@@ -69,7 +69,7 @@ class IsoChunkCacheTest {
                 ByteArray((to - from + 1).toInt()) { (from / block).toByte() }
             }
             assertTrue(entered.await(5, TimeUnit.SECONDS))
-            assertEquals(4, calls.get())
+            assertEquals(3, calls.get())
             release.countDown()
             assertTrue(done.await(5, TimeUnit.SECONDS))
             repeat((size / block).toInt()) { i ->
