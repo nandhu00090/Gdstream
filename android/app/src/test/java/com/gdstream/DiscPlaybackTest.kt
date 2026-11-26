@@ -332,5 +332,27 @@ class DiscPlaybackTest {
             (info["audioTracks"] as List<Map<*, *>>).single()["summary"],
         )
         assertEquals("English", (info["subtitleTracks"] as List<Map<*, *>>).single()["language"])
+
+        // Logical stream numbers and physical VOB IDs need not match. For 16:9
+        // only the widescreen SPU number is selected, even when a letterbox ID differs.
+        put(0x200, 0x5c, 1)
+        put(0x202, 3, 2)
+        put(0x20c, 6 shl 5, 1)
+        put(0x20d, 5, 1)
+        "en".toByteArray().copyInto(ifo, 0x20e)
+        put(pgc + 14, 0x8300, 2)
+        put(0x254, 5, 2)
+        for (i in 0..3) put(pgc + 28 + i * 4, 0x80000800.toInt() or ((5 + i) shl 16), 4)
+        put(pgc + 0xa4 + 4, 0x00eb8080, 4)
+        val disc = DvdStreams.from(specs.info(title, pes, 50_000_000))
+        assertEquals(listOf(0x81, 0x8b), disc.audio.map { it.id })
+        assertEquals(listOf("tam", "eng"), disc.audio.map { it.language })
+        assertEquals(listOf(6, 6), disc.audio.map { it.channels })
+        assertEquals(listOf(0x25, 0x26, 0x27, 0x28), disc.subtitles.map { it.id })
+        assertEquals(listOf("eng", "und", "und", "und"), disc.subtitles.map { it.language })
+        val program = disc.programAt(2048)
+        assertEquals(disc.audio.map { it.id }, program.audio)
+        assertEquals(disc.subtitles.map { it.id }, program.subtitles)
+        assertEquals(0xeb8080, program.clut[1])
     }
 }

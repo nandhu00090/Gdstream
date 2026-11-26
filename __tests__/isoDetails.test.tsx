@@ -1,6 +1,6 @@
 import React from 'react';
 import Renderer from 'react-test-renderer';
-import { NativeModules } from 'react-native';
+import { BackHandler, NativeModules } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import App from '../App';
 
@@ -20,12 +20,14 @@ jest.mock('react-native', () => {
   rn.NativeModules.VideoPlayerManager = {
     getAllWatchProgress: jest.fn().mockResolvedValue({ times: {}, durations: {} }),
     playVideo: jest.fn().mockResolvedValue(true),
+    resetWindowBrightness: jest.fn(),
     removeWatchProgress: jest.fn().mockResolvedValue(true),
   };
   return rn;
 });
 jest.mock('react-native-orientation-locker', () => ({ lockToLandscape: jest.fn(), lockToPortrait: jest.fn() }));
 jest.mock('react-native-vector-icons/MaterialIcons', () => 'Icon');
+jest.mock('react-native-video', () => 'Video');
 jest.mock('axios', () => ({ get: jest.fn().mockRejectedValue(new Error('offline')) }));
 jest.mock('@react-native-async-storage/async-storage', () => {
   const values: Record<string, string> = {};
@@ -142,31 +144,43 @@ test('only an explicit refresh bypasses the library edge cache', async () => {
   expect(list.mock.calls.map(([path]: [string]) => path)).toEqual(['/0:/', expect.stringMatching(/^\/0:\/\?_t=\d+$/)]);
 });
 
-test('recreation restores ISO details in its original folder and Back persists the folder', async () => {
+test('a cold launch from details ignores legacy route storage and opens the Home catalog', async () => {
   const vault = NativeModules.SecurityVault;
-  const folder = { name: 'Tamil Films', mimeType: 'application/vnd.google-apps.folder' };
-  const iso = { id: 'outer', name: 'Example.2009.iso', size: '50000000000', modifiedTime: '2010-01-01' };
-  vault.securePostDirectory.mockImplementation(async (path: string) => JSON.stringify({
-    data: { files: path === '/0:/' ? [folder] : [iso, { name: 'Another.mp4', modifiedTime: '2000-01-01' }] },
-  }));
-  const feature = (port: number) => JSON.stringify([{ name: 'feature.vob', link: `http://127.0.0.1:${port}/zip/id/feature.vob` }]);
-  vault.listZipMediaEntries.mockResolvedValue(feature(99));
+  vault.listZipMediaEntries.mockResolvedValue(JSON.stringify([{ name: 'feature.vob', link: 'http://127.0.0.1/zip/id/feature.vob' }]));
   await mount();
   await Renderer.act(async () => renderer.root.findByProps({ focusId: 'card_0' }).props.onPress());
-  await Renderer.act(async () => renderer.root.findByProps({ focusId: 'fcard_0' }).props.onPress());
+  expect(renderer.root.findByProps({ focusId: 'detail_play_btn' })).toBeTruthy();
   await Renderer.act(async () => renderer.unmount());
-  vault.listZipMediaEntries.mockClear().mockResolvedValue(feature(111));
+  const key = JSON.stringify(['navigation_v1', 'https://library', '']);
+  expect(await AsyncStorage.getItem(key)).toBeNull();
+  await AsyncStorage.setItem(key, JSON.stringify({ screen: 'details', item: { name: 'Osthe.iso' },
+    currentPath: '/0:/Tamil/', pathStack: ['/0:/', '/0:/Tamil/'] }));
+  vault.listZipMediaEntries.mockClear();
+  vault.securePostDirectory.mockClear();
   await mount();
-  expect(vault.listZipMediaEntries).toHaveBeenCalledWith('https://library/0:/Tamil%20Films/Example.2009.iso#name=Example.2009.iso', Number(iso.size));
-  await Renderer.act(async () => {
-    const launch = renderer.root.findByProps({ focusId: 'detail_ext_btn' }).props.onPress();
-    jest.advanceTimersByTime(32);
-    await launch;
-  });
-  expect(NativeModules.VideoPlayerManager.playVideo).toHaveBeenCalledWith('http://127.0.0.1:111/zip/id/feature.vob', expect.anything());
-  await Renderer.act(async () => renderer.root.findByProps({ focusId: 'detail_back_btn' }).props.onPress());
-  await Renderer.act(async () => renderer.unmount());
-  await mount();
+  expect(renderer.root.findByProps({ focusId: 'card_0' })).toBeTruthy();
   expect(renderer.root.findAllByProps({ focusId: 'detail_play_btn' })).toHaveLength(0);
-  expect(renderer.root.findByProps({ focusId: 'fcard_0' })).toBeTruthy();
+  expect(vault.listZipMediaEntries).not.toHaveBeenCalled();
+  expect(vault.securePostDirectory.mock.calls.map(([path]: [string]) => path)).toEqual(['/0:/']);
+});
+
+test('Back from internal playback and unmount during playback both release the brightness override', async () => {
+  const back = jest.spyOn(BackHandler, 'addEventListener');
+  const reset = NativeModules.VideoPlayerManager.resetWindowBrightness;
+  const vault = NativeModules.SecurityVault;
+  vault.listZipMediaEntries.mockResolvedValue(JSON.stringify([{ name: 'feature.vob', link: 'http://127.0.0.1/zip/id/feature.vob' }]));
+  vault.dvdPlaybackUrl.mockResolvedValue('http://127.0.0.1/hls/id/dvd.m3u8');
+  try {
+    await mount();
+    await Renderer.act(async () => renderer.root.findByProps({ focusId: 'card_0' }).props.onPress());
+    const play = async () => Renderer.act(async () => renderer.root.findByProps({ focusId: 'detail_play_btn' }).props.onPress());
+    await play();
+    expect(reset).not.toHaveBeenCalled();
+    const handler = back.mock.calls.filter(([name]) => name === 'hardwareBackPress').pop()![1];
+    await Renderer.act(async () => { expect(handler({ type: 'hardwareBackPress', timeStamp: Date.now() })).toBe(true); });
+    expect(reset).toHaveBeenCalledTimes(1);
+    await play();
+    await Renderer.act(async () => renderer.unmount());
+    expect(reset).toHaveBeenCalledTimes(2);
+  } finally { back.mockRestore(); }
 });

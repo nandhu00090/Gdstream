@@ -524,6 +524,11 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
     }
 
     @ReactMethod
+    fun resetWindowBrightness() {
+        UiThreadUtil.runOnUiThread { reactApplicationContext.currentActivity?.window?.resetPlayerBrightness() }
+    }
+
+    @ReactMethod
     fun setSystemVolume(level: Double) {
         try {
             val clampedScale = level.coerceIn(0.0, 2.0)

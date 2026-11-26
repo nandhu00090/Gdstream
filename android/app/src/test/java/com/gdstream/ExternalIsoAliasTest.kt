@@ -13,6 +13,7 @@ class ExternalIsoAliasTest {
         for (entry in listOf(vob, hls)) {
             assertEquals(vob, externalDvdUrl(entry, "title", "Arundhati.vob", avc = false))
             assertEquals(hls, externalDvdUrl(entry, "title", "Arundhati.vob", avc = true))
+            assertEquals("$hls?muxed=1", externalDvdUrl(entry, "title", "Arundhati.vob", avc = true, muxed = true))
         }
         assertTrue(dvdPlayerNeedsAvc("androidx.media3.demo.main") { true })
         assertTrue(dvdPlayerNeedsAvc("com.example.video") { false })

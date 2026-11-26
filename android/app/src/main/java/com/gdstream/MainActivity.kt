@@ -1,12 +1,23 @@
 package com.gdstream
 
 import android.view.KeyEvent
+import android.view.Window
+import android.view.WindowManager
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
 import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.fabricEnabled
 import com.facebook.react.defaults.DefaultReactActivityDelegate
 
+internal fun Window.resetPlayerBrightness() {
+  attributes = attributes.apply { screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE }
+}
+
 class MainActivity : ReactActivity() {
+
+  override fun onStop() {
+    window.resetPlayerBrightness()
+    super.onStop()
+  }
 
   override fun getMainComponentName(): String = "Gdstream"
 

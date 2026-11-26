@@ -1,12 +1,17 @@
 #include <jni.h>
+#include "dvd_codecs.h"
+#include <exception>
+#include <memory>
+#include <vector>
+
+// The audio/SPU JNI entry points also run in host-side mux integration tests.
+#ifdef __ANDROID__
 #include <media/NdkMediaCodec.h>
 #include <dlfcn.h>
 #include <chrono>
 #include <cstdint>
 #include <deque>
 #include "dvd_yuv.h"
-#include <memory>
-#include <vector>
 
 extern "C" {
 #include "libmpeg2/mpeg2.h"
@@ -236,4 +241,59 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_gdstream_DvdProxy_encode(JNIEnv *env
 
 extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_close(JNIEnv *, jobject, jlong handle) {
     delete reinterpret_cast<Session *>(handle);
+}
+
+#endif // __ANDROID__
+
+namespace {
+void codecError(JNIEnv *env, const std::exception &error) {
+    if (!env->ExceptionCheck()) env->ThrowNew(env->FindClass("java/io/IOException"), error.what());
+}
+jbyteArray toBytes(JNIEnv *env, const std::vector<uint8_t> &bytes) {
+    auto out = env->NewByteArray(bytes.size());
+    if (out && !bytes.empty()) env->SetByteArrayRegion(out, 0, bytes.size(), reinterpret_cast<const jbyte *>(bytes.data()));
+    return out;
+}
+}
+
+extern "C" JNIEXPORT jlong JNICALL Java_com_gdstream_DvdProxy_openAudio(JNIEnv *env, jobject, jint id) {
+    try {
+        auto track = std::make_unique<dvd::Audio>();
+        track->open(id);
+        return reinterpret_cast<jlong>(track.release());
+    } catch (const std::exception &e) { codecError(env, e); return 0; }
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL Java_com_gdstream_DvdProxy_convertAudio(
+        JNIEnv *env, jobject, jlong handle, jbyteArray input, jint start, jint size, jboolean last) {
+    try {
+        std::vector<uint8_t> bytes(size);
+        if (size) env->GetByteArrayRegion(input, start, size, reinterpret_cast<jbyte *>(bytes.data()));
+        if (env->ExceptionCheck()) return nullptr;
+        return toBytes(env, reinterpret_cast<dvd::Audio *>(handle)->convert(bytes.data(), size, last));
+    } catch (const std::exception &e) { codecError(env, e); return nullptr; }
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_closeAudio(JNIEnv *, jobject, jlong handle) {
+    delete reinterpret_cast<dvd::Audio *>(handle);
+}
+
+extern "C" JNIEXPORT jobject JNICALL Java_com_gdstream_DvdProxy_decodeSpu(
+        JNIEnv *env, jobject, jbyteArray input, jintArray palette, jint width, jint height) {
+    try {
+        int32_t clut[16];
+        env->GetIntArrayRegion(palette, 0, 16, clut);
+        if (env->ExceptionCheck()) return nullptr;
+        std::vector<uint8_t> bytes(env->GetArrayLength(input));
+        env->GetByteArrayRegion(input, 0, bytes.size(), reinterpret_cast<jbyte *>(bytes.data()));
+        if (env->ExceptionCheck()) return nullptr;
+        auto display = dvd::subpicture(bytes.data(), bytes.size(), clut, width, height);
+        if (display.segments.empty()) return nullptr;
+        auto type = env->FindClass("com/gdstream/DvdSpu$Display");
+        if (!type) return nullptr;
+        auto init = env->GetMethodID(type, "<init>", "(JJ[B)V");
+        auto segments = toBytes(env, display.segments);
+        return init && segments ? env->NewObject(type, init, static_cast<jlong>(display.show),
+            static_cast<jlong>(display.stop), segments) : nullptr;
+    } catch (const std::exception &e) { codecError(env, e); return nullptr; }
 }

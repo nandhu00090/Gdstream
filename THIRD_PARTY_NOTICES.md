@@ -20,9 +20,11 @@ HDMV LPCM packets to a nonexistent Android MediaCodec decoder.
 
 ## External HLS audio encoder
 
-Standalone BDAV DTS renditions use the FFmpegKit Android distribution
+DVD audio and subpicture conversion and standalone BDAV DTS renditions use the FFmpegKit Android distribution
 `com.moizhassan.ffmpeg:ffmpeg-kit-16kb:6.1.1` for software decoding, resampling
-and AC-3 encoding. The published native build enables GPL components and ships
+and AC-3 encoding. The DVD bridge also uses its DVD subtitle decoder and DVB subtitle encoder.
+Its CMake build uses the public headers from [FFmpeg 6.0](https://github.com/FFmpeg/FFmpeg/tree/n6.0).
+The published native build enables GPL components and ships
 the GPL-3.0 text and component notices in its Android resources.
 [Publisher, sources and build instructions](https://github.com/moizhassankh/ffmpeg-kit-android-16KB)
 
