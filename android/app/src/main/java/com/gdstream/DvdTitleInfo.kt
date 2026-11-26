@@ -21,7 +21,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
         return bcd(u(p)) * 3600 + bcd(u(p + 1)) * 60 + bcd(u(p + 2)) + bcd(u(p + 3) and 63) / fps
     }
 
-    data class Cell(val ranges: List<LongRange>, val durationUs: Long, val discontinuity: Boolean)
+    data class Cell(val ranges: List<LongRange>, val durationUs: Long, val discontinuity: Boolean, val pgc: Int)
     data class Title(val duration: Double, val playback: List<Cell>, val programChains: List<Int>) {
         val cells get() = playback.flatMap { it.ranges }
     }
@@ -93,7 +93,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
                         val seconds = seconds(c + 4)
                         val jump = cells.lastOrNull()?.let { it.ranges.last().last + 1 != ranges.first().first } ?: false
                         val discontinuity = u(c) and 2 != 0 || jump && u(c) and 8 == 0
-                        cells.add(Cell(ranges, (seconds * 1_000_000).toLong(), discontinuity))
+                        cells.add(Cell(ranges, (seconds * 1_000_000).toLong(), discontinuity, pgc))
                         duration += seconds
                     }
                 }
@@ -153,7 +153,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
             return "Unknown" to ""
         }
         fun s(i: Int) = sample[i].toInt() and 255
-        val frames = HashMap<Int, ByteArray>()
+        val formats = HashMap<Int, DiscAudio>()
         val mpegRates = HashMap<Int, Int>()
         var videoRate = 0
         for (i in 0 until sample.size - 16) {
@@ -176,34 +176,46 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
             if (streamId != 0xbd) continue
             val at = i + 9 + s(i + 8)
             val end = minOf(sample.size, i + 6 + (s(i + 4) shl 8) + s(i + 5))
-            if (at + 4 < end && s(at) !in frames) frames[s(at)] = sample.copyOfRange(at + 4, end)
+            if (at + 4 >= end) continue
+            val id = s(at)
+            if (id in formats || id !in 0x80..0x8f) continue
+            val probe = DiscAudio.probe(sample.copyOfRange(at + 4, end), if (id < 0x88) 0x81 else 0x82)
+            if (probe.kbps > 0 || probe.layout.isNotEmpty()) formats[id] = probe
         }
-        var ac3Substream = -1
-        var ac3Channels = 0
-        var primaryAudioCode = ""
+        fun audioId(pgc: Int, index: Int): Int {
+            val control = word(pgc + 0x0c + index * 2)
+            if (control and 0x8000 == 0) return -1
+            val base = when (u(0x204 + 8 * index) ushr 5) {
+                0 -> 0x80
+                2, 3 -> 0xc0
+                4 -> 0xa0
+                6 -> 0x88
+                else -> return -1
+            }
+            return base + ((control ushr 8) and 7)
+        }
+        fun subtitleId(pgc: Int, index: Int): Int {
+            val control = pgc + 0x1c + index * 4
+            if (u(control) and 0x80 == 0) return -1
+            // Physical stream for the authored aspect ratio (4:3 or widescreen).
+            val wide = (u(0x200) ushr 2) and 3 == 3
+            return 0x20 + (u(control + if (wide) 1 else 0) and 31)
+        }
         val audio =
             (0 until word(0x202).coerceAtMost(8)).mapNotNull { index ->
-                val control = title.programChains.firstNotNullOfOrNull { pgc ->
-                    word(pgc + 12 + index * 2).takeIf { it and 0x8000 != 0 }
-                } ?: return@mapNotNull null
+                val pgc = title.programChains.firstOrNull { word(it + 12 + index * 2) and 0x8000 != 0 }
+                    ?: return@mapNotNull null
                 val p = 0x204 + 8 * index
-                val track = (control ushr 8) and 7
+                val id = audioId(pgc, index)
                 val type = u(p) ushr 5
-                val codec =
-                    when (type) {
-                        0 -> "AC-3"
-                        2,
-                        3 -> "MPEG Audio"
-                        4 -> "LPCM"
-                        6 -> "DTS"
-                        else -> "Unknown"
-                    }
-                val format =
-                    when (type) {
-                        0 -> frames[0x80 + track]?.let { DiscAudio.probe(it, 0x81) }
-                        6 -> frames[0x88 + track]?.let { DiscAudio.probe(it, 0x82) }
-                        else -> null
-                    }
+                val codec = when (type) {
+                    0 -> "AC-3"
+                    2, 3 -> "MPEG Audio"
+                    4 -> "LPCM"
+                    6 -> "DTS"
+                    else -> "Unknown"
+                }
+                val format = formats[id]
                 val count = (u(p + 1) and 7) + 1
                 val layout =
                     format?.layout?.takeIf { it.isNotEmpty() }
@@ -218,14 +230,13 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
                             (intArrayOf(16, 20, 24, 0)[u(p + 1) ushr 6] *
                                 (if (u(p + 1) and 16 != 0) 96 else 48) *
                                 count)
-                        else mpegRates[0xc0 + track] ?: 0
+                        else mpegRates[id] ?: 0
                 val (lang, iso3) = language(p + 2, useFallback = index == 0)
-                if (type == 0 && ac3Substream < 0) {
-                    ac3Substream = 0x80 + track
-                    ac3Channels = count
-                    primaryAudioCode = iso3
-                }
                 mapOf(
+                    "ifoIndex" to index,
+                    "substreamId" to id,
+                    "languageCode" to iso3.ifEmpty { "und" },
+                    "channelCount" to count,
                     "language" to lang,
                     "channels" to layout,
                     "codec" to codec,
@@ -235,10 +246,29 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
                             .joinToString(" • "),
                 )
             }
-        val subs =
-            (0 until word(0x254).coerceAtMost(32))
-                .filter { u(title.programChains.first() + 28 + it * 4) and 128 != 0 }
-                .map { mapOf("language" to language(0x258 + it * 6).first, "format" to "DVD Subpicture") }
+        val subs = (0 until word(0x254).coerceAtMost(32)).mapNotNull { index ->
+            val pgc = title.programChains.firstOrNull { subtitleId(it, index) >= 0 } ?: return@mapNotNull null
+            val (name, code) = language(0x258 + index * 6)
+            mapOf("ifoIndex" to index, "substreamId" to subtitleId(pgc, index),
+                "language" to name, "languageCode" to code.ifEmpty { "und" }, "format" to "DVD Subpicture")
+        }
+        val programs = title.programChains.map { pgc ->
+            mapOf("audio" to audio.map { audioId(pgc, it["ifoIndex"] as Int) },
+                "subpictures" to subs.map { subtitleId(pgc, it["ifoIndex"] as Int) },
+                "clut" to List(16) { long(pgc + 0xa4 + it * 4).toInt() and 0xffffff })
+        }
+        var virtual = 0L
+        var previous = -1
+        val runs = buildList {
+            for (cell in title.playback) {
+                if (cell.pgc != previous) {
+                    add(listOf(virtual, title.programChains.indexOf(cell.pgc).toLong()))
+                    previous = cell.pgc
+                }
+                virtual += cell.ranges.sumOf { it.last - it.first + 1 }
+            }
+        }
+        val firstAc3 = audio.firstOrNull { it["codec"] == "AC-3" }
         val pal = u(0x200) and 0x10 != 0
         val picture = (u(0x201) ushr 2) and 3
         val height = (if (pal) 576 else 480) / if (picture == 3) 2 else 1
@@ -259,9 +289,11 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
             "resolution" to "${height}i",
             "frameRate" to if (pal) 25.0 else 30000.0 / 1001,
             "audioTracks" to audio,
-            "ac3Substream" to ac3Substream,
-            "ac3Channels" to ac3Channels,
-            "audioLanguageCode" to primaryAudioCode,
+            "ac3Substream" to (firstAc3?.get("substreamId") ?: -1),
+            "ac3Channels" to (firstAc3?.get("channelCount") ?: 0),
+            "audioLanguageCode" to (firstAc3?.get("languageCode") ?: ""),
+            "dvdPrograms" to programs,
+            "dvdProgramRuns" to runs,
             "subtitleTracks" to subs,
             "languages" to audio.map { it.getValue("language") }.distinct(),
             "hasHDR" to false,
@@ -272,7 +304,7 @@ internal class DvdTitleInfo private constructor(private val ifo: ByteArray) {
     }
 
     companion object {
-        const val INDEX_VERSION = 2
+        const val INDEX_VERSION = 3
         private val MPEG1_LAYER2 =
             intArrayOf(0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384)
         private val MPEG2_LAYER2 =

@@ -152,9 +152,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 DvdProxy.estimatedSegments(uncompressedSize, (seconds * 1_000_000).toLong())
             } else emptyList()
         }
+        val dvdHls by lazy { DvdHls(DvdStreams.from(resolvedInfo.orEmpty())) }
         val dvdEncoder by lazy {
             val audio = resolvedInfo?.get("audioTracks") as? List<*>
-            val supportedAudio = audio.isNullOrEmpty() || audio.any { (it as? Map<*, *>)?.get("codec") == "AC-3" }
+            val supportedAudio = audio.isNullOrEmpty() || audio.any { (it as? Map<*, *>)?.get("codec") in setOf("AC-3", "DTS", "LPCM", "MPEG Audio") }
             if (!supportedAudio || resolvedInfo == null || dvdPlaylist.isEmpty() || resolvedInfo["videoCodec"] != "MPEG-2") null else
                 DvdProxy.encoder((resolvedInfo.getValue("width") as Number).toInt(), (resolvedInfo.getValue("height") as Number).toInt())
         }
@@ -236,9 +237,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         externalIsoUrl = { url, player ->
             val entry = ArchiveProxyStreams.streamId(url)?.let { archiveEntryRegistry[it] }
             if (entry?.archiveFormat == "ISO" && entry.fileName.endsWith(".vob", true)) {
-                val avc = player != null && dvdPlayerNeedsAvc(player) { DvdProxy.canDecodeMpeg2(entry.resolvedInfo) }
+                val vlc = dvdVlcPlayer(player)
+                val avc = (vlc && !entry.standalone && entry.dvdEncoder != null) ||
+                    (player != null && dvdPlayerNeedsAvc(player) { DvdProxy.canDecodeMpeg2(entry.resolvedInfo) })
                 check(!avc || entry.dvdEncoder != null) { "AVC conversion unavailable for this DVD. Open it in VLC." }
-                externalDvdUrl(url, entry.id, entry.fileName, avc)
+                externalDvdUrl(url, entry.id, entry.fileName, avc, muxed = vlc)
             } else if (entry == null) url else if (entry.archiveFormat == "ISO" && entry.isBdavM2ts &&
                 entry.hls != null) {
                 val uri = java.net.URI(url)
@@ -1156,9 +1159,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val audioMatch = Regex("audio_([0-9]+)(?:\\.m3u8|_seg_[0-9]+\\.ts)").matchEntire(resource)
             val audioPid = audioMatch?.groupValues?.get(1)?.toIntOrNull()
             val hlsSegment = Regex("(?:audio_[0-9]+_)?seg_([0-9]+)\\.ts").matchEntire(resource)?.groupValues?.get(1)?.toIntOrNull()
-            val dvdIndex = Regex("dvd_([0-9]+)\\.ts").matchEntire(resource)?.groupValues?.get(1)?.toIntOrNull()
-            val dvd = segments[0] == "hls" && entry != null && entry.dvdPlaylist.isNotEmpty() &&
-                (resource == "dvd.m3u8" || dvdIndex != null && dvdIndex in entry.dvdPlaylist.indices)
+            val dvdResource = if (segments[0] == "hls" && entry?.archiveFormat == "ISO" && entry.dvdPlaylist.isNotEmpty())
+                entry.dvdHls.resource(resource, entry.dvdPlaylist.size, path.substringAfter('?', "") == "muxed=1" ||
+                    userAgent.contains("LibVLC", ignoreCase = true)) else null
+            val dvd = dvdResource != null
+            val dvdIndex = dvdResource?.index
             val validPath = if (dvd) true else if (segments[0] == "hls") hls != null &&
                 (audioMatch == null || hls.audio.any { it.pid == audioPid }) &&
                 (resource in listOf("index.m3u8", "video.m3u8") || audioPid != null && resource.endsWith(".m3u8") ||
@@ -1235,8 +1240,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 }
                 val complete = if (dvd) {
                     if (writeArchiveOptions(method, out, true)) return
-                    val body = if (dvdIndex == null) DvdProxy.playlist(entry.dvdPlaylist) else try {
-                        dvdChunks.segment(entry.id, dvdIndex, entry.dvdPlaylist.lastIndex, session, method == "GET") { index, owner, sequence ->
+                    val body = if (dvdIndex == null) entry.dvdHls.playlist(checkNotNull(dvdResource), entry.dvdPlaylist) else try {
+                        val trackPid = dvdResource.pid
+                        val muxed = dvdChunks.segment(entry.id, dvdIndex, entry.dvdPlaylist.lastIndex, session, method == "GET",
+                            entry.dvdHls.multivariant, trackPid) { index, owner, sequence ->
                             fun read(from: Long, to: Long) = cachedFetch(from, to, owner)
                             val segment = entry.dvdPlaylist[index]
                             val estimate = entry.standalone || entry.dvdSegments.isEmpty()
@@ -1250,12 +1257,15 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             val data = file.readRaw(start, Math.toIntExact((nextVobu ?: segment.end) - start), ::read)
                             DvdProxy.transcode(data, checkNotNull(entry.resolvedInfo), checkNotNull(entry.dvdEncoder),
                                 owner, entry.id, sequence, index, nextVobu != null, index == entry.dvdPlaylist.lastIndex,
-                                segment.discontinuity) {
+                                segment.discontinuity, start, { pos, limit ->
+                                    file.readRaw(pos, minOf(file.rawSize - pos, limit.toLong()).coerceAtLeast(0).toInt(), ::read)
+                                }) {
                                 entry.dvdSequenceHeader ?: DvdProxy.sequenceHeader(
                                     file.readRaw(0, minOf(file.size, 512L * 1024).toInt(), ::read)
                                 )?.also { entry.dvdSequenceHeader = it }
                             }
                         }
+                        if (trackPid == null) muxed else entry.dvdHls.rendition(muxed, trackPid, dvdIndex)
                     } catch (error: java.io.IOException) {
                         session.checkActive()
                         appendDebugLog("DVD_SEG_ERR", "seg=$dvdIndex ${isoFailureDetails(error)}")
@@ -4431,7 +4441,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         val ranges = DvdTitleInfo.extents(title.cells, dt.segs)
                         val movie = IsoVirtualFile(ranges, false)
                         val sample = movie.readRaw(0, minOf(movie.size, 2L * 1024 * 1024).toInt(), read)
-                        val info = specs.info(title, sample, movie.size)
+                        val info = specs.info(title, sample, movie.size, discTitle)
                         registerIsoStreamTarget(isoUrl, totalIsoSize, label, movie.size, ranges, port, "video/mpeg",
                             title.duration.toInt(), dvdInfo = info, dvdSegments = specs.segments(title))
                     }.onFailure { appendDebugLog("DVD_IFO", isoFailureDetails(it)) }.getOrNull()

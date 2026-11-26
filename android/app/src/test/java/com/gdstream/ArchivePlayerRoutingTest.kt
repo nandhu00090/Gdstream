@@ -92,7 +92,7 @@ class ArchivePlayerRoutingTest {
         val data = javaClass.getResourceAsStream("/dvd/interlaced.vob.bin")!!.readBytes()
         val frames = mutableListOf<ByteArray>()
         val timestamps = mutableListOf<Long>()
-        DvdProxy.demux(data, -1) { time, bytes ->
+        DvdProxy.demuxVideo(data) { time, bytes ->
             timestamps.add(time)
             frames.add(bytes)
         }
@@ -110,7 +110,7 @@ class ArchivePlayerRoutingTest {
                 data[i+3] == 0xb3.toByte()) data[i+3] = 0xb2.toByte()
         }
         var first: ByteArray? = null
-        DvdProxy.demux(data, -1, { header }) { _, bytes -> if (first == null) first = bytes }
+        DvdProxy.demuxVideo(data, { header }) { _, bytes -> if (first == null) first = bytes }
         assertArrayEquals(header, first)
     }
 

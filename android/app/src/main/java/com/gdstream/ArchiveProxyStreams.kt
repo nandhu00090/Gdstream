@@ -8,8 +8,10 @@ internal fun archiveFilenameMatches(encoded: String?, expected: String, bdavAlia
     decoded == expected || (bdavAlias && expected.endsWith(".m2ts", true) && decoded == expected.dropLast(5) + ".ts")
 } catch (_: IllegalArgumentException) { false }
 
+internal fun dvdVlcPlayer(player: String?) = player == "org.videolan.vlc" || player?.startsWith("org.videolan.vlc.") == true
+
 internal fun dvdPlayerNeedsAvc(player: String, platformMpeg2: () -> Boolean): Boolean = when {
-    player == "org.videolan.vlc" || player.startsWith("org.videolan.vlc.") ||
+    dvdVlcPlayer(player) ||
         player == "is.xyz.mpv" || player.startsWith("is.xyz.mpv.") || player == "live.mehiz.mpvkt" ||
         player == "org.xbmc.kodi" -> false
     player == "com.brouken.player" || player.startsWith("com.brouken.player.") ||
@@ -17,9 +19,9 @@ internal fun dvdPlayerNeedsAvc(player: String, platformMpeg2: () -> Boolean): Bo
     else -> !platformMpeg2()
 }
 
-internal fun externalDvdUrl(url: String, id: String, fileName: String, avc: Boolean = false): String {
+internal fun externalDvdUrl(url: String, id: String, fileName: String, avc: Boolean = false, muxed: Boolean = false): String {
     val uri = java.net.URI(url)
-    if (avc) return "${uri.scheme}://${uri.rawAuthority}/hls/$id/dvd.m3u8"
+    if (avc) return "${uri.scheme}://${uri.rawAuthority}/hls/$id/dvd.m3u8" + if (muxed) "?muxed=1" else ""
     val name = java.net.URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")
     return "${uri.scheme}://${uri.rawAuthority}/zip/$id/$name"
 }

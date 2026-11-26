@@ -166,10 +166,10 @@ class DvdProxyTest {
             owner.checkActive()
             return if (index == 1) prefetched else byteArrayOf(0)
         }
-        cache.segment("dvd", 0, 2, session, true, ::load)
+        cache.segment("dvd", 0, 2, session, true, load = ::load)
         assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS))
         // The in-flight next segment must never hold the completed-cache lock.
-        assertArrayEquals(byteArrayOf(0), cache.segment("dvd", 0, 2, session, false, ::load))
+        assertArrayEquals(byteArrayOf(0), cache.segment("dvd", 0, 2, session, false, load = ::load))
         release.countDown()
         val attempted = java.util.concurrent.CountDownLatch(1)
         assertSame(prefetched, cache.segment("dvd", 1, 2, session, true) { _, _, _ ->
@@ -178,6 +178,27 @@ class DvdProxyTest {
         })
         assertTrue(attempted.await(2, java.util.concurrent.TimeUnit.SECONDS))
         assertArrayEquals(byteArrayOf(2), cache.segment("dvd", 2, 2, session, false) { _, _, _ -> byteArrayOf(2) })
+    }
+
+    @Test fun lateHlsRenditionsReuseTheSameClockAndEncodeOnce() {
+        val cache = DvdSegmentCache()
+        val session = IsoReadSession()
+        val calls = mutableListOf<Pair<Int, Long>>()
+        fun request(index: Int, pid: Int? = null) = cache.segment("disc", index, 20, session, false, true, pid) { i, _, sequence ->
+            calls.add(i to sequence)
+            byteArrayOf(i.toByte())
+        }
+        val first = request(0, 0x101)
+        assertSame(first, request(0))
+        val second = request(1)
+        request(2)
+        assertSame(first, request(0, 0x120))
+        assertSame(second, request(1, 0x101))
+        assertSame(second, request(1, 0x120))
+        assertEquals(listOf(0, 1, 2), calls.map { it.first })
+        assertEquals(1, calls.map { it.second }.distinct().size)
+        assertNotSame(first, request(0)) // explicit video seek
+        assertNotEquals(calls.first().second, calls.last().second)
     }
 
     @Test fun aSeekToACachedSegmentStartsANewTimeline() {
