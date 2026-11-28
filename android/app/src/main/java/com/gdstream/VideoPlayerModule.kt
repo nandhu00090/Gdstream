@@ -440,8 +440,36 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
                 val handlers = pm.queryIntentActivities(externalVideoIntent(raw), android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
                     .distinctBy { it.activityInfo.packageName }.sortedBy { it.loadLabel(pm).toString() }
                 check(handlers.isNotEmpty()) { "No external video player installed" }
+                val iconSizePx = (36 * activity.resources.displayMetrics.density).roundToInt()
+                val iconPaddingPx = (14 * activity.resources.displayMetrics.density).roundToInt()
+                val adapter = object : android.widget.ArrayAdapter<android.content.pm.ResolveInfo>(
+                    activity,
+                    android.R.layout.select_dialog_item,
+                    android.R.id.text1,
+                    handlers
+                ) {
+                    override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                        val row = super.getView(position, convertView, parent)
+                        val textView = row.findViewById<android.widget.TextView>(android.R.id.text1)
+                        val info = handlers[position]
+                        textView.text = info.loadLabel(pm)
+                        val icon = try {
+                            info.loadIcon(pm)
+                        } catch (_: Exception) {
+                            null
+                        }
+                        if (icon != null) {
+                            icon.setBounds(0, 0, iconSizePx, iconSizePx)
+                            textView.setCompoundDrawablesRelative(icon, null, null, null)
+                            textView.compoundDrawablePadding = iconPaddingPx
+                        } else {
+                            textView.setCompoundDrawablesRelative(null, null, null, null)
+                        }
+                        return row
+                    }
+                }
                 android.app.AlertDialog.Builder(activity).setTitle(chooserTitle)
-                    .setItems(handlers.map { it.loadLabel(pm) }.toTypedArray()) { _, index ->
+                    .setAdapter(adapter) { _, index ->
                         val target = handlers[index].activityInfo
                         launch(target.packageName, android.content.ComponentName(target.packageName, target.name))
                     }.setOnCancelListener { promise.resolve(false) }.show()
