@@ -123,7 +123,7 @@ class ArchivePlayerRoutingTest {
 
     @Test fun playVideoUsesSystemChooserForDvdIsoWhilePlayVideoInVlcTargetsVlcDirectly() {
         val app = org.robolectric.RuntimeEnvironment.getApplication()
-        val reactContext = com.facebook.react.bridge.ReactApplicationContext(app)
+        val reactContext = com.facebook.react.bridge.BridgeReactContext(app)
         val security = SecurityVaultModule(reactContext)
         val player = VideoPlayerModule(reactContext)
         val registryField = SecurityVaultModule::class.java.getDeclaredField("archiveEntryRegistry").apply { isAccessible = true }

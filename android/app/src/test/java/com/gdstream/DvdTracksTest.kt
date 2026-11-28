@@ -98,8 +98,16 @@ class DvdTracksTest {
         val uri = Uri.parse("http://127.0.0.1/hls/title/dvd.m3u8")
         val master = HlsPlaylistParser().parse(uri, playlist("dvd.m3u8").inputStream()) as HlsMultivariantPlaylist
         assertEquals(2, master.audios.size)
-        assertTrue(master.subtitles.isEmpty())
-        assertFalse(String(playlist("dvd.m3u8")).contains("SUBTITLES"))
+        assertEquals(tracks.subtitles.size, master.subtitles.size)
+        for ((index, sub) in master.subtitles.withIndex()) {
+            assertEquals("text/vtt", sub.format.sampleMimeType)
+            val name = sub.url!!.lastPathSegment!!
+            assertEquals("dvd_sub_$index.m3u8", name)
+            assertTrue(String(playlist(name)).contains("\ndvd_sub_${index}_0.vtt\n"))
+        }
+        assertNull(hls.resource("dvd_sub_4.m3u8", 1))
+        assertNull(hls.resource("dvd_sub_1_1.vtt", 1))
+        assertNull(hls.resource("dvd_sub_0_0.vtt", 1, muxed = true))
         assertNull(hls.resource("dvd_pid_288.m3u8", 1))
         assertTrue(master.audios.all { it.format.sampleMimeType == "audio/ac3" })
         assertTrue(String(playlist(master.variants.single().url.lastPathSegment!!)).contains("\ndvd_pid_${tracks.videoPid}_0.ts\n"))
@@ -124,6 +132,22 @@ class DvdTracksTest {
         }
     }
 
+    @Test fun webVttClipsOpenCuesToTheSegmentAndEscapesRecognizedText() {
+        val source = DvdSpu.Source(byteArrayOf(), intArrayOf(), 480)
+        val window = DvdSubtitleWindow(700_000, 3_700_000, listOf(
+            DvdSpu.Cue(0, -100_000, 120_000, source),
+            DvdSpu.Cue(0, 1_234_000, Long.MAX_VALUE, source),
+            DvdSpu.Cue(0, 4_000_000, Long.MAX_VALUE, source),
+            DvdSpu.Cue(1, 0, 1_000_000, source)))
+        val header = "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:90000\n\n"
+        val calls = mutableListOf<DvdSpu.Source>()
+        val vtt = window.webVtt(0, (1L shl 33) + 90_000) { calls.add(it); "First & <last>\n\nline" }
+        assertEquals(listOf(source, source), calls)
+        assertEquals(header + "00:00:00.000 --> 00:00:00.120\nFirst &amp; &lt;last&gt;\nline\n\n" +
+            "00:00:01.234 --> 00:00:03.000\nFirst &amp; &lt;last&gt;\nline\n\n", String(vtt))
+        assertEquals(header, String(window.webVtt(1, 90_000) { " " }))
+    }
+
     @get:Rule val folder = TemporaryFolder()
 
     @Test fun stockHlsPlayerReadsBothAudioRenditionsWithoutDvbTextGroups() {
@@ -133,6 +157,13 @@ class DvdTracksTest {
         val ts = mux.finish(90_000, 104_400)
         val cuts = listOf(DvdProxy.Segment(0, 2048, 160_000))
         val pids = listOf(0x101, 0x102, hls.tracks.videoPid)
+        for (i in hls.tracks.subtitles.indices) {
+            val name = "dvd_sub_$i.m3u8"
+            folder.newFile(name).writeBytes(hls.playlist(checkNotNull(hls.resource(name, 1)), cuts))
+            val source = DvdSpu.Source(byteArrayOf(), intArrayOf(), 480)
+            val window = DvdSubtitleWindow(0, 160_000, listOf(DvdSpu.Cue(i, 0, 160_000, source)))
+            folder.newFile("dvd_sub_${i}_0.vtt").writeBytes(window.webVtt(i, 90_000) { "Hello" })
+        }
         for (name in listOf("dvd.m3u8", "dvd_video.m3u8") + pids.map { "dvd_pid_$it.m3u8" }) {
             folder.newFile(name).writeBytes(hls.playlist(checkNotNull(hls.resource(name, 1)), cuts))
         }
@@ -166,13 +197,14 @@ class DvdTracksTest {
                 val audios = groups.filter { it.type == C.TRACK_TYPE_AUDIO }
                 val texts = groups.filter { it.type == C.TRACK_TYPE_TEXT }
                 assertEquals(2, audios.size)
-                assertTrue(texts.isEmpty())
-                val streams = arrayOfNulls<SampleStream>(2)
+                assertEquals(hls.tracks.subtitles.size, texts.size)
+                assertTrue(texts.all { it.getFormat(0).sampleMimeType != "application/dvbsubs" })
+                val streams = arrayOfNulls<SampleStream>(3)
                 val loading = LoadingInfo.Builder().setPlaybackPositionUs(0).build()
                 for (i in audios.indices) {
-                    val groupsToRead = listOf(video, audios[i])
+                    val groupsToRead = listOf(video, audios[i], texts[i])
                     period.selectTracks(groupsToRead.map { FixedTrackSelection(it, 0) }.toTypedArray(),
-                        booleanArrayOf(i > 0, false), streams, BooleanArray(2), 0)
+                        booleanArrayOf(i > 0, false, false), streams, BooleanArray(3), 0)
                     period.readDiscontinuity()
                     val stream = checkNotNull(streams[1])
                     val holder = FormatHolder()
@@ -185,6 +217,15 @@ class DvdTracksTest {
                     assertFalse("selected rendition should supply a sample", buf.isEndOfStream)
                     assertEquals("audio/ac3", holder.format?.sampleMimeType)
                     assertEquals(audios[i].getFormat(0).language, holder.format?.language)
+                    val text = checkNotNull(streams[2])
+                    awaitReady {
+                        period.continueLoading(loading)
+                        text.maybeThrowError()
+                        buf.clear()
+                        text.readData(holder, buf, 0) == C.RESULT_BUFFER_READ
+                    }
+                    assertFalse("selected WebVTT rendition should supply a cue", buf.isEndOfStream)
+                    assertEquals(0L, buf.timeUs)
                 }
             } finally { source.releasePeriod(period) }
         } finally { source.releaseSource(caller) }

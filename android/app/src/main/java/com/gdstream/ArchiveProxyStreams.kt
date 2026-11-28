@@ -25,6 +25,10 @@ internal fun dvdPlayerNeedsAvc(player: String, platformMpeg2: () -> Boolean): Bo
 internal fun externalDvdUrl(url: String, id: String, fileName: String, avc: Boolean = false, muxed: Boolean = false): String {
     val uri = java.net.URI(url)
     if (avc) return "${uri.scheme}://${uri.rawAuthority}/hls/$id/dvd.m3u8" + if (muxed) "?muxed=1" else ""
+    return directArchiveUrl(uri, id, fileName)
+}
+
+internal fun directArchiveUrl(uri: java.net.URI, id: String, fileName: String): String {
     val name = java.net.URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")
     return "${uri.scheme}://${uri.rawAuthority}/zip/$id/$name"
 }
@@ -41,7 +45,7 @@ internal fun externalIsoTsUrl(url: String, expected: String, bdav: Boolean): Str
 
 /** Owns downstream sockets, including writes blocked on a player that never closes its socket. */
 internal class ProxyStreamRegistry {
-    private data class Active(val streamId: String, val full: Boolean, val cancel: (String) -> Unit)
+    private data class Active(val streamId: String, val primary: Boolean, val cancel: (String) -> Unit)
     private val lock = Any()
     private val active = LinkedHashMap<Any, Active>()
     @Volatile private var accepting = true
@@ -49,16 +53,16 @@ internal class ProxyStreamRegistry {
     fun resume() { synchronized(lock) { accepting = true } }
     fun checkActive() { if (!accepting) throw InterruptedIOException("Archive playback stopped") }
 
-    fun register(streamId: String, full: Boolean, cancel: (String) -> Unit): AutoCloseable {
+    fun register(streamId: String, primary: Boolean, cancel: (String) -> Unit): AutoCloseable {
         val key = Any()
         val stale = synchronized(lock) {
             checkActive()
-            val previous = active.filterValues { full && it.full && it.streamId == streamId }
+            val previous = active.filterValues { primary && it.primary && it.streamId == streamId }
             previous.keys.forEach { active.remove(it) }
-            active[key] = Active(streamId, full, cancel)
+            active[key] = Active(streamId, primary, cancel)
             previous.values.toList()
         }
-        cancel(stale, "superseded full stream: $streamId")
+        cancel(stale, "superseded playback stream: $streamId")
         return AutoCloseable { synchronized(lock) { active.remove(key) }; Unit }
     }
 
