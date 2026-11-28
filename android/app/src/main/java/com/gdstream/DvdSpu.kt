@@ -4,10 +4,16 @@ package com.gdstream
  * The PTS belongs to the first fragment, which can be in the preceding HLS segment. */
 internal class DvdSpu {
     data class Display(val show: Long, val stop: Long, val segments: ByteArray)
+    data class Bitmap(val show: Long, val stop: Long, val x: Int, val y: Int, val width: Int, val height: Int, val argb: IntArray)
+    class Source(val packet: ByteArray, val palette: IntArray, val canvasHeight: Int)
+    data class Cue(val track: Int, val showUs: Long, val stopUs: Long, val source: Source)
+
     private val header = ByteArray(2)
     private var used = 0
     private var packet: ByteArray? = null
     private var start: Long? = null
+
+    val pending get() = start != null
 
     fun reset() { packet = null; used = 0; start = null }
 

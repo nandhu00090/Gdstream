@@ -152,6 +152,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 DvdProxy.estimatedSegments(uncompressedSize, (seconds * 1_000_000).toLong())
             } else emptyList()
         }
+        val dvdStartsUs by lazy { dvdPlaylist.runningFold(0L) { start, segment -> start + segment.durationUs } }
+        @Volatile var rawSubtitle: Pair<Int, DvdSubtitleWindow>? = null
         val dvdHls by lazy { DvdHls(DvdStreams.from(resolvedInfo.orEmpty())) }
         val dvdEncoder by lazy {
             val audio = resolvedInfo?.get("audioTracks") as? List<*>
@@ -159,7 +161,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             if (!supportedAudio || resolvedInfo == null || dvdPlaylist.isEmpty() || resolvedInfo["videoCodec"] != "MPEG-2") null else
                 DvdProxy.encoder((resolvedInfo.getValue("width") as Number).toInt(), (resolvedInfo.getValue("height") as Number).toInt())
         }
-        internal val hls by lazy { if (isBdavM2ts) BluRayHls.create(bluRay, uncompressedSize, standalone,
+        val bluRayStartsUs by lazy { hls?.segments?.runningFold(0L) { start, segment -> start + segment.durationUs }.orEmpty() }
+        internal val hls: BluRayHls? by lazy { if (isBdavM2ts) BluRayHls.create(bluRay, uncompressedSize, standalone,
             standalone && bluRay?.streams?.any { it.dts } == true && FfmpegBridge.available) else null }
     }
 
@@ -413,7 +416,88 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    private fun dvdTitle(url: String) = ArchiveProxyStreams.streamId(url)?.let { archiveEntryRegistry[it] }
+        ?.takeIf { it.archiveFormat == "ISO" && !it.standalone && it.fileName.endsWith(".vob", true) }
+
+    @ReactMethod
+    fun dvdSubtitleTracks(url: String, promise: Promise) {
+        val tracks = dvdTitle(url)?.dvdHls?.tracks?.subtitles.orEmpty()
+        promise.resolve(Arguments.fromList(tracks.map { bluRayLanguage(it.language) }))
+    }
+
+    @ReactMethod
+    fun dvdSubtitleWindow(url: String, track: Int, timeUs: Double, promise: Promise) {
+        ioExecutor.execute {
+            try {
+                val entry = dvdTitle(url)
+                val window = if (entry == null || track !in entry.dvdHls.tracks.subtitles.indices) null
+                    else if (java.net.URI(url).rawPath.startsWith("/hls/")) dvdSubtitles.at(entry.id, timeUs.toLong())
+                    else rawDvdSubtitles(entry, track, timeUs.toLong())
+                promise.resolve(window?.let { Arguments.makeNativeMap(it.render(track)) })
+            } catch (error: Exception) { promise.reject("DVD_SUBTITLE", error) }
+        }
+    }
+
+    private fun rawDvdSubtitles(entry: ArchiveEntryTarget, track: Int, timeUs: Long): DvdSubtitleWindow? {
+        val starts = entry.dvdStartsUs
+        if (starts.size < 2 || timeUs !in 0L until starts.last() || entry.sourceSize <= 0) return null
+        val previous = entry.rawSubtitle?.takeIf { it.first == track }?.second
+        if (previous != null && timeUs in previous.startUs until previous.endUs) return previous
+        val search = starts.binarySearch(timeUs)
+        val index = if (search < 0) -search - 2 else search
+        val owner = IsoReadSession()
+        val lease = ArchiveProxyStreams.registry.register(entry.id, false, owner::cancel)
+        try {
+            val file = IsoVirtualFile(checkNotNull(entry.segments), false)
+            val cache = isoChunkCaches.acquire(entry.archiveUrl, owner, entry.sourceSize)
+            val height = (entry.resolvedInfo?.get("height") as? Number)?.toInt()
+            return DvdProxy.rawSubtitleWindow(entry.dvdPlaylist, starts, index, entry.dvdHls.tracks, track,
+                if (height == 576 || height == 288) 576 else 480, previous) { start, length ->
+                file.readRaw(start, length) { from, to ->
+                    cache.read(from, to, 0, entry.sourceSize - 1, owner, borrowFullBlock = true) { a, b, session ->
+                        fetchIsoByteRange(entry.archiveUrl, a, b, session)
+                    }
+                }
+            }.also { entry.rawSubtitle = track to it }
+        } finally { owner.cancel(); lease.close() }
+    }
+
+    private val dvdSubtitles = DvdSubtitleWindows()
     private val dvdChunks = DvdSegmentCache()
+
+    /** Timeline gestures can precede the first HLS request (or seek within a player's buffer).
+     * Read the physical blocks for the destination concurrently and retire obsolete speculative I/O. */
+    @ReactMethod
+    fun seekIsoPlayback(url: String, seconds: Double) {
+        val entry = ArchiveProxyStreams.streamId(url)?.let { archiveEntryRegistry[it] } ?: return
+        if (entry.archiveFormat != "ISO" || entry.standalone || entry.sourceSize <= 0 || entry.segments == null) return
+        val dvd = entry.fileName.endsWith(".vob", true)
+        val starts = if (dvd) entry.dvdStartsUs else entry.bluRayStartsUs
+        if (starts.size < 2 || !seconds.isFinite()) return
+        val result = starts.binarySearch((seconds * 1_000_000).toLong())
+        val index = (if (result < 0) -result - 2 else result).coerceIn(0, starts.lastIndex - 1)
+        if (dvd) dvdChunks.cancelPrefetch(entry.id)
+        val file = IsoVirtualFile(entry.segments, entry.isBdavM2ts)
+        val start = if (dvd) entry.dvdPlaylist[index].start else entry.hls!!.segments[index].start
+        val owner = IsoReadSession()
+        val registration = try { ArchiveProxyStreams.registry.register(entry.id, false, owner::cancel) }
+            catch (_: java.io.InterruptedIOException) { return }
+        try {
+            val cache = isoChunkCaches.acquire(entry.archiveUrl, owner, entry.sourceSize)
+            val flights = cache.prefetchSeek(file, start, entry.sourceSize, owner) { from, to, session ->
+                fetchIsoByteRange(entry.archiveUrl, from, to, session)
+            }
+            ioExecutor.execute {
+                try { flights.forEach { it.get() } } catch (_: Exception) {
+                    // A subsequent demand read can retry an interrupted speculative fetch.
+                } finally { registration.close(); owner.cancel() }
+            }
+        } catch (error: Exception) {
+            registration.close()
+            owner.cancel()
+            appendDebugLog("ISO_SEEK_PREFETCH", isoFailureDetails(error))
+        }
+    }
 
     @ReactMethod
     fun prepareArchivePlayback(url: String, promise: Promise) {
@@ -1243,7 +1327,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     val body = if (dvdIndex == null) entry.dvdHls.playlist(checkNotNull(dvdResource), entry.dvdPlaylist) else try {
                         val trackPid = dvdResource.pid
                         val muxed = dvdChunks.segment(entry.id, dvdIndex, entry.dvdPlaylist.lastIndex, session, method == "GET",
-                            entry.dvdHls.multivariant, trackPid) { index, owner, sequence ->
+                            entry.dvdHls.multivariant, trackPid.takeUnless { it == entry.dvdHls.tracks.videoPid }, onSeek = {
+                                if (!entry.standalone && method == "GET" && entry.sourceSize > 0)
+                                    isoChunkCache.prefetchSeek(file, entry.dvdPlaylist[dvdIndex].start, entry.sourceSize, session, ::upstream)
+                            }) { index, owner, sequence ->
                             fun read(from: Long, to: Long) = cachedFetch(from, to, owner)
                             val segment = entry.dvdPlaylist[index]
                             val estimate = entry.standalone || entry.dvdSegments.isEmpty()
@@ -1257,7 +1344,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             val data = file.readRaw(start, Math.toIntExact((nextVobu ?: segment.end) - start), ::read)
                             DvdProxy.transcode(data, checkNotNull(entry.resolvedInfo), checkNotNull(entry.dvdEncoder),
                                 owner, entry.id, sequence, index, nextVobu != null, index == entry.dvdPlaylist.lastIndex,
-                                segment.discontinuity, start, { pos, limit ->
+                                segment.discontinuity, start, entry.dvdStartsUs[index], { first, end, cues ->
+                                    if (entry.dvdHls.tracks.subtitles.isNotEmpty()) {
+                                        dvdSubtitles.put(entry.id, index, DvdSubtitleWindow(first, end, cues))
+                                    }
+                                }, { pos, limit ->
                                     file.readRaw(pos, minOf(file.rawSize - pos, limit.toLong()).coerceAtLeast(0).toInt(), ::read)
                                 }) {
                                 entry.dvdSequenceHeader ?: DvdProxy.sequenceHeader(
@@ -1322,14 +1413,6 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 } else {
                     val segment = hls.segments[hlsSegment]
-                    val nextWarm = java.util.concurrent.atomic.AtomicLong(segment.start)
-                    fun warm(position: Long) {
-                        if (entry.standalone || method != "GET" || entry.sourceSize <= 0 || position >= file.size) return
-                        val next = nextWarm.get()
-                        if (position < next || !nextWarm.compareAndSet(next, position + 8L * 1024 * 1024)) return
-                        val length = minOf(file.size - position, 48L * 1024 * 1024).toInt()
-                        isoChunkCache.prefetch(file.mappedRanges(position, length), entry.sourceSize, session, fetch = ::upstream)
-                    }
                     if (entry.standalone && method == "GET" && entry.sourceSize > 0) {
                         val blocks = StandaloneBdav.readAhead(segment.start, entry.sourceSize)
                         val seek = audioPid == null && hls.videoSeek(hlsSegment)
@@ -1351,18 +1434,21 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                                 owner.cancel()
                             }
                         }
-                    } else warm(segment.start)
+                    } else if (method == "GET" && entry.sourceSize > 0) {
+                        val seek = audioPid == null && hls.videoSeek(hlsSegment)
+                        if (seek) isoChunkCache.prefetchSeek(file, segment.start, entry.sourceSize, session, ::upstream)
+                        else {
+                            val length = minOf(segment.end - segment.start, IsoRangeReader.MAX_CONCURRENT_READS * IsoChunkCache.BLOCK_BYTES.toLong())
+                            isoChunkCache.prefetch(file.mappedRanges(segment.start, length.toInt()), entry.sourceSize, session, fetch = ::upstream)
+                        }
+                    }
                     val prefix = hls.prefix(program, renditionStreams, audioPid)
                     if (audioPid != null) {
                         val audioType = renditionStreams.firstOrNull { it.pid == audioPid }?.type ?: 0
-                        fun readAudio(position: Long, length: Int): ByteArray {
-                            warm(position)
-                            return rawTs(position, length)
-                        }
                         val audio = if (hls.transcodes(audioPid)) {
                             StandaloneBdav.ac3Segment(segment, program.prefix(renditionStreams, audioPid, false),
-                                prefix, audioPid, file.size, reactContext.cacheDir, session, ::readAudio)
-                        } else segment.audioBytes(prefix, audioPid, audioType, read = ::readAudio)
+                                prefix, audioPid, file.size, reactContext.cacheDir, session, ::rawTs)
+                        } else segment.audioBytes(prefix, audioPid, audioType, read = ::rawTs)
                         IsoVirtualFile(listOf(0L to audio.size.toLong()), false).serve(method, rangeHeader, "video/MP2T",
                             out, ioExecutor, session) { start, length -> audio.copyOfRange(start.toInt(), start.toInt() + length) }
                     } else {
@@ -1371,10 +1457,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         val size = video.size(header)
                         IsoVirtualFile(listOf(0L to size), false).serve(method, rangeHeader, "video/MP2T",
                             out, ioExecutor, session, maxReadBytes = 188 * 4096) { start, length ->
-                                video.read(header, start, length) { position, count ->
-                                    warm(position)
-                                    readTs(position, count)
-                                }
+                                video.read(header, start, length, ::readTs)
                             }
                     }
                 }

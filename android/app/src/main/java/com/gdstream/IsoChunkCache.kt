@@ -126,6 +126,8 @@ internal class IsoChunkCache(
         val warmers = HashMap<IsoReadSession, AutoCloseable>()
         var scheduled = false
         var foreground = false
+        var retireAfterDemand = false
+        var discSeek = false
         fun abort(reason: String) {
             owner.cancel(reason)
             task.cancel(true)
@@ -136,36 +138,57 @@ internal class IsoChunkCache(
     private var window = emptyList<LongRange>()
 
     fun prefetch(ranges: List<LongRange>, sourceSize: Long, session: IsoReadSession,
-                 priority: Boolean = false, fetch: (Long, Long, IsoReadSession) -> ByteArray): List<java.util.concurrent.Future<ByteArray>> {
+                 priority: Boolean = false, fetch: (Long, Long, IsoReadSession) -> ByteArray) =
+        prefetchBlocks(ranges, sourceSize, session, priority, discSeek = false, fetch)
+
+    fun prefetchSeek(file: IsoVirtualFile, start: Long, sourceSize: Long, session: IsoReadSession,
+                     fetch: (Long, Long, IsoReadSession) -> ByteArray) =
+        prefetchBlocks(file.seekRanges(start), sourceSize, session, priority = true, discSeek = true, fetch)
+
+    private fun prefetchBlocks(ranges: List<LongRange>, sourceSize: Long, session: IsoReadSession, priority: Boolean,
+                               discSeek: Boolean, fetch: (Long, Long, IsoReadSession) -> ByteArray): List<java.util.concurrent.Future<ByteArray>> {
         val target = ranges.firstOrNull()?.first ?: return emptyList()
         val desired = LinkedHashSet<IsoBlockKey>()
-        for (range in ranges) {
+        ranges@ for (range in ranges) {
             var start = range.first / BLOCK_BYTES * BLOCK_BYTES
             while (start <= range.last && start < sourceSize) {
                 val full = key(start, minOf(start + BLOCK_BYTES, sourceSize) - 1)
                 desired.add(full)
+                if (discSeek && desired.size == IsoRangeReader.MAX_CONCURRENT_READS) break@ranges
                 start += BLOCK_BYTES
             }
         }
-        val abandoned = synchronized(lock) {
-            session.checkActive()
-            val far = window.isNotEmpty() && window.all {
-                target < it.first - 32L * 1024 * 1024 || target > it.last + 32L * 1024 * 1024
+        var abandoned: Collection<Flight> = emptyList()
+        try {
+            return synchronized(lock) {
+                session.checkActive()
+                if (!priority && flights.any { it.value.discSeek } && desired.none { flights[it]?.discSeek == true })
+                    return emptyList()
+                val far = window.isNotEmpty() && window.all {
+                    target < it.first - 32L * 1024 * 1024 || target > it.last + 32L * 1024 * 1024
+                }
+                window = ranges
+                if (discSeek) {
+                    // The player can close the old socket just after its timeline gesture.
+                    // Keep shared demand alive until it detaches, then skip the orphan grace period.
+                    flights.forEach { (key, flight) ->
+                        flight.retireAfterDemand = key !in desired
+                        flight.discSeek = key in desired
+                    }
+                }
+                abandoned = if (priority || far) flights.filter { (key, flight) -> flight.readers == 0 && key !in desired }
+                    .also { flights.keys.removeAll(it.keys) }.values else emptyList()
+                desired.mapNotNull { key ->
+                    if (blocks.get(key) != null) return@mapNotNull null
+                    val flight = flight(key, fetch)
+                    if (discSeek) flight.discSeek = true
+                    keepWarm(key, flight, session)
+                    schedule(flight, priority)
+                    flight.task
+                }
             }
-            window = ranges
-            if (priority || far) flights.filter { (key, flight) -> flight.readers == 0 && key !in desired }
-                .also { flights.keys.removeAll(it.keys) }.values else emptyList()
-        }
-        abandoned.forEach { it.abort(if (priority) "M2TS timeline seek" else "abandoned read-ahead after seek") }
-        return synchronized(lock) {
-            session.checkActive()
-            desired.mapNotNull { key ->
-                if (blocks.get(key) != null) return@mapNotNull null
-                val flight = flight(key, fetch)
-                keepWarm(key, flight, session)
-                schedule(flight, priority)
-                flight.task
-            }
+        } finally {
+            abandoned.forEach { it.abort(if (priority) "ISO timeline seek" else "abandoned read-ahead after seek") }
         }
     }
 
@@ -228,7 +251,12 @@ internal class IsoChunkCache(
     private fun release(key: IsoBlockKey, flight: Flight, warmer: IsoReadSession?) {
         synchronized(lock) {
             if (warmer == null) flight.readers-- else flight.warmers.remove(warmer)
-            if (flight.readers != 0 || flight.warmers.isNotEmpty() || flights[key] !== flight) return
+            if (flight.readers != 0 || flights[key] !== flight) return
+            if (flight.retireAfterDemand) {
+                flights.remove(key)
+                return@synchronized
+            }
+            if (flight.warmers.isNotEmpty()) return
             val generation = ++flight.idleGeneration
             // A completed download can leave the LRU before this grace period expires.
             val idleFlight = java.lang.ref.WeakReference(flight)
@@ -240,7 +268,9 @@ internal class IsoChunkCache(
                 }
                 if (orphan) candidate.abort("last proxy client closed")
             }, 1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+            return
         }
+        flight.abort("abandoned demand after ISO seek")
     }
 
     fun read(start: Long, end: Long, extentStart: Long, extentEnd: Long,

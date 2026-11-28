@@ -81,7 +81,7 @@ class DvdProxyTest {
         val mux = DvdTsMux()
         val source = listOf(90_000L..648_558, 461_657L..1_047_242, 860_244L..1_198_081, 1_257_940L..1_595_778)
         var nextVideo = source.first().first
-        var nextAudio = nextVideo - 900
+        var nextAudio = nextVideo
         var lastCc = -1
         source.forEachIndexed { index, raw ->
             // Reopening an encoder for EOS fallback must also retain the mux timeline.
@@ -115,13 +115,28 @@ class DvdProxyTest {
         mux.audio((wrap - 16) * 1000 / 90, byteArrayOf(11, 119))
         var ts = mux.finish(16, 3616)
         assertEquals(listOf(16L), timestamps(ts, 0x0102))
-        assertEquals(listOf(wrap - 16), timestamps(ts, 0x0101))
+        assertEquals(listOf(16L), timestamps(ts, 0x0101))
         mux.beginSegment()
         mux.video(3616, picture(true))
         mux.audio(100_000, byteArrayOf(11, 119))
         ts = mux.finish(90_000, 7216)
         assertEquals(listOf(3616L), timestamps(ts, 0x0102))
-        assertEquals(listOf(2864L), timestamps(ts, 0x0101))
+        assertEquals(listOf(2896L), timestamps(ts, 0x0101))
+    }
+
+    @Test fun coldSeekDropsCompleteAudioPrerollBeforeTheFirstIdr() {
+        val mux = DvdTsMux("eng", 2)
+        val start = 300_000L
+        mux.video(0, config, true)
+        mux.video(start, picture(true))
+        val early = byteArrayOf(1, 2, 3)
+        repeat(64) { mux.audio((start - (64 - it) * 2880 - 900) * 100 / 9, early) }
+        val frame = byteArrayOf(11, 119)
+        mux.audio((start - 900) * 100 / 9, frame)
+        val ts = mux.finish(start, start + 3600)
+        assertEquals(listOf(start), timestamps(ts, 0x101))
+        assertEquals(mux.timing!!.firstVideo, mux.timing!!.firstAudio)
+        assertArrayEquals(frame, audioPayload(ts).drop(14).toByteArray())
     }
 
     @Test fun videoOverrunningTwoSequentialAudioWindowsIsScaledBeforeWritingPesAndPcr() {

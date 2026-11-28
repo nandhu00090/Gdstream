@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include "dvd_yuv.h"
+#include "dvd_avc.h"
 
 extern "C" {
 #include "libmpeg2/mpeg2.h"
@@ -31,6 +32,7 @@ struct Session {
     // Baseline AVC has no B pictures. Match each access unit to its source
     // display PTS even on encoders that rebase output timestamps at startup.
     std::deque<int64_t> pendingPts90k;
+    int64_t lastOutputUs = INT64_MIN;
     using SetParameters = media_status_t (*)(AMediaCodec *, const AMediaFormat *);
     SetParameters setParameters = reinterpret_cast<SetParameters>(dlsym(RTLD_DEFAULT, "AMediaCodec_setParameters"));
 
@@ -76,9 +78,10 @@ struct Session {
                 bool config = (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) != 0;
                 if (config) {
                     valid = deliver(bytes + info.offset, info.size, 0, true);
-                } else if (pendingPts90k.empty()) {
+                } else if (pendingPts90k.empty() || info.presentationTimeUs < lastOutputUs) {
                     valid = false;
                 } else {
+                    lastOutputUs = info.presentationTimeUs;
                     valid = deliver(bytes + info.offset, info.size, pendingPts90k.front(), false);
                     pendingPts90k.pop_front();
                 }
@@ -123,7 +126,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_gdstream_DvdProxy_hasDecoder(JNIE
 }
 
 extern "C" JNIEXPORT jlong JNICALL Java_com_gdstream_DvdProxy_open(JNIEnv *env, jobject, jstring name, jint color,
-                                                                  jint w, jint h, jdouble fps, jlong basePts90k) {
+                                                                  jint w, jint h, jdouble fps, jlong basePts90k, jboolean intraOnly) {
     if (w < 1 || w > 720 || h < 1 || h > 576 || !(fps >= 1 && fps <= 60)) return 0;
     auto s = std::make_unique<Session>();
     if (!s->decoder || ((w | h) & 1) || (color != I420 && color != NV12)) return 0;
@@ -144,10 +147,9 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_gdstream_DvdProxy_open(JNIEnv *env, 
     AMediaFormat_setInt32(format, "slice-height", h);
     AMediaFormat_setInt32(format, "bitrate", 4500000);
     AMediaFormat_setFloat(format, "frame-rate", static_cast<float>(fps));
-    AMediaFormat_setInt32(format, "max-bframes", 0);
-    AMediaFormat_setInt32(format, "latency", 0);
-    AMediaFormat_setInt32(format, "i-frame-interval", s->setParameters ? 1 : 0);
-    AMediaFormat_setInt32(format, "profile", 1); // AVC baseline: zero-latency, no B-frame reorder
+    dvd::configureAvcTiming(s->setParameters != nullptr, intraOnly, [format](const char *key, int value) {
+        AMediaFormat_setInt32(format, key, value);
+    });
     auto status = AMediaCodec_configure(s->encoder, format, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
     AMediaFormat_delete(format);
     if (status != AMEDIA_OK || AMediaCodec_start(s->encoder) != AMEDIA_OK) return 0;
@@ -279,7 +281,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_gdstream_DvdProxy_closeAudio(JNIEnv *
 }
 
 extern "C" JNIEXPORT jobject JNICALL Java_com_gdstream_DvdProxy_decodeSpu(
-        JNIEnv *env, jobject, jbyteArray input, jintArray palette, jint width, jint height) {
+        JNIEnv *env, jobject, jbyteArray input, jintArray palette, jint width, jint height, jboolean bitmap) {
     try {
         int32_t clut[16];
         env->GetIntArrayRegion(palette, 0, 16, clut);
@@ -287,7 +289,19 @@ extern "C" JNIEXPORT jobject JNICALL Java_com_gdstream_DvdProxy_decodeSpu(
         std::vector<uint8_t> bytes(env->GetArrayLength(input));
         env->GetByteArrayRegion(input, 0, bytes.size(), reinterpret_cast<jbyte *>(bytes.data()));
         if (env->ExceptionCheck()) return nullptr;
-        auto display = dvd::subpicture(bytes.data(), bytes.size(), clut, width, height);
+        auto display = dvd::subpicture(bytes.data(), bytes.size(), clut, width, height, bitmap);
+        if (bitmap) {
+            if (display.argb.empty()) return nullptr;
+            auto type = env->FindClass("com/gdstream/DvdSpu$Bitmap");
+            if (!type) return nullptr;
+            auto init = env->GetMethodID(type, "<init>", "(JJIIII[I)V");
+            if (!init) return nullptr;
+            auto pixels = env->NewIntArray(display.argb.size());
+            if (!pixels) return nullptr;
+            env->SetIntArrayRegion(pixels, 0, display.argb.size(), display.argb.data());
+            return env->ExceptionCheck() ? nullptr : env->NewObject(type, init, static_cast<jlong>(display.show),
+                static_cast<jlong>(display.stop), display.x, display.y, display.w, display.h, pixels);
+        }
         if (display.segments.empty()) return nullptr;
         auto type = env->FindClass("com/gdstream/DvdSpu$Display");
         if (!type) return nullptr;

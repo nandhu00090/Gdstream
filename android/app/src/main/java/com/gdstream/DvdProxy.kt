@@ -14,14 +14,17 @@ import java.io.IOException
 
 internal object DvdProxy {
     private external fun hasDecoder(): Boolean
-    private external fun open(encoder: String, color: Int, width: Int, height: Int, fps: Double, basePts90k: Long): Long
+    private external fun open(encoder: String, color: Int, width: Int, height: Int, fps: Double, basePts90k: Long, intraOnly: Boolean): Long
     private external fun encode(handle: Long, bytes: ByteArray?, mux: DvdTsMux, boundary: Boolean, last: Boolean): Long
     private external fun close(handle: Long)
 
     private external fun openAudio(substream: Int): Long
     private external fun convertAudio(handle: Long, data: ByteArray, start: Int, size: Int, last: Boolean): ByteArray
     private external fun closeAudio(handle: Long)
-    private external fun decodeSpu(data: ByteArray, palette: IntArray, width: Int, height: Int): DvdSpu.Display?
+    private external fun decodeSpu(data: ByteArray, palette: IntArray, width: Int, height: Int, bitmap: Boolean): Any?
+
+    fun bitmap(source: DvdSpu.Source) =
+        decodeSpu(source.packet, source.palette, 720, source.canvasHeight, true) as? DvdSpu.Bitmap
 
     fun canDecodeMpeg2(info: Map<String, Any>?): Boolean {
         val width = (info?.get("width") as? Number)?.toInt() ?: 720
@@ -52,13 +55,13 @@ internal object DvdProxy {
     }
 
     data class Segment(val start: Long, val end: Long, val durationUs: Long, val discontinuity: Boolean = false)
-    fun playlist(segments: List<Segment>, pid: Int? = null) = buildString {
+    fun playlist(segments: List<Segment>, pid: Int? = null, muxed: Boolean = false) = buildString {
         val prefix = if (pid == null) "dvd" else "dvd_pid_$pid"
         append("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n")
         append("#EXT-X-TARGETDURATION:${(segments.maxOf { it.durationUs } + 999999) / 1000000}\n")
         segments.forEachIndexed { index, segment ->
             if (index > 0 && segment.discontinuity) append("#EXT-X-DISCONTINUITY\n")
-            append("#EXTINF:${java.math.BigDecimal.valueOf(segment.durationUs, 6)},\n${prefix}_$index.ts\n")
+            append("#EXTINF:${java.math.BigDecimal.valueOf(segment.durationUs, 6)},\n${prefix}_$index.ts${if (muxed) "?muxed=1" else ""}\n")
         }
         append("#EXT-X-ENDLIST\n")
     }.toByteArray()
@@ -66,6 +69,8 @@ internal object DvdProxy {
     // Android hardware may expose a single AVC encoder. Keep the active stream warm
     // until another source or a non-sequential request takes ownership of it.
     private class Warm(val id: String, val sequence: Long, var next: Int, val mux: DvdTsMux) {
+        var clockOrigin = 0L
+        var playlistOriginUs = 0L
         var handle = 0L
         val tracks = TrackReaders(mux)
         fun closeEncoder() {
@@ -95,19 +100,20 @@ internal object DvdProxy {
 
     @Synchronized fun transcode(data: ByteArray, info: Map<String, Any>, encoder: Encoder,
                   session: IsoReadSession, streamId: String, sequence: Long, segment: Int, boundary: Boolean, last: Boolean,
-                  discontinuity: Boolean, offset: Long, subtitleLookahead: (Long, Int) -> ByteArray, sequenceHeader: () -> ByteArray?): ByteArray {
+                  discontinuity: Boolean, offset: Long, playlistStartUs: Long, publish: (Long, Long, List<DvdSpu.Cue>) -> Unit,
+                  subtitleLookahead: (Long, Int) -> ByteArray, sequenceHeader: () -> ByteArray?): ByteArray {
         if (warm?.id != streamId || warm?.sequence != sequence || warm?.next != segment) release()
         val sequential = warm != null
         val state = warm ?: Warm(streamId, sequence, segment, DvdTsMux(DvdStreams.from(info))).also { warm = it }
         val streams = state.mux.streams
         val audioId = streams.programAt(offset).audio.getOrNull(streams.primary) ?: -1
         val source = sourceTiming(data, audioId)
-        fun convertVideo(finish: Boolean): Long {
+        fun convertVideo(finish: Boolean, intraOnly: Boolean = false): Long {
             val fresh = state.handle == 0L
             if (fresh) {
                 state.handle = open(encoder.name, encoder.color, (info.getValue("width") as Number).toInt(),
                     (info.getValue("height") as Number).toInt(), (info.getValue("frameRate") as Number).toDouble(),
-                    state.mux.timing?.nextVideo ?: source.basePts)
+                    state.mux.timing?.nextVideo ?: source.basePts, intraOnly)
                 if (state.handle == 0L) throw IOException("DVD AVC encoder initialization failed")
             }
             state.mux.beginSegment(fresh)
@@ -121,20 +127,26 @@ internal object DvdProxy {
             return end
         }
         try {
-            val hadEncoder = state.handle != 0L
             val nativeEnd = try { convertVideo(last) } catch (error: IOException) {
                 state.closeEncoder()
                 session.checkActive()
-                if (last && !hadEncoder) throw error
-                // Retry vendor encoders that need EOS to release the last picture.
-                convertVideo(true)
+                // Some vendors reorder output or ignore request-sync. Retry this cut
+                // with independent pictures and drain through EOS before publishing it.
+                convertVideo(true, intraOnly = true)
             }
             // Commit audio and subtitle input once, after any video-only encoder retry.
             val height = (info.getValue("height") as Number).toInt()
             state.tracks.read(data, offset, source.basePts, height, discontinuity, last, session::checkActive)
             if (!last) state.tracks.completePending(offset + data.size, nativeEnd, height, subtitleLookahead)
-            val result = state.mux.finish(source.basePts, nativeEnd, source.navDuration)
+            val overlay = mutableListOf<DvdSpu.Cue>()
+            val result = state.mux.finish(source.basePts, nativeEnd, source.navDuration, overlay::add)
             val pts = checkNotNull(state.mux.timing)
+            if (!sequential || discontinuity) {
+                state.clockOrigin = pts.firstVideo
+                state.playlistOriginUs = playlistStartUs
+            }
+            fun timeUs(tick: Long) = state.playlistOriginUs + (tick - state.clockOrigin) * 100 / 9
+            publish(timeUs(pts.firstVideo), timeUs(pts.nextVideo), overlay)
             state.next = segment + 1
             if (last) release() else {
                 idleClose?.cancel(false)
@@ -146,6 +158,69 @@ internal object DvdProxy {
                 "pts90k=${pts.firstVideo}..${pts.lastVideo} nextVideo90k=${pts.nextVideo} firstAudio90k=${pts.firstAudio} nextAudio90k=${pts.nextAudio}")
             return result
         } catch (error: Throwable) { release(); throw error }
+    }
+
+    /** Platform MPEG-2 playback can bypass the AVC mux. Read only the selected SPU PID
+     * on that path, using the same IFO program mapping and 33-bit PES clock. */
+    fun rawSubtitleWindow(segments: List<Segment>, starts: List<Long>, index: Int, streams: DvdStreams,
+                          track: Int, height: Int, previous: DvdSubtitleWindow?, read: (Long, Int) -> ByteArray): DvdSubtitleWindow {
+        val startUs = starts[index]
+        val endUs = starts[index + 1]
+        val cues = mutableListOf<DvdSpu.Cue>()
+        fun closeAt(us: Long) {
+            val last = cues.lastOrNull() ?: return
+            if (last.stopUs > us) cues[cues.lastIndex] = last.copy(stopUs = us)
+        }
+        val sequential = previous?.endUs == startUs
+        if (sequential && !segments[index].discontinuity) {
+            previous!!.cues.lastOrNull()?.let {
+                val elapsed = startUs - previous.startUs
+                if (it.stopUs > elapsed) cues.add(it.copy(showUs = (it.showUs - elapsed).coerceAtLeast(0), stopUs = it.stopUs - elapsed))
+            }
+        }
+        val first = if (sequential || segments[index].discontinuity) index else (index - 1).coerceAtLeast(0)
+        val spu = DvdSpu()
+        var program: DvdStreams.Program? = null
+        fun consume(bytes: ByteArray, offset: Long, basePts: Long, originUs: Long, continuation: Boolean) {
+            forEachPes(bytes) { id, from, end, pts ->
+                if (id != 0xbd) return@forEachPes
+                val active = streams.programAt(offset + from)
+                if (active !== program) {
+                    if (program != null) closeAt(originUs)
+                    spu.reset()
+                    program = active
+                }
+                if (active.subtitles.getOrNull(track) != (bytes[from].toInt() and 255)) return@forEachPes
+                if (continuation && pts != C.TIME_UNSET) { spu.reset(); return@forEachPes }
+                val us = pts.takeUnless { it == C.TIME_UNSET }?.let {
+                    val delta = ((it - basePts + (1L shl 32)) and 0x1ffffffffL) - (1L shl 32)
+                    originUs + delta * 100 / 9
+                }
+                spu.consume(bytes, from + 1, end, us) emit@{ time, packet ->
+                    val source = DvdSpu.Source(packet, active.clut, height)
+                    val image = bitmap(source) ?: return@emit
+                    val show = time + image.show * 100 / 9
+                    closeAt(show)
+                    val stop = if (image.stop > image.show) time + image.stop * 100 / 9 else Long.MAX_VALUE
+                    cues.add(DvdSpu.Cue(track, show, stop, source))
+                }
+            }
+        }
+        for (i in first..index) {
+            val segment = segments[i]
+            val data = read(segment.start, Math.toIntExact(segment.end - segment.start))
+            val origin = starts[i] - startUs
+            consume(data, segment.start, sourceTiming(data, -1).basePts, origin, false)
+        }
+        var offset = segments[index].end
+        val limit = minOf(segments.last().end, offset + 2L * 1024 * 1024)
+        while (spu.pending && offset < limit) {
+            val data = read(offset, minOf(limit - offset, 65536).toInt())
+            if (data.isEmpty()) break
+            consume(data, offset, 0, endUs - startUs, true)
+            offset += data.size
+        }
+        return DvdSubtitleWindow(startUs, endUs, cues.filter { it.stopUs > 0 })
     }
 
     fun sequenceHeader(head: ByteArray): ByteArray? {
@@ -201,8 +276,9 @@ internal object DvdProxy {
 
         private fun display(i: Int, tick: Long, packet: ByteArray, clut: IntArray, height: Int) {
             val canvasHeight = if (height == 288 || height == 576) 576 else 480
-            decodeSpu(packet, clut, 720, canvasHeight)?.let { image ->
-                mux.subtitle(i, tick + image.show, image.stop.takeIf { it > image.show }?.plus(tick), image.segments)
+            (decodeSpu(packet, clut, 720, canvasHeight, false) as? DvdSpu.Display)?.let { image ->
+                mux.subtitle(i, tick + image.show, image.stop.takeIf { it > image.show }?.plus(tick), image.segments,
+                    DvdSpu.Source(packet, clut, canvasHeight))
             }
         }
 
@@ -462,11 +538,19 @@ internal class DvdSegmentCache {
     private var lastRequest: Pair<String, Int>? = null
     private var sequence = 0L
 
+    fun cancelPrefetch(id: String) {
+        val owner = synchronized(cache) {
+            pending?.takeIf { it.first.first == id }?.also { pending = null }?.second
+        }
+        owner?.cancel("DVD timeline seek")
+    }
+
     fun segment(id: String, index: Int, last: Int, session: IsoReadSession, prefetch: Boolean,
-                shared: Boolean = false, rendition: Int? = null, load: (Int, IsoReadSession, Long) -> ByteArray): ByteArray {
+                shared: Boolean = false, rendition: Int? = null, onSeek: () -> Unit = {}, load: (Int, IsoReadSession, Long) -> ByteArray): ByteArray {
         val key = id to index
         val next = id to index + 1
         var displaced: IsoReadSession? = null
+        var newWindow = false
         val requestSequence = synchronized(cache) {
             val previous = lastRequest
             // Audio, subtitle and video HTTP requests can arrive in different orders. A
@@ -478,6 +562,7 @@ internal class DvdSegmentCache {
             if (previous == null || id != previous.first || seek) {
                 // A cached response may have been normalized on a different playback
                 // timeline. Only retries and forward playback can reuse it.
+                newWindow = true
                 sequence++
                 cache.clear()
                 lastByRendition.clear()
@@ -489,6 +574,7 @@ internal class DvdSegmentCache {
             sequence
         }
         displaced?.cancel("DVD seek")
+        if (newWindow) onSeek()
         fun get(n: Int, owner: IsoReadSession): ByteArray {
             val key = id to n
             fun cached() = synchronized(cache) {

@@ -159,6 +159,50 @@ class IsoUpstreamTest {
         } finally { release.countDown(); session.cancel(); cache.clear(); pool.shutdownNow() }
     }
 
+    @Test fun explicitDiscSeekReplacesBlockedReadAheadWithThreeDestinationRanges() {
+        val block = IsoChunkCache.BLOCK_BYTES.toLong()
+        val size = 12 * block
+        val cache = IsoChunkCache()
+        val client = IsoReadSession()
+        val abandoned = CountDownLatch(3)
+        val entered = CountDownLatch(3)
+        val active = CountDownLatch(3)
+        val finish = CountDownLatch(1)
+        fun fetch(from: Long, to: Long, owner: IsoReadSession): ByteArray {
+            return IsoRangeReader.readFully("https://origin/disc.iso", from, to, session = owner, open = { a, b ->
+                object : Connection(206, "bytes $a-$b/$size", ByteArray(0)) {
+                    private val closedSocket = CountDownLatch(1)
+                    override fun disconnect() {
+                        if (closedSocket.count != 0L && a < 3 * block) abandoned.countDown()
+                        closedSocket.countDown()
+                    }
+                    override fun getInputStream(): InputStream {
+                        if (a < 3 * block) {
+                            entered.countDown()
+                            closedSocket.await(5, TimeUnit.SECONDS)
+                            throw SocketException("old read abandoned")
+                        }
+                        active.countDown()
+                        check(finish.await(5, TimeUnit.SECONDS))
+                        return ByteArrayInputStream(ByteArray((b - a + 1).toInt()))
+                    }
+                }.also { owner.track(it, IsoHostPolicy.slots) }
+            })
+        }
+        try {
+            cache.prefetch(listOf(0L until 3 * block), size, client, fetch = ::fetch)
+            assertTrue(entered.await(3, TimeUnit.SECONDS))
+            // A nearby seek must retire the old window even below the automatic distance threshold.
+            val file = IsoVirtualFile(listOf(0L to size), true)
+            val flights = cache.prefetchSeek(file, 3 * block + 188, size, client, ::fetch)
+            assertEquals(3, flights.size)
+            assertTrue(abandoned.await(2, TimeUnit.SECONDS))
+            assertTrue(active.await(2, TimeUnit.SECONDS))
+            finish.countDown()
+            flights.forEach { assertEquals(block, it.get(3, TimeUnit.SECONDS).size.toLong()) }
+        } finally { finish.countDown(); client.cancel(); cache.clear() }
+    }
+
     @Test fun sharePointLimitsActiveRangesUntilTheirConnectionsClose() {
         val pool = Executors.newFixedThreadPool(4)
         val firstThree = CountDownLatch(3)

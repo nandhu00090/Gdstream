@@ -14,7 +14,7 @@ class BluRayHlsTest {
         val playlist = String(hls.playlist())
         assertTrue(playlist.startsWith("#EXTM3U\n"))
         assertTrue(playlist.contains("#EXT-X-PLAYLIST-TYPE:VOD"))
-        assertTrue(playlist.contains("#EXT-X-TARGETDURATION:4"))
+        assertTrue(playlist.contains("#EXT-X-TARGETDURATION:2\n"))
         assertTrue(playlist.endsWith("#EXT-X-ENDLIST\n"))
         assertEquals(100_123_456, hls.segments.sumOf { it.durationUs })
         assertEquals(size, hls.segments.sumOf { it.end - it.start })
