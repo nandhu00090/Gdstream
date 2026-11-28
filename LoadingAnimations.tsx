@@ -4,6 +4,7 @@ import {
   Easing,
   Image,
   ImageProps,
+  Platform,
   Pressable,
   PressableProps,
   StyleProp,
@@ -807,19 +808,49 @@ export const SlideUpSheet: React.FC<{
 };
 
 // ---------------------------------------------------------------------------
-// 6. Ambient4KGlowCard — Breathing Crimson-Gold Edge Glow for 4K/DV/HDR Cards
+// 6. TierRimGlowCard — Tier-Aware Breathing Edge Glow (4K / 1080p / SD-720p)
 // ---------------------------------------------------------------------------
-export const Ambient4KGlowCard: React.FC<{
-  active?: boolean;
+export type CardGlowTier = '4k' | '1080p' | 'sd' | 'none';
+
+const TIER_GLOW_CONFIG: Record<
+  Exclude<CardGlowTier, 'none'>,
+  { primary: string; secondary?: string; minOpacity: number; maxOpacity: number; halfDurationMs: number }
+> = {
+  '4k': {
+    primary: '#F5C518',
+    secondary: '#E50914',
+    minOpacity: 0.2,
+    maxOpacity: 0.75,
+    halfDurationMs: 1400,
+  },
+  '1080p': {
+    primary: '#38BDF8',
+    secondary: '#0284C7',
+    minOpacity: 0.16,
+    maxOpacity: 0.52,
+    halfDurationMs: 1600,
+  },
+  sd: {
+    primary: '#F59E0B',
+    minOpacity: 0.14,
+    maxOpacity: 0.44,
+    halfDurationMs: 1800,
+  },
+};
+
+export const TierRimGlowCard: React.FC<{
+  tier?: CardGlowTier;
   isDv?: boolean;
   borderRadius?: number;
   style?: StyleProp<ViewStyle>;
   children: React.ReactNode;
-}> = ({ active = false, isDv = false, borderRadius = 12, style, children }) => {
+}> = ({ tier = 'none', isDv = false, borderRadius = 12, style, children }) => {
   const pulseAnim = useRef(new Animated.Value(0)).current;
+  const active = tier !== 'none';
+  const cfg = tier !== 'none' ? TIER_GLOW_CONFIG[tier] : null;
 
   useEffect(() => {
-    if (!active) {
+    if (!active || !cfg) {
       pulseAnim.stopAnimation();
       return;
     }
@@ -828,13 +859,13 @@ export const Ambient4KGlowCard: React.FC<{
       Animated.sequence([
         Animated.timing(pulseAnim, {
           toValue: 1,
-          duration: 1400,
+          duration: cfg.halfDurationMs,
           easing: Easing.inOut(Easing.sin),
           useNativeDriver: true,
         }),
         Animated.timing(pulseAnim, {
           toValue: 0,
-          duration: 1400,
+          duration: cfg.halfDurationMs,
           easing: Easing.inOut(Easing.sin),
           useNativeDriver: true,
         }),
@@ -842,21 +873,23 @@ export const Ambient4KGlowCard: React.FC<{
     );
     loop.start();
     return () => loop.stop();
-  }, [active, pulseAnim]);
+  }, [active, cfg, pulseAnim]);
 
-  const glowOpacity = pulseAnim.interpolate({
+  const primaryOpacity = pulseAnim.interpolate({
     inputRange: [0, 1],
-    outputRange: [0.2, 0.75],
+    outputRange: [cfg?.minOpacity ?? 0.2, cfg?.maxOpacity ?? 0.75],
   });
-  const inverseOpacity = pulseAnim.interpolate({
+  const secondaryOpacity = pulseAnim.interpolate({
     inputRange: [0, 1],
-    outputRange: [0.55, 0.2],
+    outputRange: [Math.min(0.55, (cfg?.maxOpacity ?? 0.55) * 0.8), cfg?.minOpacity ?? 0.16],
   });
+
+  const primaryColor = tier === '4k' && isDv ? '#C084FC' : cfg?.primary;
 
   return (
     <View style={style}>
       {children}
-      {active && (
+      {active && cfg && (
         <>
           <Animated.View
             pointerEvents="none"
@@ -865,37 +898,52 @@ export const Ambient4KGlowCard: React.FC<{
               {
                 borderRadius,
                 borderWidth: 1.5,
-                borderColor: isDv ? '#C084FC' : '#F5C518',
-                opacity: glowOpacity,
+                borderColor: primaryColor,
+                opacity: primaryOpacity,
               },
             ]}
           />
-          <Animated.View
-            pointerEvents="none"
-            style={[
-              StyleSheet.absoluteFill,
-              {
-                borderRadius,
-                borderWidth: 1,
-                borderColor: '#E50914',
-                opacity: inverseOpacity,
-              },
-            ]}
-          />
+          {!!cfg.secondary && (
+            <Animated.View
+              pointerEvents="none"
+              style={[
+                StyleSheet.absoluteFill,
+                {
+                  borderRadius,
+                  borderWidth: 1,
+                  borderColor: cfg.secondary,
+                  opacity: secondaryOpacity,
+                },
+              ]}
+            />
+          )}
         </>
       )}
     </View>
   );
 };
 
+export const Ambient4KGlowCard: React.FC<{
+  active?: boolean;
+  isDv?: boolean;
+  borderRadius?: number;
+  style?: StyleProp<ViewStyle>;
+  children: React.ReactNode;
+}> = ({ active = false, isDv = false, borderRadius = 12, style, children }) => (
+  <TierRimGlowCard tier={active ? '4k' : 'none'} isDv={isDv} borderRadius={borderRadius} style={style}>
+    {children}
+  </TierRimGlowCard>
+);
+
 // ---------------------------------------------------------------------------
-// 7. GlintBadge — Periodic Metallic Glint Sweep Every 4.2s
+// 7. GlintBadge — Periodic Metallic / Gold Glint Sweep Every 4.2s
 // ---------------------------------------------------------------------------
 export const GlintBadge: React.FC<{
   active?: boolean;
+  tintColor?: string;
   style?: StyleProp<ViewStyle>;
   children: React.ReactNode;
-}> = ({ active = true, style, children }) => {
+}> = ({ active = true, tintColor, style, children }) => {
   const glintProgress = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
@@ -937,6 +985,7 @@ export const GlintBadge: React.FC<{
           pointerEvents="none"
           style={[
             styles.badgeGlintStreak,
+            tintColor ? { backgroundColor: tintColor } : null,
             { transform: [{ translateX: glintX }, { rotate: '20deg' }] },
           ]}
         />
@@ -1221,6 +1270,409 @@ export const ProgressGlowTip: React.FC = () => {
   );
 };
 
+// ---------------------------------------------------------------------------
+// 12. Infuse Pro MediaInfo Telemetry Components
+// ---------------------------------------------------------------------------
+export const BitrateMeterBar: React.FC<{
+  bitrateMbps?: number;
+  maxMbps?: number;
+  color?: string;
+}> = ({ bitrateMbps = 0, maxMbps = 85, color = '#38BDF8' }) => {
+  const fillAnim = useRef(new Animated.Value(0)).current;
+  const [trackWidth, setTrackWidth] = React.useState(130);
+
+  const ratio = Math.max(0.08, Math.min(1, bitrateMbps > 0 ? bitrateMbps / maxMbps : 0.22));
+
+  useEffect(() => {
+    fillAnim.setValue(0);
+    Animated.timing(fillAnim, {
+      toValue: 1,
+      duration: 620,
+      delay: 140,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    }).start();
+  }, [bitrateMbps, ratio, fillAnim]);
+
+  const translateX = fillAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [-trackWidth, -trackWidth * (1 - ratio)],
+  });
+
+  return (
+    <View
+      onLayout={e => {
+        const w = e.nativeEvent.layout.width;
+        if (w > 0 && Math.abs(w - trackWidth) > 2) setTrackWidth(w);
+      }}
+      style={styles.bitrateTrack}>
+      <Animated.View
+        style={[
+          styles.bitrateFill,
+          { width: trackWidth, backgroundColor: color, transform: [{ translateX }] },
+        ]}
+      />
+    </View>
+  );
+};
+
+export const MiniEqualizerPulse: React.FC<{
+  active?: boolean;
+  color?: string;
+}> = ({ active = true, color = '#F5C518' }) => {
+  const b1 = useRef(new Animated.Value(0.45)).current;
+  const b2 = useRef(new Animated.Value(0.95)).current;
+  const b3 = useRef(new Animated.Value(0.6)).current;
+
+  useEffect(() => {
+    if (!active) {
+      b1.setValue(0.4);
+      b2.setValue(0.6);
+      b3.setValue(0.5);
+      return;
+    }
+    const pulse = (val: Animated.Value, lo: number, hi: number, dur: number) =>
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(val, { toValue: hi, duration: dur, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+          Animated.timing(val, { toValue: lo, duration: dur, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+        ]),
+      );
+    const l1 = pulse(b1, 0.35, 1.0, 340);
+    const l2 = pulse(b2, 0.4, 1.0, 280);
+    const l3 = pulse(b3, 0.3, 0.95, 390);
+    l1.start();
+    l2.start();
+    l3.start();
+    return () => {
+      l1.stop();
+      l2.stop();
+      l3.stop();
+    };
+  }, [active, b1, b2, b3]);
+
+  return (
+    <View style={styles.miniEqRow}>
+      {[b1, b2, b3].map((animVal, idx) => (
+        <Animated.View
+          key={idx}
+          style={[styles.miniEqBar, { backgroundColor: color, transform: [{ scaleY: animVal }] }]}
+        />
+      ))}
+    </View>
+  );
+};
+
+export const CopySpecPill: React.FC<{
+  label?: string;
+  text: string;
+  onCopy: (text: string) => void;
+  style?: StyleProp<ViewStyle>;
+  renderIcon?: (copied: boolean) => React.ReactNode;
+}> = ({ label = 'SOURCE FILE', text, onCopy, style, renderIcon }) => {
+  const [copied, setCopied] = React.useState(false);
+  const morphScale = useRef(new Animated.Value(1)).current;
+  const timerRef = useRef<any>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, []);
+
+  const handleCopy = () => {
+    onCopy(text);
+    setCopied(true);
+    morphScale.setValue(0.84);
+    Animated.spring(morphScale, {
+      toValue: 1,
+      speed: 28,
+      bounciness: 10,
+      useNativeDriver: true,
+    }).start();
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => setCopied(false), 1800);
+  };
+
+  return (
+    <View style={[styles.copySpecContainer, style]}>
+      <View style={styles.copySpecHeader}>
+        <Text style={styles.copySpecLabel}>{label}</Text>
+        <TactileSpringPressable
+          onPress={handleCopy}
+          glowColor={copied ? '#46D369' : '#64748B'}
+          glowBorderRadius={8}
+          style={[styles.copyChipBtn, copied && styles.copyChipBtnDone]}>
+          <Animated.View style={[styles.copyChipInner, { transform: [{ scale: morphScale }] }]}>
+            {renderIcon ? renderIcon(copied) : null}
+            <Text style={[styles.copyChipText, copied && styles.copyChipTextDone]}>
+              {copied ? 'Copied ✓' : 'Copy'}
+            </Text>
+          </Animated.View>
+        </TactileSpringPressable>
+      </View>
+      <Text style={styles.copySpecMono} selectable={true}>
+        {text}
+      </Text>
+    </View>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// 13. Details Action Buttons — 60fps Signature Micro-Animations
+// ---------------------------------------------------------------------------
+export const PlayHeroButton: React.FC<
+  TactileSpringPressableProps & {
+    inspecting?: boolean;
+    renderContent?: (nudgeX: Animated.Value) => React.ReactNode;
+  }
+> = ({ inspecting = false, renderContent, children, style, onPressIn, onPressOut, ...rest }) => {
+  const auraAnim = useRef(new Animated.Value(0)).current;
+  const sweepAnim = useRef(new Animated.Value(0)).current;
+  const nudgeX = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (inspecting) {
+      auraAnim.stopAnimation();
+      sweepAnim.stopAnimation();
+      return;
+    }
+    auraAnim.setValue(0);
+    sweepAnim.setValue(0);
+    const auraLoop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(auraAnim, { toValue: 1, duration: 1500, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+        Animated.timing(auraAnim, { toValue: 0, duration: 1500, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+      ]),
+    );
+    const sweepLoop = Animated.loop(
+      Animated.sequence([
+        Animated.delay(2850),
+        Animated.timing(sweepAnim, { toValue: 1, duration: 750, easing: Easing.inOut(Easing.cubic), useNativeDriver: true }),
+        Animated.timing(sweepAnim, { toValue: 0, duration: 0, useNativeDriver: true }),
+      ]),
+    );
+    auraLoop.start();
+    sweepLoop.start();
+    return () => {
+      auraLoop.stop();
+      sweepLoop.stop();
+    };
+  }, [inspecting, auraAnim, sweepAnim]);
+
+  const auraOpacity = auraAnim.interpolate({ inputRange: [0, 1], outputRange: [0.25, 0.65] });
+  const sweepX = sweepAnim.interpolate({ inputRange: [0, 1], outputRange: [-130, 420] });
+
+  const handleIn: PressableProps['onPressIn'] = (e) => {
+    Animated.spring(nudgeX, { toValue: 3, speed: 34, bounciness: 6, useNativeDriver: true }).start();
+    if (onPressIn) onPressIn(e);
+  };
+  const handleOut: PressableProps['onPressOut'] = (e) => {
+    Animated.spring(nudgeX, { toValue: 0, speed: 26, bounciness: 8, useNativeDriver: true }).start();
+    if (onPressOut) onPressOut(e);
+  };
+
+  const resolvedStyle = typeof style === 'function' ? style({ pressed: false }) : style;
+
+  return (
+    <View style={styles.playHeroAuraWrap}>
+      {!inspecting && (
+        <Animated.View
+          pointerEvents="none"
+          style={[styles.playHeroOuterAura, { opacity: auraOpacity }]}
+        />
+      )}
+      <TactileSpringPressable
+        {...rest}
+        onPressIn={handleIn}
+        onPressOut={handleOut}
+        glowBorderRadius={10}
+        style={[resolvedStyle, { overflow: 'hidden' }]}>
+        {!inspecting && (
+          <Animated.View
+            pointerEvents="none"
+            style={[
+              styles.heroSweepStreak,
+              { transform: [{ translateX: sweepX }, { rotate: '20deg' }] },
+            ]}
+          />
+        )}
+        {renderContent ? renderContent(nudgeX) : children}
+      </TactileSpringPressable>
+    </View>
+  );
+};
+
+export const ExternalLaunchButton: React.FC<
+  TactileSpringPressableProps & {
+    renderContent: (nudgeX: Animated.Value, nudgeY: Animated.Value) => React.ReactNode;
+  }
+> = ({ renderContent, onPressIn, onPressOut, glowColor = '#38BDF8', ...rest }) => {
+  const nudgeX = useRef(new Animated.Value(0)).current;
+  const nudgeY = useRef(new Animated.Value(0)).current;
+
+  const handleIn: PressableProps['onPressIn'] = (e) => {
+    Animated.parallel([
+      Animated.spring(nudgeX, { toValue: 3, speed: 34, bounciness: 6, useNativeDriver: true }),
+      Animated.spring(nudgeY, { toValue: -3, speed: 34, bounciness: 6, useNativeDriver: true }),
+    ]).start();
+    if (onPressIn) onPressIn(e);
+  };
+  const handleOut: PressableProps['onPressOut'] = (e) => {
+    Animated.parallel([
+      Animated.spring(nudgeX, { toValue: 0, speed: 26, bounciness: 8, useNativeDriver: true }),
+      Animated.spring(nudgeY, { toValue: 0, speed: 26, bounciness: 8, useNativeDriver: true }),
+    ]).start();
+    if (onPressOut) onPressOut(e);
+  };
+
+  return (
+    <TactileSpringPressable
+      {...rest}
+      glowColor={glowColor}
+      glowBorderRadius={10}
+      onPressIn={handleIn}
+      onPressOut={handleOut}>
+      {renderContent(nudgeX, nudgeY)}
+    </TactileSpringPressable>
+  );
+};
+
+export const MyListHeartButton: React.FC<
+  TactileSpringPressableProps & {
+    saved: boolean;
+    renderContent: (
+      heartScale: Animated.Value,
+      rippleScale: Animated.Value,
+      rippleOpacity: Animated.Value,
+    ) => React.ReactNode;
+  }
+> = ({ saved, renderContent, ...rest }) => {
+  const heartScale = useRef(new Animated.Value(1)).current;
+  const rippleScale = useRef(new Animated.Value(0.5)).current;
+  const rippleOpacity = useRef(new Animated.Value(0)).current;
+  const mountedRef = useRef(false);
+
+  useEffect(() => {
+    if (!mountedRef.current) {
+      mountedRef.current = true;
+      return;
+    }
+    rippleScale.setValue(0.5);
+    rippleOpacity.setValue(0.8);
+    Animated.parallel([
+      Animated.sequence([
+        Animated.spring(heartScale, { toValue: 1.38, speed: 40, bounciness: 10, useNativeDriver: true }),
+        Animated.spring(heartScale, { toValue: 1, speed: 24, bounciness: 8, useNativeDriver: true }),
+      ]),
+      Animated.timing(rippleScale, { toValue: 1.6, duration: 380, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+      Animated.timing(rippleOpacity, { toValue: 0, duration: 380, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+    ]).start();
+  }, [saved, heartScale, rippleScale, rippleOpacity]);
+
+  return (
+    <TactileSpringPressable
+      {...rest}
+      glowColor={saved ? '#E50914' : 'rgba(229, 9, 20, 0.72)'}
+      glowBorderRadius={10}>
+      {renderContent(heartScale, rippleScale, rippleOpacity)}
+    </TactileSpringPressable>
+  );
+};
+
+export const DownloadActionButton: React.FC<
+  TactileSpringPressableProps & {
+    progress?: number | null;
+    isActiveDownload?: boolean;
+    renderContent: (arrowNudgeY: Animated.Value) => React.ReactNode;
+  }
+> = ({ progress = null, isActiveDownload = false, renderContent, style, onPressIn, onPressOut, ...rest }) => {
+  const arrowNudgeY = useRef(new Animated.Value(0)).current;
+  const [btnWidth, setBtnWidth] = React.useState(260);
+  const clampedPct = progress !== null ? Math.max(0.02, Math.min(1, progress / 100)) : 0;
+
+  const handleIn: PressableProps['onPressIn'] = (e) => {
+    Animated.spring(arrowNudgeY, { toValue: 3, speed: 34, bounciness: 6, useNativeDriver: true }).start();
+    if (onPressIn) onPressIn(e);
+  };
+  const handleOut: PressableProps['onPressOut'] = (e) => {
+    Animated.spring(arrowNudgeY, { toValue: 0, speed: 26, bounciness: 8, useNativeDriver: true }).start();
+    if (onPressOut) onPressOut(e);
+  };
+
+  return (
+    <View
+      onLayout={e => {
+        const w = e.nativeEvent.layout.width;
+        if (w > 0 && Math.abs(w - btnWidth) > 2) setBtnWidth(w);
+      }}>
+      <TactileSpringPressable
+        {...rest}
+        onPressIn={handleIn}
+        onPressOut={handleOut}
+        glowColor="#46D369"
+        glowBorderRadius={10}
+        style={[typeof style === 'function' ? style({ pressed: false }) : style, { overflow: 'hidden' }]}>
+        {isActiveDownload && (
+          <View
+            pointerEvents="none"
+            style={[
+              styles.inlineDlProgressTrack,
+              { width: btnWidth, transform: [{ translateX: -btnWidth * (1 - clampedPct) }] },
+            ]}
+          />
+        )}
+        {renderContent(arrowNudgeY)}
+      </TactileSpringPressable>
+    </View>
+  );
+};
+
+export const TrailerGlowButton: React.FC<
+  TactileSpringPressableProps & {
+    available: boolean;
+  }
+> = ({ available, children, style, ...rest }) => {
+  const pulseAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (!available) {
+      pulseAnim.stopAnimation();
+      return;
+    }
+    pulseAnim.setValue(0);
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 1, duration: 1500, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 0, duration: 1500, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [available, pulseAnim]);
+
+  const violetOpacity = pulseAnim.interpolate({ inputRange: [0, 1], outputRange: [0.25, 0.8] });
+  const pinkOpacity = pulseAnim.interpolate({ inputRange: [0, 1], outputRange: [0.65, 0.2] });
+
+  return (
+    <View style={styles.trailerGlowWrap}>
+      {available && (
+        <>
+          <Animated.View pointerEvents="none" style={[styles.trailerVioletRim, { opacity: violetOpacity }]} />
+          <Animated.View pointerEvents="none" style={[styles.trailerPinkRim, { opacity: pinkOpacity }]} />
+        </>
+      )}
+      <TactileSpringPressable
+        {...rest}
+        glowColor={available ? '#EC4899' : '#3F3F46'}
+        glowBorderRadius={10}
+        style={style}>
+        {children}
+      </TactileSpringPressable>
+    </View>
+  );
+};
+
 const styles = StyleSheet.create({
   shimmerGrid: {
     flexDirection: 'row',
@@ -1460,5 +1912,134 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderWidth: 1.5,
     borderColor: '#E50914',
+  },
+  bitrateTrack: {
+    width: '100%',
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: '#1E2534',
+    overflow: 'hidden',
+    marginTop: 7,
+  },
+  bitrateFill: {
+    height: '100%',
+    borderRadius: 3,
+  },
+  miniEqRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 2,
+    height: 11,
+    marginRight: 5,
+  },
+  miniEqBar: {
+    width: 2.5,
+    height: 11,
+    borderRadius: 1.5,
+  },
+  copySpecContainer: {
+    marginTop: 14,
+    padding: 11,
+    borderRadius: 10,
+    backgroundColor: '#0D1018',
+    borderWidth: 1,
+    borderColor: '#1F2636',
+  },
+  copySpecHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  copySpecLabel: {
+    color: '#6C7789',
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 1,
+  },
+  copyChipBtn: {
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 7,
+    backgroundColor: '#181E2B',
+    borderWidth: 1,
+    borderColor: '#2E384D',
+  },
+  copyChipBtnDone: {
+    backgroundColor: 'rgba(70, 211, 105, 0.14)',
+    borderColor: '#46D369',
+  },
+  copyChipInner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  copyChipText: {
+    color: '#CBD5E1',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  copyChipTextDone: {
+    color: '#46D369',
+    fontWeight: '800',
+  },
+  copySpecMono: {
+    color: '#A3B0C4',
+    fontSize: 11.5,
+    lineHeight: 16,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+  },
+  playHeroAuraWrap: {
+    position: 'relative',
+  },
+  playHeroOuterAura: {
+    position: 'absolute',
+    top: -3,
+    bottom: -3,
+    left: -3,
+    right: -3,
+    borderRadius: 13,
+    borderWidth: 2,
+    borderColor: '#FF2A36',
+  },
+  heroSweepStreak: {
+    position: 'absolute',
+    top: -28,
+    bottom: -28,
+    width: 60,
+    backgroundColor: 'rgba(255, 255, 255, 0.24)',
+  },
+  inlineDlProgressTrack: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(70, 211, 105, 0.16)',
+    borderBottomWidth: 3,
+    borderBottomColor: '#46D369',
+  },
+  trailerGlowWrap: {
+    position: 'relative',
+    marginBottom: 14,
+  },
+  trailerVioletRim: {
+    position: 'absolute',
+    top: -1.5,
+    bottom: -1.5,
+    left: -1.5,
+    right: -1.5,
+    borderRadius: 11.5,
+    borderWidth: 1.5,
+    borderColor: '#8B5CF6',
+  },
+  trailerPinkRim: {
+    position: 'absolute',
+    top: -1.5,
+    bottom: -1.5,
+    left: -1.5,
+    right: -1.5,
+    borderRadius: 11.5,
+    borderWidth: 1.5,
+    borderColor: '#EC4899',
   },
 });

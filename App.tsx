@@ -3,7 +3,7 @@ import {
   View, Text, FlatList, TouchableOpacity, StyleSheet,
   Alert, NativeModules, TextInput, ScrollView, BackHandler, Animated,
   Platform, DeviceEventEmitter, Image, Modal, PanResponder, Dimensions,
-  StatusBar, RefreshControl, AppState,
+  StatusBar, RefreshControl, AppState, Share,
 } from 'react-native';
 import Video from 'react-native-video';
 import DvdSubtitleOverlay from './DvdSubtitleOverlay';
@@ -17,13 +17,22 @@ import {
   TactileSpringPressable,
   StaggeredSection,
   SlideUpSheet,
-  Ambient4KGlowCard,
+  TierRimGlowCard,
+  CardGlowTier,
   GlintBadge,
   WaveCascadeCard,
   KenBurnsBackdrop,
   SeekBurstOverlay,
   DownloadPulseBadge,
   ProgressGlowTip,
+  BitrateMeterBar,
+  MiniEqualizerPulse,
+  CopySpecPill,
+  PlayHeroButton,
+  ExternalLaunchButton,
+  MyListHeartButton,
+  DownloadActionButton,
+  TrailerGlowButton,
 } from './LoadingAnimations';
 import { catalogRequest, catalogJson, inCatalogSlot } from './catalogRequests';
 import Orientation from 'react-native-orientation-locker';
@@ -223,6 +232,35 @@ const requestInitialScreenFocus = (id: string) => {
   focusById(id);
 };
 
+const copyTextSafely = (value: string) => {
+  try {
+    const nativeClip = (NativeModules as any).Clipboard || (NativeModules as any).RNCClipboard;
+    if (nativeClip && typeof nativeClip.setString === 'function') {
+      nativeClip.setString(value);
+      return;
+    }
+  } catch (_e) {}
+  Share.share({ message: value }).catch(() => {});
+};
+
+const formatCompactAudioLabel = (
+  track: { language: string; codec: string; channels: string; bitrateKbps: number; summary: string },
+  hasAtmos?: boolean,
+) => {
+  const shortCodec = (track.codec || '')
+    .replace(/Dolby TrueHD.*/i, hasAtmos ? 'TrueHD Atmos' : 'TrueHD')
+    .replace(/Dolby Digital Plus.*/i, 'DD+')
+    .replace(/Dolby Digital.*/i, 'DD')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const parts = [
+    track.language && track.language !== 'Undetermined' ? track.language : '',
+    shortCodec ? (track.channels ? `${shortCodec} ${track.channels}` : shortCodec) : track.channels,
+    track.bitrateKbps > 0 ? `${track.bitrateKbps}k` : '',
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(' • ') : track.summary;
+};
+
 const FocusableButton = ({
   style,
   focusedStyle,
@@ -236,6 +274,7 @@ const FocusableButton = ({
   focusId,
   isHeaderControl = false,
   enableSheen = false,
+  Component,
   ...rest
 }: any) => {
   const [isFocused, setIsFocused] = useState(false);
@@ -277,9 +316,10 @@ const FocusableButton = ({
   }, [isLayerActive, isFocused]);
 
   const showFocus = isFocused && isLayerActive;
+  const BtnComp: React.ComponentType<any> = Component || TactileSpringPressable;
 
   return (
-    <TactileSpringPressable
+    <BtnComp
       innerRef={btnRef}
       nativeID={isLayerActive && focusId ? focusId : undefined}
       disabled={disabled || !isLayerActive}
@@ -288,11 +328,11 @@ const FocusableButton = ({
       highlighted={showFocus}
       enableSheen={enableSheen}
       glowColor={showFocus ? '#FFD700' : 'rgba(229, 9, 20, 0.72)'}
-      onPress={(e) => {
+      onPress={(e: any) => {
         if (onGlobalTvActivity) onGlobalTvActivity();
         if (onPress) onPress(e);
       }}
-      onFocus={(e) => {
+      onFocus={(e: any) => {
         if (onGlobalTvActivity) onGlobalTvActivity();
         if (focusId) {
           if (pendingInitialFocusId === focusId) {
@@ -305,7 +345,7 @@ const FocusableButton = ({
         setIsFocused(true);
         if (userOnFocus) userOnFocus(e);
       }}
-      onBlur={(e) => {
+      onBlur={(e: any) => {
         setIsFocused(false);
         if (userOnBlur) userOnBlur(e);
       }}
@@ -316,7 +356,7 @@ const FocusableButton = ({
       ]}
       {...rest}>
       {children}
-    </TactileSpringPressable>
+    </BtnComp>
   );
 };
 
@@ -993,6 +1033,7 @@ const App = () => {
 
   const [seekOverlay, setSeekOverlay] = useState({ visible: false, icon: '', time: 0, position: 'center', burstKey: 0 });
   const seekBurstCounterRef = useRef(0);
+  const detailScrollY = useRef(new Animated.Value(0)).current;
   const accumulatedSeek = useRef(0);
   const seekBaseTime = useRef<number | null>(null);
   const multiTapTimer = useRef<any>(null);
@@ -1965,6 +2006,7 @@ const App = () => {
     archiveOpenRequestRef.current++;
     setOpeningIso(false);
     setIsoInspectionError(null);
+    detailScrollY.setValue(0);
     setSelectedFile(null);
     if (archiveListing.current) setLoading(false);
     retryInspection.current = null;
@@ -3856,11 +3898,56 @@ const App = () => {
     const vItem = selectedFile;
     const vMi = realMi;
     const vRes = effectiveResolution;
+    const stickyBgOpacity = detailScrollY.interpolate({
+      inputRange: [110, 195],
+      outputRange: [0, 1],
+      extrapolate: 'clamp',
+    });
+    const stickyTitleOpacity = detailScrollY.interpolate({
+      inputRange: [135, 205],
+      outputRange: [0, 1],
+      extrapolate: 'clamp',
+    });
+    const stickyTitleTranslateY = detailScrollY.interpolate({
+      inputRange: [135, 205],
+      outputRange: [6, 0],
+      extrapolate: 'clamp',
+    });
+    const detailHeaderTitle = meta?.title || info.cleanTitle;
 
     return (
       <FocusLayerContext.Provider value="detail">
-      <ScrollView focusable={false} style={styles.detailScreen} contentContainerStyle={{ paddingBottom: 40 }}>
+      <View style={styles.detailScreen}>
         <StatusBar hidden={false} barStyle="light-content" />
+        <View style={styles.detailStickyBar} pointerEvents="box-none">
+          <Animated.View
+            pointerEvents="none"
+            style={[styles.detailStickyBg, { opacity: stickyBgOpacity }]}
+          />
+          <View style={styles.detailStickyRow} pointerEvents="box-none">
+            <FocusableButton focusId="detail_back_btn" style={styles.detailStickyBackBtn} onPress={closeDetails}>
+              <Icon name="arrow-back" size={22} color="white" />
+            </FocusableButton>
+            <Animated.Text
+              numberOfLines={1}
+              style={[
+                styles.detailStickyTitle,
+                { opacity: stickyTitleOpacity, transform: [{ translateY: stickyTitleTranslateY }] },
+              ]}>
+              {detailHeaderTitle}
+            </Animated.Text>
+          </View>
+        </View>
+
+        <Animated.ScrollView
+          focusable={false}
+          style={{ flex: 1 }}
+          contentContainerStyle={{ paddingBottom: 40 }}
+          scrollEventThrottle={16}
+          onScroll={Animated.event(
+            [{ nativeEvent: { contentOffset: { y: detailScrollY } } }],
+            { useNativeDriver: true },
+          )}>
         <View style={styles.detailHero}>
           {bannerImage ? (
             <KenBurnsBackdrop source={{ uri: bannerImage }} style={styles.detailBackdrop} resizeMode="cover" durationMs={280} />
@@ -3870,9 +3957,6 @@ const App = () => {
             </View>
           )}
           <View style={styles.detailHeroShade} />
-          <FocusableButton focusId="detail_back_btn" style={styles.detailBackTopBtn} onPress={closeDetails}>
-            <Icon name="arrow-back" size={24} color="white" />
-          </FocusableButton>
         </View>
 
         <View style={styles.detailContent}>
@@ -3964,9 +4048,18 @@ const App = () => {
                 selectedFile?.videoExtension === 'vob' ||
                 /\b(dvd|dvd5|dvd9|dvdrip|video_ts|vob)\b/i.test(String(selectedFile?.name || ''));
               const discKind: 'dvd' | 'bluray' = isDvdDisc ? 'dvd' : 'bluray';
+              const playLabel = isoInspectionError
+                ? 'Retry disc inspection'
+                : savedSec > 3
+                ? `Resume ${versionGroup.length > 1 ? getVersionTag(selectedFile.name).split(' • ')[0] : 'Watching'} (${formatRemainingLabel(savedSec, totalDur)})`
+                : versionGroup.length > 1
+                ? `Play ${getVersionTag(selectedFile.name)} in App`
+                : 'Play in App';
               return (
                 <FocusableButton
                   focusId="detail_play_btn"
+                  Component={PlayHeroButton}
+                  inspecting={openingIso}
                   hasTVPreferredFocus={true}
                   style={[
                     styles.primaryPlayButton,
@@ -3978,66 +4071,125 @@ const App = () => {
                     },
                   ]}
                   disabled={openingIso}
-                  onPress={() => isoInspectionError ? retryInspection.current?.() : handlePlayInAppPress(selectedFile)}>
-                  {openingIso ? (
-                    <DiscInspectLoader discType={discKind} />
-                  ) : (
-                    <>
-                      <Icon name="play-arrow" size={26} color="white" />
-                      <Text style={styles.primaryPlayButtonText}>
-                        {isoInspectionError ? 'Retry disc inspection' : savedSec > 3
-                          ? `Resume ${versionGroup.length > 1 ? getVersionTag(selectedFile.name).split(' • ')[0] : 'Watching'} (${formatRemainingLabel(savedSec, totalDur)})`
-                          : versionGroup.length > 1
-                          ? `Play ${getVersionTag(selectedFile.name)} in App`
-                          : 'Play in App'}
-                      </Text>
-                    </>
-                  )}
-                </FocusableButton>
+                  onPress={() => isoInspectionError ? retryInspection.current?.() : handlePlayInAppPress(selectedFile)}
+                  renderContent={(nudgeX: Animated.Value) =>
+                    openingIso ? (
+                      <DiscInspectLoader discType={discKind} />
+                    ) : (
+                      <>
+                        <Animated.View style={{ transform: [{ translateX: nudgeX }] }}>
+                          <Icon name="play-arrow" size={26} color="white" />
+                        </Animated.View>
+                        <Text style={styles.primaryPlayButtonText}>{playLabel}</Text>
+                      </>
+                    )
+                  }
+                />
               );
             })()}
 
             <View style={{ flexDirection: 'row', gap: 10 }}>
-              <FocusableButton focusId="detail_ext_btn" disabled={!!selectedFile.isoPending} style={[styles.secondaryPlayButton, { flex: 1 }]} onPress={() => openInExternalPlayer(selectedFile)}>
-                <Icon name="open-in-new" size={20} color="white" />
-                <Text style={styles.secondaryPlayButtonText}>External Player</Text>
-              </FocusableButton>
+              <FocusableButton
+                focusId="detail_ext_btn"
+                Component={ExternalLaunchButton}
+                disabled={!!selectedFile.isoPending}
+                style={[styles.secondaryPlayButton, { flex: 1 }]}
+                onPress={() => openInExternalPlayer(selectedFile)}
+                renderContent={(nx: Animated.Value, ny: Animated.Value) => (
+                  <>
+                    <Animated.View style={{ transform: [{ translateX: nx }, { translateY: ny }] }}>
+                      <Icon name="open-in-new" size={20} color="#38BDF8" />
+                    </Animated.View>
+                    <Text style={styles.secondaryPlayButtonText}>External Player</Text>
+                  </>
+                )}
+              />
               <FocusableButton
                 focusId="detail_fav_btn"
+                Component={MyListHeartButton}
+                saved={isFav}
                 style={[styles.secondaryPlayButton, { paddingHorizontal: 16 }, isFav && { borderColor: '#E50914' }]}
-                onPress={() => toggleWatchlist(selectedFile.name)}>
-                <Icon name={isFav ? 'favorite' : 'favorite-border'} size={20} color={isFav ? '#E50914' : 'white'} />
-                <Text style={styles.secondaryPlayButtonText}>{isFav ? 'Saved' : 'My List'}</Text>
-              </FocusableButton>
+                onPress={() => toggleWatchlist(selectedFile.name)}
+                renderContent={(heartScale: Animated.Value, rippleScale: Animated.Value, rippleOpacity: Animated.Value) => (
+                  <>
+                    <View style={styles.heartBurstWrap}>
+                      <Animated.View
+                        pointerEvents="none"
+                        style={[
+                          styles.heartBurstRing,
+                          { opacity: rippleOpacity, transform: [{ scale: rippleScale }] },
+                        ]}
+                      />
+                      <Animated.View style={{ transform: [{ scale: heartScale }] }}>
+                        <Icon name={isFav ? 'favorite' : 'favorite-border'} size={20} color={isFav ? '#E50914' : 'white'} />
+                      </Animated.View>
+                    </View>
+                    <Text style={styles.secondaryPlayButtonText}>{isFav ? 'In My List' : 'My List'}</Text>
+                  </>
+                )}
+              />
             </View>
 
             {!dlTask ? (
-              <FocusableButton focusId="detail_dl_btn" disabled={!!selectedFile.isoPending} style={styles.downloadActionBtn} onPress={() => handleStartDownload(selectedFile)}>
-                <Icon name="file-download" size={22} color="#46d369" />
-                <Text style={styles.downloadActionText}>
-                  {versionGroup.length > 1 ? `Download (${getVersionTag(selectedFile.name)})` : 'Download'}
-                </Text>
-              </FocusableButton>
+              <FocusableButton
+                focusId="detail_dl_btn"
+                Component={DownloadActionButton}
+                disabled={!!selectedFile.isoPending}
+                style={styles.downloadActionBtn}
+                onPress={() => handleStartDownload(selectedFile)}
+                renderContent={(arrowNudgeY: Animated.Value) => (
+                  <>
+                    <Animated.View style={{ transform: [{ translateY: arrowNudgeY }] }}>
+                      <Icon name="file-download" size={22} color="#46d369" />
+                    </Animated.View>
+                    <Text style={styles.downloadActionText}>
+                      {versionGroup.length > 1 ? `Download (${getVersionTag(selectedFile.name)})` : 'Download'}
+                    </Text>
+                  </>
+                )}
+              />
             ) : dlTask.status === 'completed' ? (
-              <FocusableButton focusId="detail_dl_btn" style={styles.downloadedReadyCard} onPress={handleOpenDownloadFolder}>
-                <Icon name="check-circle" size={20} color="#46d369" />
-                <Text style={styles.downloadedReadyText}>Saved in Download/GDStream • Tap to Open Folder</Text>
-              </FocusableButton>
+              <FocusableButton
+                focusId="detail_dl_btn"
+                Component={DownloadActionButton}
+                style={styles.downloadedReadyCard}
+                onPress={handleOpenDownloadFolder}
+                renderContent={(arrowNudgeY: Animated.Value) => (
+                  <>
+                    <Animated.View style={{ transform: [{ translateY: arrowNudgeY }] }}>
+                      <Icon name="check-circle" size={20} color="#46d369" />
+                    </Animated.View>
+                    <Text style={styles.downloadedReadyText}>Saved in Download/GDStream • Tap to Open Folder</Text>
+                  </>
+                )}
+              />
             ) : (
-              <FocusableButton focusId="detail_dl_btn" style={styles.downloadProgressCard} onPress={() => { closeDetails(); setActiveTab('downloads'); }}>
-                <View style={styles.dlCardHeaderRow}>
-                  <Text style={styles.dlCardStatusText}>
-                    {dlTask.status === 'downloading' ? `Downloading • ${formatBytes(dlTask.speedBytesPerSec)}/s` : `Download ${dlTask.status.toUpperCase()}`}
-                  </Text>
-                  <Text style={styles.dlCardPercentText}>{dlTask.progress.toFixed(1)}%</Text>
-                </View>
-                <View style={styles.dlProgressBarBg}>
-                  <View style={[styles.dlProgressBarFill, { width: `${dlTask.progress}%` }]} />
-                </View>
-                <Text style={styles.dlCardSubText}>
-                  {formatBytes(dlTask.downloadedBytes)} / {formatBytes(dlTask.totalBytes)} • Tap to open Downloads
-                </Text>
-              </FocusableButton>
+              <FocusableButton
+                focusId="detail_dl_btn"
+                Component={DownloadActionButton}
+                isActiveDownload={true}
+                progress={dlTask.progress}
+                style={styles.downloadProgressCard}
+                onPress={() => { closeDetails(); setActiveTab('downloads'); }}
+                renderContent={(arrowNudgeY: Animated.Value) => (
+                  <View style={{ width: '100%' }}>
+                    <View style={styles.dlCardHeaderRow}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <Animated.View style={{ transform: [{ translateY: arrowNudgeY }] }}>
+                          <Icon name="downloading" size={16} color="#46d369" />
+                        </Animated.View>
+                        <Text style={styles.dlCardStatusText}>
+                          {dlTask.status === 'downloading' ? `Downloading • ${formatBytes(dlTask.speedBytesPerSec)}/s` : `Download ${dlTask.status.toUpperCase()}`}
+                        </Text>
+                      </View>
+                      <Text style={styles.dlCardPercentText}>{dlTask.progress.toFixed(1)}%</Text>
+                    </View>
+                    <Text style={styles.dlCardSubText}>
+                      {formatBytes(dlTask.downloadedBytes)} / {formatBytes(dlTask.totalBytes)} • Tap to open Downloads
+                    </Text>
+                  </View>
+                )}
+              />
             )}
 
             {(() => {
@@ -4088,8 +4240,10 @@ const App = () => {
           {/* Single MediaInfo Card for Currently Selected Version Only */}
           <StaggeredSection delayMs={120} style={styles.mediaInfoCard}>
             
-                            <FocusableButton
+              <FocusableButton
                 focusId="detail_trailer_btn"
+                Component={TrailerGlowButton}
+                available={trailerState.available}
                 disabled={trailerState.loading || !trailerState.available}
                 onPress={() => {
                   if (trailerState.available && trailerState.cacheKey && SecurityVault?.playYoutubeTrailer) {
@@ -4103,7 +4257,6 @@ const App = () => {
                   borderRadius: 10,
                   paddingVertical: 13,
                   paddingHorizontal: 16,
-                  marginBottom: 14,
                   flexDirection: 'row',
                   alignItems: 'center',
                   justifyContent: 'center',
@@ -4138,100 +4291,153 @@ const App = () => {
               )}
             </View>
 
-            {openingIso ? <DiscSpecsSkeleton /> : vMi ? (
-              <View style={{ gap: 10, marginTop: 8 }}>
-                <View style={styles.miSpecRow}>
-                  <Text style={styles.miSpecLabel}>VIDEO</Text>
-                  <Text style={styles.miSpecValue}>
-                    {[
-                      vMi.width > 0 ? `${vMi.width}×${vMi.height} (${vMi.resolution})` : vRes,
-                      [vMi.videoCodec === 'AVC' ? 'AVC (H.264)' : vMi.videoCodec,
-                        vMi.videoBitrateMbps && vMi.videoBitrateMbps > 0 ? `@ ${vMi.videoBitrateMbps.toFixed(1)} Mbps` : null,
-                      ].filter(Boolean).join(' '),
-                      vMi.hasDV && vMi.hasHDR ? 'Dolby Vision + HDR10' : vMi.hasDV ? 'Dolby Vision (Single Layer)' : vMi.hasHDR ? 'HDR10' : 'SDR',
-                      vMi.frameRate > 0 ? `${vMi.frameRate.toFixed(2).replace(/\.00$/, '')} fps` : null,
-                    ].filter(Boolean).join(' • ')}
-                  </Text>
-                </View>
-                {(vMi.totalBytes > 0 || vMi.durationSec > 0) && (
-                  <View style={styles.miSpecRow}>
-                    <Text style={styles.miSpecLabel}>FILE & TIME</Text>
-                    <Text style={styles.miSpecValue}>
-                      {[vMi.totalBytes > 0 ? formatBytes(vMi.totalBytes) : null, vMi.durationSec > 0 ? formatRuntime(vMi.durationSec) : null].filter(Boolean).join(' • ')}
-                    </Text>
-                  </View>
-                )}
-                {vMi.audioTracks && vMi.audioTracks.length > 0 && (
-                  <View style={styles.miSpecRow}>
-                    <Text style={styles.miSpecLabel}>AUDIO ({vMi.audioTracks.length})</Text>
-                    <View style={styles.miTrackPillWrap}>
-                      {vMi.audioTracks.map((at, idx) => (
-                        <CascadeSpecPill key={idx} index={idx} style={styles.miAudioPill}>
-                          <Text style={styles.miAudioPillText}>
-                            {vMi.hasAtmos
-                              ? at.summary
-                                  .replace('Dolby TrueHD', 'Dolby TrueHD with Dolby Atmos')
-                                  .replace('Dolby Digital Plus (DD+)', 'Dolby Digital Plus (DD+)')
-                              : at.summary}
+            {openingIso ? <DiscSpecsSkeleton /> : vMi ? (() => {
+              const resDisplay = vRes === '4K' || vRes === '2160p' ? '4K UHD' : vRes || 'HD';
+              const codecShort = vMi.videoCodec === 'AVC' ? 'AVC' : vMi.videoCodec || 'Video';
+              const dynamicRangeTag = vMi.hasDV && vMi.hasHDR ? 'DV + HDR10' : vMi.hasDV ? 'DV' : vMi.hasHDR ? 'HDR10' : 'SDR';
+              const preferredAudioIdx = Math.max(
+                0,
+                vMi.audioTracks ? vMi.audioTracks.findIndex(t => /tamil/i.test(t.language || t.summary || '')) : 0,
+              );
+              return (
+                <View style={{ gap: 12, marginTop: 10 }}>
+                  <View style={styles.miTelemetryGrid}>
+                    <View style={styles.miTelemetryTile}>
+                      <Text style={styles.miTileLabel}>RESOLUTION & CODEC</Text>
+                      <View style={styles.miTileBadgesRow}>
+                        <View style={[styles.miMiniBadge, (vRes === '4K' || vRes === '2160p') && styles.miMiniBadge4K]}>
+                          <Text style={styles.miMiniBadgeText}>{resDisplay}</Text>
+                        </View>
+                        {!!codecShort && (
+                          <View style={styles.miMiniBadge}>
+                            <Text style={styles.miMiniBadgeText}>{codecShort}</Text>
+                          </View>
+                        )}
+                        <View style={[styles.miMiniBadge, (vMi.hasDV || vMi.hasHDR) && styles.miMiniBadgeHdr]}>
+                          <Text style={[styles.miMiniBadgeText, (vMi.hasDV || vMi.hasHDR) && { color: '#000' }]}>
+                            {dynamicRangeTag}
                           </Text>
-                        </CascadeSpecPill>
-                      ))}
+                        </View>
+                      </View>
+                      <Text style={styles.miTileSub}>
+                        {vMi.width > 0 ? `${vMi.width}×${vMi.height}` : resDisplay}
+                      </Text>
+                    </View>
+
+                    <View style={styles.miTelemetryTile}>
+                      <Text style={styles.miTileLabel}>BITRATE & FPS</Text>
+                      <Text style={styles.miTileValue}>
+                        {vMi.videoBitrateMbps && vMi.videoBitrateMbps > 0 ? `${vMi.videoBitrateMbps.toFixed(1)} Mbps` : 'VBR Stream'}
+                      </Text>
+                      <Text style={styles.miTileSub}>
+                        {vMi.frameRate > 0 ? `${vMi.frameRate.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')} fps` : 'Standard cadence'}
+                      </Text>
+                      <BitrateMeterBar
+                        bitrateMbps={vMi.videoBitrateMbps}
+                        color={vMi.hasDV ? '#C084FC' : (vRes === '4K' || vRes === '2160p') ? '#F5C518' : '#38BDF8'}
+                      />
+                    </View>
+
+                    <View style={styles.miTelemetryTile}>
+                      <Text style={styles.miTileLabel}>FILE SIZE</Text>
+                      <Text style={styles.miTileValue}>
+                        {vMi.totalBytes > 0 ? formatBytes(vMi.totalBytes) : '—'}
+                      </Text>
+                      <Text style={styles.miTileSub}>Container footprint</Text>
+                    </View>
+
+                    <View style={styles.miTelemetryTile}>
+                      <Text style={styles.miTileLabel}>RUNTIME</Text>
+                      <Text style={styles.miTileValue}>
+                        {vMi.durationSec > 0 ? formatRuntime(vMi.durationSec) : '—'}
+                      </Text>
+                      <Text style={styles.miTileSub}>Feature duration</Text>
                     </View>
                   </View>
-                )}
-                {vMi.subtitleTracks && vMi.subtitleTracks.length > 0 && (() => {
-              const groupedSubs: Array<{ label: string; count: number }> = [];
-              const subIdxMap = new Map<string, number>();
-              for (const st of vMi.subtitleTracks) {
-                const lbl = `${st.language} (${st.format})`;
-                const existingIdx = subIdxMap.get(lbl);
-                if (existingIdx !== undefined) {
-                  groupedSubs[existingIdx].count += 1;
-                } else {
-                  subIdxMap.set(lbl, groupedSubs.length);
-                  groupedSubs.push({ label: lbl, count: 1 });
-                }
-              }
-              const INITIAL_SUB_LIMIT = 6;
-              const visibleSubs = subsExpanded ? groupedSubs : groupedSubs.slice(0, INITIAL_SUB_LIMIT);
-              const hiddenCount = groupedSubs.length - visibleSubs.length;
-              return (
-                <View style={styles.miSpecRow}>
-                  <Text style={styles.miSpecLabel}>SUBTITLES ({vMi.subtitleTracks.length})</Text>
-                  <View style={styles.miTrackPillWrap}>
-                    {visibleSubs.map((gs, idx) => (
-                      <CascadeSpecPill key={idx} index={idx} style={styles.miSubPill}>
-                        <Text style={styles.miSubPillText}>
-                          {gs.count > 1 ? `${gs.label} ×${gs.count}` : gs.label}
-                        </Text>
-                      </CascadeSpecPill>
-                    ))}
-                    {groupedSubs.length > INITIAL_SUB_LIMIT && (
-                      <FocusableButton
-                        focusId="detail_subs_toggle"
-                        style={[styles.miSubPill, { backgroundColor: '#1E2433', borderColor: '#4B5563' }]}
-                        onPress={() => setSubsExpanded(prev => !prev)}>
-                        <Text style={[styles.miSubPillText, { color: '#F5C518', fontWeight: '800' }]}>
-                          {subsExpanded ? 'Show less' : `+${hiddenCount} more`}
-                        </Text>
-                      </FocusableButton>
-                    )}
-                  </View>
+
+                  {vMi.audioTracks && vMi.audioTracks.length > 0 && (
+                    <View style={styles.miSpecRow}>
+                      <Text style={styles.miSpecLabel}>AUDIO ({vMi.audioTracks.length})</Text>
+                      <View style={styles.miTrackPillWrap}>
+                        {vMi.audioTracks.map((at, idx) => {
+                          const isPreferred = idx === preferredAudioIdx;
+                          return (
+                            <CascadeSpecPill
+                              key={idx}
+                              index={idx}
+                              style={[styles.miAudioPill, isPreferred && styles.miAudioPillPreferred]}>
+                              <View style={styles.miAudioRowInner}>
+                                {isPreferred && <MiniEqualizerPulse active={true} color="#F5C518" />}
+                                <Text style={[styles.miAudioPillText, isPreferred && { color: '#FFF', fontWeight: '800' }]}>
+                                  {formatCompactAudioLabel(at, vMi.hasAtmos)}
+                                </Text>
+                              </View>
+                            </CascadeSpecPill>
+                          );
+                        })}
+                      </View>
+                    </View>
+                  )}
+
+                  {vMi.subtitleTracks && vMi.subtitleTracks.length > 0 && (() => {
+                    const groupedSubs: Array<{ label: string; count: number }> = [];
+                    const subIdxMap = new Map<string, number>();
+                    for (const st of vMi.subtitleTracks) {
+                      const lbl = `${st.language} • ${st.format}`;
+                      const existingIdx = subIdxMap.get(lbl);
+                      if (existingIdx !== undefined) {
+                        groupedSubs[existingIdx].count += 1;
+                      } else {
+                        subIdxMap.set(lbl, groupedSubs.length);
+                        groupedSubs.push({ label: lbl, count: 1 });
+                      }
+                    }
+                    const INITIAL_SUB_LIMIT = 6;
+                    const visibleSubs = subsExpanded ? groupedSubs : groupedSubs.slice(0, INITIAL_SUB_LIMIT);
+                    const hiddenCount = groupedSubs.length - visibleSubs.length;
+                    return (
+                      <View style={styles.miSpecRow}>
+                        <Text style={styles.miSpecLabel}>SUBTITLES ({vMi.subtitleTracks.length})</Text>
+                        <View style={styles.miTrackPillWrap}>
+                          {visibleSubs.map((gs, idx) => (
+                            <CascadeSpecPill key={idx} index={idx} style={styles.miSubPill}>
+                              <Text style={styles.miSubPillText}>
+                                {gs.count > 1 ? `${gs.label} ×${gs.count}` : gs.label}
+                              </Text>
+                            </CascadeSpecPill>
+                          ))}
+                          {groupedSubs.length > INITIAL_SUB_LIMIT && (
+                            <FocusableButton
+                              focusId="detail_subs_toggle"
+                              style={[styles.miSubPill, { backgroundColor: '#1E2433', borderColor: '#4B5563' }]}
+                              onPress={() => setSubsExpanded(prev => !prev)}>
+                              <Text style={[styles.miSubPillText, { color: '#F5C518', fontWeight: '800' }]}>
+                                {subsExpanded ? 'Show less' : `+${hiddenCount} more`}
+                              </Text>
+                            </FocusableButton>
+                          )}
+                        </View>
+                      </View>
+                    );
+                  })()}
                 </View>
               );
-            })()}
-              </View>
-            ) : !scanningMediaInfo ? (
+            })() : !scanningMediaInfo ? (
               <Text style={styles.rawFileName}>{vItem.name}</Text>
             ) : null}
 
-            <FocusableButton focusId="detail_source_btn" style={styles.sourceFileDivider} onPress={() => {}}>
-              <Text style={styles.rawFileLabel}>SOURCE FILE</Text>
-              <Text style={styles.rawFileName}>{vItem.name}</Text>
-            </FocusableButton>
+            <CopySpecPill
+              label="SOURCE FILE"
+              text={vItem.name}
+              onCopy={copyTextSafely}
+              renderIcon={(copied: boolean) => (
+                <Icon name={copied ? 'check' : 'content-copy'} size={13} color={copied ? '#46D369' : '#94A3B8'} />
+              )}
+            />
           </StaggeredSection>
         </View>
-      </ScrollView>
+        </Animated.ScrollView>
+      </View>
       </FocusLayerContext.Provider>
     );
   };
@@ -4385,7 +4591,23 @@ const App = () => {
       info.hasDV ||
       info.hasHDR,
     );
+    const is1080Card = Boolean(
+      cardRes === '1080p' ||
+      cardRes === 'FHD' ||
+      /\b(1080p|fhd|full\s*hd)\b/i.test(item.name || ''),
+    );
+    const isSdCard = Boolean(
+      cardRes === '720p' ||
+      cardRes === '480i' ||
+      cardRes === '576i' ||
+      cardRes === 'SD' ||
+      cardRes === 'DVD' ||
+      /\b(720p|480p|480i|576i|dvd|dvd5|dvd9|dvdrip|vob)\b/i.test(`${cardRes} ${item.name || ''}`),
+    );
+    const cardGlowTier: CardGlowTier = has4kOrHdr ? '4k' : is1080Card ? '1080p' : isSdCard ? 'sd' : 'none';
     const isDvCard = Boolean(realMi?.hasDV || info.hasDV);
+    const ratingNumeric = parseFloat(String(meta?.rating || '0'));
+    const hasHighRatingGlint = Number.isFinite(ratingNumeric) && ratingNumeric >= 7.5;
 
     if (viewMode === 'list') {
       return (
@@ -4430,7 +4652,7 @@ const App = () => {
 
     return (
       <WaveCascadeCard index={index} transitionKey={catalogTransitionKey} style={styles.posterGridSlot}>
-        <Ambient4KGlowCard active={has4kOrHdr} isDv={isDvCard} borderRadius={12}>
+        <TierRimGlowCard tier={cardGlowTier} isDv={isDvCard} borderRadius={12}>
           <FocusableButton
             focusId={cardFocusId}
             enableSheen={true}
@@ -4453,20 +4675,31 @@ const App = () => {
                 {showSeriesBadge ? (() => {
                   const badgeInfo = getHomeSeriesBadgeText(item, info, meta);
                   return (
-                    <View style={badgeInfo.isRating ? styles.ratingPill : styles.folderPill}>
+                    <GlintBadge
+                      active={badgeInfo.isRating && hasHighRatingGlint}
+                      tintColor="rgba(253, 230, 138, 0.52)"
+                      style={badgeInfo.isRating ? styles.ratingPill : styles.folderPill}>
                       <Text style={badgeInfo.isRating ? styles.ratingPillText : styles.folderPillText}>
                         {badgeInfo.text}
                       </Text>
-                    </View>
+                    </GlintBadge>
                   );
                 })() : info.seasonEpisode ? (
                   <View style={styles.folderPill}><Text style={styles.folderPillText}>{info.seasonEpisode}</Text></View>
                 ) : meta?.rating ? (
-                  <View style={styles.ratingPill}><Text style={styles.ratingPillText}>★ {meta.rating}</Text></View>
+                  <GlintBadge
+                    active={hasHighRatingGlint}
+                    tintColor="rgba(253, 230, 138, 0.52)"
+                    style={styles.ratingPill}>
+                    <Text style={styles.ratingPillText}>★ {meta.rating}</Text>
+                  </GlintBadge>
                 ) : <View />}
 
                 {!!cardRes && (
-                  <GlintBadge active={cardRes === '4K' || cardRes === '2160p'} style={[styles.resPill, cardRes === '4K' && styles.resPill4K]}>
+                  <GlintBadge
+                    active={cardRes === '4K' || cardRes === '2160p' || cardRes === '1080p' || cardRes === 'FHD'}
+                    tintColor={cardRes === '1080p' || cardRes === 'FHD' ? 'rgba(56, 189, 248, 0.45)' : undefined}
+                    style={[styles.resPill, cardRes === '4K' && styles.resPill4K]}>
                     <Text style={styles.resPillText}>{cardRes}</Text>
                   </GlintBadge>
                 )}
@@ -4511,7 +4744,7 @@ const App = () => {
               </View>
             </View>
           </FocusableButton>
-        </Ambient4KGlowCard>
+        </TierRimGlowCard>
       </WaveCascadeCard>
     );
   };
@@ -4945,6 +5178,11 @@ const styles = StyleSheet.create({
   cardResumeTag: { backgroundColor: 'rgba(229,9,20,0.18)', color: '#FF6B72', fontSize: 11, fontWeight: '800', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
   tvFocused: { borderColor: '#FFD700', borderWidth: 2, backgroundColor: 'rgba(255, 215, 0, 0.22)' },
   detailScreen: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 50, backgroundColor: '#0B0C10' },
+  detailStickyBar: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 60 },
+  detailStickyBg: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(11, 11, 15, 0.96)', borderBottomWidth: 1, borderBottomColor: 'rgba(255, 255, 255, 0.08)' },
+  detailStickyRow: { paddingTop: (StatusBar.currentHeight || (Platform.OS === 'android' ? 28 : 44)) + 6, paddingBottom: 10, paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center', gap: 12 },
+  detailStickyBackBtn: { width: 38, height: 38, borderRadius: 19, backgroundColor: 'rgba(12, 14, 20, 0.72)', alignItems: 'center', justifyContent: 'center', borderWidth: 1.5, borderColor: 'rgba(255, 255, 255, 0.14)' },
+  detailStickyTitle: { flex: 1, color: '#FFFFFF', fontSize: 16, fontWeight: '800', letterSpacing: 0.2 },
   detailHero: { width: '100%', height: 240, backgroundColor: '#141821', position: 'relative', overflow: 'hidden' },
   detailBackdrop: { width: '100%', height: '100%' },
   detailBackdropPlaceholder: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#181D29' },
@@ -5002,12 +5240,26 @@ const styles = StyleSheet.create({
   mediaInfoHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 },
   mediaInfoHeaderTitle: { color: '#9BA6B8', fontSize: 11, fontWeight: '900', letterSpacing: 0.9 },
   scanningText: { color: '#E50914', fontSize: 11, fontWeight: '700' },
+  heartBurstWrap: { position: 'relative', width: 22, height: 22, alignItems: 'center', justifyContent: 'center' },
+  heartBurstRing: { position: 'absolute', width: 28, height: 28, borderRadius: 14, borderWidth: 2, borderColor: '#E50914' },
+  miTelemetryGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  miTelemetryTile: { width: '48.5%', backgroundColor: '#161B26', borderRadius: 10, padding: 11, borderWidth: 1, borderColor: '#252E40' },
+  miTileLabel: { color: '#78849A', fontSize: 9.5, fontWeight: '800', letterSpacing: 0.8, marginBottom: 5 },
+  miTileValue: { color: '#F8FAFC', fontSize: 15, fontWeight: '800' },
+  miTileSub: { color: '#94A3B8', fontSize: 11, fontWeight: '600', marginTop: 3 },
+  miTileBadgesRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 4 },
+  miMiniBadge: { backgroundColor: '#222A3A', paddingHorizontal: 6, paddingVertical: 2.5, borderRadius: 5, borderWidth: 1, borderColor: '#374258' },
+  miMiniBadge4K: { backgroundColor: '#E50914', borderColor: '#FF4B55' },
+  miMiniBadgeHdr: { backgroundColor: '#F5C518', borderColor: '#FDE047' },
+  miMiniBadgeText: { color: '#F1F5F9', fontSize: 10, fontWeight: '900' },
   miSpecRow: { marginTop: 4 },
   miSpecLabel: { color: '#6C7789', fontSize: 10, fontWeight: '800', letterSpacing: 0.8, marginBottom: 4 },
   miSpecValue: { color: '#E2E8F0', fontSize: 13, fontWeight: '700' },
   miTrackPillWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
-  miAudioPill: { backgroundColor: '#1A202E', borderWidth: 1, borderColor: '#2E384D', paddingHorizontal: 9, paddingVertical: 5, borderRadius: 6 },
-  miAudioPillText: { color: '#D8E1EE', fontSize: 12, fontWeight: '600' },
+  miAudioPill: { backgroundColor: '#1A202E', borderWidth: 1, borderColor: '#2E384D', paddingHorizontal: 9, paddingVertical: 5, borderRadius: 7 },
+  miAudioPillPreferred: { backgroundColor: 'rgba(229, 9, 20, 0.16)', borderColor: '#F5C518' },
+  miAudioRowInner: { flexDirection: 'row', alignItems: 'center' },
+  miAudioPillText: { color: '#D8E1EE', fontSize: 11.5, fontWeight: '600' },
   miSubPill: { backgroundColor: '#171C26', borderWidth: 1, borderColor: '#283040', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
   miSubPillText: { color: '#A8B3C5', fontSize: 11, fontWeight: '600' },
   sourceFileDivider: { marginTop: 14, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#1E2430' },
