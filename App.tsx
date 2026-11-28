@@ -7,6 +7,7 @@ import {
 } from 'react-native';
 import Video from 'react-native-video';
 import DvdSubtitleOverlay from './DvdSubtitleOverlay';
+import InAppAudioFileBrowser from './InAppAudioFileBrowser';
 import {
   ShimmerCardGrid,
   FadeInPoster,
@@ -36,6 +37,10 @@ import {
   SeriesCycleBadge,
   VersionOptionCard,
   HeroPortraitPoster,
+  SeasonTriggerPill,
+  SeasonBottomSheet,
+  SeasonOptionRow,
+  ZoomHudPill,
 } from './LoadingAnimations';
 import { catalogRequest, catalogJson, inCatalogSlot } from './catalogRequests';
 import Orientation from 'react-native-orientation-locker';
@@ -244,6 +249,41 @@ const copyTextSafely = (value: string) => {
     }
   } catch (_e) {}
   Share.share({ message: value }).catch(() => {});
+};
+
+const parseSeasonFolderSpecs = (folderName: string): string[] => {
+  const raw = String(folderName || '');
+  const specs: string[] = [];
+  if (/(2160p|4K|UHD)/i.test(raw)) specs.push('4K UHD');
+  else if (/1080p/i.test(raw)) specs.push('1080p');
+  else if (/720p/i.test(raw)) specs.push('720p');
+
+  if (/REMUX/i.test(raw)) specs.push('REMUX');
+  else if (/Blu-?Ray|BDRip|BRRip/i.test(raw)) specs.push('BluRay');
+  else if (/WEB-?DL|WEBRip/i.test(raw)) specs.push('WEB-DL');
+
+  if (/\b(DoVi|DV|Dolby\.?Vision)\b/i.test(raw)) specs.push('DV');
+  else if (/HDR10\+?|HDR/i.test(raw)) specs.push('HDR10');
+
+  if (/Atmos/i.test(raw)) specs.push('Atmos');
+  else if (/TrueHD/i.test(raw)) specs.push('TrueHD');
+  else if (/DDP|DD\+|EAC3/i.test(raw)) specs.push('DDP 5.1');
+  else if (/DTS-?HD/i.test(raw)) specs.push('DTS-HD');
+  else if (/\bDTS\b/i.test(raw)) specs.push('DTS');
+
+  if (/Dual|Multi|\b(HIN|TAM|TEL|ENG)[.\-_+](HIN|TAM|TEL|ENG)\b/i.test(raw)) {
+    specs.push('Multi Audio');
+  } else if (/\b(Tamil|Tam)\b/i.test(raw)) {
+    specs.push('Tamil');
+  } else if (/\b(Hindi|Hin)\b/i.test(raw)) {
+    specs.push('Hindi');
+  }
+  return specs.slice(0, 4);
+};
+
+const zoomPctToScale = (pct: number): number => {
+  const clamped = Math.max(-100, Math.min(300, pct));
+  return clamped >= 0 ? 1 + clamped / 100 : 1 + (clamped / 100) * 0.75;
 };
 
 const formatCompactAudioLabel = (
@@ -870,6 +910,20 @@ const App = () => {
     if (!selectedFile && playMode === 'external') setPlayMode(null);
   }, [selectedFile, playMode]);
   const [resizeMode, setResizeMode] = useState<'contain' | 'cover'>('contain');
+  const [zoomPct, setZoomPct] = useState(0);
+  const [zoomHudVisible, setZoomHudVisible] = useState(false);
+  const [showAudioBrowserModal, setShowAudioBrowserModal] = useState(false);
+  const zoomPctRef = useRef(0);
+  const pinchActiveRef = useRef(false);
+  const pinchStartDistRef = useRef(1);
+  const pinchStartZoomRef = useRef(0);
+  const panXRef = useRef(0);
+  const panYRef = useRef(0);
+  const panStartRef = useRef({ x: 0, y: 0 });
+  const zoomHideTimerRef = useRef<any>(null);
+  const videoScaleAnim = useRef(new Animated.Value(1)).current;
+  const videoPanXAnim = useRef(new Animated.Value(0)).current;
+  const videoPanYAnim = useRef(new Animated.Value(0)).current;
   const [showControls, setShowControls] = useState(true);
   const [isLocked, setIsLocked] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
@@ -1326,6 +1380,27 @@ const App = () => {
     } catch {}
   }, [restoreAllSavedWatchHistory]);
 
+  const resetPlayerZoom = useCallback((immediate = false) => {
+    clearTimeout(zoomHideTimerRef.current);
+    zoomPctRef.current = 0;
+    panXRef.current = 0;
+    panYRef.current = 0;
+    pinchActiveRef.current = false;
+    setZoomPct(0);
+    setZoomHudVisible(false);
+    if (immediate) {
+      videoScaleAnim.setValue(1);
+      videoPanXAnim.setValue(0);
+      videoPanYAnim.setValue(0);
+    } else {
+      Animated.parallel([
+        Animated.spring(videoScaleAnim, { toValue: 1, speed: 24, bounciness: 5, useNativeDriver: true }),
+        Animated.spring(videoPanXAnim, { toValue: 0, speed: 24, bounciness: 5, useNativeDriver: true }),
+        Animated.spring(videoPanYAnim, { toValue: 0, speed: 24, bounciness: 5, useNativeDriver: true }),
+      ]).start();
+    }
+  }, [videoScaleAnim, videoPanXAnim, videoPanYAnim]);
+
   const playerVisible = playMode === 'internal' && selectedFile != null;
   useEffect(() => {
     if (playerVisible) return () => VideoPlayerManager?.resetWindowBrightness?.();
@@ -1345,6 +1420,8 @@ const App = () => {
       Orientation.lockToPortrait();
       setIsFullscreen(false);
     }
+    setShowAudioBrowserModal(false);
+    resetPlayerZoom(true);
     setIsLocked(false);
     isScrubbingRef.current = false;
     setIsScrubbing(false);
@@ -1381,6 +1458,7 @@ const App = () => {
       if (showSeasonModal) { setShowSeasonModal(false); return true; }
       if (showHdrChoiceModal) { setShowHdrChoiceModal(false); return true; }
       if (playMode === 'internal') {
+        if (showAudioBrowserModal) { setShowAudioBrowserModal(false); return true; }
         if (isLocked) { setShowControls(true); return true; }
         if (activeMenu) { setActiveMenu(null); return true; }
         closeInternalPlayer();
@@ -1399,7 +1477,7 @@ const App = () => {
     };
     const backHandler = BackHandler.addEventListener('hardwareBackPress', backAction);
     return () => backHandler.remove();
-  }, [playMode, selectedFile, pathStack, activeMenu, showHdrChoiceModal, showSeasonModal, isLocked, activeTab, closeInternalPlayer]);
+  }, [playMode, selectedFile, pathStack, activeMenu, showHdrChoiceModal, showSeasonModal, showAudioBrowserModal, isLocked, activeTab, closeInternalPlayer]);
 
   const searchTmdbTv = useCallback(async (
     key: string,
@@ -2808,6 +2886,8 @@ const App = () => {
     currentTimeRef.current = 0;
     durationRef.current = knownDuration;
     setResizeMode('contain');
+    resetPlayerZoom(true);
+    setShowAudioBrowserModal(false);
     setSubtitleDelay(0);
     setAudioDelay(0);
     setPlaybackRate(1.0);
@@ -3011,7 +3091,10 @@ const App = () => {
     return () => sub.remove();
   }, [playMode, playbackSource.uri, selectedFile, closeInternalPlayer]);
 
-  const handleZoomToggle = () => setResizeMode(prev => (prev === 'contain' ? 'cover' : 'contain'));
+  const handleZoomToggle = () => {
+    resetPlayerZoom(false);
+    setResizeMode(prev => (prev === 'contain' ? 'cover' : 'contain'));
+  };
 
   const cyclePlaybackSpeed = () => {
     const speeds = [0.75, 1.0, 1.25, 1.5, 2.0];
@@ -3067,60 +3150,170 @@ const App = () => {
     lastTapTime.current = now;
   }, [isLocked, triggerStepSeek]);
 
-  const gestureStartRef = useRef({ side: 'left' as 'left' | 'right', startVal: 0.5, isSwiping: false });
+  const gestureStartRef = useRef({ side: 'left' as 'left' | 'right', startVal: 0.5, isSwiping: false, isPanning: false });
   const handleZoneTapRef = useRef(handleZoneTap);
   useEffect(() => { handleZoneTapRef.current = handleZoneTap; }, [handleZoneTap]);
   const isLockedRef = useRef(isLocked);
   useEffect(() => { isLockedRef.current = isLocked; }, [isLocked]);
 
-  const playerPanResponder = useMemo(() => PanResponder.create({
-    onStartShouldSetPanResponder: () => true,
-    onMoveShouldSetPanResponder: () => true,
-    onPanResponderGrant: evt => {
-      const screenW = Dimensions.get('window').width || 800;
-      const side = evt.nativeEvent.pageX < screenW / 2 ? 'left' : 'right';
-      gestureStartRef.current = {
-        side,
-        startVal: side === 'left' ? brightnessRef.current : volumeRef.current,
-        isSwiping: false,
+  const playerPanResponder = useMemo(() => {
+    const getPinchDistance = (touches: readonly any[]) => {
+      const dx = (touches[0]?.pageX || 0) - (touches[1]?.pageX || 0);
+      const dy = (touches[0]?.pageY || 0) - (touches[1]?.pageY || 0);
+      return Math.max(12, Math.sqrt(dx * dx + dy * dy));
+    };
+
+    const clampPan = (pct: number, rawX: number, rawY: number) => {
+      if (pct <= 0) return { x: 0, y: 0 };
+      const { width: sw, height: sh } = Dimensions.get('window');
+      const s = zoomPctToScale(pct);
+      const maxX = Math.max(0, ((s - 1) * (sw || 800)) / 2);
+      const maxY = Math.max(0, ((s - 1) * (sh || 400)) / 2);
+      return {
+        x: Math.max(-maxX, Math.min(maxX, rawX)),
+        y: Math.max(-maxY, Math.min(maxY, rawY)),
       };
-    },
-    onPanResponderMove: (_, gestureState) => {
-      if (isLockedRef.current) return;
-      const { dy, dx } = gestureState;
-      if (!gestureStartRef.current.isSwiping && Math.abs(dy) > 12 && Math.abs(dy) > Math.abs(dx)) {
-        gestureStartRef.current.isSwiping = true;
-        clearTimeout(singleTapTimer.current);
-      }
-      if (gestureStartRef.current.isSwiping) {
-        const screenH = Dimensions.get('window').height || 400;
-        clearTimeout(gestureHideTimer.current);
-        if (gestureStartRef.current.side === 'left') {
-          const nextVal = Math.max(0, Math.min(1, gestureStartRef.current.startVal + (-dy / (screenH * 0.65))));
-          brightnessRef.current = nextVal;
-          setBrightnessLevel(nextVal);
-          VideoPlayerManager?.setSystemBrightness?.(nextVal);
-          setGestureIndicator({ visible: true, type: 'brightness', value: nextVal });
-        } else {
-          // 0% to 200% Real Hardware LoudnessEnhancer Sound Boost
-          const boostVal = Math.max(0, Math.min(2.0, gestureStartRef.current.startVal + (-dy / (screenH * 0.42))));
-          volumeRef.current = boostVal;
-          setVolumeLevel(boostVal);
-          VideoPlayerManager?.setSystemVolume?.(boostVal);
-          setGestureIndicator({ visible: true, type: 'volume', value: boostVal });
+    };
+
+    return PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: evt => {
+        const touches = evt.nativeEvent.touches || [];
+        if (touches.length >= 2) {
+          pinchActiveRef.current = true;
+          pinchStartDistRef.current = getPinchDistance(touches);
+          pinchStartZoomRef.current = zoomPctRef.current;
+          clearTimeout(singleTapTimer.current);
+          clearTimeout(multiTapTimer.current);
+          return;
         }
-      }
-    },
-    onPanResponderRelease: evt => {
-      if (gestureStartRef.current.isSwiping) {
-        gestureHideTimer.current = setTimeout(() => setGestureIndicator(prev => ({ ...prev, visible: false })), 900);
-      } else {
+        pinchActiveRef.current = false;
         const screenW = Dimensions.get('window').width || 800;
-        handleZoneTapRef.current(evt.nativeEvent.pageX >= screenW / 2);
-      }
-      gestureStartRef.current.isSwiping = false;
-    },
-  }), []);
+        const side = evt.nativeEvent.pageX < screenW / 2 ? 'left' : 'right';
+        panStartRef.current = { x: panXRef.current, y: panYRef.current };
+        gestureStartRef.current = {
+          side,
+          startVal: side === 'left' ? brightnessRef.current : volumeRef.current,
+          isSwiping: false,
+          isPanning: false,
+        };
+      },
+      onPanResponderMove: (evt, gestureState) => {
+        if (isLockedRef.current) return;
+        const touches = evt.nativeEvent.touches || [];
+        if (touches.length >= 2) {
+          clearTimeout(singleTapTimer.current);
+          clearTimeout(multiTapTimer.current);
+          clearTimeout(zoomHideTimerRef.current);
+          if (!pinchActiveRef.current) {
+            pinchActiveRef.current = true;
+            pinchStartDistRef.current = getPinchDistance(touches);
+            pinchStartZoomRef.current = zoomPctRef.current;
+            gestureStartRef.current.isSwiping = false;
+            gestureStartRef.current.isPanning = false;
+            setGestureIndicator(prev => ({ ...prev, visible: false }));
+          }
+          const dist = getPinchDistance(touches);
+          const ratio = dist / Math.max(12, pinchStartDistRef.current);
+          const baseScale = zoomPctToScale(pinchStartZoomRef.current);
+          const targetScale = Math.max(0.25, Math.min(4.0, baseScale * ratio));
+          const nextPct = targetScale >= 1
+            ? Math.round((targetScale - 1) * 100)
+            : Math.round(((targetScale - 1) / 0.75) * 100);
+          const clampedPct = Math.max(-100, Math.min(300, nextPct));
+          const snappedPct = Math.abs(clampedPct) <= 3 ? 0 : clampedPct;
+          const nextScale = zoomPctToScale(snappedPct);
+          const clampedPan = clampPan(snappedPct, panXRef.current, panYRef.current);
+
+          zoomPctRef.current = snappedPct;
+          panXRef.current = clampedPan.x;
+          panYRef.current = clampedPan.y;
+          videoScaleAnim.setValue(nextScale);
+          videoPanXAnim.setValue(clampedPan.x);
+          videoPanYAnim.setValue(clampedPan.y);
+          setZoomPct(snappedPct);
+          setZoomHudVisible(true);
+          return;
+        }
+
+        if (pinchActiveRef.current) return;
+        const { dy, dx } = gestureState;
+
+        if (zoomPctRef.current > 0) {
+          if (!gestureStartRef.current.isPanning && (Math.abs(dx) > 8 || Math.abs(dy) > 8)) {
+            gestureStartRef.current.isPanning = true;
+            clearTimeout(singleTapTimer.current);
+          }
+          if (gestureStartRef.current.isPanning) {
+            const clamped = clampPan(
+              zoomPctRef.current,
+              panStartRef.current.x + dx,
+              panStartRef.current.y + dy,
+            );
+            panXRef.current = clamped.x;
+            panYRef.current = clamped.y;
+            videoPanXAnim.setValue(clamped.x);
+            videoPanYAnim.setValue(clamped.y);
+            return;
+          }
+        }
+
+        if (!gestureStartRef.current.isSwiping && Math.abs(dy) > 12 && Math.abs(dy) > Math.abs(dx)) {
+          gestureStartRef.current.isSwiping = true;
+          clearTimeout(singleTapTimer.current);
+        }
+        if (gestureStartRef.current.isSwiping) {
+          const screenH = Dimensions.get('window').height || 400;
+          clearTimeout(gestureHideTimer.current);
+          if (gestureStartRef.current.side === 'left') {
+            const nextVal = Math.max(0, Math.min(1, gestureStartRef.current.startVal + (-dy / (screenH * 0.65))));
+            brightnessRef.current = nextVal;
+            setBrightnessLevel(nextVal);
+            VideoPlayerManager?.setSystemBrightness?.(nextVal);
+            setGestureIndicator({ visible: true, type: 'brightness', value: nextVal });
+          } else {
+            // 0% to 200% Real Hardware LoudnessEnhancer Sound Boost
+            const boostVal = Math.max(0, Math.min(2.0, gestureStartRef.current.startVal + (-dy / (screenH * 0.42))));
+            volumeRef.current = boostVal;
+            setVolumeLevel(boostVal);
+            VideoPlayerManager?.setSystemVolume?.(boostVal);
+            setGestureIndicator({ visible: true, type: 'volume', value: boostVal });
+          }
+        }
+      },
+      onPanResponderRelease: evt => {
+        if (pinchActiveRef.current) {
+          pinchActiveRef.current = false;
+          clearTimeout(zoomHideTimerRef.current);
+          zoomHideTimerRef.current = setTimeout(() => setZoomHudVisible(false), 1200);
+          gestureStartRef.current.isSwiping = false;
+          gestureStartRef.current.isPanning = false;
+          return;
+        }
+        if (gestureStartRef.current.isPanning) {
+          gestureStartRef.current.isPanning = false;
+          return;
+        }
+        if (gestureStartRef.current.isSwiping) {
+          gestureHideTimer.current = setTimeout(() => setGestureIndicator(prev => ({ ...prev, visible: false })), 900);
+        } else {
+          const screenW = Dimensions.get('window').width || 800;
+          handleZoneTapRef.current(evt.nativeEvent.pageX >= screenW / 2);
+        }
+        gestureStartRef.current.isSwiping = false;
+      },
+      onPanResponderTerminate: () => {
+        if (pinchActiveRef.current) {
+          pinchActiveRef.current = false;
+          clearTimeout(zoomHideTimerRef.current);
+          zoomHideTimerRef.current = setTimeout(() => setZoomHudVisible(false), 1200);
+        }
+        gestureStartRef.current.isSwiping = false;
+        gestureStartRef.current.isPanning = false;
+      },
+    });
+  }, [videoScaleAnim, videoPanXAnim, videoPanYAnim]);
 
   const handleVideoLoad = async (meta: any) => {
     if (dvdPlayerUrl && meta?.naturalSize?.height > 0) setDvdAspect(meta.naturalSize.width / meta.naturalSize.height);
@@ -3226,36 +3419,37 @@ const App = () => {
         animationType="fade"
         onRequestClose={() => setShowSeasonModal(false)}>
         <FocusLayerContext.Provider value="seasonModal">
-        <View style={styles.modalBackdrop}>
-          <SlideUpSheet style={styles.hdrModalCard}>
-            <Text style={styles.hdrModalEyebrow}>{seriesParentTitle.toUpperCase() || 'SERIES'}</Text>
-            <Text style={styles.hdrModalTitle}>Select Season</Text>
-            <ScrollView style={{ maxHeight: 300, marginTop: 12 }}>
-              {seasonFolders.map((sItem, sIdx) => {
-                const isSelected = activeSeason?.seasonNum === sItem.seasonNum;
-                return (
-                  <FocusableButton
-                    key={sItem.seasonNum}
-                    focusId={`season_opt_${sIdx}`}
-                    style={[styles.seasonOptionItem, isSelected && styles.seasonOptionItemActive]}
-                    onPress={() => handleSelectSeason(sItem)}>
-                    <View style={styles.seasonNumberCircle}>
-                      <Text style={styles.seasonNumberText}>S{sItem.seasonNum < 10 ? `0${sItem.seasonNum}` : sItem.seasonNum}</Text>
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={[styles.hdrOptionTitle, isSelected && { color: '#E50914' }]}>{sItem.label}</Text>
-                      <Text style={styles.hdrOptionDesc} numberOfLines={1}>{sItem.folderName}</Text>
-                    </View>
-                    <Icon name={isSelected ? 'check-circle' : 'chevron-right'} size={22} color={isSelected ? '#E50914' : '#888'} />
-                  </FocusableButton>
-                );
-              })}
-            </ScrollView>
-            <FocusableButton style={styles.hdrCancelBtn} onPress={() => setShowSeasonModal(false)}>
-              <Text style={{ color: '#99A3B3', fontWeight: '700' }}>Close</Text>
-            </FocusableButton>
-          </SlideUpSheet>
-        </View>
+        <SeasonBottomSheet
+          seriesTitle={seriesParentTitle || 'SERIES'}
+          seasonCount={seasonFolders.length}
+          onClose={() => setShowSeasonModal(false)}
+          closeIcon={<Icon name="close" size={18} color="#E2E8F0" />}>
+          <ScrollView style={{ maxHeight: 360 }} showsVerticalScrollIndicator={false}>
+            {seasonFolders.map((sItem, sIdx) => {
+              const isSelected = activeSeason?.seasonNum === sItem.seasonNum;
+              return (
+                <FocusableButton
+                  key={sItem.seasonNum}
+                  focusId={`season_opt_${sIdx}`}
+                  Component={SeasonOptionRow}
+                  index={sIdx}
+                  seasonNumber={sItem.seasonNum}
+                  label={sItem.label}
+                  specs={parseSeasonFolderSpecs(sItem.folderName)}
+                  active={isSelected}
+                  onPress={() => handleSelectSeason(sItem)}
+                  rightIcon={
+                    <Icon
+                      name={isSelected ? 'check-circle' : 'chevron-right'}
+                      size={22}
+                      color={isSelected ? '#F5C518' : '#64748B'}
+                    />
+                  }
+                />
+              );
+            })}
+          </ScrollView>
+        </SeasonBottomSheet>
         </FocusLayerContext.Provider>
       </Modal>
     );
@@ -3428,7 +3622,13 @@ const App = () => {
               </FocusableButton>
             )}
             {isAudio && (
-              <FocusableButton hasTVPreferredFocus={true} style={styles.menuItem} onPress={handlePickAudioFile}>
+              <FocusableButton
+                hasTVPreferredFocus={true}
+                style={styles.menuItem}
+                onPress={() => {
+                  setActiveMenu(null);
+                  setShowAudioBrowserModal(true);
+                }}>
                 <Icon name="folder-open" size={20} color={isExternalAudioSelected ? '#E50914' : 'white'} />
                 <Text style={styles.menuItemText} numberOfLines={1}>
                   {externalAudio ? `File: ${externalAudio.name}` : 'Load External Audio File 📂'}
@@ -3554,6 +3754,18 @@ const App = () => {
       <FocusLayerContext.Provider value="player">
       <View style={styles.playerWrapper}>
         <StatusBar hidden={true} />
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.videoPlayer,
+            {
+              transform: [
+                { translateX: videoPanXAnim },
+                { translateY: videoPanYAnim },
+                { scale: videoScaleAnim },
+              ],
+            },
+          ]}>
         <Video
           key={playbackIdentity}
           ref={videoRef}
@@ -3625,6 +3837,7 @@ const App = () => {
           viewType={0}
           controls={false}
         />
+        </Animated.View>
 
         {isExternalAudioSelected && !!externalAudio && (
           <Video
@@ -3659,6 +3872,8 @@ const App = () => {
         )}
 
         {!IS_TV && <View style={StyleSheet.absoluteFill} {...playerPanResponder.panHandlers} />}
+
+        <ZoomHudPill visible={zoomHudVisible} zoomPct={zoomPct} />
 
         {gestureIndicator.visible && (
           <View style={[styles.gestureHudContainer, gestureIndicator.type === 'brightness' ? styles.gestureHudLeft : styles.gestureHudRight]} pointerEvents="none">
@@ -3739,6 +3954,14 @@ const App = () => {
                 </View>
               </View>
               <View style={styles.netflixTopRightRow}>
+                {zoomPct !== 0 && (
+                  <FocusableButton
+                    style={styles.zoomResetTopPill}
+                    onPress={() => resetPlayerZoom(false)}>
+                    <Icon name="center-focus-weak" size={15} color="#38BDF8" />
+                    <Text style={styles.zoomResetTopPillText}>Reset 0%</Text>
+                  </FocusableButton>
+                )}
                 {!IS_TV && (
                   <FocusableButton style={styles.netflixCircleBtn} onPress={handleEnterPiP}>
                     <Icon name="picture-in-picture-alt" size={20} color="white" />
@@ -4334,18 +4557,14 @@ const App = () => {
                 : 'Digital Stream';
               const fpsClean = vMi.frameRate > 0 ? vMi.frameRate.toFixed(3).replace(/0+$/, '').replace(/\.$/, '') : '';
               const explicitMbps = vMi.videoBitrateMbps && vMi.videoBitrateMbps > 0 ? vMi.videoBitrateMbps : 0;
-              const estimatedMbps = explicitMbps === 0 && vMi.totalBytes > 0 && vMi.durationSec > 0
-                ? (vMi.totalBytes * 8) / (vMi.durationSec * 1_000_000)
-                : 0;
-              const meterMbps = explicitMbps > 0 ? explicitMbps : estimatedMbps;
               const bitrateTitle = explicitMbps > 0
-                ? `${explicitMbps.toFixed(1)} Mbps`
-                : estimatedMbps > 0
-                ? `~${estimatedMbps.toFixed(1)} Mbps`
+                ? `${explicitMbps >= 10 ? explicitMbps.toFixed(1) : explicitMbps.toFixed(2).replace(/\.?0+$/, '')} Mbps`
                 : 'VBR Stream';
-              const bitrateSub = explicitMbps > 0
-                ? (fpsClean ? `Cinema ${fpsClean} fps` : 'Dedicated bitrate')
-                : (fpsClean ? `VBR • ${fpsClean} fps` : 'VBR adaptive stream');
+              const bitrateSub = fpsClean
+                ? `Cinema ${fpsClean} fps`
+                : explicitMbps > 0
+                ? 'Video stream bitrate'
+                : 'VBR adaptive stream';
               return (
                 <View style={{ gap: 12, marginTop: 10 }}>
                   <View style={styles.miTelemetryGrid}>
@@ -4376,7 +4595,7 @@ const App = () => {
                       <Text style={styles.miTileValue}>{bitrateTitle}</Text>
                       <Text style={styles.miTileSub}>{bitrateSub}</Text>
                       <BitrateMeterBar
-                        bitrateMbps={meterMbps}
+                        bitrateMbps={explicitMbps}
                         color={vMi.hasDV ? '#C084FC' : (vRes === '4K' || vRes === '2160p') ? '#F5C518' : '#38BDF8'}
                       />
                     </View>
@@ -5035,12 +5254,25 @@ const App = () => {
                   </Text>
                 </FocusableButton>
 
-                {seasonFolders.length > 0 && activeSeason && (
-                  <FocusableButton focusId="f_season" isHeaderControl={true} style={styles.seasonDropdownBtn} onPress={() => setShowSeasonModal(true)}>
-                    <Text style={styles.seasonDropdownBtnText}>{activeSeason.label}</Text>
-                    <Icon name="arrow-drop-down" size={22} color="white" />
-                  </FocusableButton>
-                )}
+                {seasonFolders.length > 0 && activeSeason && (() => {
+                  const activeSeasonIdx = Math.max(
+                    0,
+                    seasonFolders.findIndex(sf => sf.seasonNum === activeSeason.seasonNum),
+                  );
+                  return (
+                    <FocusableButton
+                      focusId="f_season"
+                      Component={SeasonTriggerPill}
+                      isHeaderControl={true}
+                      label={activeSeason.label}
+                      currentIndex={activeSeasonIdx}
+                      totalCount={seasonFolders.length}
+                      isOpen={showSeasonModal}
+                      onPress={() => setShowSeasonModal(true)}
+                      chevronIcon={<Icon name="keyboard-arrow-down" size={20} color="#E2E8F0" />}
+                    />
+                  );
+                })()}
               </View>
               <TopSyncProgressBar visible={refreshing && isInsideFolder} />
 
@@ -5077,6 +5309,21 @@ const App = () => {
       {renderPlayerOverlay()}
       {renderSeasonModal()}
       {renderHdrChoiceModal()}
+      {showAudioBrowserModal && playMode === 'internal' && (
+        <InAppAudioFileBrowser
+          visible={true}
+          currentAudioUri={externalAudio?.uri}
+          onSelectAudio={track => {
+            setExternalAudio({ name: track.name, uri: track.uri });
+            setSelectedAudio({ type: 'external', value: track.name });
+          }}
+          onOpenSystemPicker={() => {
+            setShowAudioBrowserModal(false);
+            void handlePickAudioFile();
+          }}
+          onClose={() => setShowAudioBrowserModal(false)}
+        />
+      )}
       {IS_TV && isTvSearchModalOpen && (
         <Modal
           visible={isTvSearchModalOpen}
@@ -5345,7 +5592,9 @@ const styles = StyleSheet.create({
   dlBtnText: { color: 'white', fontSize: 13, fontWeight: '700' },
   modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.78)', alignItems: 'center', justifyContent: 'center', padding: 20 },
   downloadsOverlayScreen: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 40, backgroundColor: '#0B0C10', paddingTop: 38 },
-  playerWrapper: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 120, backgroundColor: 'black' },
+  playerWrapper: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 120, backgroundColor: 'black', overflow: 'hidden' },
+  zoomResetTopPill: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: 'rgba(15, 19, 28, 0.86)', borderWidth: 1, borderColor: 'rgba(56, 189, 248, 0.5)', paddingHorizontal: 11, paddingVertical: 6, borderRadius: 999 },
+  zoomResetTopPillText: { color: '#E2E8F0', fontSize: 12, fontWeight: '800' },
   videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
   playerBufferingOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.35)' },
   externalSubtitleContainer: { position: 'absolute', left: 24, right: 24, bottom: 52, alignItems: 'center', justifyContent: 'center' },

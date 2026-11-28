@@ -4694,4 +4694,168 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         walkIso9660Dir(read, totalIsoSize, rootLba, rootLen, "", 0, results)
         return results
     }
+
+    @ReactMethod
+    fun listLocalDirectory(dirPath: String?, promise: Promise) {
+        ioExecutor.execute {
+            try {
+                @Suppress("DEPRECATION")
+                val storageRoot = try {
+                    android.os.Environment.getExternalStorageDirectory()?.absolutePath ?: "/storage/emulated/0"
+                } catch (_: Throwable) {
+                    "/storage/emulated/0"
+                }
+
+                val rawInput = (dirPath ?: "").trim()
+                val basePath = if (rawInput.isEmpty() || rawInput == "~") storageRoot else rawInput
+                val normalized = basePath.replace(Regex("/+"), "/").trimEnd('/').ifEmpty { "/" }
+                val dirFile = java.io.File(normalized)
+                val targetPath = try {
+                    if (dirFile.exists()) dirFile.canonicalPath else normalized
+                } catch (_: Throwable) {
+                    normalized
+                }
+
+                val audioExts = setOf(
+                    "mka", "ac3", "eac3", "ec3", "dts", "dtshd",
+                    "thd", "truehd", "m4a", "aac", "mp3", "flac",
+                    "opus", "ogg", "wav"
+                )
+
+                val folderMap = LinkedHashMap<String, java.io.File>()
+                val fileEntries = ArrayList<com.facebook.react.bridge.WritableMap>()
+                val seenPaths = HashSet<String>()
+
+                val listed = try {
+                    if (dirFile.exists() && dirFile.isDirectory && dirFile.canRead()) dirFile.listFiles() else null
+                } catch (_: Throwable) {
+                    null
+                }
+
+                if (listed != null) {
+                    for (entry in listed) {
+                        val name = entry.name ?: continue
+                        if (name.startsWith(".") || name.equals("__MACOSX", ignoreCase = true)) continue
+                        if (entry.isDirectory) {
+                            folderMap[entry.absolutePath] = entry
+                        } else if (entry.isFile) {
+                            val ext = name.substringAfterLast('.', "").lowercase(Locale.US)
+                            if (ext in audioExts) {
+                                val abs = entry.absolutePath
+                                seenPaths.add(abs)
+                                val m = Arguments.createMap()
+                                m.putString("name", name)
+                                m.putString("path", abs)
+                                m.putString("uri", android.net.Uri.fromFile(entry).toString())
+                                m.putBoolean("isDirectory", false)
+                                m.putDouble("size", entry.length().toDouble())
+                                m.putString("ext", ext)
+                                fileEntries.add(m)
+                            }
+                        }
+                    }
+                }
+
+                // Fallback for Android 11+ scoped storage restrictions on shared directories
+                if (targetPath == storageRoot && folderMap.isEmpty()) {
+                    for (pubName in listOf("Download", "Music", "Movies", "Documents", "Audiobooks", "Podcasts")) {
+                        val pubDir = java.io.File(storageRoot, pubName)
+                        if (pubDir.exists() && pubDir.isDirectory) {
+                            folderMap[pubDir.absolutePath] = pubDir
+                        }
+                    }
+                }
+
+                if (listed == null || fileEntries.isEmpty()) {
+                    val resolver = reactContext.contentResolver
+                    val cleanPrefix = "$targetPath/"
+                    val urisToQuery = arrayOf(
+                        android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                        android.provider.MediaStore.Files.getContentUri("external")
+                    )
+                    for (queryUri in urisToQuery) {
+                        try {
+                            @Suppress("DEPRECATION")
+                            val projection = arrayOf(
+                                android.provider.MediaStore.MediaColumns._ID,
+                                android.provider.MediaStore.MediaColumns.DISPLAY_NAME,
+                                android.provider.MediaStore.MediaColumns.SIZE,
+                                android.provider.MediaStore.MediaColumns.DATA
+                            )
+                            resolver.query(queryUri, projection, null, null, null)?.use { cursor ->
+                                val idCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns._ID)
+                                val nameCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DISPLAY_NAME)
+                                val sizeCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.SIZE)
+                                @Suppress("DEPRECATION")
+                                val dataCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DATA)
+
+                                while (cursor.moveToNext()) {
+                                    val dataPath = if (dataCol >= 0) cursor.getString(dataCol) ?: "" else ""
+                                    if (!dataPath.startsWith(cleanPrefix)) continue
+                                    val relRemainder = dataPath.removePrefix(cleanPrefix)
+                                    val slashIdx = relRemainder.indexOf('/')
+                                    if (slashIdx > 0) {
+                                        val subFolderName = relRemainder.substring(0, slashIdx)
+                                        if (!subFolderName.startsWith(".") && !subFolderName.equals("__MACOSX", ignoreCase = true)) {
+                                            val subDir = java.io.File(targetPath, subFolderName)
+                                            folderMap.putIfAbsent(subDir.absolutePath, subDir)
+                                        }
+                                        continue
+                                    }
+                                    val dispName = if (nameCol >= 0) cursor.getString(nameCol) ?: "" else ""
+                                    val fileName = dispName.ifEmpty { java.io.File(dataPath).name }
+                                    val ext = fileName.substringAfterLast('.', "").lowercase(Locale.US)
+                                    if (ext !in audioExts || seenPaths.contains(dataPath)) continue
+                                    seenPaths.add(dataPath)
+                                    val mediaId = if (idCol >= 0) cursor.getLong(idCol) else -1L
+                                    val sizeBytes = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L
+                                    val itemUri = if (mediaId >= 0L) {
+                                        android.content.ContentUris.withAppendedId(queryUri, mediaId).toString()
+                                    } else {
+                                        android.net.Uri.fromFile(java.io.File(dataPath)).toString()
+                                    }
+                                    val m = Arguments.createMap()
+                                    m.putString("name", fileName)
+                                    m.putString("path", dataPath)
+                                    m.putString("uri", itemUri)
+                                    m.putBoolean("isDirectory", false)
+                                    m.putDouble("size", sizeBytes.toDouble())
+                                    m.putString("ext", ext)
+                                    fileEntries.add(m)
+                                }
+                            }
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+
+                val entriesArr = Arguments.createArray()
+                val sortedFolders = folderMap.values.sortedBy { it.name.lowercase(Locale.US) }
+                for (folder in sortedFolders) {
+                    val m = Arguments.createMap()
+                    m.putString("name", folder.name)
+                    m.putString("path", folder.absolutePath)
+                    m.putBoolean("isDirectory", true)
+                    m.putDouble("size", 0.0)
+                    entriesArr.pushMap(m)
+                }
+
+                val sortedFiles = fileEntries.sortedBy { (it.getString("name") ?: "").lowercase(Locale.US) }
+                for (fe in sortedFiles) {
+                    entriesArr.pushMap(fe)
+                }
+
+                val parentObj = java.io.File(targetPath).parentFile
+                val parentPath = parentObj?.absolutePath ?: storageRoot
+                val result = Arguments.createMap()
+                result.putString("path", targetPath)
+                result.putString("parentPath", if (parentPath.length < storageRoot.length) storageRoot else parentPath)
+                result.putBoolean("canGoUp", targetPath != storageRoot && targetPath != "/")
+                result.putArray("entries", entriesArr)
+                promise.resolve(result)
+            } catch (t: Throwable) {
+                promise.reject("LOCAL_DIR_ERR", t.message ?: "Unable to read directory", t)
+            }
+        }
+    }
 }

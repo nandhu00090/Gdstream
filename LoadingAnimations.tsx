@@ -2017,6 +2017,325 @@ export const HeroPortraitPoster: React.FC<{
   );
 };
 
+// ---------------------------------------------------------------------------
+// 17. SeasonTriggerPill, SeasonBottomSheet & SeasonOptionRow
+// ---------------------------------------------------------------------------
+export const SeasonTriggerPill: React.FC<
+  TactileSpringPressableProps & {
+    label: string;
+    currentIndex?: number;
+    totalCount: number;
+    isOpen: boolean;
+    chevronIcon?: React.ReactNode;
+  }
+> = ({ label, currentIndex = 0, totalCount, isOpen, chevronIcon, style, ...rest }) => {
+  const dotPulse = useRef(new Animated.Value(0)).current;
+  const sheenAnim = useRef(new Animated.Value(0)).current;
+  const chevronAnim = useRef(new Animated.Value(isOpen ? 1 : 0)).current;
+
+  useEffect(() => {
+    Animated.spring(chevronAnim, {
+      toValue: isOpen ? 1 : 0,
+      speed: 24,
+      bounciness: 4,
+      useNativeDriver: true,
+    }).start();
+  }, [isOpen, chevronAnim]);
+
+  useEffect(() => {
+    dotPulse.setValue(0);
+    sheenAnim.setValue(0);
+    const dotLoop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(dotPulse, { toValue: 1, duration: 1200, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+        Animated.timing(dotPulse, { toValue: 0, duration: 1200, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+      ]),
+    );
+    const sheenLoop = Animated.loop(
+      Animated.sequence([
+        Animated.delay(3650),
+        Animated.timing(sheenAnim, { toValue: 1, duration: 750, easing: Easing.inOut(Easing.cubic), useNativeDriver: true }),
+        Animated.timing(sheenAnim, { toValue: 0, duration: 0, useNativeDriver: true }),
+      ]),
+    );
+    dotLoop.start();
+    sheenLoop.start();
+    return () => {
+      dotLoop.stop();
+      sheenLoop.stop();
+    };
+  }, [dotPulse, sheenAnim]);
+
+  const dotOpacity = dotPulse.interpolate({ inputRange: [0, 1], outputRange: [0.55, 1] });
+  const sheenX = sheenAnim.interpolate({ inputRange: [0, 1], outputRange: [-90, 220] });
+  const chevronRotate = chevronAnim.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '180deg'] });
+  const resolvedStyle = typeof style === 'function' ? style({ pressed: false }) : style;
+
+  return (
+    <TactileSpringPressable
+      {...rest}
+      activeScale={0.95}
+      glowColor="rgba(229, 9, 20, 0.72)"
+      glowBorderRadius={999}
+      style={[styles.seasonTriggerPill, resolvedStyle]}>
+      <Animated.View
+        pointerEvents="none"
+        style={[styles.seasonTriggerSheen, { transform: [{ translateX: sheenX }, { rotate: '20deg' }] }]}
+      />
+      <Animated.View style={[styles.seasonTriggerDot, { opacity: dotOpacity }]} />
+      <Text style={styles.seasonTriggerLabel} numberOfLines={1}>
+        {label}
+      </Text>
+      {totalCount > 1 && (
+        <View style={styles.seasonTriggerCounter}>
+          <Text style={styles.seasonTriggerCounterText}>
+            {`${Math.max(1, currentIndex + 1)}/${totalCount}`}
+          </Text>
+        </View>
+      )}
+      <Animated.View style={{ transform: [{ rotate: chevronRotate }] }}>
+        {chevronIcon}
+      </Animated.View>
+    </TactileSpringPressable>
+  );
+};
+
+export const SeasonBottomSheet: React.FC<{
+  seriesTitle: string;
+  seasonCount: number;
+  onClose: () => void;
+  closeIcon?: React.ReactNode;
+  children: React.ReactNode;
+}> = ({ seriesTitle, seasonCount, onClose, closeIcon, children }) => {
+  const backdropOpacity = useRef(new Animated.Value(0)).current;
+  const sheetY = useRef(new Animated.Value(48)).current;
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(backdropOpacity, {
+        toValue: 1,
+        duration: 220,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+      Animated.spring(sheetY, {
+        toValue: 0,
+        speed: 20,
+        bounciness: 4,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [backdropOpacity, sheetY]);
+
+  return (
+    <View style={styles.seasonSheetBackdropWrap}>
+      <Animated.View style={[StyleSheet.absoluteFill, styles.seasonSheetDim, { opacity: backdropOpacity }]}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={onClose} accessibilityLabel="Close season drawer" />
+      </Animated.View>
+      <Animated.View style={[styles.seasonSheetContainer, { transform: [{ translateY: sheetY }] }]}>
+        <View pointerEvents="none" style={styles.seasonSheetTopRim} />
+        <View style={styles.seasonSheetHandle} />
+        <View style={styles.seasonSheetHeaderRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.seasonSheetOverline} numberOfLines={1}>
+              {(seriesTitle || 'SERIES').toUpperCase()}
+            </Text>
+            <View style={styles.seasonSheetTitleRow}>
+              <Text style={styles.seasonSheetTitle}>Select Season</Text>
+              <View style={styles.seasonSheetCountPill}>
+                <Text style={styles.seasonSheetCountText}>
+                  {seasonCount} {seasonCount === 1 ? 'SEASON' : 'SEASONS'}
+                </Text>
+              </View>
+            </View>
+          </View>
+          <TactileSpringPressable
+            onPress={onClose}
+            activeScale={0.92}
+            glowColor="rgba(255, 255, 255, 0.35)"
+            glowBorderRadius={17}
+            style={styles.seasonSheetCloseBtn}
+            accessibilityLabel="Close">
+            {closeIcon}
+          </TactileSpringPressable>
+        </View>
+        {children}
+      </Animated.View>
+    </View>
+  );
+};
+
+export const SeasonOptionRow: React.FC<
+  TactileSpringPressableProps & {
+    index: number;
+    seasonNumber: number;
+    label: string;
+    specs: string[];
+    active: boolean;
+    rightIcon: React.ReactNode;
+  }
+> = ({ index, seasonNumber, label, specs, active, rightIcon, style, onPress, ...rest }) => {
+  const enterOpacity = useRef(new Animated.Value(0)).current;
+  const enterY = useRef(new Animated.Value(12)).current;
+  const checkScale = useRef(new Animated.Value(active ? 1 : 0.8)).current;
+  const sweepAnim = useRef(new Animated.Value(0)).current;
+  const sweepOpacity = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const delay = Math.min(index, 12) * 35;
+    Animated.parallel([
+      Animated.timing(enterOpacity, {
+        toValue: 1,
+        duration: 220,
+        delay,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+      Animated.timing(enterY, {
+        toValue: 0,
+        duration: 240,
+        delay,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [index, enterOpacity, enterY]);
+
+  useEffect(() => {
+    if (active) {
+      checkScale.setValue(0.6);
+      Animated.spring(checkScale, {
+        toValue: 1,
+        speed: 32,
+        bounciness: 10,
+        useNativeDriver: true,
+      }).start();
+    } else {
+      checkScale.setValue(1);
+    }
+  }, [active, checkScale]);
+
+  const handlePress: PressableProps['onPress'] = (e) => {
+    sweepAnim.setValue(0);
+    sweepOpacity.setValue(0.85);
+    Animated.parallel([
+      Animated.timing(sweepAnim, {
+        toValue: 1,
+        duration: 380,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+      Animated.timing(sweepOpacity, {
+        toValue: 0,
+        duration: 380,
+        easing: Easing.in(Easing.quad),
+        useNativeDriver: true,
+      }),
+    ]).start();
+    if (onPress) onPress(e);
+  };
+
+  const sweepX = sweepAnim.interpolate({ inputRange: [0, 1], outputRange: [-120, 420] });
+  const resolvedStyle = typeof style === 'function' ? style({ pressed: false }) : style;
+  const badgeCode = `S${seasonNumber < 10 ? `0${seasonNumber}` : seasonNumber}`;
+
+  return (
+    <Animated.View style={{ opacity: enterOpacity, transform: [{ translateY: enterY }] }}>
+      <TactileSpringPressable
+        {...rest}
+        activeScale={0.97}
+        glowColor={active ? '#F5C518' : 'rgba(229, 9, 20, 0.65)'}
+        glowBorderRadius={14}
+        highlighted={active}
+        onPress={handlePress}
+        style={[
+          styles.seasonRowCard,
+          active && styles.seasonRowCardActive,
+          resolvedStyle,
+        ]}>
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.seasonRowSheen,
+            { opacity: sweepOpacity, transform: [{ translateX: sweepX }, { rotate: '18deg' }] },
+          ]}
+        />
+        <View style={[styles.seasonBadgeBox, active && styles.seasonBadgeBoxActive]}>
+          <Text style={[styles.seasonBadgeBoxText, active && styles.seasonBadgeBoxTextActive]}>
+            {badgeCode}
+          </Text>
+        </View>
+        <View style={{ flex: 1, gap: 4 }}>
+          <View style={styles.seasonRowTitleLine}>
+            <Text style={[styles.seasonRowTitle, active && { color: '#FFFFFF' }]} numberOfLines={1}>
+              {label}
+            </Text>
+            {active && (
+              <View style={styles.seasonNowPill}>
+                <Text style={styles.seasonNowPillText}>Now Viewing</Text>
+              </View>
+            )}
+          </View>
+          {specs.length > 0 && (
+            <View style={styles.seasonSpecChipsRow}>
+              {specs.map((sp, spIdx) => (
+                <View key={spIdx} style={[styles.seasonSpecChip, active && styles.seasonSpecChipActive]}>
+                  <Text style={styles.seasonSpecChipText}>{sp}</Text>
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
+        <Animated.View style={{ transform: [{ scale: checkScale }] }}>
+          {rightIcon}
+        </Animated.View>
+      </TactileSpringPressable>
+    </Animated.View>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// 18. ZoomHudPill — Centered Obsidian-Glass Player Zoom Indicator
+// ---------------------------------------------------------------------------
+export const ZoomHudPill: React.FC<{
+  visible: boolean;
+  zoomPct: number;
+}> = ({ visible, zoomPct }) => {
+  const opacity = useRef(new Animated.Value(0)).current;
+  const scale = useRef(new Animated.Value(0.92)).current;
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(opacity, {
+        toValue: visible ? 1 : 0,
+        duration: visible ? 140 : 220,
+        useNativeDriver: true,
+      }),
+      Animated.spring(scale, {
+        toValue: visible ? 1 : 0.92,
+        speed: 28,
+        bounciness: 5,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [visible, opacity, scale]);
+
+  const formattedPct = zoomPct > 0 ? `+${zoomPct}%` : `${zoomPct}%`;
+
+  return (
+    <Animated.View
+      pointerEvents="none"
+      style={[styles.zoomHudWrap, { opacity, transform: [{ scale }] }]}>
+      <View style={styles.zoomHudPill}>
+        <Text style={styles.zoomHudLabel}>Zoom: </Text>
+        <Text style={[styles.zoomHudValue, zoomPct !== 0 && { color: zoomPct > 0 ? '#38BDF8' : '#F5C518' }]}>
+          {formattedPct}
+        </Text>
+      </View>
+    </Animated.View>
+  );
+};
+
 const styles = StyleSheet.create({
   shimmerGrid: {
     flexDirection: 'row',
@@ -2450,5 +2769,254 @@ const styles = StyleSheet.create({
     bottom: -24,
     width: 38,
     backgroundColor: 'rgba(255, 255, 255, 0.24)',
+  },
+  seasonTriggerPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    backgroundColor: '#161924',
+    paddingVertical: 7,
+    paddingHorizontal: 13,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    overflow: 'hidden',
+    position: 'relative',
+  },
+  seasonTriggerSheen: {
+    position: 'absolute',
+    top: -16,
+    bottom: -16,
+    width: 34,
+    backgroundColor: 'rgba(255, 255, 255, 0.18)',
+  },
+  seasonTriggerDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+    backgroundColor: '#E50914',
+  },
+  seasonTriggerLabel: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  seasonTriggerCounter: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    paddingHorizontal: 6,
+    paddingVertical: 1.5,
+    borderRadius: 999,
+  },
+  seasonTriggerCounterText: {
+    color: '#CBD5E1',
+    fontSize: 10.5,
+    fontWeight: '800',
+  },
+  seasonSheetBackdropWrap: {
+    flex: 1,
+    justifyContent: 'flex-end',
+  },
+  seasonSheetDim: {
+    backgroundColor: 'rgba(0, 0, 0, 0.72)',
+  },
+  seasonSheetContainer: {
+    backgroundColor: '#0F1118',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: 18,
+    paddingTop: 10,
+    paddingBottom: 26,
+    borderWidth: 1,
+    borderBottomWidth: 0,
+    borderColor: 'rgba(255, 255, 255, 0.09)',
+    maxHeight: '78%',
+    position: 'relative',
+    overflow: 'hidden',
+  },
+  seasonSheetTopRim: {
+    position: 'absolute',
+    top: 0,
+    left: 24,
+    right: 24,
+    height: 1,
+    backgroundColor: 'rgba(255, 255, 255, 0.14)',
+  },
+  seasonSheetHandle: {
+    width: 36,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: 'rgba(255, 255, 255, 0.22)',
+    alignSelf: 'center',
+    marginBottom: 14,
+  },
+  seasonSheetHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginBottom: 14,
+  },
+  seasonSheetOverline: {
+    color: '#E50914',
+    fontSize: 10.5,
+    fontWeight: '900',
+    letterSpacing: 1.2,
+  },
+  seasonSheetTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 3,
+  },
+  seasonSheetTitle: {
+    color: '#FFFFFF',
+    fontSize: 20,
+    fontWeight: '800',
+  },
+  seasonSheetCountPill: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    paddingHorizontal: 8,
+    paddingVertical: 2.5,
+    borderRadius: 999,
+  },
+  seasonSheetCountText: {
+    color: '#CBD5E1',
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.6,
+  },
+  seasonSheetCloseBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  seasonRowCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    backgroundColor: '#161A25',
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)',
+    marginBottom: 9,
+    overflow: 'hidden',
+    position: 'relative',
+  },
+  seasonRowCardActive: {
+    backgroundColor: 'rgba(229, 9, 20, 0.12)',
+    borderColor: 'rgba(245, 197, 24, 0.55)',
+  },
+  seasonRowSheen: {
+    position: 'absolute',
+    top: -20,
+    bottom: -20,
+    width: 66,
+    backgroundColor: 'rgba(255, 255, 255, 0.22)',
+  },
+  seasonBadgeBox: {
+    paddingHorizontal: 9,
+    paddingVertical: 8,
+    minWidth: 44,
+    borderRadius: 10,
+    backgroundColor: '#1F2536',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  seasonBadgeBoxActive: {
+    backgroundColor: 'rgba(245, 197, 24, 0.16)',
+    borderColor: 'rgba(245, 197, 24, 0.65)',
+  },
+  seasonBadgeBoxText: {
+    color: '#CBD5E1',
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  seasonBadgeBoxTextActive: {
+    color: '#F5C518',
+  },
+  seasonRowTitleLine: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  seasonRowTitle: {
+    color: '#E2E8F0',
+    fontSize: 15,
+    fontWeight: '800',
+    flexShrink: 1,
+  },
+  seasonNowPill: {
+    backgroundColor: 'rgba(229, 9, 20, 0.22)',
+    borderWidth: 1,
+    borderColor: 'rgba(229, 9, 20, 0.6)',
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 999,
+  },
+  seasonNowPillText: {
+    color: '#FCA5A5',
+    fontSize: 9.5,
+    fontWeight: '800',
+  },
+  seasonSpecChipsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 5,
+  },
+  seasonSpecChip: {
+    backgroundColor: '#1E2433',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)',
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 5,
+  },
+  seasonSpecChipActive: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(245, 197, 24, 0.35)',
+  },
+  seasonSpecChipText: {
+    color: '#A5B4C8',
+    fontSize: 10.5,
+    fontWeight: '700',
+  },
+  zoomHudWrap: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  zoomHudPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(11, 13, 19, 0.86)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.16)',
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    borderRadius: 999,
+  },
+  zoomHudLabel: {
+    color: '#CBD5E1',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  zoomHudValue: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '900',
   },
 });
