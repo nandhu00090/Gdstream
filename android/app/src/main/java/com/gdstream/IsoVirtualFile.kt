@@ -11,7 +11,7 @@ internal class IsoClientDisconnected(cause: IOException) : IOException("Client c
 internal class IsoProxyReadException(val start: Long, val count: Int, cause: Throwable) :
     IOException("ISO proxy read failed: virtual bytes=$start-${start + count - 1L}", cause)
 
-internal data class HttpByteRange(val start: Long, val end: Long, val partial: Boolean) {
+internal data class HttpByteRange(val start: Long, val end: Long, val partial: Boolean, val openEnded: Boolean = !partial) {
     val length: Long get() = end - start + 1
 
     companion object {
@@ -34,7 +34,7 @@ internal data class HttpByteRange(val start: Long, val end: Long, val partial: B
                     (last.toLongOrNull() ?: throw IOException("Invalid range end")).coerceAtMost(size - 1)
                 if (start >= size || start > end) throw IOException("Unsatisfiable byte range")
             }
-            return HttpByteRange(start, end, true)
+            return HttpByteRange(start, end, true, last.isEmpty())
         }
     }
 }

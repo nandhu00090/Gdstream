@@ -75,6 +75,7 @@ const {
 } = NativeModules;
 
 const IS_TV = Platform.isTV;
+const DISABLED_TRACK = { type: 'disabled' } as const;
 const CW_STORAGE_KEY = 'gdstream_cw_history_v2';
 
 // AsyncStorage v3 returns a record from getMany; callers below consume ordered pairs.
@@ -1003,9 +1004,9 @@ const App = () => {
   }, [downloads, currentPath]);
 
   const [preparedUrl, setPreparedUrl] = useState('');
-  const playbackIdentity = playMode === 'internal'
-    ? `${selectedFile?.id || selectedFile?.name || ''}:${playerInstanceKey}` : null;
-  const playbackSource = usePlaybackSource(preparedUrl || getStreamUrl(selectedFile), playbackIdentity);
+  const preparingFile = useRef<any>(null);
+  const playbackIdentity = playMode === 'internal' ? String(playerInstanceKey) : null;
+  const playbackSource = usePlaybackSource(preparedUrl, playbackIdentity);
 
   const requestPreviewAtTime = useCallback((sec: number) => {
     const active = selectedFileRef.current;
@@ -1072,6 +1073,12 @@ const App = () => {
   }, [dvdPlayerUrl]);
   const dvdSelected = !!dvdPlayerUrl && selectedText?.type === 'dvd';
   const subtitlesActive = !dvdSelected && !!selectedText && selectedText.type !== 'disabled' && selectedText.type !== 'external';
+
+  const subtitleStyle = useMemo(() => ({
+    paddingBottom: resizeMode === 'cover' ? 70 : 20,
+    fontSize: subtitleSize,
+    subtitlesFollowVideo: resizeMode !== 'cover',
+  }), [resizeMode, subtitleSize]);
 
   const parsedExternalCues = useMemo(() => externalSubtitle?.content ? parseSubtitleFile(externalSubtitle.content) : [], [externalSubtitle]);
   const activeExternalSubtitleText = useMemo(() => {
@@ -2899,7 +2906,8 @@ const App = () => {
   };
 
   const startPlaybackWithMode = async (mode: 'dv' | 'hdr' | 'sdr', file = selectedFile) => {
-    if (!file || file.isoPending) return;
+    if (!file || file.isoPending || preparingFile.current === file) return;
+    preparingFile.current = file;
     removedHistoryRef.current.delete(file.name); // Only an intentional new play can restore this movie.
     queueHistoryWrite(async () => { await writeHistorySnapshot(); });
     try {
@@ -2914,6 +2922,8 @@ const App = () => {
       if ((error as any)?.code === 'DVD_MPEG2_UNSUPPORTED') { showDvdFallback(file); return; }
       Alert.alert('Playback error', playbackErrorMessage(error, error instanceof Error ? error.message : 'Could not open the stream.'));
       return;
+    } finally {
+      if (preparingFile.current === file) preparingFile.current = null;
     }
     hasRestoredResumeRef.current = false;
     setShowHdrChoiceModal(false);
@@ -3593,7 +3603,8 @@ const App = () => {
     }
 
     const isAudio = activeMenu === 'audio';
-    const tracks = isAudio ? audioTracks : textTracks;
+    // DVD bitmap tracks retain the original lettering and palette in the in-app overlay.
+    const tracks = isAudio ? audioTracks : dvdTracks.length ? [] : textTracks;
     const isSubtitleDisabled = !selectedText || selectedText.type === 'disabled';
 
     return (
@@ -3827,13 +3838,9 @@ const App = () => {
               Alert.alert('Playback error', playbackErrorMessage(err, err?.error?.errorString || 'Could not play the stream. Please try again.'));
             }
           }}
-          selectedAudioTrack={isExternalAudioSelected ? { type: 'disabled' } : selectedAudio}
-          subtitleStyle={{
-            paddingBottom: resizeMode === 'cover' ? 70 : 20,
-            fontSize: subtitleSize,
-            subtitlesFollowVideo: resizeMode !== 'cover',
-          }}
-          selectedTextTrack={subtitlesActive ? selectedText : { type: 'disabled' }}
+          selectedAudioTrack={isExternalAudioSelected ? DISABLED_TRACK : selectedAudio}
+          subtitleStyle={subtitleStyle}
+          selectedTextTrack={subtitlesActive ? selectedText : DISABLED_TRACK}
           viewType={0}
           controls={false}
         />

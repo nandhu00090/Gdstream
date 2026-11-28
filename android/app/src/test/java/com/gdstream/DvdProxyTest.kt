@@ -166,25 +166,27 @@ class DvdProxyTest {
         assertEquals(listOf(10_000L), timestamps(mux.finish(500_000, 13_600), 0x0102))
     }
 
+    private fun encoded(value: Int) = DvdProxy.Encoded(byteArrayOf(value.toByte()), DvdSubtitleWindow(0, 1, emptyList()), 0)
+
     @Test fun speculativeSuccessIsReusedAndFailureIsRetriedOnDemand() {
         val cache = DvdSegmentCache()
         val session = IsoReadSession()
         val entered = java.util.concurrent.CountDownLatch(1)
         val release = java.util.concurrent.CountDownLatch(1)
-        val prefetched = byteArrayOf(1)
-        fun load(index: Int, owner: IsoReadSession, sequence: Long): ByteArray {
+        val prefetched = encoded(1)
+        fun load(index: Int, owner: IsoReadSession, sequence: Long): DvdProxy.Encoded {
             assertTrue(sequence > 0)
             if (index == 1) {
                 entered.countDown()
                 assertTrue(release.await(2, java.util.concurrent.TimeUnit.SECONDS))
             }
             owner.checkActive()
-            return if (index == 1) prefetched else byteArrayOf(0)
+            return if (index == 1) prefetched else encoded(0)
         }
         cache.segment("dvd", 0, 2, session, true, load = ::load)
         assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS))
         // The in-flight next segment must never hold the completed-cache lock.
-        assertArrayEquals(byteArrayOf(0), cache.segment("dvd", 0, 2, session, false, load = ::load))
+        assertArrayEquals(byteArrayOf(0), cache.segment("dvd", 0, 2, session, false, load = ::load).bytes)
         release.countDown()
         val attempted = java.util.concurrent.CountDownLatch(1)
         assertSame(prefetched, cache.segment("dvd", 1, 2, session, true) { _, _, _ ->
@@ -192,7 +194,7 @@ class DvdProxyTest {
             throw java.io.IOException("transient")
         })
         assertTrue(attempted.await(2, java.util.concurrent.TimeUnit.SECONDS))
-        assertArrayEquals(byteArrayOf(2), cache.segment("dvd", 2, 2, session, false) { _, _, _ -> byteArrayOf(2) })
+        assertArrayEquals(byteArrayOf(2), cache.segment("dvd", 2, 2, session, false) { _, _, _ -> encoded(2) }.bytes)
     }
 
     @Test fun lateHlsRenditionsReuseTheSameClockAndEncodeOnce() {
@@ -201,7 +203,7 @@ class DvdProxyTest {
         val calls = mutableListOf<Pair<Int, Long>>()
         fun request(index: Int, pid: Int? = null) = cache.segment("disc", index, 20, session, false, true, pid) { i, _, sequence ->
             calls.add(i to sequence)
-            byteArrayOf(i.toByte())
+            encoded(i)
         }
         val first = request(0, 0x101)
         assertSame(first, request(0))
@@ -220,14 +222,14 @@ class DvdProxyTest {
         val cache = DvdSegmentCache()
         val session = IsoReadSession()
         fun request(index: Int) = cache.segment("dvd", index, 20, session, false) { _, _, sequence ->
-            byteArrayOf(sequence.toByte())
+            encoded(sequence.toInt())
         }
         val first = request(5)
-        assertArrayEquals(first, request(6))
+        assertArrayEquals(first.bytes, request(6).bytes)
         val back = request(5)
-        assertFalse(first.contentEquals(back))
+        assertFalse(first.bytes.contentEquals(back.bytes))
         assertSame(back, request(5))
-        assertArrayEquals(back, request(6))
+        assertArrayEquals(back.bytes, request(6).bytes)
     }
 
     @Test fun segmentOpensWithValidPatAndPmtAndKeepsAc3Bytes() {

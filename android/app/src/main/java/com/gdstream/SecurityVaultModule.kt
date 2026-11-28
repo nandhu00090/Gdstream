@@ -95,8 +95,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
     @Volatile
     private var cachedShieldToken: String = ""
 
-    @Volatile
-    private var cachedSslFactory: SSLSocketFactory? = null
+    private data class PinnedTls(val factory: SSLSocketFactory, val trustManager: X509TrustManager)
 
     data class DirectTrailerStream(
         val label: String,
@@ -242,17 +241,18 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         archiveFormat = { id -> archiveEntryRegistry[id]?.archiveFormat }
         externalIsoUrl = { url, player ->
             val entry = ArchiveProxyStreams.streamId(url)?.let { archiveEntryRegistry[it] }
-            if (entry?.archiveFormat == "ISO" && entry.fileName.endsWith(".vob", true)) {
+            if (entry?.archiveFormat != "ISO") url else if (entry.fileName.endsWith(".vob", true)) {
                 val vlc = dvdVlcPlayer(player)
                 val avc = ((vlc || player == null) && !entry.standalone && entry.dvdEncoder != null) ||
                     (player != null && dvdPlayerNeedsAvc(player) { DvdProxy.canDecodeMpeg2(entry.resolvedInfo) })
                 check(!avc || entry.dvdEncoder != null) { "AVC conversion unavailable for this DVD. Open it in VLC." }
                 externalDvdUrl(url, entry.id, entry.fileName, avc, muxed = vlc)
-            } else if (entry == null) url else if (entry.archiveFormat == "ISO" && entry.isBdavM2ts &&
-                entry.hls != null) {
+            } else if (!entry.isBdavM2ts) url else if (!entry.standalone) {
+                directArchiveUrl(java.net.URI(url), entry.id, entry.fileName)
+            } else if (entry.hls != null) {
                 val uri = java.net.URI(url)
                 "${uri.scheme}://${uri.rawAuthority}/hls/${entry.id}/index.m3u8"
-            } else externalIsoTsUrl(url, entry.fileName, entry.archiveFormat == "ISO" && entry.isBdavM2ts)
+            } else externalIsoTsUrl(url, entry.fileName, true)
         }
         externalPrefetch = { url ->
             val entry = ArchiveProxyStreams.streamId(url)?.let { archiveEntryRegistry[it] }
@@ -522,8 +522,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
     private external fun nSync(slot: Int, sigSeed: Int): String
 
-    private fun buildPinnedSystemSslFactory(): SSLSocketFactory {
-        cachedSslFactory?.let { return it }
+    private val pinnedTls by lazy {
         val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
         tmf.init(null as KeyStore?)
         val defaultTm = tmf.trustManagers.firstOrNull { it is X509TrustManager } as? X509TrustManager
@@ -573,9 +572,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
 
         val sslContext = SSLContext.getInstance("TLS")
         sslContext.init(null, arrayOf<TrustManager>(strictTm), SecureRandom())
-        val factory = sslContext.socketFactory
-        cachedSslFactory = factory
-        return factory
+        PinnedTls(sslContext.socketFactory, strictTm)
     }
 
     private fun isSnifferPackageInstalled(): Boolean {
@@ -679,7 +676,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 setRequestProperty("Cookie", sessionCookieHeader)
             }
             if (this is HttpsURLConnection) {
-                sslSocketFactory = buildPinnedSystemSslFactory()
+                sslSocketFactory = pinnedTls.factory
                 hostnameVerifier = HttpsURLConnection.getDefaultHostnameVerifier()
             }
         }
@@ -905,9 +902,13 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             headers = { mapOf("User-Agent" to "GDStream-Native-Engine/3.0", "Cookie" to sessionCookieHeader, "X-GD-Shield" to cachedShieldToken) },
             configure = { conn ->
                 if (conn is HttpsURLConnection) {
-                    conn.sslSocketFactory = buildPinnedSystemSslFactory()
+                    conn.sslSocketFactory = pinnedTls.factory
                     conn.hostnameVerifier = HttpsURLConnection.getDefaultHostnameVerifier()
                 }
+            },
+            configureIsoClient = {
+                sslSocketFactory(pinnedTls.factory, pinnedTls.trustManager)
+                hostnameVerifier(HttpsURLConnection.getDefaultHostnameVerifier())
             },
             receiveCookies = { updated ->
                 synchronized(this) {
@@ -1265,14 +1266,16 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                 return
             }
 
-            val session = IsoReadSession()
-            isoSession = session
-            val full = segments[0] == "zip" && method == "GET" && try {
-                val requested = HttpByteRange.parse(rangeHeader, entry.uncompressedSize)
-                requested.start == 0L && requested.end == entry.uncompressedSize - 1
-            } catch (_: java.io.IOException) { false }
             val offline = entry.isBdavM2ts && segments[0] == "zip" && path.substringAfter('?', "") == "offline=m2ts"
-            registration = (if (offline) offlineStreams else ArchiveProxyStreams.registry).register(entry.id, full) { reason ->
+            val isoPlayback = entry.archiveFormat == "ISO" && !offline
+            val playbackRange = if (segments[0] == "zip" && method == "GET") try {
+                HttpByteRange.parse(rangeHeader, entry.uncompressedSize)
+            } catch (_: java.io.IOException) { null } else null
+            val primary = playbackRange != null && if (isoPlayback) playbackRange.openEnded
+                else playbackRange.start == 0L && playbackRange.end == entry.uncompressedSize - 1
+            val session = IsoReadSession(cancelOrphanedReads = isoPlayback && primary)
+            isoSession = session
+            registration = (if (offline) offlineStreams else ArchiveProxyStreams.registry).register(entry.id, primary) { reason ->
                 try { socket.close() } catch (_: java.io.IOException) { }
                 session.cancel(reason)
                 remoteConnToClean.get()?.disconnect()
@@ -1330,8 +1333,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     if (writeArchiveOptions(method, out, true)) return
                     val body = if (dvdIndex == null) entry.dvdHls.playlist(checkNotNull(dvdResource), entry.dvdPlaylist) else try {
                         val trackPid = dvdResource.pid
+                        val subtitle = dvdResource.subtitle
+                        val renditionPid = subtitle?.let { DvdStreams.SUBTITLE_PID + it } ?: trackPid
                         val muxed = dvdChunks.segment(entry.id, dvdIndex, entry.dvdPlaylist.lastIndex, session, method == "GET",
-                            entry.dvdHls.multivariant, trackPid.takeUnless { it == entry.dvdHls.tracks.videoPid }, onSeek = {
+                            entry.dvdHls.multivariant, renditionPid.takeUnless { it == entry.dvdHls.tracks.videoPid }, onSeek = {
                                 if (!entry.standalone && method == "GET" && entry.sourceSize > 0)
                                     isoChunkCache.prefetchSeek(file, entry.dvdPlaylist[dvdIndex].start, entry.sourceSize, session, ::upstream)
                             }) { index, owner, sequence ->
@@ -1348,19 +1353,26 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             val data = file.readRaw(start, Math.toIntExact((nextVobu ?: segment.end) - start), ::read)
                             DvdProxy.transcode(data, checkNotNull(entry.resolvedInfo), checkNotNull(entry.dvdEncoder),
                                 owner, entry.id, sequence, index, nextVobu != null, index == entry.dvdPlaylist.lastIndex,
-                                segment.discontinuity, start, entry.dvdStartsUs[index], { first, end, cues ->
-                                    if (entry.dvdHls.tracks.subtitles.isNotEmpty()) {
-                                        dvdSubtitles.put(entry.id, index, DvdSubtitleWindow(first, end, cues))
-                                    }
-                                }, { pos, limit ->
+                                segment.discontinuity, start, entry.dvdStartsUs[index], { pos, limit ->
                                     file.readRaw(pos, minOf(file.rawSize - pos, limit.toLong()).coerceAtLeast(0).toInt(), ::read)
                                 }) {
                                 entry.dvdSequenceHeader ?: DvdProxy.sequenceHeader(
                                     file.readRaw(0, minOf(file.size, 512L * 1024).toInt(), ::read)
                                 )?.also { entry.dvdSequenceHeader = it }
+                            }.also { encoded ->
+                                if (entry.dvdHls.tracks.subtitles.isNotEmpty()) dvdSubtitles.put(entry.id, index, encoded.subtitles)
                             }
                         }
-                        if (trackPid == null) muxed else entry.dvdHls.rendition(muxed, trackPid, dvdIndex)
+                        when {
+                            subtitle != null -> DvdSubtitleOcr().use { ocr ->
+                                muxed.subtitles.webVtt(subtitle, muxed.firstVideoPts) { cue ->
+                                    session.checkActive()
+                                    ocr.recognize(cue)
+                                }
+                            }
+                            trackPid != null -> entry.dvdHls.rendition(muxed.bytes, trackPid, dvdIndex)
+                            else -> muxed.bytes
+                        }
                     } catch (error: java.io.IOException) {
                         session.checkActive()
                         appendDebugLog("DVD_SEG_ERR", "seg=$dvdIndex ${isoFailureDetails(error)}")
@@ -1369,7 +1381,11 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                         return
                     }
                     IsoVirtualFile(listOf(0L to body.size.toLong()), false).serve(method, rangeHeader,
-                        if (dvdIndex == null) "application/vnd.apple.mpegurl" else "video/MP2T", out, ioExecutor, session) { start, length ->
+                        when {
+                            dvdIndex == null -> "application/vnd.apple.mpegurl"
+                            dvdResource.subtitle != null -> "text/vtt"
+                            else -> "video/MP2T"
+                        }, out, ioExecutor, session) { start, length ->
                         body.copyOfRange(start.toInt(), start.toInt() + length)
                     }
                 } else if (offline) {
@@ -1383,6 +1399,9 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 } else if (hls == null) {
                     val direct = entry.standalone && entry.isBdavM2ts
+                    if (!entry.standalone && playbackRange?.openEnded == true && playbackRange.start > 0 && entry.sourceSize > 0) {
+                        isoChunkCache.prefetchSeek(file, playbackRange.start, entry.sourceSize, session, ::upstream)
+                    }
                     var first = true
                     var warmAt = 0L
                     file.serve(method, rangeHeader, "video/MP2T".takeIf { entry.isBdavM2ts } ?: mimeType,

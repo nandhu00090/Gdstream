@@ -13,6 +13,11 @@ import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.UnknownHostException
 import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
+import okhttp3.Call
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
 
 internal fun safeStreamUrl(url: String): String = url.substringBefore('#').substringBefore('?') +
     if ('?' in url.substringBefore('#')) "?[redacted]" else ""
@@ -40,8 +45,13 @@ internal object IsoHostPolicy {
 internal class RangeConnections(
     private val headers: () -> Map<String, String>,
     private val configure: (HttpURLConnection) -> Unit = {},
+    configureIsoClient: OkHttpClient.Builder.() -> Unit = {},
     private val receiveCookies: (List<String>) -> Unit = {}
 ) {
+    private val isoClient by lazy {
+        OkHttpClient.Builder().proxy(Proxy.NO_PROXY).followRedirects(false).followSslRedirects(false)
+            .retryOnConnectionFailure(false).apply(configureIsoClient).build()
+    }
     private val cookies = CookieManager(null, CookiePolicy.ACCEPT_ORIGINAL_SERVER)
     private val seededCookies = HashMap<String, String>()
 
@@ -85,7 +95,8 @@ internal class RangeConnections(
         var current = original
         for (redirect in 0..5) {
             if (Thread.currentThread().isInterrupted) throw InterruptedIOException("Range request cancelled")
-            val conn = current.openConnection(Proxy.NO_PROXY) as HttpURLConnection
+            val conn = if (session != null) IsoHttpConnection(current, isoClient)
+                else current.openConnection(Proxy.NO_PROXY) as HttpURLConnection
             var status: Int? = null
             try {
                 if (session != null && !limited && IsoHostPolicy.throttled(current)) {
@@ -138,6 +149,52 @@ internal class RangeConnections(
             }
         }
         throw IOException("Too many range redirects")
+    }
+}
+
+/** The proxy and range validator use HttpURLConnection's response interface. Use a cancellable
+ * Call for ISO GETs: platform disconnect() can wait for a stalled body read to finish. */
+private class IsoHttpConnection(url: URL, private val client: OkHttpClient) : HttpURLConnection(url) {
+    private var call: Call? = null
+    @Volatile private var response: Response? = null
+    private var closed = false
+
+    // A single range worker reads this response. Cancellation may come from any thread.
+    private fun openResponse(): Response {
+        response?.let { return it }
+        val request = Request.Builder().url(url).apply {
+            requestProperties.forEach { (name, values) -> values.forEach { addHeader(name, it) } }
+        }.build()
+        val exchange = client.newBuilder().connectTimeout(connectTimeout.toLong(), TimeUnit.MILLISECONDS)
+            .readTimeout(readTimeout.toLong(), TimeUnit.MILLISECONDS).build().newCall(request)
+        synchronized(this) {
+            if (closed) throw InterruptedIOException("ISO connection closed")
+            call = exchange
+        }
+        val reply = exchange.execute()
+        synchronized(this) {
+            if (!closed) {
+                response = reply
+                return reply
+            }
+        }
+        reply.close()
+        throw InterruptedIOException("ISO connection closed")
+    }
+
+    override fun connect() { openResponse() }
+    override fun getResponseCode() = openResponse().code
+    override fun getHeaderFields() = openResponse().headers.toMultimap()
+    override fun getHeaderField(name: String) = openResponse().header(name)
+    override fun getInputStream() = checkNotNull(openResponse().body).byteStream()
+    override fun usingProxy() = false
+    override fun disconnect() {
+        val reply = synchronized(this) {
+            closed = true
+            call?.cancel()
+            response.also { response = null }
+        }
+        reply?.close()
     }
 }
 

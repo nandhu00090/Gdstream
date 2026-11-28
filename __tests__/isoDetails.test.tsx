@@ -15,7 +15,9 @@ jest.mock('react-native', () => {
     getArchiveWatchAliases: jest.fn().mockResolvedValue(['inner', 'Example.2009 [Main Movie - 2h].m2ts', 'http://127.0.0.1:99/zip/inner/movie.m2ts']),
     writeDebugLog: jest.fn(),
     dvdPlaybackUrl: jest.fn(),
+    dvdSubtitleTracks: jest.fn().mockResolvedValue([]),
   };
+  rn.NativeModules.SecurityVault.prepareArchivePlayback = jest.fn().mockResolvedValue(true);
   rn.NativeModules.MediaInfoModule = { inspectMedia: jest.fn() };
   rn.NativeModules.VideoPlayerManager = {
     getAllWatchProgress: jest.fn().mockResolvedValue({ times: {}, durations: {} }),
@@ -106,6 +108,33 @@ test('X removes outer and persisted inner progress and remains removed after rem
   NativeModules.SecurityVault.listZipMediaEntries.mockResolvedValue(JSON.stringify([{ name: inner, link: 'http://127.0.0.1:99/zip/inner/movie.m2ts' }]));
   await Renderer.act(async () => renderer.root.findByProps({ focusId: 'card_0' }).props.onPress());
   expect(renderedText(renderer.toJSON())).not.toContain('Resume Watching');
+});
+
+test('opening a Blu-ray title once keeps the same native player and source through track setup', async () => {
+  const url = 'http://127.0.0.1:99/zip/title/feature.m2ts';
+  const vault = NativeModules.SecurityVault;
+  vault.listZipMediaEntries.mockResolvedValue(JSON.stringify([{ name: 'feature.m2ts', link: url, durationSec: 7200 }]));
+  await mount();
+  await Renderer.act(async () => renderer.root.findByProps({ focusId: 'card_0' }).props.onPress());
+  await Renderer.act(async () => {
+    const play = renderer.root.findByProps({ focusId: 'detail_play_btn' }).props.onPress;
+    play();
+    play();
+  });
+  expect(vault.prepareArchivePlayback).toHaveBeenCalledTimes(1);
+  const player = () => renderer.root.findByType('Video' as any);
+  const original = player();
+  const { source, selectedTextTrack, subtitleStyle } = original.props;
+  expect(source.uri).toBe(url);
+  await Renderer.act(async () => {
+    await original.props.onLoad({ duration: 7200, audioTracks: [{ language: 'tam' }] });
+    original.props.onTextTracks({ textTracks: [{ language: 'eng' }] });
+    original.props.onProgress({ currentTime: 1 });
+  });
+  expect(player()).toBe(original);
+  expect(player().props.source).toBe(source);
+  expect(player().props.selectedTextTrack).toBe(selectedTextTrack);
+  expect(player().props.subtitleStyle).toBe(subtitleStyle);
 });
 
 test('external DVD chooser gets the virtual VOB after ISO resolution', async () => {

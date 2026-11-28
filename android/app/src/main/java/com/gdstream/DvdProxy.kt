@@ -55,13 +55,18 @@ internal object DvdProxy {
     }
 
     data class Segment(val start: Long, val end: Long, val durationUs: Long, val discontinuity: Boolean = false)
-    fun playlist(segments: List<Segment>, pid: Int? = null, muxed: Boolean = false) = buildString {
-        val prefix = if (pid == null) "dvd" else "dvd_pid_$pid"
+    fun playlist(segments: List<Segment>, pid: Int? = null, muxed: Boolean = false, subtitle: Int? = null) = buildString {
+        val prefix = when {
+            subtitle != null -> "dvd_sub_$subtitle"
+            pid != null -> "dvd_pid_$pid"
+            else -> "dvd"
+        }
+        val extension = if (subtitle != null) "vtt" else "ts"
         append("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n")
         append("#EXT-X-TARGETDURATION:${(segments.maxOf { it.durationUs } + 999999) / 1000000}\n")
         segments.forEachIndexed { index, segment ->
             if (index > 0 && segment.discontinuity) append("#EXT-X-DISCONTINUITY\n")
-            append("#EXTINF:${java.math.BigDecimal.valueOf(segment.durationUs, 6)},\n${prefix}_$index.ts${if (muxed) "?muxed=1" else ""}\n")
+            append("#EXTINF:${java.math.BigDecimal.valueOf(segment.durationUs, 6)},\n${prefix}_$index.$extension${if (muxed) "?muxed=1" else ""}\n")
         }
         append("#EXT-X-ENDLIST\n")
     }.toByteArray()
@@ -98,10 +103,12 @@ internal object DvdProxy {
         current.tracks.reset()
     }
 
+    data class Encoded(val bytes: ByteArray, val subtitles: DvdSubtitleWindow, val firstVideoPts: Long)
+
     @Synchronized fun transcode(data: ByteArray, info: Map<String, Any>, encoder: Encoder,
                   session: IsoReadSession, streamId: String, sequence: Long, segment: Int, boundary: Boolean, last: Boolean,
-                  discontinuity: Boolean, offset: Long, playlistStartUs: Long, publish: (Long, Long, List<DvdSpu.Cue>) -> Unit,
-                  subtitleLookahead: (Long, Int) -> ByteArray, sequenceHeader: () -> ByteArray?): ByteArray {
+                  discontinuity: Boolean, offset: Long, playlistStartUs: Long,
+                  subtitleLookahead: (Long, Int) -> ByteArray, sequenceHeader: () -> ByteArray?): Encoded {
         if (warm?.id != streamId || warm?.sequence != sequence || warm?.next != segment) release()
         val sequential = warm != null
         val state = warm ?: Warm(streamId, sequence, segment, DvdTsMux(DvdStreams.from(info))).also { warm = it }
@@ -146,7 +153,7 @@ internal object DvdProxy {
                 state.playlistOriginUs = playlistStartUs
             }
             fun timeUs(tick: Long) = state.playlistOriginUs + (tick - state.clockOrigin) * 100 / 9
-            publish(timeUs(pts.firstVideo), timeUs(pts.nextVideo), overlay)
+            val window = DvdSubtitleWindow(timeUs(pts.firstVideo), timeUs(pts.nextVideo), overlay)
             state.next = segment + 1
             if (last) release() else {
                 idleClose?.cancel(false)
@@ -156,7 +163,7 @@ internal object DvdProxy {
             }
             DebugLogger.log("DVD_SEG_OK", "seg=$segment frames=${state.mux.frames} bytes=${result.size} warm=$sequential " +
                 "pts90k=${pts.firstVideo}..${pts.lastVideo} nextVideo90k=${pts.nextVideo} firstAudio90k=${pts.firstAudio} nextAudio90k=${pts.nextAudio}")
-            return result
+            return Encoded(result, window, pts.firstVideo)
         } catch (error: Throwable) { release(); throw error }
     }
 
@@ -528,7 +535,7 @@ internal object DvdProxy {
 /** One encoder serves both HTTP demand and look-ahead. Completed hits never acquire its lock. */
 internal class DvdSegmentCache {
     private val encoder = Any()
-    private val cache = LinkedHashMap<Pair<String, Int>, ByteArray>(4, 0.75f, true)
+    private val cache = LinkedHashMap<Pair<String, Int>, DvdProxy.Encoded>(4, 0.75f, true)
     private val lastByRendition = mutableMapOf<Int?, Int>()
     private val worker = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
         Thread(task, "DVDPretranscode").apply { isDaemon = true }
@@ -546,7 +553,7 @@ internal class DvdSegmentCache {
     }
 
     fun segment(id: String, index: Int, last: Int, session: IsoReadSession, prefetch: Boolean,
-                shared: Boolean = false, rendition: Int? = null, onSeek: () -> Unit = {}, load: (Int, IsoReadSession, Long) -> ByteArray): ByteArray {
+                shared: Boolean = false, rendition: Int? = null, onSeek: () -> Unit = {}, load: (Int, IsoReadSession, Long) -> DvdProxy.Encoded): DvdProxy.Encoded {
         val key = id to index
         val next = id to index + 1
         var displaced: IsoReadSession? = null
@@ -575,7 +582,7 @@ internal class DvdSegmentCache {
         }
         displaced?.cancel("DVD seek")
         if (newWindow) onSeek()
-        fun get(n: Int, owner: IsoReadSession): ByteArray {
+        fun get(n: Int, owner: IsoReadSession): DvdProxy.Encoded {
             val key = id to n
             fun cached() = synchronized(cache) {
                 if (sequence != requestSequence) throw java.io.InterruptedIOException("DVD seek")
@@ -590,7 +597,7 @@ internal class DvdSegmentCache {
                         if (sequence != requestSequence) throw java.io.InterruptedIOException("DVD seek")
                         cache[key] = bytes
                         val limit = if (shared) 8 else 2
-                        while (cache.size > limit || cache.size > 1 && cache.values.sumOf { it.size.toLong() } > 32L * 1024 * 1024)
+                        while (cache.size > limit || cache.size > 1 && cache.values.sumOf { it.bytes.size.toLong() } > 32L * 1024 * 1024)
                             cache.remove(cache.entries.first().key)
                     }
                 }

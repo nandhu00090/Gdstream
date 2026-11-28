@@ -6,10 +6,18 @@ internal class DvdHls(val tracks: DvdStreams) {
     val multivariant = tracks.audio.size > 1 || tracks.subtitles.isNotEmpty()
     private val pids = tracks.audio.indices.map { DvdStreams.AUDIO_PID + it } + tracks.videoPid
 
-    data class Resource(val index: Int? = null, val pid: Int? = null, val master: Boolean = false, val muxed: Boolean = false)
+    data class Resource(val index: Int? = null, val pid: Int? = null, val master: Boolean = false, val muxed: Boolean = false,
+                        val subtitle: Int? = null)
     fun resource(name: String, count: Int, muxed: Boolean = false): Resource? {
         if (name == "dvd.m3u8") return Resource(master = multivariant && !muxed, muxed = muxed)
         if (multivariant && name == "dvd_video.m3u8") return Resource(pid = tracks.videoPid)
+        SUBTITLE.matchEntire(name)?.let { match ->
+            val track = match.groupValues[1].toIntOrNull()
+            if (muxed || track !in tracks.subtitles.indices) return null
+            val index = match.groups[2]?.value?.toIntOrNull()
+            if (name.endsWith(".vtt") && index !in 0 until count) return null
+            return Resource(index = index, subtitle = track)
+        }
         val match = FILE.matchEntire(name) ?: return null
         val pid = match.groups[1]?.value?.toIntOrNull()
         if (match.groups[1] != null && (!multivariant || pid !in pids)) return null
@@ -19,7 +27,7 @@ internal class DvdHls(val tracks: DvdStreams) {
     }
 
     fun playlist(resource: Resource, segments: List<DvdProxy.Segment>): ByteArray {
-        if (!resource.master) return DvdProxy.playlist(segments, resource.pid, resource.muxed)
+        if (!resource.master) return DvdProxy.playlist(segments, resource.pid, resource.muxed, resource.subtitle)
         return buildString {
             append("#EXTM3U\n#EXT-X-VERSION:3\n")
             for ((i, track) in tracks.audio.withIndex()) {
@@ -30,10 +38,16 @@ internal class DvdHls(val tracks: DvdStreams) {
                 append("DEFAULT=$default,AUTOSELECT=$default,CHANNELS=\"${track.channels.coerceIn(1, 6)}\",")
                 append("URI=\"dvd_pid_${DvdStreams.AUDIO_PID + i}.m3u8\"\n")
             }
+            for ((i, track) in tracks.subtitles.withIndex()) {
+                val name = "${bluRayLanguage(track.language)} • DVD ${i + 1}"
+                append("#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"$name\",LANGUAGE=\"${track.language}\",")
+                append("DEFAULT=NO,AUTOSELECT=NO,URI=\"dvd_sub_$i.m3u8\"\n")
+            }
             append("#EXT-X-STREAM-INF:BANDWIDTH=${6500000 + tracks.audio.size * 640000},CODECS=\"avc1")
             if (tracks.audio.isNotEmpty()) append(",ac-3")
             append("\",CLOSED-CAPTIONS=NONE")
             if (tracks.audio.isNotEmpty()) append(",AUDIO=\"audio\"")
+            if (tracks.subtitles.isNotEmpty()) append(",SUBTITLES=\"subs\"")
             append("\ndvd_video.m3u8\n")
         }.toByteArray()
     }
@@ -81,6 +95,7 @@ internal class DvdHls(val tracks: DvdStreams) {
     private fun pidAt(data: ByteArray, p: Int) = ((data[p + 1].toInt() and 31) shl 8) or (data[p + 2].toInt() and 255)
 
     companion object {
+        private val SUBTITLE = Regex("dvd_sub_([0-9]+)(?:_([0-9]+)\\.vtt|\\.m3u8)")
         private val FILE = Regex("dvd(?:_pid_([0-9]+))?(?:_([0-9]+)\\.ts|\\.m3u8)")
     }
 }

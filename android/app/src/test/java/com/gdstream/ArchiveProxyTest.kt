@@ -198,6 +198,8 @@ class ArchiveProxyTest {
             val target = JSONObject().put("id", "disc").put("fileName", "Movie.m2ts").put("archiveFormat", "ISO")
                 .put("compressionMethod", 0).put("compressedSize", 384).put("uncompressedSize", 376)
                 .put("isBdavM2ts", true).put("segments", JSONArray("[[1000,200],[2000,184]]"))
+            target.put("bluRay", BluRayProfile(5_000_000, listOf(BluRayPoint(0, 0), BluRayPoint(2_000_000, 188)),
+                emptyList()).toJson())
             val item = JSONObject().put("id", "disc").put("name", "Movie.m2ts").put("link", "http://127.0.0.1:1111/zip/obsolete/Movie.m2ts")
             val cache = JSONObject().put("rawJson", JSONArray().put(item).toString()).put("targets", JSONArray().put(target))
             assertNull(restore.invoke(module, cache.toString(), "https://example/disc.iso"))
@@ -209,6 +211,11 @@ class ArchiveProxyTest {
             assertEquals("ISO", restored.getString("archiveFormat"))
             @Suppress("UNCHECKED_CAST")
             val registry = field(module, "archiveEntryRegistry") as ConcurrentHashMap<String, SecurityVaultModule.ArchiveEntryTarget>
+            assertNotNull(registry["disc"]!!.hls)
+            val direct = restored.getString("link")
+            val oldMaster = "http://127.0.0.1:$activePort/hls/disc/index.m3u8"
+            assertEquals(direct, SecurityVaultModule.externalPlayerUrl(direct, "com.brouken.player"))
+            assertEquals(direct, SecurityVaultModule.externalPlayerUrl(oldMaster))
             assertEquals("https://example/disc.iso?fresh=1", registry["disc"]!!.archiveUrl)
             assertEquals(376L, registry["disc"]!!.uncompressedSize)
             target.put("uncompressedSize", 188) // Old per-extent rounding must not survive validation.
@@ -329,6 +336,86 @@ class ArchiveProxyTest {
         }
     }
 
+    @Test fun openEndedIsoSeeksDisplaceAllThreeReadsWhileBoundedProbesLeavePlaybackActive() {
+        val module = SecurityVaultModule(mock(ReactApplicationContext::class.java))
+        val pool = Executors.newCachedThreadPool()
+        val block = IsoChunkCache.BLOCK_BYTES.toLong()
+        val sourceSize = 24 * block
+        val id = "seek-permits"
+        val bind = InetAddress.getByName("127.0.0.1")
+        val origin = ServerSocket(0, 16, bind)
+        val proxy = ServerSocket(0, 16, bind)
+        val reads = java.util.concurrent.LinkedBlockingQueue<Long>()
+        val clients = mutableListOf<Socket>()
+        val upstreams = java.util.concurrent.ConcurrentLinkedQueue<Socket>()
+        val handler = SecurityVaultModule::class.java.getDeclaredMethod("handleArchiveProxyClient", Socket::class.java)
+            .apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val entries = field(module, "archiveEntryRegistry") as ConcurrentHashMap<String, SecurityVaultModule.ArchiveEntryTarget>
+        // A sparse first block serves startup and the small probe locally. The next three
+        // origin GETs remain stalled until the proxy disconnects them on a seek.
+        entries[id] = SecurityVaultModule.ArchiveEntryTarget(id, "http://127.0.0.1:${origin.localPort}/download.aspx",
+            "title.vob", "ISO", 0, sourceSize, sourceSize, 0, segments = listOf(-1L to block, 0L to sourceSize - block),
+            sourceSize = sourceSize)
+        ArchiveProxyStreams.registry.resume()
+        pool.submit {
+            while (!origin.isClosed) {
+                val socket = origin.accept()
+                upstreams.add(socket)
+                pool.submit {
+                    socket.use {
+                        val input = it.getInputStream().bufferedReader()
+                        val headers = generateSequence { input.readLine() }.takeWhile { line -> line.isNotEmpty() }
+                        val range = headers.toList().single { line -> line.startsWith("Range:", true) }
+                        val from = range.substringAfter('=').substringBefore('-').toLong()
+                        // Stall some reads in the body and others waiting for response headers.
+                        if (from / block % 2 == 0L) {
+                            it.getOutputStream().write(("HTTP/1.1 206 Partial Content\r\nContent-Length: $block\r\n" +
+                                "Content-Range: bytes $from-${from + block - 1}/$sourceSize\r\n\r\nx").toByteArray())
+                        }
+                        reads.put(from / block)
+                        input.read()
+                    }
+                }
+            }
+        }
+        fun request(range: String?): Pair<Socket, java.util.concurrent.Future<*>> {
+            val job = pool.submit { handler.invoke(module, proxy.accept()) }
+            val client = Socket(bind, proxy.localPort)
+            clients.add(client)
+            client.soTimeout = 3000
+            val header = range?.let { "Range: bytes=$it\r\n" }.orEmpty()
+            client.getOutputStream().write("GET /zip/$id/title.vob HTTP/1.1\r\n${header}Connection: close\r\n\r\n".toByteArray())
+            return client to job
+        }
+        fun assertWindow(start: Long) {
+            val actual = List(3) { reads.poll(3, TimeUnit.SECONDS) }
+            assertEquals((start until start + 3).toSet(), actual.toSet())
+        }
+        try {
+            val (_, full) = request(null)
+            assertWindow(0)
+            val (probe, done) = request("0-524287")
+            assertTrue(probe.getInputStream().readBytes().toString(Charsets.ISO_8859_1).startsWith("HTTP/1.1 206"))
+            done.get(1, TimeUnit.SECONDS)
+            assertFalse(full.isDone)
+            val (_, seek) = request("${8 * block}-")
+            assertWindow(7)
+            full.get(1, TimeUnit.SECONDS)
+            request("${16 * block}-")
+            assertWindow(15)
+            seek.get(1, TimeUnit.SECONDS)
+        } finally {
+            clients.forEach { it.close() }
+            origin.close()
+            upstreams.forEach { it.close() }
+            proxy.close()
+            ArchiveProxyStreams.registry.cancelStream(id, "test finished")
+            pool.shutdownNow()
+            (field(module, "ioExecutor") as ExecutorService).shutdownNow()
+        }
+    }
+
     @Test fun isoKeepAliveHandlesHeadThenTwoRangesOnOneSocket() {
         val module = SecurityVaultModule(mock(ReactApplicationContext::class.java))
         val pool = Executors.newSingleThreadExecutor()
@@ -374,9 +461,10 @@ class ArchiveProxyTest {
             "width" to 720,
             "height" to 480,
             "audioTracks" to listOf(
-                mapOf("codec" to "AC-3", "language" to "tam", "channels" to 6),
-                mapOf("codec" to "DTS", "language" to "eng", "channels" to 6)
-            )
+                mapOf("codec" to "AC-3", "languageCode" to "tam", "channelCount" to 6, "substreamId" to 0x80),
+                mapOf("codec" to "DTS", "languageCode" to "eng", "channelCount" to 6, "substreamId" to 0x89)
+            ),
+            "subtitleTracks" to listOf(mapOf("substreamId" to 0x20, "languageCode" to "eng"))
         )
         val target = SecurityVaultModule.ArchiveEntryTarget(
             id = "dvd_chooser",
@@ -429,6 +517,17 @@ class ArchiveProxyTest {
                 assertTrue(media3Response.contains("#EXT-X-MEDIA:TYPE=AUDIO"))
                 assertTrue(media3Response.contains("dvd_video.m3u8"))
                 assertFalse(media3Response.contains("muxed=1"))
+
+                assertTrue(media3Response.contains("URI=\"dvd_sub_0.m3u8\""))
+                val subPlaylist = request("/hls/${target.id}/dvd_sub_0.m3u8", "JustPlayer")
+                assertTrue(subPlaylist.contains("\ndvd_sub_0_0.vtt\n"))
+                val cache = field(module, "dvdChunks") as DvdSegmentCache
+                cache.segment(target.id, 0, 0, IsoReadSession(), false, shared = true) { _, _, _ ->
+                    DvdProxy.Encoded(byteArrayOf(), DvdSubtitleWindow(0, 4_000_000, emptyList()), 90_000)
+                }
+                val segment = request("/hls/${target.id}/dvd_sub_0_0.vtt", "JustPlayer")
+                assertTrue(segment.contains("Content-Type: text/vtt\r\n"))
+                assertTrue(segment.endsWith("WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:90000\n\n"))
 
                 val explicitMuxedResponse = request("/hls/${target.id}/dvd.m3u8?muxed=1", "Dalvik/2.1.0 (Linux; U; Android 14)")
                 assertTrue(explicitMuxedResponse.startsWith("HTTP/1.1 200 OK"))

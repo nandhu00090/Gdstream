@@ -195,7 +195,7 @@ internal class IsoChunkCache(
     // Called under lock. Keep a progressive download alive between consecutive socket writes.
     private fun keepWarm(key: IsoBlockKey, flight: Flight, session: IsoReadSession) {
         if (session in flight.warmers) return
-        val registration = session.onCancel { release(key, flight, session) }
+        val registration = session.onCancel { release(key, flight, session, warmer = true) }
         session.checkActive()
         flight.warmers[session] = registration
     }
@@ -248,11 +248,11 @@ internal class IsoChunkCache(
             }
         }
 
-    private fun release(key: IsoBlockKey, flight: Flight, warmer: IsoReadSession?) {
+    private fun release(key: IsoBlockKey, flight: Flight, session: IsoReadSession, warmer: Boolean) {
         synchronized(lock) {
-            if (warmer == null) flight.readers-- else flight.warmers.remove(warmer)
+            if (warmer) flight.warmers.remove(session) else flight.readers--
             if (flight.readers != 0 || flights[key] !== flight) return
-            if (flight.retireAfterDemand) {
+            if (flight.retireAfterDemand || (session.cancelOrphanedReads && session.isCancelled && flight.warmers.isEmpty())) {
                 flights.remove(key)
                 return@synchronized
             }
@@ -313,7 +313,7 @@ internal class IsoChunkCache(
             flight(key, fetch).also { it.readers++; schedule(it, true) }
         }
         val released = java.util.concurrent.atomic.AtomicBoolean()
-        fun detach() { if (released.compareAndSet(false, true)) release(key, flight, null) }
+        fun detach() { if (released.compareAndSet(false, true)) release(key, flight, session, warmer = false) }
         val registration = session.onCancel {
             synchronized(flight.progress) { flight.progress.notifyAll() }
             detach()
