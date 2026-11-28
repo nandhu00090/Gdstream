@@ -132,9 +132,21 @@ const InAppAudioFileBrowser: React.FC<InAppAudioFileBrowserProps> = ({
     if (Platform.OS !== 'android') return true;
     try {
       const apiLevel = Number(Platform.Version) || 0;
-      const perm = apiLevel >= 33
-        ? (PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO || 'android.permission.READ_MEDIA_AUDIO')
-        : PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE;
+      if (apiLevel >= 33) {
+        const audioPerm = PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO || 'android.permission.READ_MEDIA_AUDIO';
+        const videoPerm = PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO || 'android.permission.READ_MEDIA_VIDEO';
+        const [hasAudio, hasVideo] = await Promise.all([
+          PermissionsAndroid.check(audioPerm),
+          PermissionsAndroid.check(videoPerm),
+        ]);
+        if (hasAudio && hasVideo) return true;
+        const results = await PermissionsAndroid.requestMultiple([audioPerm, videoPerm]);
+        return (
+          results[audioPerm] === PermissionsAndroid.RESULTS.GRANTED ||
+          results[videoPerm] === PermissionsAndroid.RESULTS.GRANTED
+        );
+      }
+      const perm = PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE;
       if (!perm) return true;
       const already = await PermissionsAndroid.check(perm);
       if (already) return true;
