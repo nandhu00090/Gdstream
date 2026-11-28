@@ -1,8 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  AppState,
   FlatList,
   Modal,
   NativeModules,
+  PermissionsAndroid,
+  Platform,
   ScrollView,
   StyleSheet,
   Text,
@@ -58,7 +61,18 @@ const CODEC_BADGE_MAP: Record<string, CodecStyle> = {
 };
 
 const getCodecBadge = (name: string, ext?: string): CodecStyle => {
-  const cleanExt = (ext || name.split('.').pop() || '').toLowerCase();
+  const lower = name.toLowerCase();
+  if (/\.e?ac3\.[a-z0-9]{2,5}$/.test(lower)) {
+    return /\.eac3\./.test(lower) ? CODEC_BADGE_MAP.eac3 : CODEC_BADGE_MAP.ac3;
+  }
+  if (/\.dtshd\.[a-z0-9]{2,5}$/.test(lower)) return CODEC_BADGE_MAP.dtshd;
+  if (/\.dts\.[a-z0-9]{2,5}$/.test(lower)) return CODEC_BADGE_MAP.dts;
+  if (/\.(truehd|thd)\.[a-z0-9]{2,5}$/.test(lower)) return CODEC_BADGE_MAP.truehd;
+  if (/\.flac\.[a-z0-9]{2,5}$/.test(lower)) return CODEC_BADGE_MAP.flac;
+  if (/\.opus\.[a-z0-9]{2,5}$/.test(lower)) return CODEC_BADGE_MAP.opus;
+  if (/\.aac\.[a-z0-9]{2,5}$/.test(lower)) return CODEC_BADGE_MAP.aac;
+
+  const cleanExt = (ext || lower.split('.').pop() || '').toLowerCase();
   if (CODEC_BADGE_MAP[cleanExt]) return CODEC_BADGE_MAP[cleanExt];
   return {
     label: (cleanExt || 'AUDIO').toUpperCase(),
@@ -109,7 +123,47 @@ const InAppAudioFileBrowser: React.FC<InAppAudioFileBrowserProps> = ({
   const [entries, setEntries] = useState<LocalDirEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [hasAllFiles, setHasAllFiles] = useState(true);
   const requestIdRef = useRef(0);
+  const currentDirRef = useRef(currentDir);
+  currentDirRef.current = currentDir;
+
+  const ensureAudioPermission = useCallback(async () => {
+    if (Platform.OS !== 'android') return true;
+    try {
+      const apiLevel = Number(Platform.Version) || 0;
+      const perm = apiLevel >= 33
+        ? (PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO || 'android.permission.READ_MEDIA_AUDIO')
+        : PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE;
+      if (!perm) return true;
+      const already = await PermissionsAndroid.check(perm);
+      if (already) return true;
+      const status = await PermissionsAndroid.request(perm, {
+        title: 'Audio Library Access',
+        message: 'Allow GDStream to read downloaded external audio tracks from your folders.',
+        buttonPositive: 'Allow',
+        buttonNegative: 'Deny',
+      });
+      return status === PermissionsAndroid.RESULTS.GRANTED;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const refreshAllFilesFlag = useCallback(async () => {
+    if (Platform.OS !== 'android' || !SecurityVault?.hasAllFilesAccess) {
+      setHasAllFiles(true);
+      return true;
+    }
+    try {
+      const ok = await SecurityVault.hasAllFilesAccess();
+      setHasAllFiles(Boolean(ok));
+      return Boolean(ok);
+    } catch {
+      setHasAllFiles(true);
+      return true;
+    }
+  }, []);
 
   const loadDirectory = useCallback(async (targetPath: string, pushHistory = false) => {
     const reqId = ++requestIdRef.current;
@@ -126,8 +180,8 @@ const InAppAudioFileBrowser: React.FC<InAppAudioFileBrowserProps> = ({
       const resolvedPath = typeof res?.path === 'string' && res.path ? res.path : targetPath;
       const rawEntries: LocalDirEntry[] = Array.isArray(res?.entries) ? res.entries : [];
 
-      if (pushHistory && resolvedPath !== currentDir) {
-        setHistoryStack(prev => [...prev, currentDir]);
+      if (pushHistory && resolvedPath !== currentDirRef.current) {
+        setHistoryStack(prev => [...prev, currentDirRef.current]);
       }
       setCurrentDir(resolvedPath);
       setEntries(rawEntries);
@@ -138,15 +192,35 @@ const InAppAudioFileBrowser: React.FC<InAppAudioFileBrowserProps> = ({
     } finally {
       if (reqId === requestIdRef.current) setLoading(false);
     }
-  }, [currentDir]);
+  }, []);
 
   useEffect(() => {
     if (!visible) return;
+    let active = true;
     setHistoryStack([]);
-    void loadDirectory(initialPath, false);
-    // Load target path cleanly each time modal becomes visible.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, initialPath]);
+    const boot = async () => {
+      await ensureAudioPermission();
+      await refreshAllFilesFlag();
+      if (active) {
+        await loadDirectory(initialPath, false);
+      }
+    };
+    void boot();
+
+    const sub = AppState.addEventListener('change', state => {
+      if (state === 'active' && active) {
+        void (async () => {
+          await refreshAllFilesFlag();
+          await loadDirectory(currentDirRef.current, false);
+        })();
+      }
+    });
+
+    return () => {
+      active = false;
+      sub.remove();
+    };
+  }, [visible, initialPath, ensureAudioPermission, refreshAllFilesFlag, loadDirectory]);
 
   const handleBack = () => {
     if (historyStack.length > 0) {
@@ -263,7 +337,7 @@ const InAppAudioFileBrowser: React.FC<InAppAudioFileBrowserProps> = ({
                   glowBorderRadius={999}
                   style={[styles.shortcutPill, isActive && styles.shortcutPillActive]}>
                   <Icon name={sc.icon} size={14} color={isActive ? '#FFFFFF' : '#94A3B8'} />
-                  <Text style={[styles.shortcutPillText, isActive && { color: '#FFFFFF' }]}>
+                  <Text style={[styles.shortcutPillText, isActive && { color: '#FFFFFF' }]} numberOfLines={1}>
                     {sc.label}
                   </Text>
                 </TactileSpringPressable>
@@ -372,15 +446,28 @@ const InAppAudioFileBrowser: React.FC<InAppAudioFileBrowserProps> = ({
             <Text style={styles.footerStats}>
               {`${folderCount} folders • ${audioCount} tracks`}
             </Text>
-            <TactileSpringPressable
-              onPress={onOpenSystemPicker}
-              activeScale={0.95}
-              glowColor="rgba(56, 189, 248, 0.55)"
-              glowBorderRadius={8}
-              style={styles.systemPickerPill}>
-              <Icon name="launch" size={13} color="#94A3B8" />
-              <Text style={styles.systemPickerText}>System Picker</Text>
-            </TactileSpringPressable>
+            <View style={styles.footerActionsRow}>
+              {!hasAllFiles && Platform.OS === 'android' && (
+                <TactileSpringPressable
+                  onPress={() => SecurityVault?.openAllFilesAccessSettings?.()}
+                  activeScale={0.95}
+                  glowColor="#F5C518"
+                  glowBorderRadius={8}
+                  style={styles.allFilesPill}>
+                  <Icon name="folder-special" size={13} color="#F5C518" />
+                  <Text style={styles.allFilesPillText}>Grant All Files</Text>
+                </TactileSpringPressable>
+              )}
+              <TactileSpringPressable
+                onPress={onOpenSystemPicker}
+                activeScale={0.95}
+                glowColor="rgba(56, 189, 248, 0.55)"
+                glowBorderRadius={8}
+                style={styles.systemPickerPill}>
+                <Icon name="launch" size={13} color="#94A3B8" />
+                <Text style={styles.systemPickerText}>System Picker</Text>
+              </TactileSpringPressable>
+            </View>
           </View>
         </SlideUpSheet>
       </View>
@@ -395,12 +482,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 14,
-    paddingVertical: 16,
+    paddingVertical: 14,
   },
   card: {
     width: '100%',
     maxWidth: 620,
-    maxHeight: '90%',
+    maxHeight: '92%',
     backgroundColor: '#10131B',
     borderRadius: 22,
     borderWidth: 1,
@@ -423,6 +510,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
+    flexShrink: 0,
   },
   headerTitle: {
     color: '#FFFFFF',
@@ -456,22 +544,27 @@ const styles = StyleSheet.create({
   },
   shortcutsScroller: {
     flexGrow: 0,
-    marginTop: 11,
+    flexShrink: 0,
+    minHeight: 38,
+    marginTop: 10,
     marginBottom: 8,
   },
   shortcutsContent: {
-    gap: 7,
+    alignItems: 'center',
+    gap: 8,
     paddingRight: 8,
+    paddingVertical: 2,
   },
   shortcutPill: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 5,
+    gap: 6,
     backgroundColor: '#161A25',
     borderWidth: 1,
     borderColor: 'rgba(255, 255, 255, 0.08)',
-    paddingHorizontal: 11,
-    paddingVertical: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    minHeight: 32,
     borderRadius: 999,
   },
   shortcutPillActive: {
@@ -484,12 +577,12 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   listBody: {
-    minHeight: 175,
-    maxHeight: 330,
+    minHeight: 110,
+    maxHeight: 320,
     flexShrink: 1,
   },
   centerStateBox: {
-    minHeight: 165,
+    minHeight: 130,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 18,
@@ -593,11 +686,33 @@ const styles = StyleSheet.create({
     paddingTop: 8,
     borderTopWidth: 1,
     borderTopColor: 'rgba(255, 255, 255, 0.07)',
+    flexShrink: 0,
   },
   footerStats: {
     color: '#64748B',
     fontSize: 11,
     fontWeight: '600',
+  },
+  footerActionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+  },
+  allFilesPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: 'rgba(245, 197, 24, 0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(245, 197, 24, 0.5)',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 8,
+  },
+  allFilesPillText: {
+    color: '#F5C518',
+    fontSize: 11.5,
+    fontWeight: '800',
   },
   systemPickerPill: {
     flexDirection: 'row',

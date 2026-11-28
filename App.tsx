@@ -4559,12 +4559,12 @@ const App = () => {
               const explicitMbps = vMi.videoBitrateMbps && vMi.videoBitrateMbps > 0 ? vMi.videoBitrateMbps : 0;
               const bitrateTitle = explicitMbps > 0
                 ? `${explicitMbps >= 10 ? explicitMbps.toFixed(1) : explicitMbps.toFixed(2).replace(/\.?0+$/, '')} Mbps`
-                : 'VBR Stream';
+                : '—';
               const bitrateSub = fpsClean
-                ? `Cinema ${fpsClean} fps`
+                ? `${fpsClean} fps`
                 : explicitMbps > 0
                 ? 'Video stream bitrate'
-                : 'VBR adaptive stream';
+                : 'Frame rate';
               return (
                 <View style={{ gap: 12, marginTop: 10 }}>
                   <View style={styles.miTelemetryGrid}>

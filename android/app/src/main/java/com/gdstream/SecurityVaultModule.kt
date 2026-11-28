@@ -4742,7 +4742,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                             val ext = name.substringAfterLast('.', "").lowercase(Locale.US)
                             if (ext in audioExts) {
                                 val abs = entry.absolutePath
-                                seenPaths.add(abs)
+                                seenPaths.add(abs.lowercase(Locale.US))
+                                seenPaths.add("$targetPath/$name".lowercase(Locale.US))
                                 val m = Arguments.createMap()
                                 m.putString("name", name)
                                 m.putString("path", abs)
@@ -4766,33 +4767,50 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                     }
                 }
 
-                if (listed == null || fileEntries.isEmpty()) {
-                    val resolver = reactContext.contentResolver
-                    val cleanPrefix = "$targetPath/"
-                    val urisToQuery = arrayOf(
-                        android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-                        android.provider.MediaStore.Files.getContentUri("external")
-                    )
-                    for (queryUri in urisToQuery) {
-                        try {
+                val resolver = reactContext.contentResolver
+                val cleanPrefix = "$targetPath/"
+                val relSubpath = if (targetPath.startsWith(storageRoot)) {
+                    targetPath.removePrefix(storageRoot).trim('/')
+                } else ""
+                val urisToQuery = arrayOf(
+                    android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                    android.provider.MediaStore.Files.getContentUri("external")
+                )
+                for (queryUri in urisToQuery) {
+                    try {
+                        @Suppress("DEPRECATION")
+                        val projection = arrayOf(
+                            android.provider.MediaStore.MediaColumns._ID,
+                            android.provider.MediaStore.MediaColumns.DISPLAY_NAME,
+                            android.provider.MediaStore.MediaColumns.SIZE,
+                            android.provider.MediaStore.MediaColumns.DATA,
+                            "relative_path"
+                        )
+                        resolver.query(queryUri, projection, null, null, null)?.use { cursor ->
+                            val idCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns._ID)
+                            val nameCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DISPLAY_NAME)
+                            val sizeCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.SIZE)
                             @Suppress("DEPRECATION")
-                            val projection = arrayOf(
-                                android.provider.MediaStore.MediaColumns._ID,
-                                android.provider.MediaStore.MediaColumns.DISPLAY_NAME,
-                                android.provider.MediaStore.MediaColumns.SIZE,
-                                android.provider.MediaStore.MediaColumns.DATA
-                            )
-                            resolver.query(queryUri, projection, null, null, null)?.use { cursor ->
-                                val idCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns._ID)
-                                val nameCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DISPLAY_NAME)
-                                val sizeCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.SIZE)
-                                @Suppress("DEPRECATION")
-                                val dataCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DATA)
+                            val dataCol = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DATA)
+                            val relCol = cursor.getColumnIndex("relative_path")
 
-                                while (cursor.moveToNext()) {
-                                    val dataPath = if (dataCol >= 0) cursor.getString(dataCol) ?: "" else ""
-                                    if (!dataPath.startsWith(cleanPrefix)) continue
-                                    val relRemainder = dataPath.removePrefix(cleanPrefix)
+                            while (cursor.moveToNext()) {
+                                val dataPath = if (dataCol >= 0) cursor.getString(dataCol) ?: "" else ""
+                                val relPath = if (relCol >= 0) (cursor.getString(relCol) ?: "").trim('/') else ""
+                                val dispName = if (nameCol >= 0) cursor.getString(nameCol) ?: "" else ""
+                                val effectiveDataPath = if (dataPath.isNotEmpty()) {
+                                    dataPath
+                                } else if (relPath.isNotEmpty() && dispName.isNotEmpty()) {
+                                    "$storageRoot/$relPath/$dispName"
+                                } else {
+                                    ""
+                                }
+                                if (!effectiveDataPath.startsWith(cleanPrefix)) {
+                                    if (!(relSubpath.isNotEmpty() && relPath == relSubpath && dispName.isNotEmpty())) {
+                                        continue
+                                    }
+                                } else {
+                                    val relRemainder = effectiveDataPath.removePrefix(cleanPrefix)
                                     val slashIdx = relRemainder.indexOf('/')
                                     if (slashIdx > 0) {
                                         val subFolderName = relRemainder.substring(0, slashIdx)
@@ -4802,30 +4820,36 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
                                         }
                                         continue
                                     }
-                                    val dispName = if (nameCol >= 0) cursor.getString(nameCol) ?: "" else ""
-                                    val fileName = dispName.ifEmpty { java.io.File(dataPath).name }
-                                    val ext = fileName.substringAfterLast('.', "").lowercase(Locale.US)
-                                    if (ext !in audioExts || seenPaths.contains(dataPath)) continue
-                                    seenPaths.add(dataPath)
-                                    val mediaId = if (idCol >= 0) cursor.getLong(idCol) else -1L
-                                    val sizeBytes = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L
-                                    val itemUri = if (mediaId >= 0L) {
-                                        android.content.ContentUris.withAppendedId(queryUri, mediaId).toString()
-                                    } else {
-                                        android.net.Uri.fromFile(java.io.File(dataPath)).toString()
-                                    }
-                                    val m = Arguments.createMap()
-                                    m.putString("name", fileName)
-                                    m.putString("path", dataPath)
-                                    m.putString("uri", itemUri)
-                                    m.putBoolean("isDirectory", false)
-                                    m.putDouble("size", sizeBytes.toDouble())
-                                    m.putString("ext", ext)
-                                    fileEntries.add(m)
                                 }
+                                val fileName = dispName.ifEmpty { java.io.File(effectiveDataPath).name }
+                                val ext = fileName.substringAfterLast('.', "").lowercase(Locale.US)
+                                val dedupKey = effectiveDataPath.lowercase(Locale.US)
+                                val nameDedupKey = "$targetPath/$fileName".lowercase(Locale.US)
+                                if (ext !in audioExts || seenPaths.contains(dedupKey) || seenPaths.contains(nameDedupKey)) continue
+                                seenPaths.add(dedupKey)
+                                seenPaths.add(nameDedupKey)
+
+                                val mediaId = if (idCol >= 0) cursor.getLong(idCol) else -1L
+                                val sizeBytes = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L
+                                val localFileObj = java.io.File(effectiveDataPath)
+                                val itemUri = if (localFileObj.exists() && localFileObj.canRead()) {
+                                    android.net.Uri.fromFile(localFileObj).toString()
+                                } else if (mediaId >= 0L) {
+                                    android.content.ContentUris.withAppendedId(queryUri, mediaId).toString()
+                                } else {
+                                    android.net.Uri.fromFile(localFileObj).toString()
+                                }
+                                val m = Arguments.createMap()
+                                m.putString("name", fileName)
+                                m.putString("path", effectiveDataPath)
+                                m.putString("uri", itemUri)
+                                m.putBoolean("isDirectory", false)
+                                m.putDouble("size", sizeBytes.toDouble())
+                                m.putString("ext", ext)
+                                fileEntries.add(m)
                             }
-                        } catch (_: Throwable) {
                         }
+                    } catch (_: Throwable) {
                     }
                 }
 
@@ -4856,6 +4880,41 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             } catch (t: Throwable) {
                 promise.reject("LOCAL_DIR_ERR", t.message ?: "Unable to read directory", t)
             }
+        }
+    }
+
+    @ReactMethod
+    fun hasAllFilesAccess(promise: Promise) {
+        try {
+            val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                android.os.Environment.isExternalStorageManager()
+            } else {
+                true
+            }
+            promise.resolve(granted)
+        } catch (_: Throwable) {
+            promise.resolve(false)
+        }
+    }
+
+    @ReactMethod
+    fun openAllFilesAccessSettings() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val uri = android.net.Uri.parse("package:${reactContext.packageName}")
+                val intent = android.content.Intent(
+                    android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    uri
+                ).apply { addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK) }
+                reactContext.startActivity(intent)
+            }
+        } catch (_: Throwable) {
+            try {
+                val fallback = android.content.Intent(
+                    android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION
+                ).apply { addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK) }
+                reactContext.startActivity(fallback)
+            } catch (_: Throwable) {}
         }
     }
 }

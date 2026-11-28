@@ -2030,6 +2030,8 @@ export const SeasonTriggerPill: React.FC<
   }
 > = ({ label, currentIndex = 0, totalCount, isOpen, chevronIcon, style, ...rest }) => {
   const dotPulse = useRef(new Animated.Value(0)).current;
+  const radarAnim = useRef(new Animated.Value(0)).current;
+  const rimPulse = useRef(new Animated.Value(0)).current;
   const sheenAnim = useRef(new Animated.Value(0)).current;
   const chevronAnim = useRef(new Animated.Value(isOpen ? 1 : 0)).current;
 
@@ -2044,59 +2046,102 @@ export const SeasonTriggerPill: React.FC<
 
   useEffect(() => {
     dotPulse.setValue(0);
+    radarAnim.setValue(0);
+    rimPulse.setValue(0);
     sheenAnim.setValue(0);
+
     const dotLoop = Animated.loop(
       Animated.sequence([
-        Animated.timing(dotPulse, { toValue: 1, duration: 1200, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
-        Animated.timing(dotPulse, { toValue: 0, duration: 1200, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+        Animated.timing(dotPulse, { toValue: 1, duration: 950, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+        Animated.timing(dotPulse, { toValue: 0, duration: 950, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+      ]),
+    );
+    const radarLoop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(radarAnim, { toValue: 1, duration: 1400, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+        Animated.timing(radarAnim, { toValue: 0, duration: 0, useNativeDriver: true }),
+      ]),
+    );
+    const rimLoop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(rimPulse, { toValue: 1, duration: 1500, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+        Animated.timing(rimPulse, { toValue: 0, duration: 1500, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
       ]),
     );
     const sheenLoop = Animated.loop(
       Animated.sequence([
-        Animated.delay(3650),
+        Animated.delay(2450),
         Animated.timing(sheenAnim, { toValue: 1, duration: 750, easing: Easing.inOut(Easing.cubic), useNativeDriver: true }),
         Animated.timing(sheenAnim, { toValue: 0, duration: 0, useNativeDriver: true }),
       ]),
     );
+
     dotLoop.start();
+    radarLoop.start();
+    rimLoop.start();
     sheenLoop.start();
     return () => {
       dotLoop.stop();
+      radarLoop.stop();
+      rimLoop.stop();
       sheenLoop.stop();
     };
-  }, [dotPulse, sheenAnim]);
+  }, [dotPulse, radarAnim, rimPulse, sheenAnim]);
 
-  const dotOpacity = dotPulse.interpolate({ inputRange: [0, 1], outputRange: [0.55, 1] });
-  const sheenX = sheenAnim.interpolate({ inputRange: [0, 1], outputRange: [-90, 220] });
+  const dotScale = dotPulse.interpolate({ inputRange: [0, 1], outputRange: [0.92, 1.15] });
+  const radarScale = radarAnim.interpolate({ inputRange: [0, 1], outputRange: [0.8, 2.3] });
+  const radarOpacity = radarAnim.interpolate({ inputRange: [0, 1], outputRange: [0.75, 0] });
+  const outerAuraOpacity = rimPulse.interpolate({ inputRange: [0, 1], outputRange: [0.28, 0.85] });
+  const goldRimOpacity = rimPulse.interpolate({ inputRange: [0, 1], outputRange: [0.5, 0.2] });
+  const sheenX = sheenAnim.interpolate({ inputRange: [0, 1], outputRange: [-90, 230] });
   const chevronRotate = chevronAnim.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '180deg'] });
   const resolvedStyle = typeof style === 'function' ? style({ pressed: false }) : style;
 
   return (
-    <TactileSpringPressable
-      {...rest}
-      activeScale={0.95}
-      glowColor="rgba(229, 9, 20, 0.72)"
-      glowBorderRadius={999}
-      style={[styles.seasonTriggerPill, resolvedStyle]}>
+    <View style={styles.seasonTriggerOuterWrap}>
       <Animated.View
         pointerEvents="none"
-        style={[styles.seasonTriggerSheen, { transform: [{ translateX: sheenX }, { rotate: '20deg' }] }]}
+        style={[styles.seasonTriggerCrimsonAura, { opacity: outerAuraOpacity }]}
       />
-      <Animated.View style={[styles.seasonTriggerDot, { opacity: dotOpacity }]} />
-      <Text style={styles.seasonTriggerLabel} numberOfLines={1}>
-        {label}
-      </Text>
-      {totalCount > 1 && (
-        <View style={styles.seasonTriggerCounter}>
-          <Text style={styles.seasonTriggerCounterText}>
-            {`${Math.max(1, currentIndex + 1)}/${totalCount}`}
-          </Text>
+      <Animated.View
+        pointerEvents="none"
+        style={[styles.seasonTriggerGoldRim, { opacity: goldRimOpacity }]}
+      />
+      <TactileSpringPressable
+        {...rest}
+        activeScale={0.95}
+        glowColor="#F5C518"
+        glowBorderRadius={999}
+        style={[styles.seasonTriggerPill, resolvedStyle]}>
+        <Animated.View
+          pointerEvents="none"
+          style={[styles.seasonTriggerSheen, { transform: [{ translateX: sheenX }, { rotate: '20deg' }] }]}
+        />
+        <View style={styles.seasonTriggerDotAnchor}>
+          <Animated.View
+            pointerEvents="none"
+            style={[
+              styles.seasonTriggerDotRadar,
+              { opacity: radarOpacity, transform: [{ scale: radarScale }] },
+            ]}
+          />
+          <Animated.View style={[styles.seasonTriggerDot, { transform: [{ scale: dotScale }] }]} />
         </View>
-      )}
-      <Animated.View style={{ transform: [{ rotate: chevronRotate }] }}>
-        {chevronIcon}
-      </Animated.View>
-    </TactileSpringPressable>
+        <Text style={styles.seasonTriggerLabel} numberOfLines={1}>
+          {label}
+        </Text>
+        {totalCount > 1 && (
+          <View style={styles.seasonTriggerCounter}>
+            <Text style={styles.seasonTriggerCounterText}>
+              {`${Math.max(1, currentIndex + 1)}/${totalCount}`}
+            </Text>
+          </View>
+        )}
+        <Animated.View style={{ transform: [{ rotate: chevronRotate }] }}>
+          {chevronIcon}
+        </Animated.View>
+      </TactileSpringPressable>
+    </View>
   );
 };
 
@@ -2770,16 +2815,39 @@ const styles = StyleSheet.create({
     width: 38,
     backgroundColor: 'rgba(255, 255, 255, 0.24)',
   },
+  seasonTriggerOuterWrap: {
+    position: 'relative',
+  },
+  seasonTriggerCrimsonAura: {
+    position: 'absolute',
+    top: -2,
+    bottom: -2,
+    left: -2,
+    right: -2,
+    borderRadius: 999,
+    borderWidth: 1.5,
+    borderColor: '#E50914',
+  },
+  seasonTriggerGoldRim: {
+    position: 'absolute',
+    top: -1,
+    bottom: -1,
+    left: -1,
+    right: -1,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#F5C518',
+  },
   seasonTriggerPill: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 7,
-    backgroundColor: '#161924',
+    backgroundColor: '#1B1118',
     paddingVertical: 7,
     paddingHorizontal: 13,
     borderRadius: 999,
     borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.12)',
+    borderColor: 'rgba(229, 9, 20, 0.65)',
     overflow: 'hidden',
     position: 'relative',
   },
@@ -2788,7 +2856,22 @@ const styles = StyleSheet.create({
     top: -16,
     bottom: -16,
     width: 34,
-    backgroundColor: 'rgba(255, 255, 255, 0.18)',
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+  },
+  seasonTriggerDotAnchor: {
+    width: 10,
+    height: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  seasonTriggerDotRadar: {
+    position: 'absolute',
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    borderWidth: 1.5,
+    borderColor: '#FF4B55',
   },
   seasonTriggerDot: {
     width: 7,
@@ -2802,15 +2885,17 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   seasonTriggerCounter: {
-    backgroundColor: 'rgba(255, 255, 255, 0.08)',
-    paddingHorizontal: 6,
+    backgroundColor: 'rgba(245, 197, 24, 0.18)',
+    borderWidth: 1,
+    borderColor: 'rgba(245, 197, 24, 0.42)',
+    paddingHorizontal: 7,
     paddingVertical: 1.5,
     borderRadius: 999,
   },
   seasonTriggerCounterText: {
-    color: '#CBD5E1',
+    color: '#F5C518',
     fontSize: 10.5,
-    fontWeight: '800',
+    fontWeight: '900',
   },
   seasonSheetBackdropWrap: {
     flex: 1,
