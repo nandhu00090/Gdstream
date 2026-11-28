@@ -37,6 +37,7 @@ const VIDEO_EXT_RE = /\.(mkv|mp4|avi|mov|webm|m4v|ts|m2ts|vob|mpg|mpeg|flv|wmv|i
 const MEDIA_EXT_STRIP_RE = /\.(mkv|mp4|avi|mov|webm|m4v|ts|m2ts|vob|mpg|mpeg|flv|wmv|zip|rar|iso)$/i;
 const EDITION_WORDS_RE = /\b(director'?s?\s*cut|extended(?:\s*cut)?|theatrical(?:\s*cut)?|uncut|unrated|remastered|special\s*edition|imax|proper|repack)\b/gi;
 const QUALITY_STRIP_RE = /\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu\s*ray|remux|web\s*dl|webdl|webrip|web|hevc|avc|x264|x265|h\s*264|h\s*265|dv|dovi|dolby\s*vision|hdr10\+?|hdr|atmos|ddp\d*|dd\+?|aac|eac3|ac3|truehd|dts(?:hd)?|multi|dual|org|fhd|tam|tamil|tel|telugu|mal|malayalam|hin|hindi|kan|kannada|eng|english)\b/gi;
+const AUXILIARY_SUBFOLDER_RE = /^(?:subs?|subtitles?|sample|extras?|featurettes?|behind[\s._-]*the[\s._-]*scenes|audio|covers?|artwork|scans?)$/i;
 
 export const extractSeasonNumberFromFolder = (name: string): number | null => {
   const norm = name.replace(/[._-]+/g, ' ').trim();
@@ -169,6 +170,55 @@ export const isVideoFileItem = (file: any): boolean => {
 export const isAmbiguousDriveFolder = (item: any): boolean =>
   Boolean(item && !item.isZipEntry && item.mimeType?.includes('folder') && !hasExplicitSeriesFolderMarker(String(item.name || '')));
 
+export const isSeriesContainerItem = (item: any, classified?: FolderClassification): boolean => {
+  if (!item || item.isZipEntry) return false;
+  if (item.mimeType?.includes('folder')) {
+    if (classified) return classified.kind === 'series';
+    return hasExplicitSeriesFolderMarker(String(item.name || ''));
+  }
+  const n = String(item.name || '');
+  if (/\.(zip|rar)$/i.test(n)) return true;
+  return false;
+};
+
+const qualityScore = (name: string): number => {
+  const n = String(name || '').toUpperCase();
+  let score = 0;
+  if (/\b(2160P|4K|UHD)\b/.test(n)) score += 400;
+  else if (/\b1080P\b/.test(n)) score += 300;
+  else if (/\b720P\b/.test(n)) score += 200;
+  else if (/\b480P\b/.test(n)) score += 100;
+  if (/\bREMUX\b/.test(n)) score += 40;
+  else if (/\b(BLURAY|BLU-RAY)\b/.test(n)) score += 30;
+  else if (/\b(WEB-DL|WEBDL|WEB\s*DL)\b/.test(n)) score += 20;
+  else if (/\bWEBRIP\b/.test(n)) score += 10;
+  if (/\b(DV|DOVI|DOLBY\s*VISION)\b/.test(n)) score += 8;
+  if (/\b(HDR10\+|HDR10|HDR)\b/.test(n)) score += 4;
+  return score;
+};
+
+export const sortMovieVersionsByQuality = <T extends { name?: string }>(versions: T[]): T[] =>
+  [...versions].sort((a, b) => qualityScore(String(b?.name || '')) - qualityScore(String(a?.name || '')));
+
+const RESOLUTION_RANK: Record<string, number> = { '4K': 4, '1080p': 3, '720p': 2, '480p': 1 };
+
+export const highestResolutionLabel = (item: any, mediaInfoMap: Record<string, any> = {}): string => {
+  const candidates = Array.isArray(item?._versions) && item._versions.length > 0 ? item._versions : [item];
+  let best = '';
+  let bestRank = 0;
+  for (const v of candidates) {
+    if (!v?.name) continue;
+    const mi = v.mediaInfo ?? mediaInfoMap[v.name];
+    const res = mi?.resolution || parseMediaFilename(String(v.name), false).resolution;
+    const rank = RESOLUTION_RANK[res] || 0;
+    if (rank > bestRank) {
+      bestRank = rank;
+      best = res;
+    }
+  }
+  return best;
+};
+
 const normalizeComparisonTitle = (raw: string): string =>
   raw
     .replace(EDITION_WORDS_RE, ' ')
@@ -190,6 +240,7 @@ export const classifyFolderContents = (
   const folderInfo = parseMediaFilename(folderName, false);
   const folderBase = normalizeComparisonTitle(folderInfo.cleanTitle);
   const subFolders = subFiles.filter(f => f?.mimeType?.includes('folder'));
+  const significantSubFolders = subFolders.filter(sf => !AUXILIARY_SUBFOLDER_RE.test(String(sf.name || '').trim()));
   const rawVideos = subFiles.filter(isVideoFileItem);
   const nonSampleVideos = rawVideos.filter(f => !/\b(sample|trailer)\b/i.test(String(f.name || '')));
   const videos = nonSampleVideos.length > 0 ? nonSampleVideos : rawVideos;
@@ -263,7 +314,7 @@ export const classifyFolderContents = (
     uniqueBases.length <= 1 ||
     (Boolean(folderBase) && nonEmptyBases.every(b => b === folderBase || b.startsWith(`${folderBase} `)));
 
-  if (videos.length === 1 && subFolders.length === 0) {
+  if (videos.length === 1 && significantSubFolders.length === 0) {
     const only = parsedVideos[0].info;
     return {
       kind: 'movie',
@@ -286,11 +337,18 @@ export const classifyFolderContents = (
     };
   }
 
-  if (videos.length >= 2 && sameTitleGroup && subFolders.length === 0) {
+  if (videos.length >= 2 && sameTitleGroup && significantSubFolders.length === 0) {
     const inferredYear = folderInfo.year || uniqueYears[0] || '';
     const langMatch = parsedVideos.find(({ info }) => Boolean(info.langCode))?.info;
     const inferredLangCode = folderInfo.langCode || langMatch?.langCode || '';
     const inferredLangName = folderInfo.langName || langMatch?.langName || '';
+    const sortedVersions = sortMovieVersionsByQuality(videos).map(v => ({
+      ...v,
+      _parentPath: folderPath,
+      _folderName: folderName,
+      _folderYear: inferredYear,
+      _folderLangCode: inferredLangCode,
+    }));
     return {
       kind: 'movie',
       folderPath,
@@ -300,13 +358,7 @@ export const classifyFolderContents = (
       year: inferredYear,
       langCode: inferredLangCode,
       langName: inferredLangName,
-      versions: videos.map(v => ({
-        ...v,
-        _parentPath: folderPath,
-        _folderName: folderName,
-        _folderYear: inferredYear,
-        _folderLangCode: inferredLangCode,
-      })),
+      versions: sortedVersions,
       minSeason: 0,
       maxSeason: 0,
     };
@@ -315,7 +367,7 @@ export const classifyFolderContents = (
   // Multiple distinct titles inside a folder without season/episode markers:
   // If files carry separate release years or subfolders exist, treat as a browsable collection folder;
   // otherwise distinct episode titles (e.g. "01 - Pilot", "02 - ...") belong to a series.
-  if (subFolders.length > 0 || uniqueYears.length > 1) {
+  if (significantSubFolders.length > 0 || uniqueYears.length > 1) {
     return {
       kind: 'collection',
       folderPath,
@@ -406,4 +458,207 @@ export const selectBestTmdbMovieMatch = (
     }
   }
   return best;
+};
+
+export interface ProcessCatalogOptions {
+  rawList: any[];
+  isEpFolder: boolean;
+  searchQuery: string;
+  activeCategory: string;
+  sortBy: 'newest' | 'az';
+  folderClassifications: Record<string, FolderClassification>;
+  getFolderPath: (item: any) => string;
+  mediaInfoMap?: Record<string, any>;
+  watchlist?: Record<string, boolean>;
+}
+
+export const processCatalogItems = ({
+  rawList,
+  isEpFolder,
+  searchQuery,
+  activeCategory,
+  sortBy,
+  folderClassifications,
+  getFolderPath,
+  mediaInfoMap = {},
+  watchlist = {},
+}: ProcessCatalogOptions): any[] => {
+  const q = searchQuery.trim().toLowerCase();
+
+  const resolveEntry = (file: any) => {
+    const classified = file?.mimeType?.includes('folder') ? folderClassifications[getFolderPath(file)] : undefined;
+    const isSeriesItem = isSeriesContainerItem(file, classified);
+    const isCollectionFolder = Boolean(file?.mimeType?.includes('folder') && classified?.kind === 'collection');
+    const isMovieFolder = Boolean(
+      file?._movieFolder || (file?.mimeType?.includes('folder') && classified?.kind === 'movie' && classified.versions.length > 0),
+    );
+    const isPendingAmbiguous = Boolean(file?.mimeType?.includes('folder') && !classified && isAmbiguousDriveFolder(file));
+
+    if (isMovieFolder && classified && classified.versions.length > 0) {
+      const orderedVersions = sortMovieVersionsByQuality(classified.versions);
+      const primary = orderedVersions[0];
+      const primaryInfo = parseMediaFilename(String(primary.name || file.name), false);
+      const info: ParsedMediaInfo = {
+        ...primaryInfo,
+        cleanTitle: primaryInfo.cleanTitle || classified.title,
+        searchTitle: primaryInfo.searchTitle || classified.searchTitle,
+        year: primaryInfo.year || classified.year,
+        langCode: primaryInfo.langCode || classified.langCode,
+        langName: primaryInfo.langName || classified.langName,
+        isFolder: false,
+      };
+      const promotedItem = {
+        ...primary,
+        modifiedTime: primary.modifiedTime || file.modifiedTime,
+        _movieFolder: true,
+        _folderName: file.name,
+        _folderId: file.id,
+        _folderPath: classified.folderPath,
+        _folderYear: classified.year,
+        _folderLangCode: classified.langCode,
+        _folderLangName: classified.langName,
+        _versions: orderedVersions,
+        versions: orderedVersions,
+        files: orderedVersions,
+      };
+      return {
+        item: promotedItem,
+        rawName: String(file.name || ''),
+        classified,
+        isSeriesItem: false,
+        isCollectionFolder: false,
+        isMovieFolder: true,
+        isPendingAmbiguous: false,
+        info,
+        versions: orderedVersions,
+      };
+    }
+
+    const rawInfo = parseMediaFilename(String(file?.name || ''), isSeriesItem);
+    return {
+      item: file,
+      rawName: String(file?.name || ''),
+      classified,
+      isSeriesItem,
+      isCollectionFolder,
+      isMovieFolder: Boolean(file?._movieFolder),
+      isPendingAmbiguous,
+      info: rawInfo,
+      versions: Array.isArray(file?._versions) ? (file._versions as any[]) : undefined,
+    };
+  };
+
+  const resolvedEntries = rawList.map((file, originalIndex) => ({
+    ...resolveEntry(file),
+    originalIndex,
+  }));
+
+  const filtered = resolvedEntries.filter((entry) => {
+    const { item, rawName, isSeriesItem, isCollectionFolder, isPendingAmbiguous, info, versions } = entry;
+    const realMi = item.mediaInfo ?? mediaInfoMap[item.name];
+
+    if (q) {
+      const titleLower = info.cleanTitle.toLowerCase();
+      const titleWords = titleLower.split(/\s+/);
+      const queryWords = q.split(/\s+/).filter(Boolean);
+      const folderTitleLower = rawName.toLowerCase();
+      const versionMatch = Boolean(versions?.some((v: any) => String(v?.name || '').toLowerCase().includes(q)));
+      const matchesSearch =
+        titleLower.includes(q) ||
+        folderTitleLower.includes(q) ||
+        queryWords.every(qw => titleWords.some(tw => tw.startsWith(qw))) ||
+        info.year.toLowerCase().startsWith(q) ||
+        info.langName.toLowerCase().includes(q) ||
+        info.seasonEpisode.toLowerCase().includes(q) ||
+        versionMatch;
+      if (!matchesSearch) return false;
+    }
+
+    switch (activeCategory) {
+      case 'movies':
+        return !isSeriesItem && !isCollectionFolder && !isPendingAmbiguous && !info.seasonEpisode;
+      case 'series':
+        return isSeriesItem || !!info.seasonEpisode;
+      case '4k':
+        return (realMi?.resolution || info.resolution) === '4K' ||
+          Boolean(versions?.some((v: any) => (mediaInfoMap[v.name]?.resolution || parseMediaFilename(String(v.name || ''), false).resolution) === '4K'));
+      case 'dv':
+        return (realMi ? realMi.hasDV : info.hasDV) ||
+          Boolean(versions?.some((v: any) => (mediaInfoMap[v.name] ? mediaInfoMap[v.name].hasDV : parseMediaFilename(String(v.name || ''), false).hasDV)));
+      case 'watchlist':
+        return Boolean(
+          watchlist[item.name] ||
+          (item._folderName && watchlist[item._folderName]) ||
+          versions?.some((v: any) => watchlist[v.name]),
+        );
+      default:
+        return true;
+    }
+  });
+
+  const indexed = filtered.map((entry) => ({
+    ...entry,
+    modMs: entry.item?.modifiedTime ? Date.parse(entry.item.modifiedTime) || 0 : 0,
+  }));
+
+  if (isEpFolder && sortBy === 'newest') {
+    indexed.sort((a, b) => {
+      if (a.info.episodeNum !== b.info.episodeNum) return a.info.episodeNum - b.info.episodeNum;
+      return String(a.item?.name || '').localeCompare(String(b.item?.name || ''));
+    });
+    return indexed.map(x => x.item);
+  }
+
+  if (sortBy === 'az') {
+    indexed.sort((a, b) => a.info.cleanTitle.localeCompare(b.info.cleanTitle));
+  } else {
+    indexed.sort((a, b) => {
+      if (a.modMs > 0 && b.modMs > 0 && a.modMs !== b.modMs) {
+        return b.modMs - a.modMs;
+      }
+      return b.originalIndex - a.originalIndex;
+    });
+  }
+
+  const groupedMap = new Map<string, any[]>();
+  const mergedOrder: any[] = [];
+  for (const entry of indexed) {
+    const { item, info, isSeriesItem, isCollectionFolder, isMovieFolder, versions } = entry;
+    if (isSeriesItem || isCollectionFolder || info.seasonEpisode || info.episodeNum > 0) {
+      mergedOrder.push(item);
+    } else {
+      const key = `${info.cleanTitle.toLowerCase()}|${info.year}`;
+      const addedVersions = versions && versions.length > 0 ? versions : [item];
+      if (!groupedMap.has(key)) {
+        groupedMap.set(key, [...addedVersions]);
+        mergedOrder.push(item);
+      } else {
+        const list = groupedMap.get(key)!;
+        for (const v of addedVersions) {
+          if (!list.some(existing => existing.name === v.name && existing._parentPath === v._parentPath)) {
+            list.push(v);
+          }
+        }
+        if (isMovieFolder && !mergedOrder.some(m => `${parseMediaFilename(String(m.name || ''), false).cleanTitle.toLowerCase()}|${parseMediaFilename(String(m.name || ''), false).year}` === key && m._movieFolder)) {
+          const idx = mergedOrder.findIndex(m => `${parseMediaFilename(String(m.name || ''), false).cleanTitle.toLowerCase()}|${parseMediaFilename(String(m.name || ''), false).year}` === key);
+          if (idx >= 0) mergedOrder[idx] = { ...item, _versions: list, versions: list, files: list };
+        }
+      }
+    }
+  }
+
+  return mergedOrder.map(item => {
+    const isSeriesItem = isSeriesContainerItem(item);
+    const info = parseMediaFilename(String(item?.name || ''), isSeriesItem);
+    const isCollection = Boolean(item?.mimeType?.includes('folder') && !isSeriesItem);
+    if (isSeriesItem || isCollection || info.seasonEpisode || info.episodeNum > 0) return item;
+    const effectiveYear = info.year || item._folderYear || '';
+    const key = `${info.cleanTitle.toLowerCase()}|${effectiveYear}`;
+    const rawVers = groupedMap.get(key) || item._versions || [item];
+    const vers = sortMovieVersionsByQuality(rawVers);
+    if (item._movieFolder) {
+      return { ...item, _versions: vers, versions: vers, files: vers };
+    }
+    return vers.length > 1 ? { ...item, _versions: vers } : item;
+  });
 };

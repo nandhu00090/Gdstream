@@ -20,7 +20,10 @@ import {
   extractSeasonNumberFromFolder,
   hasExplicitSeriesFolderMarker,
   isAmbiguousDriveFolder,
+  isSeriesContainerItem,
+  highestResolutionLabel,
   classifyFolderContents,
+  processCatalogItems,
   metadataCacheKey,
   legacyMetadataCacheKeys,
   isStaleMovieCache,
@@ -161,17 +164,6 @@ const getVersionTag = (name: string): string => {
   if (/\b(DV|DOVI|DOLBY\s*VISION)\b/.test(n)) tags.push('DV');
   if (/\b(HDR10\+|HDR10|HDR)\b/.test(n)) tags.push('HDR');
   return tags.join(' • ');
-};
-
-const isSeriesContainerItem = (item: any, classified?: FolderClassification): boolean => {
-  if (!item || item.isZipEntry) return false;
-  if (item.mimeType?.includes('folder')) {
-    if (classified) return classified.kind === 'series';
-    return hasExplicitSeriesFolderMarker(String(item.name || ''));
-  }
-  const n = String(item.name || '');
-  if (/\.(zip|rar)$/i.test(n)) return true;
-  return false;
 };
 
 const ActiveLayerContext = createContext<string>('home');
@@ -431,6 +423,8 @@ const App = () => {
   const [showSeriesRatingTick, setShowSeriesRatingTick] = React.useState(false);
   const [seriesSeasonRangeMap, setSeriesSeasonRangeMap] = React.useState<Record<string, { min: number; max: number }>>({});
   const [folderClassifications, setFolderClassifications] = React.useState<Record<string, FolderClassification>>({});
+  const folderClassificationsRef = React.useRef<Record<string, FolderClassification>>({});
+  folderClassificationsRef.current = folderClassifications;
   const folderClassifyingRef = React.useRef<Set<string>>(new Set());
 
   const folderPathForItem = useCallback((item: any): string => {
@@ -1435,71 +1429,128 @@ const App = () => {
     if (rawList.length === 0 || !vaultReady || playMode !== null) return;
 
     const pendingFolders = rawList.filter((f: any) => {
-      if (!f?.mimeType?.includes('folder') || !f?.name) return false;
+      if (!isAmbiguousDriveFolder(f) || !f?.name) return false;
       const subPath = folderPathForItem(f);
-      return !folderClassifications[subPath] && !folderClassifyingRef.current.has(subPath);
+      return !folderClassificationsRef.current[subPath] && !folderClassifyingRef.current.has(subPath);
     });
     if (pendingFolders.length === 0) return;
 
     let cancelled = false;
+    const qLower = searchQuery.trim().toLowerCase();
+
+    const applyClassified = (item: any, subPath: string, classified: FolderClassification, batch: Record<string, FolderClassification>) => {
+      if (classified.kind === 'movie') {
+        const movieInfo = parseMediaFilename(String(item.name), false);
+        const enrichedInfo: ParsedMediaInfo = {
+          ...movieInfo,
+          year: movieInfo.year || classified.year,
+          langCode: movieInfo.langCode || classified.langCode,
+          langName: movieInfo.langName || classified.langName,
+        };
+        const staleKeys = [
+          ...legacyMetadataCacheKeys(movieInfo),
+          ...legacyMetadataCacheKeys(enrichedInfo),
+        ];
+        void AsyncStorage.removeMany(Array.from(new Set(staleKeys))).catch(() => {});
+        fetchedKeysRef.current.delete(String(item.name));
+        setMetadataMap(prev => {
+          if (prev[item.name]?.mediaType !== 'tv') return prev;
+          const next = { ...prev };
+          delete next[item.name];
+          return next;
+        });
+      } else if (classified.kind === 'series') {
+        const clean = String(classified.searchTitle || classified.title || '').trim().toUpperCase();
+        if (clean && classified.minSeason > 0) {
+          setSeriesSeasonRangeMap(prev => ({
+            ...prev,
+            [clean]: prev[clean]
+              ? { min: Math.min(prev[clean].min, classified.minSeason), max: Math.max(prev[clean].max, classified.maxSeason) }
+              : { min: classified.minSeason, max: classified.maxSeason },
+          }));
+        }
+      }
+      folderClassificationsRef.current = { ...folderClassificationsRef.current, [subPath]: classified };
+      batch[subPath] = classified;
+    };
+
     const inspectFolders = async () => {
+      const toFetch: any[] = [];
+      const cachedBatch: Record<string, FolderClassification> = {};
+
+      try {
+        const dirKeys = pendingFolders.map(f => directoryKey(folderPathForItem(f)));
+        const cachedPairs = await readStoragePairs(dirKeys);
+        if (cancelled) return;
+        for (let i = 0; i < pendingFolders.length; i++) {
+          const item = pendingFolders[i];
+          const subPath = folderPathForItem(item);
+          const raw = cachedPairs[i]?.[1];
+          if (raw) {
+            try {
+              const parsed = JSON.parse(raw);
+              if (Array.isArray(parsed?.files)) {
+                const classified = classifyFolderContents(String(item.name), parsed.files, subPath);
+                folderClassifyingRef.current.add(subPath);
+                applyClassified(item, subPath, classified, cachedBatch);
+                continue;
+              }
+            } catch {}
+          }
+          toFetch.push(item);
+        }
+      } catch {
+        toFetch.push(...pendingFolders);
+      }
+
+      if (!cancelled && Object.keys(cachedBatch).length > 0) {
+        setFolderClassifications(prev => ({ ...prev, ...cachedBatch }));
+      }
+      if (cancelled || toFetch.length === 0) return;
+
+      toFetch.sort((a, b) => {
+        if (qLower) {
+          const aMatch = String(a?.name || '').toLowerCase().includes(qLower) ? 1 : 0;
+          const bMatch = String(b?.name || '').toLowerCase().includes(qLower) ? 1 : 0;
+          if (aMatch !== bMatch) return bMatch - aMatch;
+        }
+        const ma = a?.modifiedTime ? Date.parse(a.modifiedTime) || 0 : 0;
+        const mb = b?.modifiedTime ? Date.parse(b.modifiedTime) || 0 : 0;
+        return mb - ma;
+      });
+
       let cursor = 0;
       const CONCURRENCY = 3;
       const runWorker = async () => {
-        while (!cancelled && cursor < pendingFolders.length) {
-          const item = pendingFolders[cursor++];
+        while (!cancelled && cursor < toFetch.length) {
+          const item = toFetch[cursor++];
           if (!item?.name) continue;
           const subPath = folderPathForItem(item);
-          if (folderClassifyingRef.current.has(subPath)) continue;
+          if (folderClassificationsRef.current[subPath] || folderClassifyingRef.current.has(subPath)) continue;
           folderClassifyingRef.current.add(subPath);
+          let committed = false;
           try {
             const subFiles = await requestRawDirectory(subPath);
             if (cancelled || !Array.isArray(subFiles)) continue;
             const classified = classifyFolderContents(String(item.name), subFiles, subPath);
-            if (classified.kind === 'movie') {
-              const movieInfo = parseMediaFilename(String(item.name), false);
-              const enrichedInfo: ParsedMediaInfo = {
-                ...movieInfo,
-                year: movieInfo.year || classified.year,
-                langCode: movieInfo.langCode || classified.langCode,
-                langName: movieInfo.langName || classified.langName,
-              };
-              const staleKeys = [
-                ...legacyMetadataCacheKeys(movieInfo),
-                ...legacyMetadataCacheKeys(enrichedInfo),
-              ];
-              void AsyncStorage.removeMany(Array.from(new Set(staleKeys))).catch(() => {});
-              fetchedKeysRef.current.delete(String(item.name));
-              setMetadataMap(prev => {
-                if (prev[item.name]?.mediaType !== 'tv') return prev;
-                const next = { ...prev };
-                delete next[item.name];
-                return next;
-              });
-            } else if (classified.kind === 'series') {
-              const clean = String(classified.searchTitle || classified.title || '').trim().toUpperCase();
-              if (clean && classified.minSeason > 0) {
-                setSeriesSeasonRangeMap(prev => ({
-                  ...prev,
-                  [clean]: prev[clean]
-                    ? { min: Math.min(prev[clean].min, classified.minSeason), max: Math.max(prev[clean].max, classified.maxSeason) }
-                    : { min: classified.minSeason, max: classified.maxSeason },
-                }));
-              }
-            }
+            const singleBatch: Record<string, FolderClassification> = {};
+            applyClassified(item, subPath, classified, singleBatch);
+            committed = true;
             if (!cancelled) {
-              setFolderClassifications(prev => ({ ...prev, [subPath]: classified }));
+              setFolderClassifications(prev => ({ ...prev, ...singleBatch }));
             }
           } catch {
-            folderClassifyingRef.current.delete(subPath);
+            // Allow retry on transient directory failure.
+          } finally {
+            if (!committed) folderClassifyingRef.current.delete(subPath);
           }
         }
       };
-      await Promise.all(Array.from({ length: Math.min(CONCURRENCY, pendingFolders.length) }, () => runWorker()));
+      await Promise.all(Array.from({ length: Math.min(CONCURRENCY, toFetch.length) }, () => runWorker()));
     };
     void inspectFolders();
     return () => { cancelled = true; };
-  }, [activeRawFiles, vaultReady, playMode, folderClassifications, folderPathForItem]);
+  }, [activeRawFiles, vaultReady, playMode, folderPathForItem, searchQuery]);
 
   useEffect(() => {
     if (!activeRawFiles.length || !vaultReady || selectedFile || playMode !== null) return;
@@ -1700,115 +1751,16 @@ const App = () => {
   }, [isInsideFolder, folderFiles, seriesParentTitle, activeSeason, vaultReady, playMode]);
 
   const buildProcessedList = useCallback((rawList: any[], isEpFolder: boolean) => {
-    const q = searchQuery.trim().toLowerCase();
-    const resolveEntry = (file: any) => {
-      const classified = file?.mimeType?.includes('folder') ? folderClassifications[folderPathForItem(file)] : undefined;
-      const isSeriesItem = isSeriesContainerItem(file, classified);
-      const isCollectionFolder = Boolean(file?.mimeType?.includes('folder') && classified?.kind === 'collection');
-      const isMovieFolder = Boolean(file?.mimeType?.includes('folder') && classified?.kind === 'movie');
-      const isPendingAmbiguous = Boolean(file?.mimeType?.includes('folder') && !classified && isAmbiguousDriveFolder(file));
-      const rawInfo = parseMediaFilename(file.name, isSeriesItem);
-      const info: ParsedMediaInfo = isMovieFolder && classified
-        ? {
-            ...rawInfo,
-            year: rawInfo.year || classified.year,
-            langCode: rawInfo.langCode || classified.langCode,
-            langName: rawInfo.langName || classified.langName,
-          }
-        : rawInfo;
-      return { classified, isSeriesItem, isCollectionFolder, isMovieFolder, isPendingAmbiguous, info };
-    };
-
-    const filtered = rawList.filter((file) => {
-      const { classified, isSeriesItem, isCollectionFolder, isMovieFolder, isPendingAmbiguous, info } = resolveEntry(file);
-      const realMi: RealMediaInfo | undefined = file.mediaInfo ?? mediaInfoMap[file.name];
-      const versions = isMovieFolder ? classified?.versions : undefined;
-
-      if (q) {
-        const titleLower = info.cleanTitle.toLowerCase();
-        const titleWords = titleLower.split(/\s+/);
-        const queryWords = q.split(/\s+/).filter(Boolean);
-        const matchesSearch =
-          titleLower.includes(q) ||
-          queryWords.every(qw => titleWords.some(tw => tw.startsWith(qw))) ||
-          info.year.toLowerCase().startsWith(q) ||
-          info.seasonEpisode.toLowerCase().includes(q);
-        if (!matchesSearch) return false;
-      }
-      switch (activeCategory) {
-        case 'movies': return !isSeriesItem && !isCollectionFolder && !isPendingAmbiguous && !info.seasonEpisode;
-        case 'series': return isSeriesItem || !!info.seasonEpisode;
-        case '4k':
-          return (realMi?.resolution || info.resolution) === '4K' ||
-            Boolean(versions?.some(v => (mediaInfoMap[v.name]?.resolution || parseMediaFilename(v.name, false).resolution) === '4K'));
-        case 'dv':
-          return (realMi ? realMi.hasDV : info.hasDV) ||
-            Boolean(versions?.some(v => (mediaInfoMap[v.name] ? mediaInfoMap[v.name].hasDV : parseMediaFilename(v.name, false).hasDV)));
-        case 'watchlist': return !!watchlist[file.name];
-        default: return true;
-      }
-    });
-
-    const indexed = filtered.map((item, originalIndex) => {
-      const resolved = resolveEntry(item);
-      return {
-        item,
-        originalIndex,
-        ...resolved,
-        modMs: item.modifiedTime ? Date.parse(item.modifiedTime) || 0 : 0,
-      };
-    });
-
-    if (isEpFolder && sortBy === 'newest') {
-      indexed.sort((a, b) => {
-        if (a.info.episodeNum !== b.info.episodeNum) return a.info.episodeNum - b.info.episodeNum;
-        return a.item.name.localeCompare(b.item.name);
-      });
-      return indexed.map(x => x.item);
-    }
-
-    if (sortBy === 'az') {
-      indexed.sort((a, b) => a.info.cleanTitle.localeCompare(b.info.cleanTitle));
-    } else {
-      indexed.sort((a, b) => {
-        if (a.modMs > 0 && b.modMs > 0 && a.modMs !== b.modMs) {
-          return b.modMs - a.modMs;
-        }
-        return b.originalIndex - a.originalIndex;
-      });
-    }
-
-    const groupedMap = new Map<string, any[]>();
-    const mergedOrder: any[] = [];
-    for (const entry of indexed) {
-      const { item, info, classified, isSeriesItem, isCollectionFolder, isMovieFolder } = entry;
-      if (isSeriesItem || isCollectionFolder || info.seasonEpisode || info.episodeNum > 0) {
-        mergedOrder.push(item);
-      } else if (isMovieFolder && classified && classified.versions.length > 0) {
-        const key = `${info.cleanTitle.toLowerCase()}|${info.year}`;
-        const existing = groupedMap.get(key) || [];
-        groupedMap.set(key, [...existing, ...classified.versions]);
-        if (existing.length === 0) {
-          mergedOrder.push({ ...item, _movieFolder: true, _versions: classified.versions });
-        }
-      } else {
-        const key = `${info.cleanTitle.toLowerCase()}|${info.year}`;
-        if (!groupedMap.has(key)) {
-          groupedMap.set(key, [item]);
-          mergedOrder.push(item);
-        } else {
-          groupedMap.get(key)!.push(item);
-        }
-      }
-    }
-
-    return mergedOrder.map(item => {
-      const { isSeriesItem, isCollectionFolder, isMovieFolder, info } = resolveEntry(item);
-      if (isSeriesItem || isCollectionFolder || info.seasonEpisode || info.episodeNum > 0) return item;
-      const key = `${info.cleanTitle.toLowerCase()}|${info.year}`;
-      const vers = groupedMap.get(key) || item._versions || [item];
-      if (isMovieFolder) return { ...item, _movieFolder: true, _versions: vers };
-      return vers.length > 1 ? { ...item, _versions: vers } : item;
+    return processCatalogItems({
+      rawList,
+      isEpFolder,
+      searchQuery,
+      activeCategory,
+      sortBy,
+      folderClassifications,
+      getFolderPath: folderPathForItem,
+      mediaInfoMap,
+      watchlist,
     });
   }, [searchQuery, activeCategory, sortBy, mediaInfoMap, watchlist, folderClassifications, folderPathForItem]);
 
@@ -2491,6 +2443,9 @@ const App = () => {
       setRefreshing(true);
       for (const k of Array.from(folderClassifyingRef.current)) {
         if (k.startsWith(path)) folderClassifyingRef.current.delete(k);
+      }
+      for (const k of Object.keys(folderClassificationsRef.current)) {
+        if (k.startsWith(path)) delete folderClassificationsRef.current[k];
       }
       setFolderClassifications(prev => {
         const next: Record<string, FolderClassification> = {};
@@ -4182,23 +4137,30 @@ const App = () => {
     const isPhysicalFolder = Boolean(item?.mimeType?.includes('folder'));
     const isMovieFolder = Boolean(item?._movieFolder || classified?.kind === 'movie');
     const rawInfo = parseMediaFilename(item.name, isFolder);
-    const info: ParsedMediaInfo = isMovieFolder && classified
+    const effectiveBadges = rawInfo.badges.length > 0
+      ? rawInfo.badges
+      : (item._folderLangName ? [item._folderLangName] : (classified?.langName ? [classified.langName] : []));
+    const info: ParsedMediaInfo = isMovieFolder
       ? {
           ...rawInfo,
-          year: rawInfo.year || classified.year,
-          langCode: rawInfo.langCode || classified.langCode,
-          langName: rawInfo.langName || classified.langName,
+          year: rawInfo.year || item._folderYear || classified?.year || '',
+          langCode: rawInfo.langCode || item._folderLangCode || classified?.langCode || '',
+          langName: rawInfo.langName || item._folderLangName || classified?.langName || '',
+          badges: effectiveBadges,
         }
       : rawInfo;
-    const meta = metadataMap[item.name];
+    const meta = metadataMap[item.name] || (item._folderName ? metadataMap[item._folderName] : undefined);
     const realMi: RealMediaInfo | undefined = item.mediaInfo ?? mediaInfoMap[item.name];
     const activeVerForCard = item._versions?.find((v: any) => (savedTimesMap[v.name] || 0) > 3) || item._versions?.[0] || item;
     const savedSec = savedTimesMap[activeVerForCard.name] || 0;
     const totalDur = savedDurationsMap[activeVerForCard.name] || mediaInfoMap[activeVerForCard.name]?.durationSec || 0;
     const resumePct = totalDur > 0 && savedSec > 0 ? Math.min(98, Math.max(5, (savedSec / totalDur) * 100)) : 45;
-    const verInfo = activeVerForCard !== item ? parseMediaFilename(activeVerForCard.name, false) : null;
-    const cardRes = realMi?.resolution || info.resolution || mediaInfoMap[activeVerForCard.name]?.resolution || verInfo?.resolution || '';
-    const isFav = !!watchlist[item.name];
+    const cardRes = highestResolutionLabel(item, mediaInfoMap) || realMi?.resolution || info.resolution || '';
+    const isFav = Boolean(
+      watchlist[item.name] ||
+      (item._folderName && watchlist[item._folderName]) ||
+      item._versions?.some((v: any) => watchlist[v.name]),
+    );
     const versionCount = item._versions?.length || 1;
     const showSeriesBadge = isFolder || (!isInsideFolder && !!info.seasonEpisode);
 

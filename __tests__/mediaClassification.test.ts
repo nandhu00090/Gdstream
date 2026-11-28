@@ -2,11 +2,13 @@ import {
   classifyFolderContents,
   hasExplicitSeriesFolderMarker,
   hasEpisodeMarker,
+  highestResolutionLabel,
   isAmbiguousDriveFolder,
   isStaleMovieCache,
   legacyMetadataCacheKeys,
   metadataCacheKey,
   parseMediaFilename,
+  processCatalogItems,
   selectBestTmdbMovieMatch,
 } from '../mediaClassification';
 
@@ -156,5 +158,103 @@ describe('TMDB movie matching and cache invalidation', () => {
     expect(isStaleMovieCache({ title: '96', year: '2025', mediaType: 'tv' }, movieInfo)).toBe(true);
     expect(isStaleMovieCache({ title: '96', year: '2025' }, movieInfo)).toBe(true);
     expect(isStaleMovieCache({ title: '96', year: '2018', mediaType: 'movie' }, movieInfo)).toBe(false);
+  });
+});
+
+describe('processCatalogItems root and search flattening', () => {
+  test('flattens 96 - 2018 multi-version movie folder into a single 2 VERSIONS card on homepage and search with no folder card duplicate', () => {
+    const folderPath = '/0:/96%20-%202018/';
+    const child720 = { id: 'f2', name: '96 (2018) Tamil 720p BluRay x265.mkv', mimeType: 'video/x-matroska', modifiedTime: '2026-10-01T10:00:00Z' };
+    const child1080 = { id: 'f1', name: '96 (2018) Tamil 1080p WEB-DL x264.mkv', mimeType: 'video/x-matroska', modifiedTime: '2026-10-01T10:05:00Z' };
+    const movieClassified = classifyFolderContents('96 - 2018', [child720, child1080], folderPath);
+
+    const seriesClassified = classifyFolderContents(
+      'Dark (2017)',
+      [
+        { id: 's1', name: 'Dark.S01E01.1080p.mkv', mimeType: 'video/x-matroska' },
+        { id: 's2', name: 'Dark.S01E02.1080p.mkv', mimeType: 'video/x-matroska' },
+      ],
+      '/0:/Dark%20(2017)/',
+    );
+    const collectionClassified = classifyFolderContents(
+      'Tamil Movies',
+      [
+        { id: 'm1', name: 'Leo (2023).mkv', mimeType: 'video/x-matroska' },
+        { id: 'm2', name: 'Vikram (2022).mkv', mimeType: 'video/x-matroska' },
+      ],
+      '/0:/Tamil%20Movies/',
+    );
+
+    const rawHome = [
+      { id: 'dir_96', name: '96 - 2018', mimeType: 'application/vnd.google-apps.folder', modifiedTime: '2026-10-01T10:05:00Z' },
+      { id: 'dir_dark', name: 'Dark (2017)', mimeType: 'application/vnd.google-apps.folder', modifiedTime: '2026-09-01T10:00:00Z' },
+      { id: 'dir_tamil', name: 'Tamil Movies', mimeType: 'application/vnd.google-apps.folder', modifiedTime: '2026-08-01T10:00:00Z' },
+    ];
+    const folderClassifications = {
+      [folderPath]: movieClassified,
+      '/0:/Dark%20(2017)/': seriesClassified,
+      '/0:/Tamil%20Movies/': collectionClassified,
+    };
+    const getFolderPath = (item: any) => `/0:/${encodeURIComponent(item.name)}/`;
+
+    const homeCards = processCatalogItems({
+      rawList: rawHome,
+      isEpFolder: false,
+      searchQuery: '',
+      activeCategory: 'all',
+      sortBy: 'newest',
+      folderClassifications,
+      getFolderPath,
+    });
+    expect(homeCards).toHaveLength(3);
+    const flattened96 = homeCards[0];
+    expect(flattened96._movieFolder).toBe(true);
+    expect(flattened96._folderName).toBe('96 - 2018');
+    expect(flattened96.mimeType).toBe('video/x-matroska');
+    expect(flattened96.name).toBe(child1080.name);
+    expect(flattened96._versions).toHaveLength(2);
+    expect(flattened96.versions).toHaveLength(2);
+    expect(flattened96._versions[0]._parentPath).toBe(folderPath);
+    expect(flattened96._versions[1]._parentPath).toBe(folderPath);
+    expect(highestResolutionLabel(flattened96)).toBe('1080p');
+    expect(parseMediaFilename(flattened96.name, false).badges).toContain('Tamil');
+    expect(homeCards.filter(c => c._folderName === '96 - 2018' || c.name === '96 - 2018')).toHaveLength(1);
+
+    // Search results for "96" return exactly 1 flattened movie card (no duplicate folder card).
+    const searchCards = processCatalogItems({
+      rawList: rawHome,
+      isEpFolder: false,
+      searchQuery: '96',
+      activeCategory: 'all',
+      sortBy: 'newest',
+      folderClassifications,
+      getFolderPath,
+    });
+    expect(searchCards).toHaveLength(1);
+    expect(searchCards[0]._movieFolder).toBe(true);
+    expect(searchCards[0]._versions).toHaveLength(2);
+
+    // Category filters: appears in Movies, excluded from Series.
+    const movieTab = processCatalogItems({
+      rawList: rawHome,
+      isEpFolder: false,
+      searchQuery: '',
+      activeCategory: 'movies',
+      sortBy: 'newest',
+      folderClassifications,
+      getFolderPath,
+    });
+    expect(movieTab.map(c => c._folderName)).toEqual(['96 - 2018']);
+
+    const seriesTab = processCatalogItems({
+      rawList: rawHome,
+      isEpFolder: false,
+      searchQuery: '',
+      activeCategory: 'series',
+      sortBy: 'newest',
+      folderClassifications,
+      getFolderPath,
+    });
+    expect(seriesTab.map(c => c.name)).toEqual(['Dark (2017)']);
   });
 });
