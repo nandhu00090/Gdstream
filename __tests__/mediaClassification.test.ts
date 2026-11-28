@@ -1,15 +1,18 @@
 import {
+  buildTvSearchQueries,
   classifyFolderContents,
   hasExplicitSeriesFolderMarker,
   hasEpisodeMarker,
   highestResolutionLabel,
   isAmbiguousDriveFolder,
   isStaleMovieCache,
+  isUsableCachedMetadata,
   legacyMetadataCacheKeys,
   metadataCacheKey,
   parseMediaFilename,
   processCatalogItems,
   selectBestTmdbMovieMatch,
+  selectBestTmdbTvMatch,
 } from '../mediaClassification';
 
 describe('parseMediaFilename title and year extraction', () => {
@@ -29,6 +32,25 @@ describe('parseMediaFilename title and year extraction', () => {
     const titleWithYear = parseMediaFilename('1917 - 2019', false);
     expect(titleWithYear.cleanTitle).toBe('1917');
     expect(titleWithYear.year).toBe('2019');
+    expect(titleWithYear.yearExplicit).toBe(true);
+  });
+
+  test('parses multi-year movie filenames like 2012.2009.1080p as title 2012 and year 2009 with yearExplicit', () => {
+    const movie = parseMediaFilename('2012.2009.1080p.JIO.WEB-DL.DDP5.1.H264.mkv', false);
+    expect(movie.cleanTitle).toBe('2012');
+    expect(movie.searchTitle).toBe('2012');
+    expect(movie.year).toBe('2009');
+    expect(movie.yearExplicit).toBe(true);
+    expect(movie.resolution).toBe('1080p');
+
+    const unyeared = parseMediaFilename('The Hunting Party', true);
+    expect(unyeared.year).toBe('');
+    expect(unyeared.yearExplicit).toBe(false);
+
+    const modifiedFallback = parseMediaFilename('C B Strike: Troubled Blood', true, '2025-04-12T10:00:00Z');
+    expect(modifiedFallback.cleanTitle).toBe('C B Strike: Troubled Blood');
+    expect(modifiedFallback.year).toBe('2025');
+    expect(modifiedFallback.yearExplicit).toBe(false);
   });
 
   test('detects episode markers across SxxExx, E01, Ep 1, Episode 1, Season 1, and 1x01', () => {
@@ -158,6 +180,23 @@ describe('TMDB movie matching and cache invalidation', () => {
     expect(isStaleMovieCache({ title: '96', year: '2025', mediaType: 'tv' }, movieInfo)).toBe(true);
     expect(isStaleMovieCache({ title: '96', year: '2025' }, movieInfo)).toBe(true);
     expect(isStaleMovieCache({ title: '96', year: '2018', mediaType: 'movie' }, movieInfo)).toBe(false);
+    expect(isUsableCachedMetadata({ title: 'Blue Lock', mediaType: 'tv' }, parseMediaFilename('Blue Lock', true))).toBe(false);
+    expect(isUsableCachedMetadata({ title: '2012 2009', poster: 'https://img/p.jpg' }, parseMediaFilename('2012.2009.1080p.mkv', false))).toBe(false);
+    expect(isUsableCachedMetadata({ title: '2012', poster: 'https://img/2012.jpg', year: '2009', mediaType: 'movie' }, parseMediaFilename('2012.2009.1080p.mkv', false))).toBe(true);
+  });
+
+  test('builds TV search fallbacks for colon/initials titles and ignores non-explicit modifiedTime years', () => {
+    const queries = buildTvSearchQueries('C B Strike: Troubled Blood');
+    expect(queries[0]).toBe('C B Strike: Troubled Blood');
+    expect(queries).toContain('C B Strike');
+    expect(queries).toContain('C.B. Strike');
+
+    const tvResults = [
+      { id: 73493, name: 'C.B. Strike', first_air_date: '2017-08-27', poster_path: '/strike.jpg', popularity: 35 },
+    ];
+    // Even if Drive modifiedTime fallback produced 2025 (yearExplicit = false), 2017 show still matches cleanly.
+    const match = selectBestTmdbTvMatch(tvResults, 'C B Strike: Troubled Blood', '2025', false);
+    expect(match?.id).toBe(73493);
   });
 });
 

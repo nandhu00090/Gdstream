@@ -27,7 +27,10 @@ import {
   metadataCacheKey,
   legacyMetadataCacheKeys,
   isStaleMovieCache,
+  isUsableCachedMetadata,
+  buildTvSearchQueries,
   selectBestTmdbMovieMatch,
+  selectBestTmdbTvMatch,
 } from './mediaClassification';
 
 import { linkedWatchKeys, watchAliases } from './watchHistory';
@@ -527,12 +530,17 @@ const App = () => {
         if (itemObj?.mimeType?.includes('folder') && itemObj?.name) {
           const baseFolderPath = currentPath.startsWith('/0:/') ? currentPath : '/0:/';
           const subPath = `${baseFolderPath}${encodeLibraryName(itemObj.name)}/`;
-          const subFiles = await requestRawDirectory(subPath);
-          if (Array.isArray(subFiles) && subFiles.length > 0) {
-            for (const sf of subFiles) {
-              const subRange = extractSeasonRangeFromName(String(sf?.name || ''));
-              if (subRange) {
-                foundSeasons.push(subRange.min, subRange.max);
+          const already = folderClassificationsRef.current[subPath];
+          if (already && already.kind === 'series' && already.minSeason > 0) {
+            foundSeasons.push(already.minSeason, already.maxSeason);
+          } else {
+            const subFiles = await requestRawDirectory(subPath);
+            if (Array.isArray(subFiles) && subFiles.length > 0) {
+              for (const sf of subFiles) {
+                const subRange = extractSeasonRangeFromName(String(sf?.name || ''));
+                if (subRange) {
+                  foundSeasons.push(subRange.min, subRange.max);
+                }
               }
             }
           }
@@ -541,14 +549,16 @@ const App = () => {
 
       // Fetch TMDb rating only (never override owned seasons with total released TMDb seasons)
       try {
-        const tmdbKey = vaultRef.current?.tmdbKey || '';
-        if (tmdbKey && !IS_TV) {
-          const sUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(searchName)}`;
-          const sData = await catalogJson(sUrl);
-          const sList: any[] = sData?.results || [];
-          const first = sList.find((r: any) => String(r?.name || r?.original_name || '').toLowerCase().trim() === searchName.toLowerCase()) || sList[0];
-          const voteAvg = Number(first?.vote_average || 0);
-          if (voteAvg > 0) tmdbRating = voteAvg.toFixed(1);
+        const existingRating = metadataMap[itemObj?.name]?.rating;
+        if (existingRating) {
+          tmdbRating = existingRating;
+        } else {
+          const tmdbKey = vaultRef.current?.tmdbKey || '';
+          if (tmdbKey && !IS_TV) {
+            const hit = await searchTmdbTv(tmdbKey.trim(), searchName, infoObj?.year || '', Boolean(infoObj?.yearExplicit), infoObj?.langCode || '');
+            const voteAvg = Number(hit?.vote_average || 0);
+            if (voteAvg > 0) tmdbRating = voteAvg.toFixed(1);
+          }
         }
       } catch (_e) {}
 
@@ -671,10 +681,9 @@ const App = () => {
             const eNum = epMatch ? parseInt(epMatch[2], 10) : (parsed.episodeNum || 1);
             const codeStr = `S${String(sNum).padStart(2, '0')}E${String(eNum).padStart(2, '0')}`;
 
-            const tvSearchUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(searchTitle)}`;
-            const tvRes = await catalogJson(tvSearchUrl);
-            const tvHit = tvRes?.results?.[0];
+            const tvHit = await searchTmdbTv(tmdbKey.trim(), searchTitle, parsed.year, parsed.yearExplicit, parsed.langCode);
             const tvId = tvHit?.id;
+            if (tvHit) propagateShowMetadataToParent(tvHit, searchTitle);
 
             if (tvId && !cancelled) {
               try {
@@ -1285,6 +1294,87 @@ const App = () => {
     return () => backHandler.remove();
   }, [playMode, selectedFile, pathStack, activeMenu, showHdrChoiceModal, showSeasonModal, isLocked, activeTab, closeInternalPlayer]);
 
+  const searchTmdbTv = useCallback(async (
+    key: string,
+    searchTitle: string,
+    year = '',
+    yearExplicit = false,
+    langCode = '',
+  ): Promise<any | null> => {
+    const queries = buildTvSearchQueries(searchTitle);
+    for (let i = 0; i < queries.length; i++) {
+      const q = queries[i];
+      if (i === 0 && yearExplicit && year) {
+        try {
+          const withYearUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(q)}&first_air_date_year=${encodeURIComponent(year)}`;
+          const yearRes = await catalogJson(withYearUrl);
+          const yearHit = selectBestTmdbTvMatch(yearRes?.results || [], searchTitle, year, true, langCode);
+          if (yearHit) return yearHit;
+        } catch {}
+      }
+      try {
+        const tvUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(q)}`;
+        const res = await catalogJson(tvUrl);
+        const hit = selectBestTmdbTvMatch(res?.results || [], searchTitle, year, yearExplicit, langCode);
+        if (hit) return hit;
+      } catch {}
+    }
+    return null;
+  }, []);
+
+  const propagateShowMetadataToParent = useCallback((tvObj: any, showTitle: string) => {
+    if (!tvObj?.poster_path) return;
+    const showMeta: MediaMetadata = {
+      title: tvObj.name || tvObj.original_name || showTitle,
+      tmdbId: tvObj.id,
+      originalLanguage: tvObj.original_language,
+      mediaType: 'tv',
+      poster: `https://image.tmdb.org/t/p/w342${tvObj.poster_path}`,
+      backdrop: tvObj.backdrop_path ? `https://image.tmdb.org/t/p/w780${tvObj.backdrop_path}` : undefined,
+      rating: tvObj.vote_average && tvObj.vote_average > 0 ? Number(tvObj.vote_average).toFixed(1) : undefined,
+      overview: tvObj.overview || undefined,
+      year: String(tvObj.first_air_date || '').slice(0, 4) || undefined,
+    };
+
+    const candidateNames = new Set<string>();
+    const cleanShow = String(showTitle || '').trim();
+    if (cleanShow) candidateNames.add(cleanShow);
+
+    const pathCandidates = [...pathStack, currentPath];
+    for (const p of pathCandidates) {
+      const segs = String(p || '').split('/').filter(Boolean);
+      const rootIdx = segs.findIndex(s => /^\d+:$/.test(s));
+      const rel = rootIdx >= 0 ? segs.slice(rootIdx + 1) : segs;
+      for (const seg of rel) {
+        try {
+          const decoded = decodeURIComponent(seg);
+          if (decoded && extractSeasonNumberFromFolder(decoded) === null) {
+            candidateNames.add(decoded);
+          }
+        } catch {}
+      }
+    }
+
+    const showNorm = cleanShow.toLowerCase();
+    for (const hf of homeFiles) {
+      if (!hf?.mimeType?.includes('folder') || !hf?.name) continue;
+      const p = parseMediaFilename(String(hf.name), true);
+      if (p.searchTitle.toLowerCase() === showNorm || p.cleanTitle.toLowerCase() === showNorm) {
+        candidateNames.add(String(hf.name));
+      }
+    }
+
+    const updates: Record<string, MediaMetadata> = {};
+    for (const name of candidateNames) {
+      updates[name] = showMeta;
+      const parentInfo = parseMediaFilename(name, true);
+      void AsyncStorage.setItem(metadataCacheKey(parentInfo), JSON.stringify(showMeta)).catch(() => {});
+    }
+    if (Object.keys(updates).length > 0) {
+      setMetadataMap(prev => ({ ...prev, ...updates }));
+    }
+  }, [pathStack, currentPath, homeFiles]);
+
   const fetchSingleMetadata = useCallback(async (info: ParsedMediaInfo, needLanguage = false): Promise<MediaMetadata | null> => {
     const isTvQuery = Boolean(info.seasonEpisode || info.seasonNum > 0 || info.isFolder);
     const cacheKey = metadataCacheKey(info);
@@ -1292,60 +1382,42 @@ const App = () => {
       const cached = await AsyncStorage.getItem(cacheKey);
       if (cached) {
         const previous = JSON.parse(cached);
-        if (!isStaleMovieCache(previous, info) && (!needLanguage || previous.originalLanguage !== undefined)) return previous;
+        if (isUsableCachedMetadata(previous, info) && (!needLanguage || previous.originalLanguage !== undefined)) {
+          return previous;
+        }
       }
     } catch {}
     if (!isTvQuery) {
       void AsyncStorage.removeMany(legacyMetadataCacheKeys(info)).catch(() => {});
     }
 
-    const targetLower = info.searchTitle.toLowerCase().trim();
-    const infoYearNum = info.year ? parseInt(info.year, 10) : 0;
+    const explicitYear = info.yearExplicit ? info.year : '';
+    const infoYearNum = explicitYear ? parseInt(explicitYear, 10) : 0;
     const tmdbKey = vaultRef.current.tmdbKey;
 
     if (tmdbKey && tmdbKey.trim().length >= 20) {
       try {
         const key = tmdbKey.trim();
         let match: any = null;
-        const normTitle = (r: any) => String(r.title || r.name || r.original_title || r.original_name || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-        const cleanTarget = targetLower.replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
 
         if (!isTvQuery) {
-          const mvYearUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}${info.year ? `&year=${encodeURIComponent(info.year)}` : ''}`;
+          const mvYearUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}${explicitYear ? `&year=${encodeURIComponent(explicitYear)}` : ''}`;
           const mvRes = await catalogJson(mvYearUrl);
-          match = selectBestTmdbMovieMatch(mvRes?.results || [], info.searchTitle, info.year, info.langCode);
+          match = selectBestTmdbMovieMatch(mvRes?.results || [], info.searchTitle, explicitYear, info.langCode);
 
           if (!match && infoYearNum > 0) {
-            const primaryYearUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}&primary_release_year=${encodeURIComponent(info.year)}`;
+            const primaryYearUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}&primary_release_year=${encodeURIComponent(explicitYear)}`;
             const primaryRes = await catalogJson(primaryYearUrl);
-            match = selectBestTmdbMovieMatch(primaryRes?.results || [], info.searchTitle, info.year, info.langCode);
+            match = selectBestTmdbMovieMatch(primaryRes?.results || [], info.searchTitle, explicitYear, info.langCode);
           }
 
           if (!match && infoYearNum > 0) {
             const anyYearUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}`;
             const anyYearRes = await catalogJson(anyYearUrl);
-            match = selectBestTmdbMovieMatch(anyYearRes?.results || [], info.searchTitle, info.year, info.langCode);
+            match = selectBestTmdbMovieMatch(anyYearRes?.results || [], info.searchTitle, explicitYear, info.langCode);
           }
         } else {
-          const tvUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}`;
-          const res = await catalogJson(tvUrl);
-          const results: any[] = (res?.results || []).filter((r: any) => r.media_type !== 'person' && r.poster_path);
-          match =
-            results.find((r: any) => {
-              const rYear = parseInt(String(r.release_date || r.first_air_date || '').slice(0, 4), 10);
-              return infoYearNum > 0 && rYear > 0 && Math.abs(rYear - infoYearNum) <= 1 && normTitle(r) === cleanTarget;
-            }) ||
-            results.find((r: any) => normTitle(r) === cleanTarget) ||
-            results.find((r: any) => {
-              const rYear = parseInt(String(r.release_date || r.first_air_date || '').slice(0, 4), 10);
-              return infoYearNum > 0 && rYear > 0 && Math.abs(rYear - infoYearNum) <= 1 && normTitle(r).includes(cleanTarget);
-            });
-          if (!match && results.length > 0) {
-            match =
-              (info.langCode ? results.find((r: any) => r.original_language === info.langCode && String(r.title || r.name || '').toLowerCase().trim() === targetLower) : null) ||
-              results.find((r: any) => String(r.title || r.name || '').toLowerCase().trim() === targetLower) ||
-              results[0];
-          }
+          match = await searchTmdbTv(key, info.searchTitle, explicitYear, info.yearExplicit, info.langCode);
         }
 
         if (match) {
@@ -1358,19 +1430,20 @@ const App = () => {
             backdrop: match.backdrop_path ? `https://image.tmdb.org/t/p/w780${match.backdrop_path}` : undefined,
             rating: match.vote_average && match.vote_average > 0 ? Number(match.vote_average).toFixed(1) : undefined,
             overview: match.overview || undefined,
-            year: (match.release_date || match.first_air_date || '').slice(0, 4) || info.year,
+            year: (match.release_date || match.first_air_date || '').slice(0, 4) || explicitYear,
           };
-          if (meta.poster || meta.overview) {
+          if (meta.poster) {
             await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
             return meta;
           }
+          if (meta.overview) return meta;
         }
       } catch {}
     }
 
     if (needLanguage) return null;
     try {
-      const query = `${info.searchTitle} ${info.year}`.trim();
+      const query = `${info.searchTitle} ${explicitYear}`.trim();
       const cleanQ = query.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
       const firstChar = cleanQ.charAt(0) || 'a';
       const imdbUrl = `https://v3.sg.media-imdb.com/suggestion/${firstChar}/${encodeURIComponent(cleanQ.slice(0, 35))}.json`;
@@ -1384,18 +1457,21 @@ const App = () => {
       if (match && match.i?.imageUrl) {
         const rawImg: string = match.i.imageUrl;
         const meta: MediaMetadata = {
+          mediaType: isTvQuery ? 'tv' : 'movie',
           poster: rawImg.replace(/\._V1_.*\.jpg$/i, '._V1_QL75_UX500_.jpg'),
           backdrop: rawImg.replace(/\._V1_.*\.jpg$/i, '._V1_QL75_UX1000_.jpg'),
-          year: match.y ? String(match.y) : info.year,
+          year: match.y ? String(match.y) : explicitYear,
           cast: match.s || undefined,
           overview: match.s ? `${match.q ? `${match.q.toUpperCase()} • ` : ''}Starring: ${match.s}` : undefined,
         };
-        await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
+        if (meta.poster) {
+          await AsyncStorage.setItem(cacheKey, JSON.stringify(meta));
+        }
         return meta;
       }
     } catch {}
     return null;
-  }, []);
+  }, [searchTmdbTv]);
 
   const standaloneSources = useRef(new Map<string, Promise<string>>());
   const resolvePlaybackUrl = useCallback(async (file: any) => {
@@ -1577,13 +1653,14 @@ const App = () => {
         if (classified?.kind === 'movie' && metadataMap[itemKey]?.mediaType === 'tv') {
           fetchedKeysRef.current.delete(itemKey);
         }
-        if (fetchedKeysRef.current.has(itemKey)) continue;
+        if (fetchedKeysRef.current.has(itemKey) && metadataMap[itemKey]?.poster) continue;
         const isFolder = isSeriesContainerItem(item, classified);
         const rawInfo = parseMediaFilename(itemKey, isFolder);
         const info: ParsedMediaInfo = classified?.kind === 'movie'
           ? {
               ...rawInfo,
               year: rawInfo.year || classified.year,
+              yearExplicit: rawInfo.yearExplicit || Boolean(classified.year),
               langCode: rawInfo.langCode || classified.langCode,
               langName: rawInfo.langName || classified.langName,
             }
@@ -1607,7 +1684,7 @@ const App = () => {
         const instantBatch: Record<string, MediaMetadata> = {};
         for (const p of pendingItems) {
           const hit = cacheLookup[p.cacheKey];
-          if (hit && !isStaleMovieCache(hit, p.info)) {
+          if (hit && isUsableCachedMetadata(hit, p.info)) {
             instantBatch[p.itemKey] = hit;
             if (p.versions) {
               for (const v of p.versions) {
@@ -1652,7 +1729,6 @@ const App = () => {
           if (selectedFileRef.current) break;
           const current = uncachedQueue[cursor++];
           if (!current) break;
-          fetchedKeysRef.current.add(current.itemKey);
           let p = inflightByCacheKey.get(current.cacheKey);
           if (!p) {
             p = fetchSingleMetadata(current.info);
@@ -1660,6 +1736,7 @@ const App = () => {
           }
           const meta = await p;
           if (meta && !cancelled) {
+            if (meta.poster) fetchedKeysRef.current.add(current.itemKey);
             stagedUpdates[current.itemKey] = meta;
             if (current.versions) {
               for (const v of current.versions) {
@@ -1704,10 +1781,10 @@ const App = () => {
     const fetchEpisodeStills = async () => {
       try {
         const primaryShow = epEntries[0].showTitle;
-        const tvSearchUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(primaryShow)}`;
-        const tvRes = await catalogJson(tvSearchUrl);
-        const tvId = tvRes?.results?.[0]?.id;
+        const tvHit = await searchTmdbTv(tmdbKey, primaryShow);
+        const tvId = tvHit?.id;
         if (!tvId || cancelled) return;
+        propagateShowMetadataToParent(tvHit, primaryShow);
 
         const neededSeasons = Array.from(new Set(epEntries.map(e => e.sNum)));
         const seasonLookup: Record<string, { epTitle: string; stillUrl: string | null; runtimeMin: number }> = {};
@@ -2441,6 +2518,7 @@ const App = () => {
 
     if (isPullRefresh) {
       setRefreshing(true);
+      fetchedKeysRef.current.clear();
       for (const k of Array.from(folderClassifyingRef.current)) {
         if (k.startsWith(path)) folderClassifyingRef.current.delete(k);
       }

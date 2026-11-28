@@ -3,6 +3,7 @@ export interface ParsedMediaInfo {
   cleanTitle: string;
   searchTitle: string;
   year: string;
+  yearExplicit: boolean;
   seasonEpisode: string;
   seasonNum: number;
   episodeNum: number;
@@ -78,7 +79,7 @@ export const hasExplicitSeriesFolderMarker = (name: string): boolean => {
   );
 };
 
-export const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => {
+export const parseMediaFilename = (name: string, isFolder = false, fallbackModifiedTime?: string): ParsedMediaInfo => {
   const withoutExt = isFolder ? name : name.replace(MEDIA_EXT_STRIP_RE, '');
   const normalized = withoutExt
     .replace(/[._]+/g, ' ')
@@ -129,11 +130,19 @@ export const parseMediaFilename = (name: string, isFolder = false): ParsedMediaI
     seasonEpisode = seasonNum > 0 ? `S${seasonNum < 10 ? `0${seasonNum}` : seasonNum}` : '';
   }
 
-  const yearMatches = Array.from(normalized.matchAll(/(?:^|[\s(\-–—])((?:19|20)\d{2})(?:[\s)\-–—]|$)/g));
-  const yearMatch = yearMatches.length > 0 ? yearMatches[yearMatches.length - 1] : null;
-  const year = yearMatch ? yearMatch[1] : '';
-
   const cutPattern = /\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-ray|remux|web-dl|webdl|webrip|web|amzn|nf|snxt|sonyliv|jiohotstar|zee5|aha|it|hdtv|ddp\d|dd[+]|\bddp\b|aac|eac3|ac3|truehd|dts|dtshd|hevc|avc|x264|x265|h\s*264|h\s*265|multi|dual|org|fhd|jpn|kor|tam|tel|mal|hin|kan|eng|esub|esubs|msub|msubs|subs|sub|uncut|remastered|imax)\b/i;
+  const cutMatch = normalized.match(cutPattern);
+  const yearMatches = Array.from(normalized.matchAll(/(?:^|[\s(\-–—])((?:19|20)\d{2})(?=[\s)\-–—]|$)/g));
+  const yearsBeforeTech = cutMatch?.index !== undefined
+    ? yearMatches.filter(m => (m.index ?? 0) < cutMatch.index!)
+    : yearMatches;
+  const yearPool = yearsBeforeTech.length > 0 ? yearsBeforeTech : yearMatches;
+  const yearMatch = yearPool.length > 0 ? yearPool[yearPool.length - 1] : null;
+  const parsedYear = yearMatch ? yearMatch[1] : '';
+  const fallbackYearMatch = !parsedYear && fallbackModifiedTime ? String(fallbackModifiedTime).match(/^((?:19|20)\d{2})/) : null;
+  const year = parsedYear || (fallbackYearMatch ? fallbackYearMatch[1] : '');
+  const yearExplicit = Boolean(parsedYear);
+
   let titlePart = normalized;
   if (seMatch && seMatch.index !== undefined && seMatch.index > 1) titlePart = titlePart.slice(0, seMatch.index);
   if (yearMatch && yearMatch.index !== undefined && yearMatch.index >= 1) {
@@ -142,8 +151,8 @@ export const parseMediaFilename = (name: string, isFolder = false): ParsedMediaI
       titlePart = beforeYear;
     }
   }
-  const cutMatch = titlePart.match(cutPattern);
-  if (cutMatch && cutMatch.index !== undefined && cutMatch.index > 1) titlePart = titlePart.slice(0, cutMatch.index);
+  const titleCutMatch = titlePart.match(cutPattern);
+  if (titleCutMatch && titleCutMatch.index !== undefined && titleCutMatch.index > 1) titlePart = titlePart.slice(0, titleCutMatch.index);
 
   titlePart = titlePart
     .replace(/\((?:19|20)\d{2}\)/g, '')
@@ -155,7 +164,7 @@ export const parseMediaFilename = (name: string, isFolder = false): ParsedMediaI
   const searchTitle = TYPO_FIXES[cleanTitle.toLowerCase()] || cleanTitle;
 
   return {
-    rawName: name, cleanTitle, searchTitle, year, seasonEpisode,
+    rawName: name, cleanTitle, searchTitle, year, yearExplicit, seasonEpisode,
     seasonNum, episodeNum, resolution, badges: badges.slice(0, 4),
     hasDV, hasHDR, langCode, langName, isFolder,
   };
@@ -395,18 +404,117 @@ export const metadataCacheKey = (info: ParsedMediaInfo): string => {
 
 export const legacyMetadataCacheKeys = (info: ParsedMediaInfo): string[] => {
   const base = `${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
-  return [
+  const keys = [
     `meta_tv_v8_${base}`,
     `meta_tv_v9_${base}`,
   ];
+  const rawYears = Array.from(String(info.rawName || '').replace(/[._]+/g, ' ').matchAll(/(?:^|[\s(\-–—])((?:19|20)\d{2})(?=[\s)\-–—]|$)/g)).map(m => m[1]);
+  if (rawYears.length >= 2) {
+    keys.push(`meta_v8_${rawYears.slice(0, 2).join(' ')}_${rawYears[0]}_${info.langCode}`);
+  }
+  return keys;
 };
+
+const TWO_YEARS_RE = /\b(?:19|20)\d{2}\b.*\b(?:19|20)\d{2}\b/;
 
 export const isStaleMovieCache = (cached: any, info: ParsedMediaInfo): boolean => {
   if (!cached || info.isFolder || info.seasonEpisode || info.seasonNum > 0) return false;
   if (cached.mediaType === 'tv') return true;
+  if (!info.yearExplicit) return false;
   const infoYear = info.year ? parseInt(info.year, 10) : 0;
   const cachedYear = cached.year ? parseInt(String(cached.year).slice(0, 4), 10) : 0;
   return infoYear > 0 && cachedYear > 0 && Math.abs(cachedYear - infoYear) > 2;
+};
+
+export const isUsableCachedMetadata = (cached: any, info: ParsedMediaInfo): boolean => {
+  if (!cached || typeof cached !== 'object') return false;
+  if (!cached.poster) return false;
+  if (isStaleMovieCache(cached, info)) return false;
+  if (TWO_YEARS_RE.test(String(cached.title || '')) || TWO_YEARS_RE.test(info.searchTitle)) return false;
+  return true;
+};
+
+export const buildTvSearchQueries = (searchTitle: string): string[] => {
+  const trimmed = String(searchTitle || '').trim();
+  if (!trimmed) return [];
+  const queries: string[] = [];
+  const push = (q: string) => {
+    const clean = q.replace(/\s+/g, ' ').trim();
+    if (clean.length >= 2 && !queries.some(x => x.toLowerCase() === clean.toLowerCase())) {
+      queries.push(clean);
+    }
+  };
+  const dotInitials = (q: string) =>
+    q.replace(/\b([A-Za-z](?:\s+[A-Za-z])+)\b/g, m => m.split(/\s+/).map(ch => `${ch}.`).join(''));
+  const joinInitials = (q: string) =>
+    q.replace(/\b([A-Za-z](?:\s+[A-Za-z])+)\b/g, m => m.split(/\s+/).join(''));
+
+  push(trimmed);
+  const sepMatch = trimmed.match(/^(.+?)(?:\s*:\s*|\s+[-–—]\s+)(.+)$/);
+  if (sepMatch && sepMatch[1].trim().length >= 2) {
+    const base = sepMatch[1].trim();
+    push(base);
+    push(dotInitials(base));
+    push(joinInitials(base));
+  }
+  push(dotInitials(trimmed));
+  push(joinInitials(trimmed));
+  if (/[:–—-]/.test(trimmed)) {
+    push(trimmed.replace(/[:–—-]+/g, ' '));
+  }
+  return queries;
+};
+
+export const selectBestTmdbTvMatch = (
+  results: any[],
+  searchTitle: string,
+  year: string,
+  yearExplicit: boolean,
+  langCode = '',
+): any | null => {
+  const shows = (results || []).filter(
+    (r: any) => r && r.poster_path && r.media_type !== 'person' && r.media_type !== 'movie',
+  );
+  if (shows.length === 0) return null;
+  const normalize = (val: string) =>
+    String(val || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  const variants = buildTvSearchQueries(searchTitle).map(normalize).filter(Boolean);
+  const targetYear = yearExplicit && year ? parseInt(year, 10) : 0;
+
+  const score = (r: any): number => {
+    const rYear = parseInt(String(r.first_air_date || r.release_date || '').slice(0, 4), 10) || 0;
+    const n1 = normalize(r.name || r.title || '');
+    const n2 = normalize(r.original_name || r.original_title || '');
+    const exactTitle = variants.some(v => n1 === v || n2 === v);
+    const partialTitle = !exactTitle && variants.some(v => n1.includes(v) || n2.includes(v));
+    let total = 0;
+    if (exactTitle) total += 100;
+    else if (partialTitle) total += 30;
+    if (targetYear > 0 && rYear > 0) {
+      const diff = Math.abs(rYear - targetYear);
+      if (diff === 0) total += 80;
+      else if (diff === 1) total += 40;
+      else total -= 40;
+    }
+    if (langCode && r.original_language === langCode) total += 50;
+    total += Math.min(10, Number(r.popularity || 0) / 20);
+    return total;
+  };
+
+  let best = shows[0];
+  let bestScore = score(best);
+  for (let i = 1; i < shows.length; i++) {
+    const s = score(shows[i]);
+    if (s > bestScore) {
+      best = shows[i];
+      bestScore = s;
+    }
+  }
+  return best;
 };
 
 export const selectBestTmdbMovieMatch = (
