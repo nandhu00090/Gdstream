@@ -120,4 +120,57 @@ class ArchivePlayerRoutingTest {
         val bd = Uri.parse("http://127.0.0.1:9090/zip/disc/movie.m2ts")
         assertTrue(isoExtractors(bd, null, false).createExtractors().single() is BluRayTsExtractor)
     }
+
+    @Test fun playVideoUsesSystemChooserForDvdIsoWhilePlayVideoInVlcTargetsVlcDirectly() {
+        val app = org.robolectric.RuntimeEnvironment.getApplication()
+        val reactContext = com.facebook.react.bridge.ReactApplicationContext(app)
+        val security = SecurityVaultModule(reactContext)
+        val player = VideoPlayerModule(reactContext)
+        val registryField = SecurityVaultModule::class.java.getDeclaredField("archiveEntryRegistry").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val entries = registryField.get(security) as java.util.concurrent.ConcurrentHashMap<String, SecurityVaultModule.ArchiveEntryTarget>
+        val target = SecurityVaultModule.ArchiveEntryTarget(
+            id = "dvd_intent",
+            archiveUrl = "http://127.0.0.1:1/never-fetch",
+            fileName = "Movie [DVD Main].vob",
+            archiveFormat = "ISO",
+            compressionMethod = 0,
+            compressedSize = 4096,
+            uncompressedSize = 4096,
+            localHeaderOffset = 0,
+            segments = listOf(0L to 4096L),
+            resolvedInfo = mapOf("videoCodec" to "MPEG-2", "width" to 720, "height" to 480),
+            dvdSegments = listOf(DvdProxy.Segment(0, 2048, 4_000_000)),
+            dvdEncoderOverride = DvdProxy.Encoder("c2.test.avc", 0)
+        )
+        entries[target.id] = target
+        val sourceUrl = "http://127.0.0.1:9090/zip/${target.id}/Movie%20%5BDVD%20Main%5D.vob"
+        try {
+            val chooserPromise = org.mockito.Mockito.mock(com.facebook.react.bridge.Promise::class.java)
+            player.playVideo(sourceUrl, "Open with external player", chooserPromise)
+            val chooserIntent = org.robolectric.Shadows.shadowOf(app).nextStartedActivity
+            assertEquals(Intent.ACTION_CHOOSER, chooserIntent.action)
+            assertEquals("Open with external player", chooserIntent.getCharSequenceExtra(Intent.EXTRA_TITLE))
+            @Suppress("DEPRECATION")
+            val innerIntent = chooserIntent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)!!
+            assertEquals(Intent.ACTION_VIEW, innerIntent.action)
+            assertEquals("video/*", innerIntent.type)
+            assertNull(innerIntent.`package`)
+            assertEquals("http://127.0.0.1:9090/hls/${target.id}/dvd.m3u8", innerIntent.dataString)
+            org.mockito.Mockito.verify(chooserPromise).resolve(true)
+
+            val vlcPromise = org.mockito.Mockito.mock(com.facebook.react.bridge.Promise::class.java)
+            player.playVideoInVlc(sourceUrl, vlcPromise)
+            val vlcIntent = org.robolectric.Shadows.shadowOf(app).nextStartedActivity
+            assertEquals(Intent.ACTION_VIEW, vlcIntent.action)
+            assertEquals("org.videolan.vlc", vlcIntent.`package`)
+            assertEquals("http://127.0.0.1:9090/hls/${target.id}/dvd.m3u8?muxed=1", vlcIntent.dataString)
+            org.mockito.Mockito.verify(vlcPromise).resolve(true)
+        } finally {
+            entries.remove(target.id)
+            ArchiveProxyStreams.stop("http://127.0.0.1:9090/hls/${target.id}/dvd.m3u8")
+            val ioField = SecurityVaultModule::class.java.getDeclaredField("ioExecutor").apply { isAccessible = true }
+            (ioField.get(security) as java.util.concurrent.ExecutorService).shutdownNow()
+        }
+    }
 }

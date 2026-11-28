@@ -137,7 +137,8 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         val resolvedInfo: Map<String, Any>? = null,
         val sourceSize: Long = 0L,
         val standalone: Boolean = false,
-        val dvdSegments: List<DvdProxy.Segment> = emptyList()
+        val dvdSegments: List<DvdProxy.Segment> = emptyList(),
+        internal val dvdEncoderOverride: DvdProxy.Encoder? = null
     ) {
         // Accessed only under the DVD encoder lock.
         internal var dvdSequenceHeader: ByteArray? = null
@@ -156,10 +157,12 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
         @Volatile var rawSubtitle: Pair<Int, DvdSubtitleWindow>? = null
         val dvdHls by lazy { DvdHls(DvdStreams.from(resolvedInfo.orEmpty())) }
         val dvdEncoder by lazy {
-            val audio = resolvedInfo?.get("audioTracks") as? List<*>
-            val supportedAudio = audio.isNullOrEmpty() || audio.any { (it as? Map<*, *>)?.get("codec") in setOf("AC-3", "DTS", "LPCM", "MPEG Audio") }
-            if (!supportedAudio || resolvedInfo == null || dvdPlaylist.isEmpty() || resolvedInfo["videoCodec"] != "MPEG-2") null else
-                DvdProxy.encoder((resolvedInfo.getValue("width") as Number).toInt(), (resolvedInfo.getValue("height") as Number).toInt())
+            dvdEncoderOverride ?: run {
+                val audio = resolvedInfo?.get("audioTracks") as? List<*>
+                val supportedAudio = audio.isNullOrEmpty() || audio.any { (it as? Map<*, *>)?.get("codec") in setOf("AC-3", "DTS", "LPCM", "MPEG Audio") }
+                if (!supportedAudio || resolvedInfo == null || dvdPlaylist.isEmpty() || resolvedInfo["videoCodec"] != "MPEG-2") null else
+                    DvdProxy.encoder((resolvedInfo.getValue("width") as Number).toInt(), (resolvedInfo.getValue("height") as Number).toInt())
+            }
         }
         val bluRayStartsUs by lazy { hls?.segments?.runningFold(0L) { start, segment -> start + segment.durationUs }.orEmpty() }
         internal val hls: BluRayHls? by lazy { if (isBdavM2ts) BluRayHls.create(bluRay, uncompressedSize, standalone,
@@ -241,7 +244,7 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val entry = ArchiveProxyStreams.streamId(url)?.let { archiveEntryRegistry[it] }
             if (entry?.archiveFormat == "ISO" && entry.fileName.endsWith(".vob", true)) {
                 val vlc = dvdVlcPlayer(player)
-                val avc = (vlc && !entry.standalone && entry.dvdEncoder != null) ||
+                val avc = ((vlc || player == null) && !entry.standalone && entry.dvdEncoder != null) ||
                     (player != null && dvdPlayerNeedsAvc(player) { DvdProxy.canDecodeMpeg2(entry.resolvedInfo) })
                 check(!avc || entry.dvdEncoder != null) { "AVC conversion unavailable for this DVD. Open it in VLC." }
                 externalDvdUrl(url, entry.id, entry.fileName, avc, muxed = vlc)
@@ -1243,9 +1246,10 @@ class SecurityVaultModule(private val reactContext: ReactApplicationContext) :
             val audioMatch = Regex("audio_([0-9]+)(?:\\.m3u8|_seg_[0-9]+\\.ts)").matchEntire(resource)
             val audioPid = audioMatch?.groupValues?.get(1)?.toIntOrNull()
             val hlsSegment = Regex("(?:audio_[0-9]+_)?seg_([0-9]+)\\.ts").matchEntire(resource)?.groupValues?.get(1)?.toIntOrNull()
+            val dvdMuxed = path.substringAfter('?', "").split('&').any { it == "muxed=1" } ||
+                isVlcUserAgent(userAgent)
             val dvdResource = if (segments[0] == "hls" && entry?.archiveFormat == "ISO" && entry.dvdPlaylist.isNotEmpty())
-                entry.dvdHls.resource(resource, entry.dvdPlaylist.size, path.substringAfter('?', "") == "muxed=1" ||
-                    userAgent.contains("LibVLC", ignoreCase = true)) else null
+                entry.dvdHls.resource(resource, entry.dvdPlaylist.size, dvdMuxed) else null
             val dvd = dvdResource != null
             val dvdIndex = dvdResource?.index
             val validPath = if (dvd) true else if (segments[0] == "hls") hls != null &&

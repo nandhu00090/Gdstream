@@ -18,6 +18,13 @@ class ExternalIsoAliasTest {
         assertTrue(dvdPlayerNeedsAvc("androidx.media3.demo.main") { true })
         assertTrue(dvdPlayerNeedsAvc("com.example.video") { false })
         assertFalse(dvdPlayerNeedsAvc("com.example.video") { true })
+        assertTrue(isVlcUserAgent("LibVLC/3.0.21 (Linux; Android 14)"))
+        assertTrue(isVlcUserAgent("VLC/3.6.0"))
+        assertTrue(isVlcUserAgent("vlc media player"))
+        assertFalse(isVlcUserAgent("Dalvik/2.1.0 (Linux; U; Android 14)"))
+        assertFalse(isVlcUserAgent("JustPlayer/0.194"))
+        assertFalse(isVlcUserAgent("(absent)"))
+        assertFalse(isVlcUserAgent(null))
     }
 
     @Test fun aliasPreservesEncodingQueryAndFragmentAndRejectsOtherFilenames() {

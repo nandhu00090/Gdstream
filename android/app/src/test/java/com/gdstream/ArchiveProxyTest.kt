@@ -366,4 +366,79 @@ class ArchiveProxyTest {
         } finally { pool.shutdownNow(); (field(module, "ioExecutor") as ExecutorService).shutdownNow() }
     }
 
+    @Test fun dvdSystemChooserRoutesBetweenMuxedVlcAndMultivariantMedia3ByUserAgent() {
+        val module = SecurityVaultModule(mock(ReactApplicationContext::class.java))
+        val pool = Executors.newSingleThreadExecutor()
+        val resolvedInfo = mapOf(
+            "videoCodec" to "MPEG-2",
+            "width" to 720,
+            "height" to 480,
+            "audioTracks" to listOf(
+                mapOf("codec" to "AC-3", "language" to "tam", "channels" to 6),
+                mapOf("codec" to "DTS", "language" to "eng", "channels" to 6)
+            )
+        )
+        val target = SecurityVaultModule.ArchiveEntryTarget(
+            id = "dvd_chooser",
+            archiveUrl = "http://127.0.0.1:1/never-fetch",
+            fileName = "Movie [DVD Main].vob",
+            archiveFormat = "ISO",
+            compressionMethod = 0,
+            compressedSize = 4096,
+            uncompressedSize = 4096,
+            localHeaderOffset = 0,
+            segments = listOf(0L to 4096L),
+            resolvedInfo = resolvedInfo,
+            dvdSegments = listOf(DvdProxy.Segment(0, 2048, 4_000_000)),
+            dvdEncoderOverride = DvdProxy.Encoder("c2.test.avc", 0)
+        )
+        @Suppress("UNCHECKED_CAST")
+        val entries = field(module, "archiveEntryRegistry") as ConcurrentHashMap<String, SecurityVaultModule.ArchiveEntryTarget>
+        entries[target.id] = target
+        ArchiveProxyStreams.registry.resume()
+        try {
+            val baseUrl = "http://127.0.0.1:9090/zip/${target.id}/Movie%20%5BDVD%20Main%5D.vob"
+            assertEquals("http://127.0.0.1:9090/hls/${target.id}/dvd.m3u8", SecurityVaultModule.externalPlayerUrl(baseUrl, null))
+            assertEquals("http://127.0.0.1:9090/hls/${target.id}/dvd.m3u8?muxed=1", SecurityVaultModule.externalPlayerUrl(baseUrl, "org.videolan.vlc"))
+
+            ServerSocket(0).use { server ->
+                val handler = SecurityVaultModule::class.java.getDeclaredMethod("handleArchiveProxyClient", Socket::class.java)
+                    .apply { isAccessible = true }
+                fun request(path: String, userAgent: String): String {
+                    val job = pool.submit { handler.invoke(module, server.accept()) }
+                    val raw = Socket("127.0.0.1", server.localPort).use { client ->
+                        client.soTimeout = 5000
+                        client.getOutputStream().write(
+                            "GET $path HTTP/1.1\r\nConnection: close\r\nHost: 127.0.0.1\r\nUser-Agent: $userAgent\r\n\r\n".toByteArray()
+                        )
+                        client.getInputStream().readBytes().toString(Charsets.UTF_8)
+                    }
+                    job.get(5, TimeUnit.SECONDS)
+                    return raw
+                }
+
+                for (vlcAgent in listOf("LibVLC/3.0.21 (Linux; Android 14)", "VLC/3.6.0")) {
+                    val vlcResponse = request("/hls/${target.id}/dvd.m3u8", vlcAgent)
+                    assertTrue(vlcResponse.startsWith("HTTP/1.1 200 OK"))
+                    assertTrue(vlcResponse.contains("dvd_0.ts?muxed=1"))
+                    assertFalse(vlcResponse.contains("#EXT-X-MEDIA:TYPE=AUDIO"))
+                }
+
+                val media3Response = request("/hls/${target.id}/dvd.m3u8", "Dalvik/2.1.0 (Linux; U; Android 14)")
+                assertTrue(media3Response.startsWith("HTTP/1.1 200 OK"))
+                assertTrue(media3Response.contains("#EXT-X-MEDIA:TYPE=AUDIO"))
+                assertTrue(media3Response.contains("dvd_video.m3u8"))
+                assertFalse(media3Response.contains("muxed=1"))
+
+                val explicitMuxedResponse = request("/hls/${target.id}/dvd.m3u8?muxed=1", "Dalvik/2.1.0 (Linux; U; Android 14)")
+                assertTrue(explicitMuxedResponse.startsWith("HTTP/1.1 200 OK"))
+                assertTrue(explicitMuxedResponse.contains("dvd_0.ts?muxed=1"))
+            }
+        } finally {
+            entries.remove(target.id)
+            pool.shutdownNow()
+            (field(module, "ioExecutor") as ExecutorService).shutdownNow()
+        }
+    }
+
 }

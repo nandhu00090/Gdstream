@@ -10,6 +10,9 @@ internal fun archiveFilenameMatches(encoded: String?, expected: String, bdavAlia
 
 internal fun dvdVlcPlayer(player: String?) = player == "org.videolan.vlc" || player?.startsWith("org.videolan.vlc.") == true
 
+internal fun isVlcUserAgent(userAgent: String?): Boolean =
+    !userAgent.isNullOrBlank() && (userAgent.contains("VLC", ignoreCase = true) || userAgent.contains("LibVLC", ignoreCase = true))
+
 internal fun dvdPlayerNeedsAvc(player: String, platformMpeg2: () -> Boolean): Boolean = when {
     dvdVlcPlayer(player) ||
         player == "is.xyz.mpv" || player.startsWith("is.xyz.mpv.") || player == "live.mehiz.mpvkt" ||

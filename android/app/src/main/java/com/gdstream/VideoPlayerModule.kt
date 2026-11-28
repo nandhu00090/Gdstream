@@ -410,7 +410,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
             try { stopExternalStreamBridge() } catch (cleanup: Exception) { error.addSuppressed(cleanup) }
             promise.reject("E_EXTERNAL_PLAYER", error)
         }
-        fun launch(player: String?, component: android.content.ComponentName? = null) {
+        fun launch(player: String?) {
             try {
                 val uri = resolvePlayableUri(SecurityVaultModule.externalPlayerUrl(url, player))
                 if (uri.host == "127.0.0.1" || uri.host == "localhost") {
@@ -419,7 +419,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
                     SecurityVaultModule.prefetchExternalLaunch(url)
                 }
                 val intent = externalVideoIntent(uri)
-                if (component != null) intent.component = component else intent.setPackage(player)
+                intent.setPackage(player)
                 DebugLogger.log("EXTERNAL_PLAYER_LAUNCH", "uri=${safeStreamUrl(uri.toString())} player=$player")
                 reactApplicationContext.startActivity(if (player != null) intent else
                     Intent.createChooser(intent, chooserTitle).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -427,54 +427,7 @@ class VideoPlayerModule(reactContext: ReactApplicationContext) : ReactContextBas
             } catch (e: Exception) { failed(e) }
         }
 
-        if (chooserTitle == null) { launch("org.videolan.vlc"); return }
-        val raw = Uri.parse(SecurityVaultModule.externalPlayerUrl(url))
-        if (!SecurityVaultModule.isIsoStream(url) || raw.videoExtension != "vob") { launch(null); return }
-
-        // The system chooser shares one data URI across handlers. Pick the DVD handler before
-        // constructing its ACTION_VIEW so each app gets the representation it can decode.
-        UiThreadUtil.runOnUiThread {
-            try {
-                val activity = checkNotNull(reactApplicationContext.currentActivity) { "Player chooser needs an activity" }
-                val pm = activity.packageManager
-                val handlers = pm.queryIntentActivities(externalVideoIntent(raw), android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
-                    .distinctBy { it.activityInfo.packageName }.sortedBy { it.loadLabel(pm).toString() }
-                check(handlers.isNotEmpty()) { "No external video player installed" }
-                val iconSizePx = (36 * activity.resources.displayMetrics.density).roundToInt()
-                val iconPaddingPx = (14 * activity.resources.displayMetrics.density).roundToInt()
-                val adapter = object : android.widget.ArrayAdapter<android.content.pm.ResolveInfo>(
-                    activity,
-                    android.R.layout.select_dialog_item,
-                    android.R.id.text1,
-                    handlers
-                ) {
-                    override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-                        val row = super.getView(position, convertView, parent)
-                        val textView = row.findViewById<android.widget.TextView>(android.R.id.text1)
-                        val info = handlers[position]
-                        textView.text = info.loadLabel(pm)
-                        val icon = try {
-                            info.loadIcon(pm)
-                        } catch (_: Exception) {
-                            null
-                        }
-                        if (icon != null) {
-                            icon.setBounds(0, 0, iconSizePx, iconSizePx)
-                            textView.setCompoundDrawablesRelative(icon, null, null, null)
-                            textView.compoundDrawablePadding = iconPaddingPx
-                        } else {
-                            textView.setCompoundDrawablesRelative(null, null, null, null)
-                        }
-                        return row
-                    }
-                }
-                android.app.AlertDialog.Builder(activity).setTitle(chooserTitle)
-                    .setAdapter(adapter) { _, index ->
-                        val target = handlers[index].activityInfo
-                        launch(target.packageName, android.content.ComponentName(target.packageName, target.name))
-                    }.setOnCancelListener { promise.resolve(false) }.show()
-            } catch (e: Exception) { failed(e) }
-        }
+        launch(if (chooserTitle == null) "org.videolan.vlc" else null)
     }
 
     @ReactMethod
