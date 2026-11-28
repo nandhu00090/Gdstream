@@ -11,10 +11,19 @@ import {
   ShimmerCardGrid,
   FadeInPoster,
   CinemaArcLoader,
+  DiscInspectLoader,
+  CascadeSpecPill,
   TopSyncProgressBar,
   TactileSpringPressable,
   StaggeredSection,
   SlideUpSheet,
+  Ambient4KGlowCard,
+  GlintBadge,
+  WaveCascadeCard,
+  KenBurnsBackdrop,
+  SeekBurstOverlay,
+  DownloadPulseBadge,
+  ProgressGlowTip,
 } from './LoadingAnimations';
 import { catalogRequest, catalogJson, inCatalogSlot } from './catalogRequests';
 import Orientation from 'react-native-orientation-locker';
@@ -226,6 +235,7 @@ const FocusableButton = ({
   disabled = false,
   focusId,
   isHeaderControl = false,
+  enableSheen = false,
   ...rest
 }: any) => {
   const [isFocused, setIsFocused] = useState(false);
@@ -276,6 +286,7 @@ const FocusableButton = ({
       focusable={isLayerActive}
       accessible={isLayerActive}
       highlighted={showFocus}
+      enableSheen={enableSheen}
       glowColor={showFocus ? '#FFD700' : 'rgba(229, 9, 20, 0.72)'}
       onPress={(e) => {
         if (onGlobalTvActivity) onGlobalTvActivity();
@@ -980,8 +991,8 @@ const App = () => {
     return cue ? cue.text : '';
   }, [isExternalSubtitleSelected, parsedExternalCues, currentTime, subtitleDelay]);
 
-  const [seekOverlay, setSeekOverlay] = useState({ visible: false, icon: '', time: 0, position: 'center' });
-  const fadeAnim = useRef(new Animated.Value(0)).current;
+  const [seekOverlay, setSeekOverlay] = useState({ visible: false, icon: '', time: 0, position: 'center', burstKey: 0 });
+  const seekBurstCounterRef = useRef(0);
   const accumulatedSeek = useRef(0);
   const seekBaseTime = useRef<number | null>(null);
   const multiTapTimer = useRef<any>(null);
@@ -2236,9 +2247,14 @@ const App = () => {
     accumulatedSeek.current += 10;
     const totalSeek = accumulatedSeek.current;
 
-    setSeekOverlay({ visible: true, icon: 'replay-10', time: totalSeek, position: isForward ? 'right' : 'left' });
-    fadeAnim.setValue(1);
-    Animated.timing(fadeAnim, { toValue: 0, duration: 800, useNativeDriver: true }).start();
+    seekBurstCounterRef.current += 1;
+    setSeekOverlay({
+      visible: true,
+      icon: 'replay-10',
+      time: totalSeek,
+      position: isForward ? 'right' : 'left',
+      burstKey: seekBurstCounterRef.current,
+    });
 
     multiTapTimer.current = setTimeout(() => {
       const base = seekBaseTime.current ?? currentTimeRef.current;
@@ -2250,7 +2266,7 @@ const App = () => {
       accumulatedSeek.current = 0;
       lastTapDirection.current = null;
     }, 300);
-  }, [fadeAnim, seekBothPlayers]);
+  }, [seekBothPlayers]);
 
 
   const currentActiveLayer = isTvSearchModalOpen
@@ -3635,12 +3651,12 @@ const App = () => {
           </View>
         )}
 
-        <Animated.View style={[styles.seekOverlay, { opacity: fadeAnim, alignItems: seekOverlay.position === 'right' ? 'flex-end' : 'flex-start' }]} pointerEvents="none">
-          <View style={styles.netflixSeekBubble}>
-            <Icon name={seekOverlay.position === 'right' ? 'forward-10' : 'replay-10'} size={42} color="white" />
-            <Text style={styles.seekText}>{seekOverlay.position === 'right' ? `+${seekOverlay.time}s` : `-${seekOverlay.time}s`}</Text>
-          </View>
-        </Animated.View>
+        <SeekBurstOverlay
+          visible={seekOverlay.visible}
+          position={seekOverlay.position}
+          time={seekOverlay.time}
+          burstKey={seekOverlay.burstKey}
+        />
 
         {isVideoBuffering && !showControls && (
           <View style={styles.playerBufferingOverlay} pointerEvents="none">
@@ -3847,7 +3863,7 @@ const App = () => {
         <StatusBar hidden={false} barStyle="light-content" />
         <View style={styles.detailHero}>
           {bannerImage ? (
-            <FadeInPoster source={{ uri: bannerImage }} style={styles.detailBackdrop} resizeMode="cover" durationMs={280} />
+            <KenBurnsBackdrop source={{ uri: bannerImage }} style={styles.detailBackdrop} resizeMode="cover" durationMs={280} />
           ) : (
             <View style={styles.detailBackdropPlaceholder}>
               <Text style={styles.placeholderMonogram}>{info.cleanTitle.charAt(0).toUpperCase()}</Text>
@@ -3882,7 +3898,7 @@ const App = () => {
               {topChips.length > 0 && (
                 <View style={styles.badgeWrapRow}>
                   {topChips.map((b, idx) => (
-                    <View key={idx} style={styles.techChip}><Text style={styles.techChipText}>{b}</Text></View>
+                    <CascadeSpecPill key={idx} index={idx} style={styles.techChip}><Text style={styles.techChipText}>{b}</Text></CascadeSpecPill>
                   ))}
                 </View>
               )}
@@ -3943,16 +3959,43 @@ const App = () => {
 
           {!!isoInspectionError && <Text accessibilityRole="alert" style={{ color: '#FCA5A5', marginBottom: 12 }}>{isoInspectionError}</Text>}
           <StaggeredSection delayMs={80} style={styles.detailActionButtons}>
-            <FocusableButton focusId="detail_play_btn" hasTVPreferredFocus={true} style={styles.primaryPlayButton} disabled={openingIso} onPress={() => isoInspectionError ? retryInspection.current?.() : handlePlayInAppPress(selectedFile)}>
-              {openingIso ? <CinemaArcLoader size="small" compact /> : <Icon name="play-arrow" size={26} color="white" />}
-              <Text style={styles.primaryPlayButtonText}>
-                {openingIso ? 'Inspecting Blu-ray disc...' : isoInspectionError ? 'Retry disc inspection' : savedSec > 3
-                  ? `Resume ${versionGroup.length > 1 ? getVersionTag(selectedFile.name).split(' • ')[0] : 'Watching'} (${formatRemainingLabel(savedSec, totalDur)})`
-                  : versionGroup.length > 1
-                  ? `Play ${getVersionTag(selectedFile.name)} in App`
-                  : 'Play in App'}
-              </Text>
-            </FocusableButton>
+            {(() => {
+              const isDvdDisc =
+                selectedFile?.videoExtension === 'vob' ||
+                /\b(dvd|dvd5|dvd9|dvdrip|video_ts|vob)\b/i.test(String(selectedFile?.name || ''));
+              const discKind: 'dvd' | 'bluray' = isDvdDisc ? 'dvd' : 'bluray';
+              return (
+                <FocusableButton
+                  focusId="detail_play_btn"
+                  hasTVPreferredFocus={true}
+                  style={[
+                    styles.primaryPlayButton,
+                    openingIso && {
+                      backgroundColor: '#121622',
+                      borderColor: isDvdDisc ? '#F5C518' : '#38BDF8',
+                      overflow: 'hidden',
+                      paddingVertical: 11,
+                    },
+                  ]}
+                  disabled={openingIso}
+                  onPress={() => isoInspectionError ? retryInspection.current?.() : handlePlayInAppPress(selectedFile)}>
+                  {openingIso ? (
+                    <DiscInspectLoader discType={discKind} />
+                  ) : (
+                    <>
+                      <Icon name="play-arrow" size={26} color="white" />
+                      <Text style={styles.primaryPlayButtonText}>
+                        {isoInspectionError ? 'Retry disc inspection' : savedSec > 3
+                          ? `Resume ${versionGroup.length > 1 ? getVersionTag(selectedFile.name).split(' • ')[0] : 'Watching'} (${formatRemainingLabel(savedSec, totalDur)})`
+                          : versionGroup.length > 1
+                          ? `Play ${getVersionTag(selectedFile.name)} in App`
+                          : 'Play in App'}
+                      </Text>
+                    </>
+                  )}
+                </FocusableButton>
+              );
+            })()}
 
             <View style={{ flexDirection: 'row', gap: 10 }}>
               <FocusableButton focusId="detail_ext_btn" disabled={!!selectedFile.isoPending} style={[styles.secondaryPlayButton, { flex: 1 }]} onPress={() => openInExternalPlayer(selectedFile)}>
@@ -4123,7 +4166,7 @@ const App = () => {
                     <Text style={styles.miSpecLabel}>AUDIO ({vMi.audioTracks.length})</Text>
                     <View style={styles.miTrackPillWrap}>
                       {vMi.audioTracks.map((at, idx) => (
-                        <View key={idx} style={styles.miAudioPill}>
+                        <CascadeSpecPill key={idx} index={idx} style={styles.miAudioPill}>
                           <Text style={styles.miAudioPillText}>
                             {vMi.hasAtmos
                               ? at.summary
@@ -4131,7 +4174,7 @@ const App = () => {
                                   .replace('Dolby Digital Plus (DD+)', 'Dolby Digital Plus (DD+)')
                               : at.summary}
                           </Text>
-                        </View>
+                        </CascadeSpecPill>
                       ))}
                     </View>
                   </View>
@@ -4157,11 +4200,11 @@ const App = () => {
                   <Text style={styles.miSpecLabel}>SUBTITLES ({vMi.subtitleTracks.length})</Text>
                   <View style={styles.miTrackPillWrap}>
                     {visibleSubs.map((gs, idx) => (
-                      <View key={idx} style={styles.miSubPill}>
+                      <CascadeSpecPill key={idx} index={idx} style={styles.miSubPill}>
                         <Text style={styles.miSubPillText}>
                           {gs.count > 1 ? `${gs.label} ×${gs.count}` : gs.label}
                         </Text>
-                      </View>
+                      </CascadeSpecPill>
                     ))}
                     {groupedSubs.length > INITIAL_SUB_LIMIT && (
                       <FocusableButton
@@ -4333,36 +4376,49 @@ const App = () => {
       if (isFolderCard) lastFolderCardIdRef.current = cardFocusId;
       else lastHomeCardIdRef.current = cardFocusId;
     };
+    const catalogTransitionKey = `${activeCategory}|${sortBy}|${viewMode}|${currentPath}`;
+    const has4kOrHdr = Boolean(
+      cardRes === '4K' ||
+      cardRes === '2160p' ||
+      realMi?.hasDV ||
+      realMi?.hasHDR ||
+      info.hasDV ||
+      info.hasHDR,
+    );
+    const isDvCard = Boolean(realMi?.hasDV || info.hasDV);
 
     if (viewMode === 'list') {
       return (
-        <FocusableButton
-          focusId={cardFocusId}
-          style={styles.listCard}
-          onFocus={recordCardFocus}
-          onPress={() => {
-            recordCardFocus();
-            handlePress(item);
-          }}>
-          <View style={styles.listPosterFallback}>
-            <Icon name={!isMovieFolder && isPhysicalFolder ? 'folder' : 'movie'} size={26} color={!isMovieFolder && isPhysicalFolder ? '#F5C518' : '#E50914'} />
-            {!!meta?.poster && (
-              <FadeInPoster source={{ uri: meta.poster }} style={[styles.listPosterThumb, StyleSheet.absoluteFill]} resizeMode="cover" />
-            )}
-          </View>
-          <View style={styles.listCardBody}>
-            <Text style={styles.listCardTitle} numberOfLines={1}>
-              {!isFolder && info.episodeNum > 0 ? `E${info.episodeNum < 10 ? `0${info.episodeNum}` : info.episodeNum} • ${info.cleanTitle}` : info.cleanTitle}
-            </Text>
-            <View style={styles.listCardMetaRow}>
-              {!!(meta?.year || info.year) && <Text style={styles.cardSubText}>{meta?.year || info.year}</Text>}
-              {!!info.seasonEpisode && <Text style={styles.cardSeasonTag}>{info.seasonEpisode}</Text>}
-              {!!cardRes && <Text style={styles.cardQualityTag}>{cardRes}</Text>}
-              {versionCount > 1 && <Text style={styles.cardSeasonTag}>{versionCount} Versions</Text>}
-              {savedSec > 3 && <Text style={styles.cardResumeTag}>{formatRemainingLabel(savedSec, totalDur)}</Text>}
+        <WaveCascadeCard index={index} transitionKey={catalogTransitionKey}>
+          <FocusableButton
+            focusId={cardFocusId}
+            enableSheen={true}
+            style={styles.listCard}
+            onFocus={recordCardFocus}
+            onPress={() => {
+              recordCardFocus();
+              handlePress(item);
+            }}>
+            <View style={styles.listPosterFallback}>
+              <Icon name={!isMovieFolder && isPhysicalFolder ? 'folder' : 'movie'} size={26} color={!isMovieFolder && isPhysicalFolder ? '#F5C518' : '#E50914'} />
+              {!!meta?.poster && (
+                <FadeInPoster source={{ uri: meta.poster }} style={[styles.listPosterThumb, StyleSheet.absoluteFill]} resizeMode="cover" />
+              )}
             </View>
-          </View>
-        </FocusableButton>
+            <View style={styles.listCardBody}>
+              <Text style={styles.listCardTitle} numberOfLines={1}>
+                {!isFolder && info.episodeNum > 0 ? `E${info.episodeNum < 10 ? `0${info.episodeNum}` : info.episodeNum} • ${info.cleanTitle}` : info.cleanTitle}
+              </Text>
+              <View style={styles.listCardMetaRow}>
+                {!!(meta?.year || info.year) && <Text style={styles.cardSubText}>{meta?.year || info.year}</Text>}
+                {!!info.seasonEpisode && <Text style={styles.cardSeasonTag}>{info.seasonEpisode}</Text>}
+                {!!cardRes && <Text style={styles.cardQualityTag}>{cardRes}</Text>}
+                {versionCount > 1 && <Text style={styles.cardSeasonTag}>{versionCount} Versions</Text>}
+                {savedSec > 3 && <Text style={styles.cardResumeTag}>{formatRemainingLabel(savedSec, totalDur)}</Text>}
+              </View>
+            </View>
+          </FocusableButton>
+        </WaveCascadeCard>
       );
     }
 
@@ -4373,62 +4429,67 @@ const App = () => {
       : meta?.poster;
 
     return (
-      <FocusableButton
-        focusId={cardFocusId}
-        style={styles.posterCard}
-        onFocus={recordCardFocus}
-        onPress={() => {
-          recordCardFocus();
-          handlePress(item);
-        }}>
-        <View style={[styles.posterImageContainer, isEpisodeStillCard && { aspectRatio: 16 / 9 }]}>
-          <View style={styles.posterFallback}>
-            <Icon name={!isMovieFolder && isPhysicalFolder ? 'folder-special' : 'local-movies'} size={isEpisodeStillCard ? 30 : 38} color={!isMovieFolder && isPhysicalFolder ? '#F5C518' : '#E50914'} />
-            <Text style={styles.posterFallbackTitle} numberOfLines={2}>{epCardMeta?.epTitle || info.cleanTitle}</Text>
-          </View>
-          {!!cardImageUri && (
-            <FadeInPoster source={{ uri: cardImageUri }} style={[styles.posterImage, StyleSheet.absoluteFill]} resizeMode="cover" />
-          )}
-
-          <View style={styles.posterTopBadges}>
-            {showSeriesBadge ? (() => {
-              const badgeInfo = getHomeSeriesBadgeText(item, info, meta);
-              return (
-                <View style={badgeInfo.isRating ? styles.ratingPill : styles.folderPill}>
-                  <Text style={badgeInfo.isRating ? styles.ratingPillText : styles.folderPillText}>
-                    {badgeInfo.text}
-                  </Text>
-                </View>
-              );
-            })() : info.seasonEpisode ? (
-              <View style={styles.folderPill}><Text style={styles.folderPillText}>{info.seasonEpisode}</Text></View>
-            ) : meta?.rating ? (
-              <View style={styles.ratingPill}><Text style={styles.ratingPillText}>★ {meta.rating}</Text></View>
-            ) : <View />}
-
-            {!!cardRes && (
-              <View style={[styles.resPill, cardRes === '4K' && styles.resPill4K]}>
-                <Text style={styles.resPillText}>{cardRes}</Text>
+      <WaveCascadeCard index={index} transitionKey={catalogTransitionKey} style={styles.posterGridSlot}>
+        <Ambient4KGlowCard active={has4kOrHdr} isDv={isDvCard} borderRadius={12}>
+          <FocusableButton
+            focusId={cardFocusId}
+            enableSheen={true}
+            style={[styles.posterCard, { maxWidth: '100%', margin: 0 }]}
+            onFocus={recordCardFocus}
+            onPress={() => {
+              recordCardFocus();
+              handlePress(item);
+            }}>
+            <View style={[styles.posterImageContainer, isEpisodeStillCard && { aspectRatio: 16 / 9 }]}>
+              <View style={styles.posterFallback}>
+                <Icon name={!isMovieFolder && isPhysicalFolder ? 'folder-special' : 'local-movies'} size={isEpisodeStillCard ? 30 : 38} color={!isMovieFolder && isPhysicalFolder ? '#F5C518' : '#E50914'} />
+                <Text style={styles.posterFallbackTitle} numberOfLines={2}>{epCardMeta?.epTitle || info.cleanTitle}</Text>
               </View>
-            )}
-          </View>
+              {!!cardImageUri && (
+                <FadeInPoster source={{ uri: cardImageUri }} style={[styles.posterImage, StyleSheet.absoluteFill]} resizeMode="cover" />
+              )}
 
-          {versionCount > 1 && (
-            <View style={styles.multiVersionBadge}>
-              <Text style={styles.multiVersionBadgeText}>{versionCount} VERSIONS</Text>
+              <View style={styles.posterTopBadges}>
+                {showSeriesBadge ? (() => {
+                  const badgeInfo = getHomeSeriesBadgeText(item, info, meta);
+                  return (
+                    <View style={badgeInfo.isRating ? styles.ratingPill : styles.folderPill}>
+                      <Text style={badgeInfo.isRating ? styles.ratingPillText : styles.folderPillText}>
+                        {badgeInfo.text}
+                      </Text>
+                    </View>
+                  );
+                })() : info.seasonEpisode ? (
+                  <View style={styles.folderPill}><Text style={styles.folderPillText}>{info.seasonEpisode}</Text></View>
+                ) : meta?.rating ? (
+                  <View style={styles.ratingPill}><Text style={styles.ratingPillText}>★ {meta.rating}</Text></View>
+                ) : <View />}
+
+                {!!cardRes && (
+                  <GlintBadge active={cardRes === '4K' || cardRes === '2160p'} style={[styles.resPill, cardRes === '4K' && styles.resPill4K]}>
+                    <Text style={styles.resPillText}>{cardRes}</Text>
+                  </GlintBadge>
+                )}
+              </View>
+
+              {versionCount > 1 && (
+                <GlintBadge active={true} style={styles.multiVersionBadge}>
+                  <Text style={styles.multiVersionBadgeText}>{versionCount} VERSIONS</Text>
+                </GlintBadge>
+              )}
+
+              {isFav && (
+                <View style={styles.posterFavBadge}><Icon name="favorite" size={13} color="#E50914" /></View>
+              )}
+
+              {savedSec > 3 && (
+                <View style={styles.resumeBarBg}>
+                  <View style={[styles.resumeBarFill, { width: `${resumePct}%` }]}>
+                    <ProgressGlowTip />
+                  </View>
+                </View>
+              )}
             </View>
-          )}
-
-          {isFav && (
-            <View style={styles.posterFavBadge}><Icon name="favorite" size={13} color="#E50914" /></View>
-          )}
-
-          {savedSec > 3 && (
-            <View style={styles.resumeBarBg}>
-              <View style={[styles.resumeBarFill, { width: `${resumePct}%` }]} />
-            </View>
-          )}
-        </View>
 
         <View style={styles.posterCardFooter}>
           <Text style={styles.posterTitle} numberOfLines={1}>
@@ -4436,20 +4497,22 @@ const App = () => {
               ? (epCardMeta?.epTitle ? `E${String(info.episodeNum).padStart(2, '0')} • ${epCardMeta.epTitle}` : `Episode ${info.episodeNum} • ${info.cleanTitle}`)
               : info.cleanTitle}
           </Text>
-          <View style={styles.posterSubRow}>
-            {savedSec > 3 ? (
-              <Text style={styles.posterResumeText}>▶ {formatRemainingLabel(savedSec, totalDur)}</Text>
-            ) : (
-              <>
-                <Text style={styles.posterYear}>{meta?.year || info.year || (isFolder ? 'Series' : 'Movie')}</Text>
-                {(realMi?.languages?.length ? realMi.languages.slice(0, 2) : info.badges.slice(0, 2)).map((b, idx) => (
-                  <Text key={idx} style={styles.posterMiniTag}>• {b}</Text>
-                ))}
-              </>
-            )}
-          </View>
-        </View>
-      </FocusableButton>
+              <View style={styles.posterSubRow}>
+                {savedSec > 3 ? (
+                  <Text style={styles.posterResumeText}>▶ {formatRemainingLabel(savedSec, totalDur)}</Text>
+                ) : (
+                  <>
+                    <Text style={styles.posterYear}>{meta?.year || info.year || (isFolder ? 'Series' : 'Movie')}</Text>
+                    {(realMi?.languages?.length ? realMi.languages.slice(0, 2) : info.badges.slice(0, 2)).map((b, idx) => (
+                      <Text key={idx} style={styles.posterMiniTag}>• {b}</Text>
+                    ))}
+                  </>
+                )}
+              </View>
+            </View>
+          </FocusableButton>
+        </Ambient4KGlowCard>
+      </WaveCascadeCard>
     );
   };
 
@@ -4520,7 +4583,9 @@ const App = () => {
                     )}
                     <View style={styles.cwPlayBadge}><Icon name="play-arrow" size={18} color="white" /></View>
                     <View style={styles.resumeBarBg}>
-                      <View style={[styles.resumeBarFill, { width: `${cwPct}%` }]} />
+                      <View style={[styles.resumeBarFill, { width: `${cwPct}%` }]}>
+                        <ProgressGlowTip />
+                      </View>
                     </View>
                   </View>
                   <View style={styles.cwFooter}>
@@ -4573,10 +4638,12 @@ const App = () => {
 
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
             <FocusableButton focusId="hdr_dl" isHeaderControl={true} style={styles.headerIconBtn} onPress={() => setActiveTab('downloads')}>
-              <Icon name="file-download" size={22} color={activeDownloadsCount > 0 ? '#46d369' : 'white'} />
-              {downloads.length > 0 && (
-                <View style={styles.dlBadgeDot}><Text style={styles.dlBadgeDotText}>{downloads.length}</Text></View>
-              )}
+              <DownloadPulseBadge active={activeDownloadsCount > 0}>
+                <Icon name="file-download" size={22} color={activeDownloadsCount > 0 ? '#46d369' : 'white'} />
+                {downloads.length > 0 && (
+                  <View style={styles.dlBadgeDot}><Text style={styles.dlBadgeDotText}>{downloads.length}</Text></View>
+                )}
+              </DownloadPulseBadge>
             </FocusableButton>
             <FocusableButton focusId="hdr_refresh" accessibilityLabel="Refresh Library" isHeaderControl={true} style={styles.headerIconBtn} onPress={handleRefresh}>
               <Icon name="refresh" size={21} color="white" />
@@ -4841,6 +4908,7 @@ const styles = StyleSheet.create({
   cwFooter: { paddingHorizontal: 9, paddingVertical: 7 },
   cwTitle: { color: 'white', fontSize: 13, fontWeight: '700' },
   cwTimeText: { color: '#E50914', fontSize: 11, fontWeight: '700', marginTop: 2 },
+  posterGridSlot: { flex: 1, maxWidth: IS_TV ? '18.6%' : '47%', margin: '1.5%' },
   posterCard: { flex: 1, maxWidth: IS_TV ? '18.6%' : '47%', margin: '1.5%', backgroundColor: '#14171F', borderRadius: 12, overflow: 'hidden', borderWidth: 2, borderColor: '#1F2430' },
   posterImageContainer: { width: '100%', aspectRatio: 2 / 3, backgroundColor: '#191D26', position: 'relative' },
   posterImage: { width: '100%', height: '100%' },
@@ -4877,7 +4945,7 @@ const styles = StyleSheet.create({
   cardResumeTag: { backgroundColor: 'rgba(229,9,20,0.18)', color: '#FF6B72', fontSize: 11, fontWeight: '800', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
   tvFocused: { borderColor: '#FFD700', borderWidth: 2, backgroundColor: 'rgba(255, 215, 0, 0.22)' },
   detailScreen: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 50, backgroundColor: '#0B0C10' },
-  detailHero: { width: '100%', height: 240, backgroundColor: '#141821', position: 'relative' },
+  detailHero: { width: '100%', height: 240, backgroundColor: '#141821', position: 'relative', overflow: 'hidden' },
   detailBackdrop: { width: '100%', height: '100%' },
   detailBackdropPlaceholder: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#181D29' },
   placeholderMonogram: { color: 'rgba(229, 9, 20, 0.35)', fontSize: 84, fontWeight: '900' },
