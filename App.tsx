@@ -1,12 +1,21 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, useContext, createContext } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity, Pressable, StyleSheet, ActivityIndicator,
+  View, Text, FlatList, TouchableOpacity, StyleSheet,
   Alert, NativeModules, TextInput, ScrollView, BackHandler, Animated,
   Platform, DeviceEventEmitter, Image, Modal, PanResponder, Dimensions,
   StatusBar, RefreshControl, AppState,
 } from 'react-native';
 import Video from 'react-native-video';
 import DvdSubtitleOverlay from './DvdSubtitleOverlay';
+import {
+  ShimmerCardGrid,
+  FadeInPoster,
+  CinemaArcLoader,
+  TopSyncProgressBar,
+  TactileSpringPressable,
+  StaggeredSection,
+  SlideUpSheet,
+} from './LoadingAnimations';
 import { catalogRequest, catalogJson, inCatalogSlot } from './catalogRequests';
 import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
@@ -260,12 +269,14 @@ const FocusableButton = ({
   const showFocus = isFocused && isLayerActive;
 
   return (
-    <Pressable
-      ref={btnRef}
+    <TactileSpringPressable
+      innerRef={btnRef}
       nativeID={isLayerActive && focusId ? focusId : undefined}
       disabled={disabled || !isLayerActive}
       focusable={isLayerActive}
       accessible={isLayerActive}
+      highlighted={showFocus}
+      glowColor={showFocus ? '#FFD700' : 'rgba(229, 9, 20, 0.72)'}
       onPress={(e) => {
         if (onGlobalTvActivity) onGlobalTvActivity();
         if (onPress) onPress(e);
@@ -287,15 +298,14 @@ const FocusableButton = ({
         setIsFocused(false);
         if (userOnBlur) userOnBlur(e);
       }}
-      style={({ pressed }: any) => [
+      style={[
         style,
-        pressed && { opacity: activeOpacity },
         showFocus && styles.tvFocused,
         showFocus && focusedStyle,
       ]}
       {...rest}>
       {children}
-    </Pressable>
+    </TactileSpringPressable>
   );
 };
 
@@ -377,10 +387,14 @@ const App = () => {
   // Separate Home Catalog vs Series/Subfolder Files so Home FlatList never unmounts or loses scroll position!
   const directoryRequest = useRef(0);
   const [homeFiles, setHomeFiles] = useState<any[]>([]);
+  const homeFilesRef = useRef<any[]>([]);
+  homeFilesRef.current = homeFiles;
   const [folderFiles, setFolderFiles] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [folderLoading, setFolderLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [syncingCatalog, setSyncingCatalog] = useState(false);
+  const [isEnrichingMetadata, setIsEnrichingMetadata] = useState(false);
   const [pathStack, setPathStack] = useState(['/0:/']);
   const [currentPath, setCurrentPath] = useState('/0:/');
   const [searchQuery, setSearchQuery] = useState('');
@@ -419,7 +433,7 @@ const App = () => {
   const [playerInstanceKey, setPlayerInstanceKey] = useState(0);
 
   const archiveListing = useRef<{ path: string; url: string; size: number } | null>(null);
-  const [navigationReady, setNavigationReady] = useState(false);
+  const [navigationReady, setNavigationReady] = useState(true);
   const [selectedFile, setSelectedFile] = useState<any>(null);
 
   
@@ -1114,7 +1128,51 @@ const App = () => {
     });
 
     let mounted = true;
+    const hydrateColdBootCache = async () => {
+      try {
+        const lastRootKey = await AsyncStorage.getItem('gdstream_last_root_dir_key_v1');
+        if (!mounted || !lastRootKey) return;
+        const raw = await AsyncStorage.getItem(lastRootKey);
+        if (!mounted || !raw) return;
+        const cache = JSON.parse(raw);
+        if (!Array.isArray(cache?.files) || cache.files.length === 0) return;
+
+        setHomeFiles(cache.files);
+        setLoading(false);
+        setSyncingCatalog(true);
+
+        const metaKeys: string[] = Array.from(new Set<string>(
+          cache.files
+            .filter((f: any) => f?.name)
+            .map((f: any) => metadataCacheKey(parseMediaFilename(String(f.name), isSeriesContainerItem(f)))),
+        ));
+        if (metaKeys.length > 0) {
+          const pairs = await readStoragePairs(metaKeys);
+          if (!mounted) return;
+          const hydratedMeta: Record<string, MediaMetadata> = {};
+          const lookup: Record<string, MediaMetadata> = {};
+          for (const [k, v] of pairs) {
+            if (v) {
+              try { lookup[k] = JSON.parse(v); } catch {}
+            }
+          }
+          for (const f of cache.files) {
+            if (!f?.name) continue;
+            const info = parseMediaFilename(String(f.name), isSeriesContainerItem(f));
+            const hit = lookup[metadataCacheKey(info)];
+            if (hit && isUsableCachedMetadata(hit, info)) {
+              hydratedMeta[f.name] = hit;
+            }
+          }
+          if (Object.keys(hydratedMeta).length > 0) {
+            setMetadataMap(prev => ({ ...hydratedMeta, ...prev }));
+          }
+        }
+      } catch {}
+    };
+
     const initVaultAndFetch = async () => {
+      const cacheHydration = hydrateColdBootCache();
       try {
         if (SecurityVault?.getVaultConfig) {
           const cfg = await SecurityVault.getVaultConfig();
@@ -1124,12 +1182,13 @@ const App = () => {
             password: cfg?.c || cfg?.password || '', tmdbKey: cfg?.d || cfg?.tmdbKey || '',
           };
         }
+        await cacheHydration;
         if (!mounted) return;
         setVaultReady(true);
         setNavigationReady(true);
         void fetchDirectory('/0:/');
       } catch {
-        if (mounted) { setNavigationReady(true); setLoading(false); }
+        if (mounted) { setNavigationReady(true); setLoading(false); setSyncingCatalog(false); }
       }
     };
     initVaultAndFetch();
@@ -1705,6 +1764,7 @@ const App = () => {
 
       if (cancelled || !uncachedQueue.length) return;
 
+      if (!cancelled) setIsEnrichingMetadata(true);
       const inflightByCacheKey = new Map<string, Promise<MediaMetadata | null>>();
       let stagedUpdates: Record<string, MediaMetadata> = {};
       let lastFlushTime = Date.now();
@@ -1748,12 +1808,19 @@ const App = () => {
         }
       };
 
-      await Promise.all(Array.from({ length: Math.min(CONCURRENCY, uncachedQueue.length) }, () => runWorker()));
-      flushStaged(true);
+      try {
+        await Promise.all(Array.from({ length: Math.min(CONCURRENCY, uncachedQueue.length) }, () => runWorker()));
+        flushStaged(true);
+      } finally {
+        if (!cancelled) setIsEnrichingMetadata(false);
+      }
     };
 
     enrichAllFast();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      setIsEnrichingMetadata(false);
+    };
   }, [activeRawFiles, vaultReady, selectedFile, playMode, fetchSingleMetadata, loadSavedTimesForFiles, folderClassifications, folderPathForItem]);
 
   React.useEffect(() => {
@@ -2514,10 +2581,14 @@ const App = () => {
     const remember = (files: any[], displayPath = path, seasons: SeasonFolderItem[] = [],
       season: SeasonFolderItem | null = null, title = '') => {
       void AsyncStorage.setItem(key, JSON.stringify({ files, displayPath, seasons, season, title })).catch(() => {});
+      if (isRoot) {
+        void AsyncStorage.setItem('gdstream_last_root_dir_key_v1', key).catch(() => {});
+      }
     };
 
     if (isPullRefresh) {
       setRefreshing(true);
+      setSyncingCatalog(true);
       fetchedKeysRef.current.clear();
       for (const k of Array.from(folderClassifyingRef.current)) {
         if (k.startsWith(path)) folderClassifyingRef.current.delete(k);
@@ -2533,7 +2604,10 @@ const App = () => {
         return next;
       });
     }
-    else if (isRoot) setLoading(true);
+    else if (isRoot) {
+      if (homeFilesRef.current.length > 0) setSyncingCatalog(true);
+      else setLoading(true);
+    }
     else setFolderLoading(true);
 
     try {
@@ -2552,6 +2626,7 @@ const App = () => {
           setCurrentPath(cache.displayPath);
           setLoading(false);
           setFolderLoading(false);
+          setSyncingCatalog(true);
           showingCache = true;
         }
       } catch {}
@@ -2642,6 +2717,7 @@ const App = () => {
         setLoading(false);
         setFolderLoading(false);
         setRefreshing(false);
+        setSyncingCatalog(false);
       }
     }
   };
@@ -3097,7 +3173,7 @@ const App = () => {
         onRequestClose={() => setShowSeasonModal(false)}>
         <FocusLayerContext.Provider value="seasonModal">
         <View style={styles.modalBackdrop}>
-          <View style={styles.hdrModalCard}>
+          <SlideUpSheet style={styles.hdrModalCard}>
             <Text style={styles.hdrModalEyebrow}>{seriesParentTitle.toUpperCase() || 'SERIES'}</Text>
             <Text style={styles.hdrModalTitle}>Select Season</Text>
             <ScrollView style={{ maxHeight: 300, marginTop: 12 }}>
@@ -3124,7 +3200,7 @@ const App = () => {
             <FocusableButton style={styles.hdrCancelBtn} onPress={() => setShowSeasonModal(false)}>
               <Text style={{ color: '#99A3B3', fontWeight: '700' }}>Close</Text>
             </FocusableButton>
-          </View>
+          </SlideUpSheet>
         </View>
         </FocusLayerContext.Provider>
       </Modal>
@@ -3142,7 +3218,7 @@ const App = () => {
         onRequestClose={() => setShowHdrChoiceModal(false)}>
         <FocusLayerContext.Provider value="hdrModal">
         <View style={styles.modalBackdrop}>
-          <View style={styles.hdrModalCard}>
+          <SlideUpSheet style={styles.hdrModalCard}>
             <Text style={styles.hdrModalEyebrow}>SELECT DISPLAY FORMAT</Text>
             <Text style={styles.hdrModalTitle}>{info.cleanTitle}</Text>
             <Text style={styles.hdrModalSub}>
@@ -3167,7 +3243,7 @@ const App = () => {
             <FocusableButton style={styles.hdrCancelBtn} onPress={() => setShowHdrChoiceModal(false)}>
               <Text style={{ color: '#99A3B3', fontWeight: '700' }}>Cancel</Text>
             </FocusableButton>
-          </View>
+          </SlideUpSheet>
         </View>
         </FocusLayerContext.Provider>
       </Modal>
@@ -3226,7 +3302,7 @@ const App = () => {
       return (
         <FocusLayerContext.Provider value="playerMenu">
         <View style={styles.netflixSheetOverlay}>
-          <View style={[styles.floatingMenu, { width: 400 }]}>
+          <SlideUpSheet style={[styles.floatingMenu, { width: 400 }]}>
             <View style={styles.floatingMenuHeader}>
               <Text style={styles.floatingMenuTitle}>Episodes ({playableFolderEpisodes.length})</Text>
               <FocusableButton style={styles.menuCloseBtn} onPress={() => setActiveMenu(null)}>
@@ -3262,7 +3338,7 @@ const App = () => {
                 );
               })}
             </ScrollView>
-          </View>
+          </SlideUpSheet>
         </View>
         </FocusLayerContext.Provider>
       );
@@ -3275,7 +3351,7 @@ const App = () => {
     return (
       <FocusLayerContext.Provider value="playerMenu">
       <View style={styles.netflixSheetOverlay}>
-        <View style={styles.floatingMenu}>
+        <SlideUpSheet style={styles.floatingMenu}>
           <View style={styles.floatingMenuHeader}>
             <Text style={styles.floatingMenuTitle}>{isAudio ? 'Audio & Sound Boost' : 'Subtitles & Captions'}</Text>
             <FocusableButton style={styles.menuCloseBtn} onPress={() => setActiveMenu(null)}>
@@ -3398,7 +3474,7 @@ const App = () => {
               );
             })}
           </ScrollView>
-        </View>
+        </SlideUpSheet>
       </View>
       </FocusLayerContext.Provider>
     );
@@ -3566,6 +3642,12 @@ const App = () => {
           </View>
         </Animated.View>
 
+        {isVideoBuffering && !showControls && (
+          <View style={styles.playerBufferingOverlay} pointerEvents="none">
+            <CinemaArcLoader size="large" statusText="Buffering stream..." />
+          </View>
+        )}
+
         {showControls && isLocked && (
           <View style={styles.lockedOverlay} pointerEvents="box-none">
             <FocusableButton style={styles.unlockPillBtn} onPress={() => setIsLocked(false)}>
@@ -3627,7 +3709,7 @@ const App = () => {
                   persistPlaybackProgress(selectedFile.name, currentTimeRef.current, durationRef.current);
                 }
               }} style={styles.netflixMainPlayBtn}>
-                {isVideoBuffering ? <ActivityIndicator size="large" color="#FFFFFF" /> : <Icon name={isPaused ? 'play-arrow' : 'pause'} size={54} color="white" />}
+                {isVideoBuffering ? <CinemaArcLoader size="medium" compact /> : <Icon name={isPaused ? 'play-arrow' : 'pause'} size={54} color="white" />}
               </FocusableButton>
               <FocusableButton style={styles.netflixSeekCircleBtn} onPress={() => triggerStepSeek(true)}>
                 <Icon name="forward-10" size={40} color="white" />
@@ -3765,7 +3847,7 @@ const App = () => {
         <StatusBar hidden={false} barStyle="light-content" />
         <View style={styles.detailHero}>
           {bannerImage ? (
-            <Image source={{ uri: bannerImage }} style={styles.detailBackdrop} resizeMode="cover" />
+            <FadeInPoster source={{ uri: bannerImage }} style={styles.detailBackdrop} resizeMode="cover" durationMs={280} />
           ) : (
             <View style={styles.detailBackdropPlaceholder}>
               <Text style={styles.placeholderMonogram}>{info.cleanTitle.charAt(0).toUpperCase()}</Text>
@@ -3779,8 +3861,12 @@ const App = () => {
 
         <View style={styles.detailContent}>
           <View style={styles.detailHeaderRow}>
-            {meta?.poster ? <Image source={{ uri: meta.poster }} style={styles.detailPosterThumb} resizeMode="cover" /> : null}
-            <View style={{ flex: 1 }}>
+            {meta?.poster ? (
+              <StaggeredSection delayMs={0}>
+                <FadeInPoster source={{ uri: meta.poster }} style={styles.detailPosterThumb} resizeMode="cover" />
+              </StaggeredSection>
+            ) : null}
+            <StaggeredSection delayMs={40} style={{ flex: 1 }}>
               <Text style={styles.detailTitle}>{meta?.title || info.cleanTitle}</Text>
               {!!episodeTmdbMeta?.epTitle && (
                 <Text style={{ color: '#D1D5DB', fontSize: 14, fontWeight: '600', marginTop: 2, marginBottom: 4 }} numberOfLines={2}>
@@ -3800,7 +3886,7 @@ const App = () => {
                   ))}
                 </View>
               )}
-            </View>
+            </StaggeredSection>
           </View>
 
           {savedSec > 3 && (
@@ -3856,9 +3942,9 @@ const App = () => {
           )}
 
           {!!isoInspectionError && <Text accessibilityRole="alert" style={{ color: '#FCA5A5', marginBottom: 12 }}>{isoInspectionError}</Text>}
-          <View style={styles.detailActionButtons}>
+          <StaggeredSection delayMs={80} style={styles.detailActionButtons}>
             <FocusableButton focusId="detail_play_btn" hasTVPreferredFocus={true} style={styles.primaryPlayButton} disabled={openingIso} onPress={() => isoInspectionError ? retryInspection.current?.() : handlePlayInAppPress(selectedFile)}>
-              <Icon name="play-arrow" size={26} color="white" />
+              {openingIso ? <CinemaArcLoader size="small" compact /> : <Icon name="play-arrow" size={26} color="white" />}
               <Text style={styles.primaryPlayButtonText}>
                 {openingIso ? 'Inspecting Blu-ray disc...' : isoInspectionError ? 'Retry disc inspection' : savedSec > 3
                   ? `Resume ${versionGroup.length > 1 ? getVersionTag(selectedFile.name).split(' • ')[0] : 'Watching'} (${formatRemainingLabel(savedSec, totalDur)})`
@@ -3954,10 +4040,10 @@ const App = () => {
                 </FocusableButton>
               );
             })()}
-          </View>
+          </StaggeredSection>
 
           {/* Single MediaInfo Card for Currently Selected Version Only */}
-          <View style={styles.mediaInfoCard}>
+          <StaggeredSection delayMs={120} style={styles.mediaInfoCard}>
             
                             <FocusableButton
                 focusId="detail_trailer_btn"
@@ -4003,7 +4089,7 @@ const App = () => {
               </View>
               {scanningMediaInfo && !vMi && (
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                  <ActivityIndicator size="small" color="#E50914" />
+                  <CinemaArcLoader size="small" compact />
                   <Text style={styles.scanningText}>Scanning...</Text>
                 </View>
               )}
@@ -4100,7 +4186,7 @@ const App = () => {
               <Text style={styles.rawFileLabel}>SOURCE FILE</Text>
               <Text style={styles.rawFileName}>{vItem.name}</Text>
             </FocusableButton>
-          </View>
+          </StaggeredSection>
         </View>
       </ScrollView>
       </FocusLayerContext.Provider>
@@ -4148,7 +4234,7 @@ const App = () => {
                 <View style={styles.dlItemCard}>
                   <View style={{ flexDirection: 'row', gap: 12 }}>
                     {item.poster ? (
-                      <Image source={{ uri: item.poster }} style={styles.dlPosterThumb} resizeMode="cover" />
+                      <FadeInPoster source={{ uri: item.poster }} style={styles.dlPosterThumb} resizeMode="cover" />
                     ) : (
                       <View style={styles.dlPosterFallback}><Icon name="movie" size={28} color="#E50914" /></View>
                     )}
@@ -4261,7 +4347,7 @@ const App = () => {
           <View style={styles.listPosterFallback}>
             <Icon name={!isMovieFolder && isPhysicalFolder ? 'folder' : 'movie'} size={26} color={!isMovieFolder && isPhysicalFolder ? '#F5C518' : '#E50914'} />
             {!!meta?.poster && (
-              <Image source={{ uri: meta.poster }} style={[styles.listPosterThumb, StyleSheet.absoluteFill]} resizeMode="cover" />
+              <FadeInPoster source={{ uri: meta.poster }} style={[styles.listPosterThumb, StyleSheet.absoluteFill]} resizeMode="cover" />
             )}
           </View>
           <View style={styles.listCardBody}>
@@ -4301,7 +4387,7 @@ const App = () => {
             <Text style={styles.posterFallbackTitle} numberOfLines={2}>{epCardMeta?.epTitle || info.cleanTitle}</Text>
           </View>
           {!!cardImageUri && (
-            <Image source={{ uri: cardImageUri }} style={[styles.posterImage, StyleSheet.absoluteFill]} resizeMode="cover" />
+            <FadeInPoster source={{ uri: cardImageUri }} style={[styles.posterImage, StyleSheet.absoluteFill]} resizeMode="cover" />
           )}
 
           <View style={styles.posterTopBadges}>
@@ -4428,7 +4514,7 @@ const App = () => {
                   }}>
                   <View style={styles.cwImageWrap}>
                     {imgUri ? (
-                      <Image source={{ uri: imgUri }} style={styles.cwImage} resizeMode="cover" />
+                      <FadeInPoster source={{ uri: imgUri }} style={styles.cwImage} resizeMode="cover" />
                     ) : (
                       <View style={styles.cwFallback}><Icon name="play-circle-outline" size={32} color="#E50914" /></View>
                     )}
@@ -4464,7 +4550,7 @@ const App = () => {
     );
   }
 
-  if (!navigationReady) return <View style={styles.container}><ActivityIndicator size="large" /></View>;
+  if (!navigationReady) return <View style={styles.container}><ShimmerCardGrid columns={numColumns} count={numColumns >= 5 ? 10 : 6} /></View>;
 
   const isCatalogCovered = !!selectedFile || playMode === 'internal' || activeTab === 'downloads';
 
@@ -4500,6 +4586,7 @@ const App = () => {
             </FocusableButton>
           </View>
         </View>
+        <TopSyncProgressBar visible={syncingCatalog || refreshing || isEnrichingMetadata} style={{ marginTop: -8, marginBottom: 8 }} />
 
         <View style={styles.searchRow}>
           {IS_TV ? (
@@ -4567,7 +4654,7 @@ const App = () => {
             importantForAccessibility={isInsideFolder ? 'no-hide-descendants' : 'auto'}
             pointerEvents={isInsideFolder ? 'none' : 'auto'}>
             {loading ? (
-              <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 60 }} />
+              <ShimmerCardGrid columns={numColumns} count={numColumns >= 5 ? 10 : 6} />
             ) : (
               <FlatList
                 focusable={false}
@@ -4610,9 +4697,10 @@ const App = () => {
                   </FocusableButton>
                 )}
               </View>
+              <TopSyncProgressBar visible={refreshing && isInsideFolder} />
 
               {folderLoading ? (
-                <ActivityIndicator size="large" color="#E50914" style={{ marginTop: 60 }} />
+                <ShimmerCardGrid columns={numColumns} count={numColumns >= 5 ? 10 : 6} />
               ) : (
                 <FlatList
                   focusable={false}
@@ -4655,7 +4743,7 @@ const App = () => {
           }}>
           <FocusLayerContext.Provider value="searchModal">
             <View style={styles.modalBackdrop}>
-              <View style={styles.hdrModalCard}>
+              <SlideUpSheet style={styles.hdrModalCard}>
                 <Text style={styles.hdrModalEyebrow}>SEARCH CATALOG</Text>
                 <Text style={styles.hdrModalTitle}>Type Movie or Series Name</Text>
                 <View style={{ backgroundColor: '#1B1F2C', borderRadius: 10, borderWidth: 2, borderColor: '#FFD700', marginTop: 12, paddingHorizontal: 10 }}>
@@ -4700,7 +4788,7 @@ const App = () => {
                     </FocusableButton>
                   )}
                 </View>
-              </View>
+              </SlideUpSheet>
             </View>
           </FocusLayerContext.Provider>
         </Modal>
@@ -4892,6 +4980,7 @@ const styles = StyleSheet.create({
   downloadsOverlayScreen: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 40, backgroundColor: '#0B0C10', paddingTop: 38 },
   playerWrapper: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 120, backgroundColor: 'black' },
   videoPlayer: { position: 'absolute', top: 0, left: 0, bottom: 0, right: 0 },
+  playerBufferingOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.35)' },
   externalSubtitleContainer: { position: 'absolute', left: 24, right: 24, bottom: 52, alignItems: 'center', justifyContent: 'center' },
   externalSubtitleText: { color: '#FFFFFF', backgroundColor: 'transparent', fontWeight: '700', textAlign: 'center', textShadowColor: 'rgba(0, 0, 0, 0.95)', textShadowOffset: { width: 1.5, height: 1.5 }, textShadowRadius: 4 },
   gestureHudContainer: { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, justifyContent: 'center' },
