@@ -34,6 +34,8 @@ private:
 struct Display {
     int64_t show = 0, stop = 0; // DCSQ offsets in 90 kHz ticks, zero stop means open-ended.
     std::vector<uint8_t> segments;
+    int x = 0, y = 0, w = 0, h = 0;
+    std::vector<int32_t> argb;
 };
-Display subpicture(const uint8_t *data, int size, const int32_t *clut, int width, int height);
+Display subpicture(const uint8_t *data, int size, const int32_t *clut, int width, int height, bool bitmap = false);
 }

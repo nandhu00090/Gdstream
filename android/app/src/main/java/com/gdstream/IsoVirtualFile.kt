@@ -90,6 +90,9 @@ internal class IsoVirtualFile(
         return result
     }
 
+    fun seekRanges(start: Long) = mappedRanges(start,
+        minOf(size - start, IsoChunkCache.BLOCK_BYTES.toLong() * IsoRangeReader.MAX_CONCURRENT_READS).toInt())
+
     fun mappedRanges(start: Long, length: Int): List<LongRange> {
         val rawStart = if (bdav) (start / 188L) * 192L else start
         val rawEnd = if (bdav) ((start + length - 1) / 188L + 1) * 192L else start + length

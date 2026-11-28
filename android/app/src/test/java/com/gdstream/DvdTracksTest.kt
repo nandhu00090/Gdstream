@@ -98,44 +98,44 @@ class DvdTracksTest {
         val uri = Uri.parse("http://127.0.0.1/hls/title/dvd.m3u8")
         val master = HlsPlaylistParser().parse(uri, playlist("dvd.m3u8").inputStream()) as HlsMultivariantPlaylist
         assertEquals(2, master.audios.size)
-        assertEquals(4, master.subtitles.size)
+        assertTrue(master.subtitles.isEmpty())
+        assertFalse(String(playlist("dvd.m3u8")).contains("SUBTITLES"))
+        assertNull(hls.resource("dvd_pid_288.m3u8", 1))
         assertTrue(master.audios.all { it.format.sampleMimeType == "audio/ac3" })
-        assertTrue(String(playlist(master.variants.single().url.lastPathSegment!!)).contains("\ndvd_0.ts\n"))
+        assertTrue(String(playlist(master.variants.single().url.lastPathSegment!!)).contains("\ndvd_pid_${tracks.videoPid}_0.ts\n"))
         val vlc = checkNotNull(hls.resource("dvd.m3u8", 1, muxed = true))
-        assertArrayEquals(playlist("dvd_video.m3u8"), hls.playlist(vlc, segments))
+        assertTrue(String(hls.playlist(vlc, segments)).contains("dvd_0.ts?muxed=1"))
+        assertNull(hls.resource("dvd_0.ts", 1, muxed = true)!!.pid)
+        assertEquals(tracks.videoPid, hls.resource("dvd_0.ts", 1)!!.pid)
         val mux = DvdTsMux(tracks)
         picture(mux, 90_000)
         val ts = mux.finish(90_000, 93_600)
-        for (r in master.audios + master.subtitles) {
+        val video = hls.rendition(ts, tracks.videoPid, 0)
+        assertEquals(listOf(tracks.videoPid), BluRayPsi.streams(video).map { it.pid })
+        assertTrue(extract(ts, TsExtractor.MODE_SINGLE_PMT).formats.any { it.sampleMimeType == "application/dvbsubs" })
+        for (r in master.audios) {
             val media = String(playlist(r.url!!.lastPathSegment!!))
             val pid = hls.resource(media.lines().single { it.endsWith(".ts") }, 1)!!.pid!!
             val view = hls.rendition(ts, pid, 0)
             val program = checkNotNull(BluRayPsi.program(view))
             assertEquals(pid, program.pcrPid)
             assertEquals(pid, program.streams.single().pid)
-            val output = extract(view, TsExtractor.MODE_HLS)
-            if (pid < 0x120) {
-                assertEquals(6, output.formats.single { it.sampleMimeType == "audio/ac3" }.channelCount)
-            } else {
-                val sub = output.formats.single { it.sampleMimeType == "application/dvbsubs" }
-                assertArrayEquals(byteArrayOf(0, 1, 0, 1), sub.initializationData.single())
-            }
+            assertEquals(6, extract(view, TsExtractor.MODE_HLS).formats.single { it.sampleMimeType == "audio/ac3" }.channelCount)
         }
     }
 
     @get:Rule val folder = TemporaryFolder()
 
-    @Test fun stockHlsPlayerPreparesAndReadsAllSixRenditions() {
+    @Test fun stockHlsPlayerReadsBothAudioRenditionsWithoutDvbTextGroups() {
         val hls = DvdHls(tracks())
         val mux = DvdTsMux(hls.tracks)
         picture(mux, 90_000, 4)
         val ts = mux.finish(90_000, 104_400)
         val cuts = listOf(DvdProxy.Segment(0, 2048, 160_000))
-        val pids = listOf(0x101, 0x102, 0x120, 0x121, 0x122, 0x123)
+        val pids = listOf(0x101, 0x102, hls.tracks.videoPid)
         for (name in listOf("dvd.m3u8", "dvd_video.m3u8") + pids.map { "dvd_pid_$it.m3u8" }) {
             folder.newFile(name).writeBytes(hls.playlist(checkNotNull(hls.resource(name, 1)), cuts))
         }
-        folder.newFile("dvd_0.ts").writeBytes(ts)
         pids.forEach { folder.newFile("dvd_pid_${it}_0.ts").writeBytes(hls.rendition(ts, it, 0)) }
         fun awaitReady(ready: () -> Boolean) {
             val deadline = System.nanoTime() + 10_000_000_000L
@@ -166,27 +166,25 @@ class DvdTracksTest {
                 val audios = groups.filter { it.type == C.TRACK_TYPE_AUDIO }
                 val texts = groups.filter { it.type == C.TRACK_TYPE_TEXT }
                 assertEquals(2, audios.size)
-                assertEquals(4, texts.size)
-                val streams = arrayOfNulls<SampleStream>(3)
+                assertTrue(texts.isEmpty())
+                val streams = arrayOfNulls<SampleStream>(2)
                 val loading = LoadingInfo.Builder().setPlaybackPositionUs(0).build()
-                for (i in texts.indices) {
-                    val groupsToRead = listOf(video, audios[i % 2], texts[i])
+                for (i in audios.indices) {
+                    val groupsToRead = listOf(video, audios[i])
                     period.selectTracks(groupsToRead.map { FixedTrackSelection(it, 0) }.toTypedArray(),
-                        booleanArrayOf(i > 0, false, false), streams, BooleanArray(3), 0)
+                        booleanArrayOf(i > 0, false), streams, BooleanArray(2), 0)
                     period.readDiscontinuity()
-                    for (j in 1..2) {
-                        val stream = checkNotNull(streams[j])
-                        val holder = FormatHolder()
-                        val buf = DecoderInputBuffer(DecoderInputBuffer.BUFFER_REPLACEMENT_MODE_NORMAL)
-                        awaitReady {
-                            period.continueLoading(loading)
-                            stream.maybeThrowError()
-                            stream.readData(holder, buf, 0) == C.RESULT_BUFFER_READ
-                        }
-                        assertFalse("selected rendition should supply a sample", buf.isEndOfStream)
-                        assertEquals(if (j == 1) "audio/ac3" else "application/x-media3-cues", holder.format?.sampleMimeType)
-                        assertEquals(groupsToRead[j].getFormat(0).language, holder.format?.language)
+                    val stream = checkNotNull(streams[1])
+                    val holder = FormatHolder()
+                    val buf = DecoderInputBuffer(DecoderInputBuffer.BUFFER_REPLACEMENT_MODE_NORMAL)
+                    awaitReady {
+                        period.continueLoading(loading)
+                        stream.maybeThrowError()
+                        stream.readData(holder, buf, 0) == C.RESULT_BUFFER_READ
                     }
+                    assertFalse("selected rendition should supply a sample", buf.isEndOfStream)
+                    assertEquals("audio/ac3", holder.format?.sampleMimeType)
+                    assertEquals(audios[i].getFormat(0).language, holder.format?.language)
                 }
             } finally { source.releasePeriod(period) }
         } finally { source.releaseSource(caller) }
@@ -238,6 +236,37 @@ class DvdTracksTest {
         return packet
     }
 
+    @Test fun rawMpeg2FallbackReassemblesSpuAcrossCutsAndPreservesPngTransparency() {
+        val jni = System.getenv("GDSTREAM_TEST_DVD_JNI")
+        assumeNotNull(jni)
+        System.load(jni!!)
+        val spu = javaClass.getResourceAsStream("/dvd/caption.spu")!!.readBytes()
+        spu[16] = 0xf0.toByte() // alpha for palette index 2 (blue) is zero
+        val video = sector(byteArrayOf(1), 90_000).also { it[3] = 0xe0.toByte() }
+        val vob = video + sector(byteArrayOf(0x25) + spu.copyOf(1), 90_000) +
+            sector(byteArrayOf(0x25) + spu.copyOfRange(1, spu.size))
+        val segments = listOf(DvdProxy.Segment(0, 4096, 40_000), DvdProxy.Segment(4096, 6144, 1_000_000))
+        val starts = listOf(0L, 40_000L, 1_040_000L)
+        fun window(index: Int, prev: DvdSubtitleWindow? = null) =
+            DvdProxy.rawSubtitleWindow(segments, starts, index, tracks(), 0, 576, prev) { offset, count ->
+                vob.copyOfRange(offset.toInt(), offset.toInt() + count)
+            }
+        val opening = window(0)
+        val image = (opening.render(0)["cues"] as List<*>).single() as Map<*, *>
+        assertEquals((2048 * 100 / 9).toDouble(), image["showUs"])
+        assertEquals(40_000.0, image["stopUs"])
+        val png = android.util.Base64.decode((image["uri"] as String).substringAfter(','), 0)
+        val bitmap = android.graphics.BitmapFactory.decodeByteArray(png, 0, png.size)
+        assertEquals(255, android.graphics.Color.alpha(bitmap.getPixel(0, 0)))
+        assertEquals(0, android.graphics.Color.alpha(bitmap.getPixel(3, 0)))
+        // Enter the next cut both sequentially and by seeking into the split SPU.
+        for (next in listOf(window(1, opening), window(1))) {
+            val carried = (next.render(0)["cues"] as List<*>).single() as Map<*, *>
+            assertEquals(40_000.0, carried["showUs"])
+            assertEquals((90 * 1024L * 100 / 9).toDouble(), carried["stopUs"])
+        }
+    }
+
     @Test fun fragmentedDtsAndSpuReachMedia3AlongsideCopiedAc3OnTheWarmClock() {
         // scripts/test-dvd-tracks.sh builds these same JNI entry points against FFmpeg 6.0 for the host.
         val jni = System.getenv("GDSTREAM_TEST_DVD_JNI")
@@ -270,7 +299,22 @@ class DvdTracksTest {
             data.write(sector(byteArrayOf(0x25) + spu.copyOfRange(1, spu.size)))
             picture(mux, 93_600, 4)
             readers.read(data.toByteArray(), 2048, 5_000_000, 576, false, false) {}
-            val dialogue = mux.finish(5_000_000, 108_000)
+            val overlay = mutableListOf<DvdSpu.Cue>()
+            val dialogue = mux.finish(5_000_000, 108_000, overlay = overlay::add)
+            val window = DvdSubtitleWindow(40_000, 200_000, overlay)
+            val images = window.render(0)["cues"] as List<*>
+            val image = images.single() as Map<*, *>
+            assertEquals(40_000.0 + (93_000 + 2 * 1024 - 93_600) * 100 / 9, image["showUs"])
+            assertEquals(200_000.0, image["stopUs"]) // carried into the following segment
+            assertEquals(100, image["x"])
+            assertEquals(200, image["y"])
+            val png = android.util.Base64.decode((image["uri"] as String).substringAfter(','), 0)
+            val decoded = android.graphics.BitmapFactory.decodeByteArray(png, 0, png.size)
+            assertEquals(4, decoded.width)
+            assertEquals(2, decoded.height)
+            assertEquals(android.graphics.Color.WHITE, decoded.getPixel(0, 0))
+            assertTrue(android.graphics.Color.blue(decoded.getPixel(3, 0)) > 220)
+            assertTrue((window.render(1)["cues"] as List<*>).isEmpty())
             val tail = ByteArrayOutputStream()
             while (at < tone.size) {
                 val end = minOf(tone.size, at + 1200)

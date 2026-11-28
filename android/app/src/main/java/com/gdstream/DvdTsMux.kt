@@ -140,11 +140,11 @@ internal class DvdTsMux(val streams: DvdStreams) {
         return (timing?.nextVideo ?: sourceStart) + offset
     }
 
-    private data class Cue(val start: Long, val stop: Long?, val display: ByteArray)
+    private data class Cue(val start: Long, val stop: Long?, val display: ByteArray, val source: DvdSpu.Source?)
     private val subtitleVersions = IntArray(streams.subtitles.size)
     private val cues = List(streams.subtitles.size) { mutableListOf<Cue>() }
-    fun subtitle(track: Int, show: Long, stop: Long?, display: ByteArray) {
-        cues[track].add(Cue(show, stop, display))
+    fun subtitle(track: Int, show: Long, stop: Long?, display: ByteArray, source: DvdSpu.Source? = null) {
+        cues[track].add(Cue(show, stop, display, source))
     }
 
     fun endSubtitles(tick: Long) {
@@ -157,7 +157,7 @@ internal class DvdTsMux(val streams: DvdStreams) {
         }
     }
 
-    private fun addSubtitles(start: Long, end: Long) {
+    private fun addSubtitles(start: Long, end: Long, overlay: (DvdSpu.Cue) -> Unit) {
         for ((index, queue) in cues.withIndex()) {
             val pid = DvdStreams.SUBTITLE_PID + index
             queue.sortBy { it.start }
@@ -168,6 +168,9 @@ internal class DvdTsMux(val streams: DvdStreams) {
                 if (stop <= start) continue
                 if (cue.start < end) {
                     val show = maxOf(start, cue.start)
+                    if (stop > show && cue.source != null) {
+                        overlay(DvdSpu.Cue(index, (show - start) * 100 / 9, (minOf(stop, end) - start) * 100 / 9, cue.source))
+                    }
                     samples.add(UnitData(pid, show, cue.display))
                     if (show == start) atStart = true
                     if (stop < end && stop != queue.getOrNull(i + 1)?.start)
@@ -182,15 +185,21 @@ internal class DvdTsMux(val streams: DvdStreams) {
         }
     }
 
-    fun finish(sourceStart: Long, nativeEnd: Long, navDuration: Long = 0): ByteArray {
+    fun finish(sourceStart: Long, nativeEnd: Long, navDuration: Long = 0, overlay: (DvdSpu.Cue) -> Unit = {}): ByteArray {
         if (frames == 0) throw IOException("DVD segment produced 0 decodable AVC frames (no IDR)")
         val video = samples.filter { it.pid == streams.videoPid }
         val start = timing?.nextVideo ?: sourceStart
+        if (timing == null) {
+            // A cold VOBU may contain whole AC-3 frames belonging to the preceding GOP.
+            samples.removeAll { it.pid - DvdStreams.AUDIO_PID in clocks.indices &&
+                outputPts(it.ticks, sourceStart) <= start - AC3_FRAME_TICKS }
+        }
         val audio = clocks.indices.map { index -> samples.filter { it.pid == DvdStreams.AUDIO_PID + index } }
         val firstAudio = arrayOfNulls<Long>(clocks.size)
         for ((i, clock) in clocks.withIndex()) {
             val first = audio[i].firstOrNull() ?: continue
-            val tick = clock.next ?: outputPts(first.ticks, sourceStart)
+            // An AC-3 frame straddling the cut starts with the first displayed IDR.
+            val tick = clock.next ?: outputPts(first.ticks, sourceStart).coerceAtLeast(start)
             firstAudio[i] = tick
             if (clock.phase == null) clock.phase = tick - start
             audio[i].forEachIndexed { frame, sample -> sample.ticks = tick + frame * AC3_FRAME_TICKS }
@@ -223,7 +232,7 @@ internal class DvdTsMux(val streams: DvdStreams) {
             }
             clock.next = tick
         }
-        addSubtitles(start, end)
+        addSubtitles(start, end, overlay)
         val writer = DvdTsWriter(cc)
         writer.tables(streams, legacyAudio = audio[0].isNotEmpty())
         for (sample in samples.sortedBy { it.ticks }) {

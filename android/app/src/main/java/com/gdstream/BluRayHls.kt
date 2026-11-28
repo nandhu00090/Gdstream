@@ -288,8 +288,9 @@ internal class BluRayHls private constructor(val segments: List<Segment>, val au
             if (points.any { it.timeUs < 0 || it.timeUs >= profile.durationUs || it.position < 0 || it.position >= size || it.position % 188 != 0L } ||
                 points.zipWithNext().any { (a, b) -> b.timeUs <= a.timeUs || b.position <= a.position }) return null
             val boundaries = arrayListOf(BluRayPoint(0, 0))
+            val targetUs = if (standalone) 4_000_000L else 2_000_000L
             for (point in points) {
-                if (point.timeUs - boundaries.last().timeUs >= 4_000_000 && point.position > boundaries.last().position) boundaries.add(point)
+                if (point.timeUs - boundaries.last().timeUs >= targetUs && point.position > boundaries.last().position) boundaries.add(point)
             }
             boundaries.add(BluRayPoint(profile.durationUs, size))
             return BluRayHls(boundaries.zipWithNext { a, b -> Segment(a.position, b.position, b.timeUs - a.timeUs) }, supportedAudio)

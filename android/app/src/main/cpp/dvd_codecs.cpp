@@ -180,7 +180,7 @@ std::vector<uint8_t> Audio::convert(const uint8_t *data, int size, bool last) {
     return out;
 }
 
-Display subpicture(const uint8_t *data, int size, const int32_t *clut, int width, int height) {
+Display subpicture(const uint8_t *data, int size, const int32_t *clut, int width, int height, bool bitmap) {
     std::unique_ptr<AVCodecContext, Free> dec(context(avcodec_find_decoder(AV_CODEC_ID_DVD_SUBTITLE)));
     std::string palette;
     for (int i = 0; i < 16; ++i) {
@@ -209,6 +209,23 @@ Display subpicture(const uint8_t *data, int size, const int32_t *clut, int width
     auto ticks = [](uint32_t ms) { return ((ms * 90LL + 512) / 1024) * 1024; };
     display.show = ticks(sub.start_display_time);
     display.stop = ticks(sub.end_display_time);
+
+    if (bitmap) {
+        // dvdsubdec returns one cropped, paletted rectangle in DVD canvas coordinates.
+        const auto &r = *sub.rects[0];
+        if (r.x < 0 || r.y < 0 || r.w <= 0 || r.h <= 0 || r.x > width - r.w ||
+            r.y > height - r.h || r.linesize[0] < r.w || !r.data[0] || !r.data[1]) return display;
+        display.x = r.x;
+        display.y = r.y;
+        display.w = r.w;
+        display.h = r.h;
+        const auto *colors = reinterpret_cast<const uint32_t *>(r.data[1]);
+        display.argb.reserve(r.w * r.h);
+        for (int y = 0; y < r.h; ++y)
+            for (int x = 0; x < r.w; ++x)
+                display.argb.push_back(colors[r.data[0][y * r.linesize[0] + x]]);
+        return display;
+    }
 
     std::unique_ptr<AVCodecContext, Free> enc(context(avcodec_find_encoder(AV_CODEC_ID_DVB_SUBTITLE)));
     enc->width = width;

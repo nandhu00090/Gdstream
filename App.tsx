@@ -6,6 +6,7 @@ import {
   StatusBar, RefreshControl, AppState,
 } from 'react-native';
 import Video from 'react-native-video';
+import DvdSubtitleOverlay from './DvdSubtitleOverlay';
 import { catalogRequest, catalogJson, inCatalogSlot } from './catalogRequests';
 import Orientation from 'react-native-orientation-locker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
@@ -1020,7 +1021,19 @@ const App = () => {
 
   const isExternalSubtitleSelected = selectedText?.type === 'external' && !!externalSubtitle;
   const isExternalAudioSelected = selectedAudio?.type === 'external' && !!externalAudio;
-  const subtitlesActive = !!selectedText && selectedText.type !== 'disabled' && selectedText.type !== 'external';
+  const dvdPlayerUrl = playMode === 'internal' && selectedFile?.archiveFormat === 'ISO' &&
+    /\/(?:dvd\.m3u8|[^/?]+\.vob)(?:$|[?#])/i.test(playbackSource.uri) ? playbackSource.uri : '';
+  const [dvdCatalog, setDvdCatalog] = useState<{url: string; tracks: string[]}>();
+  const dvdTracks = dvdCatalog?.url === dvdPlayerUrl ? dvdCatalog.tracks : [];
+  const [dvdAspect, setDvdAspect] = useState(0);
+  useEffect(() => {
+    let active = true;
+    if (dvdPlayerUrl) SecurityVault.dvdSubtitleTracks(dvdPlayerUrl)
+      .then((tracks: string[]) => { if (active) setDvdCatalog({url: dvdPlayerUrl, tracks}); }).catch(() => {});
+    return () => { active = false; };
+  }, [dvdPlayerUrl]);
+  const dvdSelected = !!dvdPlayerUrl && selectedText?.type === 'dvd';
+  const subtitlesActive = !dvdSelected && !!selectedText && selectedText.type !== 'disabled' && selectedText.type !== 'external';
 
   const parsedExternalCues = useMemo(() => externalSubtitle?.content ? parseSubtitleFile(externalSubtitle.content) : [], [externalSubtitle]);
   const activeExternalSubtitleText = useMemo(() => {
@@ -1982,6 +1995,7 @@ const App = () => {
   }, [selectedFile, versionGroup, playMode, mediaInfoMap, metadataMap, getStreamUrl, resolvePlaybackUrl]);
 
   const seekBothPlayers = useCallback((targetTime: number) => {
+    if (isIsoPlayback) SecurityVault.seekIsoPlayback(playbackSource.uri, targetTime);
     videoRef.current?.seek(targetTime);
     setCurrentTime(targetTime);
     currentTimeRef.current = targetTime;
@@ -1994,7 +2008,7 @@ const App = () => {
       externalAudioTimeRef.current = audioTarget;
       lastAudioSyncMs.current = Date.now();
     }
-  }, [isExternalAudioSelected, audioDelay, selectedFile, persistPlaybackProgress]);
+  }, [isIsoPlayback, playbackSource.uri, isExternalAudioSelected, audioDelay, selectedFile, persistPlaybackProgress]);
 
   const seekbarPanResponder = useMemo(() => PanResponder.create({
     onStartShouldSetPanResponder: () => true,
@@ -2865,6 +2879,7 @@ const App = () => {
   }), []);
 
   const handleVideoLoad = async (meta: any) => {
+    if (dvdPlayerUrl && meta?.naturalSize?.height > 0) setDvdAspect(meta.naturalSize.width / meta.naturalSize.height);
     const loadedDur = playbackDuration(selectedFile, Number(meta?.duration), savedDurationsRef.current[selectedFile?.name] || 0);
     if (loadedDur > 0) {
       setDuration(loadedDur);
@@ -2914,6 +2929,7 @@ const App = () => {
         if (savedTimeStr) savedTime = parseFloat(savedTimeStr);
       }
       if (savedTime > 3 && (loadedDur <= 0 || loadedDur - savedTime > 90)) {
+        if (isIsoPlayback) SecurityVault.seekIsoPlayback(playbackSource.uri, savedTime);
         videoRef.current?.seek(savedTime);
         setCurrentTime(savedTime);
         currentTimeRef.current = savedTime;
@@ -3235,6 +3251,13 @@ const App = () => {
                 <FocusableButton style={styles.adjustBtn} onPress={() => setPlaybackRate(r => Math.min(2.0, Math.round((r + 0.25) * 100) / 100))}><Icon name="add" size={20} color="white" /></FocusableButton>
               </View>
             )}
+            {!isAudio && dvdTracks.map((label, index) => (
+              <FocusableButton key={`dvd-${index}`} style={styles.menuItem}
+                onPress={() => handleSelectTextTrack({ type: 'dvd', value: index })}>
+                <Icon name="check" size={20} color="#E50914" style={{ opacity: dvdSelected && selectedText.value === index ? 1 : 0 }} />
+                <Text style={styles.menuItemText}>{label} • DVD {index + 1}</Text>
+              </FocusableButton>
+            ))}
             {tracks.map((track, index) => {
               const indexStr = String(index);
               const title = track.language?.trim().toUpperCase() || `Track ${index + 1}`;
@@ -3299,7 +3322,7 @@ const App = () => {
           disableFocus={isExternalAudioSelected}
           rate={playbackRate}
           focusable={false}
-          progressUpdateInterval={500}
+          progressUpdateInterval={dvdSelected ? 80 : 500}
           onLoad={handleVideoLoad}
           onBuffer={(b: any) => setIsVideoBuffering(!!b?.isBuffering)}
           onAudioTracks={(data: any) => {
@@ -3378,6 +3401,11 @@ const App = () => {
             onProgress={(ap: any) => { externalAudioTimeRef.current = ap.currentTime; }}
             style={{ width: 0, height: 0 }}
           />
+        )}
+
+        {dvdSelected && (
+          <DvdSubtitleOverlay key={`${dvdPlayerUrl}/${selectedText.value}`} url={dvdPlayerUrl} track={selectedText.value}
+            clock={currentTimeRef} delay={subtitleDelay} aspect={dvdAspect} zoom={resizeMode === 'cover'} />
         )}
 
         {isExternalSubtitleSelected && !!activeExternalSubtitleText && (
