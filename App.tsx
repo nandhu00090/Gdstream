@@ -33,6 +33,9 @@ import {
   MyListHeartButton,
   DownloadActionButton,
   TrailerGlowButton,
+  SeriesCycleBadge,
+  VersionOptionCard,
+  HeroPortraitPoster,
 } from './LoadingAnimations';
 import { catalogRequest, catalogJson, inCatalogSlot } from './catalogRequests';
 import Orientation from 'react-native-orientation-locker';
@@ -488,7 +491,6 @@ const App = () => {
   const [selectedFile, setSelectedFile] = useState<any>(null);
 
   
-  const [showSeriesRatingTick, setShowSeriesRatingTick] = React.useState(false);
   const [seriesSeasonRangeMap, setSeriesSeasonRangeMap] = React.useState<Record<string, { min: number; max: number }>>({});
   const [folderClassifications, setFolderClassifications] = React.useState<Record<string, FolderClassification>>({});
   const folderClassificationsRef = React.useRef<Record<string, FolderClassification>>({});
@@ -519,14 +521,6 @@ const App = () => {
       return { min: fromHelper, max: fromHelper };
     }
     return null;
-  }, []);
-
-  React.useEffect(() => {
-    if (IS_TV) return;
-    const timer = setInterval(() => {
-      setShowSeriesRatingTick(prev => !prev);
-    }, 2600);
-    return () => clearInterval(timer);
   }, []);
 
   // Discover actual owned season range (e.g., S04 or S02-S03) strictly from Drive files/folders in memory
@@ -647,7 +641,7 @@ const App = () => {
     return null;
   };
 
-  const getHomeSeriesBadgeText = (itemObj: any, infoObj: any, metaObj: any): { text: string; isRating: boolean } => {
+  const getHomeSeriesBadgeText = (itemObj: any, infoObj: any, metaObj: any): { seasonText: string; rating: number | null } => {
     const cached = ensureSeriesMetaLoaded(itemObj, infoObj);
     const cleanKey = String(infoObj?.searchTitle || infoObj?.cleanTitle || '').trim().toUpperCase();
     const mappedRange = cleanKey ? seriesSeasonRangeMap[cleanKey] : undefined;
@@ -671,15 +665,17 @@ const App = () => {
     const minS = candidatesMin.length > 0 ? Math.min(...candidatesMin) : 1;
     const maxS = candidatesMax.length > 0 ? Math.max(...candidatesMax) : 1;
 
-    const seasonRangeText = maxS > minS
+    const seasonText = maxS > minS
       ? `S${String(minS).padStart(2, '0')}-S${String(maxS).padStart(2, '0')}`
       : `S${String(minS).padStart(2, '0')}`;
 
-    const ratingVal = metaObj?.rating || cached?.rating || '';
-    if (ratingVal && showSeriesRatingTick) {
-      return { text: `★ ${ratingVal}`, isRating: true };
-    }
-    return { text: seasonRangeText, isRating: false };
+    const rawRating = metaObj?.rating ?? cached?.rating ?? null;
+    const parsedRating = typeof rawRating === 'number' ? rawRating : parseFloat(String(rawRating ?? ''));
+    const validRating = typeof parsedRating === 'number' && Number.isFinite(parsedRating) && parsedRating > 0.1
+      ? parsedRating
+      : null;
+
+    return { seasonText, rating: validRating };
   };
 
   const [episodeTmdbMeta, setEpisodeTmdbMeta] = React.useState<{
@@ -3767,7 +3763,7 @@ const App = () => {
                   persistPlaybackProgress(selectedFile.name, currentTimeRef.current, durationRef.current);
                 }
               }} style={styles.netflixMainPlayBtn}>
-                {isVideoBuffering ? <CinemaArcLoader size="medium" compact /> : <Icon name={isPaused ? 'play-arrow' : 'pause'} size={54} color="white" />}
+                {isVideoBuffering ? <CinemaArcLoader size="medium" compact variant="onCrimson" /> : <Icon name={isPaused ? 'play-arrow' : 'pause'} size={54} color="white" />}
               </FocusableButton>
               <FocusableButton style={styles.netflixSeekCircleBtn} onPress={() => triggerStepSeek(true)}>
                 <Icon name="forward-10" size={40} color="white" />
@@ -3961,11 +3957,28 @@ const App = () => {
 
         <View style={styles.detailContent}>
           <View style={styles.detailHeaderRow}>
-            {meta?.poster ? (
-              <StaggeredSection delayMs={0}>
-                <FadeInPoster source={{ uri: meta.poster }} style={styles.detailPosterThumb} resizeMode="cover" />
-              </StaggeredSection>
-            ) : null}
+            {meta?.poster ? (() => {
+              const detailHas4k = Boolean(
+                effectiveResolution === '4K' ||
+                effectiveResolution === '2160p' ||
+                effectiveHasDV ||
+                effectiveHasHDR,
+              );
+              const detailIs1080 = Boolean(
+                effectiveResolution === '1080p' ||
+                effectiveResolution === 'FHD' ||
+                /\b(1080p|fhd)\b/i.test(selectedFile?.name || ''),
+              );
+              const detailTier: CardGlowTier = detailHas4k ? '4k' : detailIs1080 ? '1080p' : 'sd';
+              return (
+                <HeroPortraitPoster
+                  source={{ uri: meta.poster }}
+                  tier={detailTier}
+                  isDv={effectiveHasDV}
+                  style={styles.detailPosterThumb}
+                />
+              );
+            })() : null}
             <StaggeredSection delayMs={40} style={{ flex: 1 }}>
               <Text style={styles.detailTitle}>{meta?.title || info.cleanTitle}</Text>
               {!!episodeTmdbMeta?.epTitle && (
@@ -4019,19 +4032,21 @@ const App = () => {
                     <FocusableButton
                       key={vFile.name || vIdx}
                       focusId={`detail_ver_${vIdx}`}
+                      Component={VersionOptionCard}
+                      active={isCurrentVer}
                       style={[styles.versionPillBtn, isCurrentVer && styles.versionPillBtnActive]}
-                      onPress={() => openFile(vFile)}>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      onPress={() => openFile(vFile)}
+                      renderRadioIcon={() => (
                         <Icon
                           name={isCurrentVer ? 'radio-button-checked' : 'radio-button-unchecked'}
-                          size={16}
+                          size={18}
                           color={isCurrentVer ? '#E50914' : '#8A94A6'}
                         />
-                        <Text style={[styles.versionPillTitle, isCurrentVer && { color: '#FFF' }]}>
-                          {getVersionTag(vFile.name)}
-                        </Text>
-                      </View>
-                      <Text style={styles.versionPillSub} numberOfLines={1}>
+                      )}>
+                      <Text style={[styles.versionPillTitle, isCurrentVer && { color: '#FFF' }]}>
+                        {getVersionTag(vFile.name)}
+                      </Text>
+                      <Text style={[styles.versionPillSub, { marginLeft: 0 }]} numberOfLines={1}>
                         {verMi?.totalBytes ? `${formatBytes(verMi.totalBytes)} • ` : ''}{vFile.name}
                       </Text>
                     </FocusableButton>
@@ -4060,6 +4075,7 @@ const App = () => {
                   focusId="detail_play_btn"
                   Component={PlayHeroButton}
                   inspecting={openingIso}
+                  pulseTrigger={selectedFile.name}
                   hasTVPreferredFocus={true}
                   style={[
                     styles.primaryPlayButton,
@@ -4134,6 +4150,7 @@ const App = () => {
               <FocusableButton
                 focusId="detail_dl_btn"
                 Component={DownloadActionButton}
+                pulseTrigger={selectedFile.name}
                 disabled={!!selectedFile.isoPending}
                 style={styles.downloadActionBtn}
                 onPress={() => handleStartDownload(selectedFile)}
@@ -4604,7 +4621,7 @@ const App = () => {
       cardRes === 'DVD' ||
       /\b(720p|480p|480i|576i|dvd|dvd5|dvd9|dvdrip|vob)\b/i.test(`${cardRes} ${item.name || ''}`),
     );
-    const cardGlowTier: CardGlowTier = has4kOrHdr ? '4k' : is1080Card ? '1080p' : isSdCard ? 'sd' : 'none';
+    const cardGlowTier: CardGlowTier = versionCount > 1 ? 'multi' : has4kOrHdr ? '4k' : is1080Card ? '1080p' : isSdCard ? 'sd' : 'none';
     const isDvCard = Boolean(realMi?.hasDV || info.hasDV);
     const ratingNumeric = parseFloat(String(meta?.rating || '0'));
     const hasHighRatingGlint = Number.isFinite(ratingNumeric) && ratingNumeric >= 7.5;
@@ -4675,14 +4692,10 @@ const App = () => {
                 {showSeriesBadge ? (() => {
                   const badgeInfo = getHomeSeriesBadgeText(item, info, meta);
                   return (
-                    <GlintBadge
-                      active={badgeInfo.isRating && hasHighRatingGlint}
-                      tintColor="rgba(253, 230, 138, 0.52)"
-                      style={badgeInfo.isRating ? styles.ratingPill : styles.folderPill}>
-                      <Text style={badgeInfo.isRating ? styles.ratingPillText : styles.folderPillText}>
-                        {badgeInfo.text}
-                      </Text>
-                    </GlintBadge>
+                    <SeriesCycleBadge
+                      seasonText={badgeInfo.seasonText}
+                      rating={badgeInfo.rating}
+                    />
                   );
                 })() : info.seasonEpisode ? (
                   <View style={styles.folderPill}><Text style={styles.folderPillText}>{info.seasonEpisode}</Text></View>
@@ -4706,7 +4719,11 @@ const App = () => {
               </View>
 
               {versionCount > 1 && (
-                <GlintBadge active={true} style={styles.multiVersionBadge}>
+                <GlintBadge
+                  active={true}
+                  pulse={true}
+                  tintColor="rgba(56, 189, 248, 0.55)"
+                  style={[styles.multiVersionBadge, { borderWidth: 1, borderColor: 'rgba(56, 189, 248, 0.65)' }]}>
                   <Text style={styles.multiVersionBadgeText}>{versionCount} VERSIONS</Text>
                 </GlintBadge>
               )}

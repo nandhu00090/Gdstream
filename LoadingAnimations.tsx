@@ -4,6 +4,7 @@ import {
   Easing,
   Image,
   ImageProps,
+  ImageStyle,
   Platform,
   Pressable,
   PressableProps,
@@ -184,6 +185,7 @@ interface CinemaArcLoaderProps {
   statusText?: string;
   messages?: string[];
   compact?: boolean;
+  variant?: 'default' | 'onCrimson';
   style?: StyleProp<ViewStyle>;
 }
 
@@ -192,6 +194,7 @@ export const CinemaArcLoader: React.FC<CinemaArcLoaderProps> = ({
   statusText,
   messages,
   compact = false,
+  variant = 'default',
   style,
 }) => {
   const outerSpin = useRef(new Animated.Value(0)).current;
@@ -285,10 +288,25 @@ export const CinemaArcLoader: React.FC<CinemaArcLoaderProps> = ({
   const outerRotate = outerSpin.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '360deg'] });
   const innerRotate = innerSpin.interpolate({ inputRange: [0, 1], outputRange: ['360deg', '0deg'] });
   const activeText = messages && messages.length > 0 ? messages[msgIdx % messages.length] : statusText;
+  const onCrimson = variant === 'onCrimson';
+  const outerColor = onCrimson ? '#FFFFFF' : '#E50914';
+  const outerTrackColor = onCrimson ? 'rgba(255,255,255,0.24)' : 'rgba(229,9,20,0.18)';
+  const innerColor = '#F5C518';
+  const innerTrackColor = onCrimson ? 'rgba(245,197,24,0.28)' : 'rgba(245,197,24,0.16)';
+  const barPrimary = onCrimson ? '#FFFFFF' : '#E50914';
+  const barCenter = onCrimson ? '#FFFFFF' : '#F5C518';
 
   return (
     <View style={[compact ? styles.arcCompactWrap : styles.arcCenterWrap, style]}>
-      <View style={{ width: dim, height: dim, alignItems: 'center', justifyContent: 'center' }}>
+      <View
+        style={{
+          width: dim,
+          height: dim,
+          borderRadius: dim / 2,
+          alignItems: 'center',
+          justifyContent: 'center',
+          backgroundColor: onCrimson ? 'rgba(11, 11, 15, 0.35)' : 'transparent',
+        }}>
         <Animated.View
           style={{
             position: 'absolute',
@@ -296,9 +314,9 @@ export const CinemaArcLoader: React.FC<CinemaArcLoaderProps> = ({
             height: dim,
             borderRadius: dim / 2,
             borderWidth: stroke,
-            borderColor: 'rgba(229,9,20,0.18)',
-            borderTopColor: '#E50914',
-            borderRightColor: '#E50914',
+            borderColor: outerTrackColor,
+            borderTopColor: outerColor,
+            borderRightColor: outerColor,
             transform: [{ rotate: outerRotate }],
           }}
         />
@@ -309,9 +327,9 @@ export const CinemaArcLoader: React.FC<CinemaArcLoaderProps> = ({
             height: innerDim,
             borderRadius: innerDim / 2,
             borderWidth: Math.max(1.5, stroke - 0.5),
-            borderColor: 'rgba(245,197,24,0.16)',
-            borderBottomColor: '#F5C518',
-            borderLeftColor: '#F5C518',
+            borderColor: innerTrackColor,
+            borderBottomColor: innerColor,
+            borderLeftColor: innerColor,
             transform: [{ rotate: innerRotate }],
           }}
         />
@@ -321,7 +339,7 @@ export const CinemaArcLoader: React.FC<CinemaArcLoaderProps> = ({
               width: barWidth,
               height: barHeight,
               borderRadius: barWidth,
-              backgroundColor: '#E50914',
+              backgroundColor: barPrimary,
               transform: [{ scaleY: bar1 }],
             }}
           />
@@ -330,7 +348,7 @@ export const CinemaArcLoader: React.FC<CinemaArcLoaderProps> = ({
               width: barWidth,
               height: barHeight,
               borderRadius: barWidth,
-              backgroundColor: '#F5C518',
+              backgroundColor: barCenter,
               transform: [{ scaleY: bar2 }],
             }}
           />
@@ -339,7 +357,7 @@ export const CinemaArcLoader: React.FC<CinemaArcLoaderProps> = ({
               width: barWidth,
               height: barHeight,
               borderRadius: barWidth,
-              backgroundColor: '#E50914',
+              backgroundColor: barPrimary,
               transform: [{ scaleY: bar3 }],
             }}
           />
@@ -810,12 +828,19 @@ export const SlideUpSheet: React.FC<{
 // ---------------------------------------------------------------------------
 // 6. TierRimGlowCard — Tier-Aware Breathing Edge Glow (4K / 1080p / SD-720p)
 // ---------------------------------------------------------------------------
-export type CardGlowTier = '4k' | '1080p' | 'sd' | 'none';
+export type CardGlowTier = 'multi' | '4k' | '1080p' | 'sd' | 'none';
 
 const TIER_GLOW_CONFIG: Record<
   Exclude<CardGlowTier, 'none'>,
   { primary: string; secondary?: string; minOpacity: number; maxOpacity: number; halfDurationMs: number }
 > = {
+  multi: {
+    primary: '#38BDF8',
+    secondary: '#E50914',
+    minOpacity: 0.24,
+    maxOpacity: 0.78,
+    halfDurationMs: 1350,
+  },
   '4k': {
     primary: '#F5C518',
     secondary: '#E50914',
@@ -940,11 +965,13 @@ export const Ambient4KGlowCard: React.FC<{
 // ---------------------------------------------------------------------------
 export const GlintBadge: React.FC<{
   active?: boolean;
+  pulse?: boolean;
   tintColor?: string;
   style?: StyleProp<ViewStyle>;
   children: React.ReactNode;
-}> = ({ active = true, tintColor, style, children }) => {
+}> = ({ active = true, pulse = false, tintColor, style, children }) => {
   const glintProgress = useRef(new Animated.Value(0)).current;
+  const pulseAnim = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
     if (!active) {
@@ -972,13 +999,38 @@ export const GlintBadge: React.FC<{
     return () => loop.stop();
   }, [active, glintProgress]);
 
+  useEffect(() => {
+    if (!pulse) {
+      pulseAnim.setValue(1);
+      return;
+    }
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, {
+          toValue: 1.05,
+          duration: 1100,
+          easing: Easing.inOut(Easing.sin),
+          useNativeDriver: true,
+        }),
+        Animated.timing(pulseAnim, {
+          toValue: 1,
+          duration: 1100,
+          easing: Easing.inOut(Easing.sin),
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [pulse, pulseAnim]);
+
   const glintX = glintProgress.interpolate({
     inputRange: [0, 1],
     outputRange: [-55, 115],
   });
 
   return (
-    <View style={[style, { overflow: 'hidden' }]}>
+    <Animated.View style={[style, { overflow: 'hidden', transform: [{ scale: pulseAnim }] }]}>
       {children}
       {active && (
         <Animated.View
@@ -990,7 +1042,7 @@ export const GlintBadge: React.FC<{
           ]}
         />
       )}
-    </View>
+    </Animated.View>
   );
 };
 
@@ -1424,12 +1476,25 @@ export const CopySpecPill: React.FC<{
 export const PlayHeroButton: React.FC<
   TactileSpringPressableProps & {
     inspecting?: boolean;
+    pulseTrigger?: string | number;
     renderContent?: (nudgeX: Animated.Value) => React.ReactNode;
   }
-> = ({ inspecting = false, renderContent, children, style, onPressIn, onPressOut, ...rest }) => {
+> = ({ inspecting = false, pulseTrigger, renderContent, children, style, onPressIn, onPressOut, ...rest }) => {
   const auraAnim = useRef(new Animated.Value(0)).current;
   const sweepAnim = useRef(new Animated.Value(0)).current;
   const nudgeX = useRef(new Animated.Value(0)).current;
+  const switchScale = useRef(new Animated.Value(1)).current;
+  const prevTriggerRef = useRef(pulseTrigger);
+
+  useEffect(() => {
+    if (pulseTrigger !== undefined && prevTriggerRef.current !== pulseTrigger) {
+      prevTriggerRef.current = pulseTrigger;
+      Animated.sequence([
+        Animated.spring(switchScale, { toValue: 1.035, speed: 34, bounciness: 6, useNativeDriver: true }),
+        Animated.spring(switchScale, { toValue: 1, speed: 24, bounciness: 8, useNativeDriver: true }),
+      ]).start();
+    }
+  }, [pulseTrigger, switchScale]);
 
   useEffect(() => {
     if (inspecting) {
@@ -1475,7 +1540,7 @@ export const PlayHeroButton: React.FC<
   const resolvedStyle = typeof style === 'function' ? style({ pressed: false }) : style;
 
   return (
-    <View style={styles.playHeroAuraWrap}>
+    <Animated.View style={[styles.playHeroAuraWrap, { transform: [{ scale: switchScale }] }]}>
       {!inspecting && (
         <Animated.View
           pointerEvents="none"
@@ -1499,7 +1564,7 @@ export const PlayHeroButton: React.FC<
         )}
         {renderContent ? renderContent(nudgeX) : children}
       </TactileSpringPressable>
-    </View>
+    </Animated.View>
   );
 };
 
@@ -1584,12 +1649,25 @@ export const DownloadActionButton: React.FC<
   TactileSpringPressableProps & {
     progress?: number | null;
     isActiveDownload?: boolean;
+    pulseTrigger?: string | number;
     renderContent: (arrowNudgeY: Animated.Value) => React.ReactNode;
   }
-> = ({ progress = null, isActiveDownload = false, renderContent, style, onPressIn, onPressOut, ...rest }) => {
+> = ({ progress = null, isActiveDownload = false, pulseTrigger, renderContent, style, onPressIn, onPressOut, ...rest }) => {
   const arrowNudgeY = useRef(new Animated.Value(0)).current;
+  const switchScale = useRef(new Animated.Value(1)).current;
+  const prevTriggerRef = useRef(pulseTrigger);
   const [btnWidth, setBtnWidth] = React.useState(260);
   const clampedPct = progress !== null ? Math.max(0.02, Math.min(1, progress / 100)) : 0;
+
+  useEffect(() => {
+    if (pulseTrigger !== undefined && prevTriggerRef.current !== pulseTrigger) {
+      prevTriggerRef.current = pulseTrigger;
+      Animated.sequence([
+        Animated.spring(switchScale, { toValue: 1.035, speed: 34, bounciness: 6, useNativeDriver: true }),
+        Animated.spring(switchScale, { toValue: 1, speed: 24, bounciness: 8, useNativeDriver: true }),
+      ]).start();
+    }
+  }, [pulseTrigger, switchScale]);
 
   const handleIn: PressableProps['onPressIn'] = (e) => {
     Animated.spring(arrowNudgeY, { toValue: 3, speed: 34, bounciness: 6, useNativeDriver: true }).start();
@@ -1601,7 +1679,8 @@ export const DownloadActionButton: React.FC<
   };
 
   return (
-    <View
+    <Animated.View
+      style={{ transform: [{ scale: switchScale }] }}
       onLayout={e => {
         const w = e.nativeEvent.layout.width;
         if (w > 0 && Math.abs(w - btnWidth) > 2) setBtnWidth(w);
@@ -1624,7 +1703,7 @@ export const DownloadActionButton: React.FC<
         )}
         {renderContent(arrowNudgeY)}
       </TactileSpringPressable>
-    </View>
+    </Animated.View>
   );
 };
 
@@ -1670,6 +1749,267 @@ export const TrailerGlowButton: React.FC<
         {children}
       </TactileSpringPressable>
     </View>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// 14. SeriesCycleBadge — Synchronized Season / Rating Pill Flip (Never Blank)
+// ---------------------------------------------------------------------------
+export const SeriesCycleBadge: React.FC<{
+  seasonText: string;
+  rating?: number | null;
+}> = ({ seasonText, rating }) => {
+  const phase = useRef(new Animated.Value(0)).current;
+  const hasValidRating = typeof rating === 'number' && Number.isFinite(rating) && rating > 0.1;
+  const safeSeason = seasonText || 'S01';
+  const ratingText = hasValidRating ? `★ ${rating!.toFixed(1)}` : '';
+
+  useEffect(() => {
+    if (!hasValidRating || !safeSeason) {
+      phase.setValue(0);
+      return;
+    }
+    phase.setValue(0);
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.delay(2400),
+        Animated.timing(phase, {
+          toValue: 1,
+          duration: 380,
+          easing: Easing.inOut(Easing.cubic),
+          useNativeDriver: true,
+        }),
+        Animated.delay(2400),
+        Animated.timing(phase, {
+          toValue: 0,
+          duration: 380,
+          easing: Easing.inOut(Easing.cubic),
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [hasValidRating, safeSeason, phase]);
+
+  if (!hasValidRating) {
+    return (
+      <View style={styles.seriesSeasonPill}>
+        <Text style={styles.seriesSeasonPillText}>{safeSeason}</Text>
+      </View>
+    );
+  }
+
+  const seasonOpacity = phase.interpolate({ inputRange: [0, 0.55, 1], outputRange: [1, 0, 0] });
+  const seasonY = phase.interpolate({ inputRange: [0, 1], outputRange: [0, -10] });
+  const ratingOpacity = phase.interpolate({ inputRange: [0, 0.45, 1], outputRange: [0, 0, 1] });
+  const ratingY = phase.interpolate({ inputRange: [0, 1], outputRange: [10, 0] });
+  const sizingLabel = safeSeason.length >= ratingText.length ? safeSeason : ratingText;
+
+  return (
+    <GlintBadge
+      active={hasValidRating && rating! >= 7.5}
+      tintColor="rgba(253, 230, 138, 0.52)"
+      style={styles.seriesCycleWrap}>
+      <View style={[styles.seriesSeasonPill, { backgroundColor: 'transparent' }]}>
+        <Text style={[styles.seriesSeasonPillText, { opacity: 0 }]}>{sizingLabel}</Text>
+      </View>
+      <Animated.View
+        pointerEvents="none"
+        style={[
+          StyleSheet.absoluteFill,
+          styles.seriesSeasonPill,
+          { opacity: seasonOpacity, transform: [{ translateY: seasonY }] },
+        ]}>
+        <Text style={styles.seriesSeasonPillText} numberOfLines={1}>
+          {safeSeason}
+        </Text>
+      </Animated.View>
+      <Animated.View
+        pointerEvents="none"
+        style={[
+          StyleSheet.absoluteFill,
+          styles.seriesRatingPill,
+          { opacity: ratingOpacity, transform: [{ translateY: ratingY }] },
+        ]}>
+        <Text style={styles.seriesRatingPillText} numberOfLines={1}>
+          {ratingText}
+        </Text>
+      </Animated.View>
+    </GlintBadge>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// 15. VersionOptionCard — Tactile Version Switcher with Radio Pop & Sheen
+// ---------------------------------------------------------------------------
+export const VersionOptionCard: React.FC<
+  TactileSpringPressableProps & {
+    active: boolean;
+    renderRadioIcon: (radioScale: Animated.Value) => React.ReactNode;
+    children: React.ReactNode;
+  }
+> = ({ active, renderRadioIcon, children, style, ...rest }) => {
+  const radioScale = useRef(new Animated.Value(1)).current;
+  const activeBorderOpacity = useRef(new Animated.Value(active ? 1 : 0)).current;
+  const sweepAnim = useRef(new Animated.Value(0)).current;
+  const sweepOpacity = useRef(new Animated.Value(0)).current;
+  const prevActiveRef = useRef(active);
+
+  useEffect(() => {
+    Animated.timing(activeBorderOpacity, {
+      toValue: active ? 1 : 0,
+      duration: 200,
+      useNativeDriver: true,
+    }).start();
+
+    if (active && !prevActiveRef.current) {
+      radioScale.setValue(0.5);
+      sweepAnim.setValue(0);
+      sweepOpacity.setValue(0.85);
+      Animated.parallel([
+        Animated.sequence([
+          Animated.spring(radioScale, { toValue: 1.18, speed: 36, bounciness: 10, useNativeDriver: true }),
+          Animated.spring(radioScale, { toValue: 1, speed: 24, bounciness: 8, useNativeDriver: true }),
+        ]),
+        Animated.timing(sweepAnim, {
+          toValue: 1,
+          duration: 420,
+          easing: Easing.out(Easing.cubic),
+          useNativeDriver: true,
+        }),
+        Animated.timing(sweepOpacity, {
+          toValue: 0,
+          duration: 420,
+          easing: Easing.in(Easing.quad),
+          useNativeDriver: true,
+        }),
+      ]).start();
+    }
+    prevActiveRef.current = active;
+  }, [active, activeBorderOpacity, radioScale, sweepAnim, sweepOpacity]);
+
+  const sweepX = sweepAnim.interpolate({ inputRange: [0, 1], outputRange: [-110, 380] });
+  const resolvedStyle = typeof style === 'function' ? style({ pressed: false }) : style;
+
+  return (
+    <TactileSpringPressable
+      {...rest}
+      activeScale={0.97}
+      glowColor="#E50914"
+      glowBorderRadius={9}
+      style={[resolvedStyle, { overflow: 'hidden', position: 'relative' }]}>
+      <Animated.View
+        pointerEvents="none"
+        style={[
+          StyleSheet.absoluteFill,
+          styles.versionActiveBorderOverlay,
+          { opacity: activeBorderOpacity },
+        ]}
+      />
+      <Animated.View
+        pointerEvents="none"
+        style={[
+          styles.versionSheenStreak,
+          { opacity: sweepOpacity, transform: [{ translateX: sweepX }, { rotate: '18deg' }] },
+        ]}
+      />
+      <View style={styles.versionOptionContentRow}>
+        <Animated.View style={{ transform: [{ scale: radioScale }] }}>
+          {renderRadioIcon(radioScale)}
+        </Animated.View>
+        <View style={{ flex: 1 }}>{children}</View>
+      </View>
+    </TactileSpringPressable>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// 16. HeroPortraitPoster — Spring Entrance, Tier Rim, Periodic 4.5s Sheen
+// ---------------------------------------------------------------------------
+export const HeroPortraitPoster: React.FC<{
+  source: ImageProps['source'];
+  tier?: CardGlowTier;
+  isDv?: boolean;
+  style?: StyleProp<ViewStyle>;
+  imageStyle?: StyleProp<ImageStyle>;
+}> = ({ source, tier = 'none', isDv = false, style, imageStyle }) => {
+  const enterOpacity = useRef(new Animated.Value(0)).current;
+  const enterScale = useRef(new Animated.Value(0.9)).current;
+  const enterY = useRef(new Animated.Value(12)).current;
+  const periodicSweep = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    enterOpacity.setValue(0);
+    enterScale.setValue(0.9);
+    enterY.setValue(12);
+    Animated.parallel([
+      Animated.timing(enterOpacity, {
+        toValue: 1,
+        duration: 280,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+      Animated.spring(enterScale, {
+        toValue: 1,
+        speed: 22,
+        bounciness: 6,
+        useNativeDriver: true,
+      }),
+      Animated.timing(enterY, {
+        toValue: 0,
+        duration: 260,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [enterOpacity, enterScale, enterY]);
+
+  useEffect(() => {
+    periodicSweep.setValue(0);
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.delay(3800),
+        Animated.timing(periodicSweep, {
+          toValue: 1,
+          duration: 700,
+          easing: Easing.inOut(Easing.cubic),
+          useNativeDriver: true,
+        }),
+        Animated.timing(periodicSweep, {
+          toValue: 0,
+          duration: 0,
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [periodicSweep]);
+
+  const periodicX = periodicSweep.interpolate({ inputRange: [0, 1], outputRange: [-90, 175] });
+  const resolvedGlow = tier === '4k' ? (isDv ? '#C084FC' : '#F5C518') : tier === '1080p' ? '#38BDF8' : tier === 'sd' ? '#F59E0B' : '#E50914';
+
+  return (
+    <Animated.View style={{ opacity: enterOpacity, transform: [{ scale: enterScale }, { translateY: enterY }] }}>
+      <TierRimGlowCard tier={tier} isDv={isDv} borderRadius={10}>
+        <TactileSpringPressable
+          enableSheen={true}
+          activeScale={0.96}
+          glowBorderRadius={10}
+          glowColor={resolvedGlow}
+          style={[style, { overflow: 'hidden', position: 'relative' }]}>
+          <FadeInPoster source={source} style={[styles.heroPosterInnerImg, imageStyle]} resizeMode="cover" />
+          <Animated.View
+            pointerEvents="none"
+            style={[
+              styles.portraitSheenStreak,
+              { transform: [{ translateX: periodicX }, { rotate: '20deg' }] },
+            ]}
+          />
+        </TactileSpringPressable>
+      </TierRimGlowCard>
+    </Animated.View>
   );
 };
 
@@ -2041,5 +2381,67 @@ const styles = StyleSheet.create({
     borderRadius: 11.5,
     borderWidth: 1.5,
     borderColor: '#EC4899',
+  },
+  seriesCycleWrap: {
+    borderRadius: 5,
+    overflow: 'hidden',
+    position: 'relative',
+  },
+  seriesSeasonPill: {
+    backgroundColor: 'rgba(245, 197, 24, 0.94)',
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 5,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  seriesSeasonPillText: {
+    color: '#000000',
+    fontSize: 10,
+    fontWeight: '900',
+  },
+  seriesRatingPill: {
+    backgroundColor: 'rgba(11, 13, 18, 0.9)',
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 5,
+    borderWidth: 1,
+    borderColor: 'rgba(245, 197, 24, 0.65)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  seriesRatingPillText: {
+    color: '#F5C518',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  versionActiveBorderOverlay: {
+    borderRadius: 9,
+    borderWidth: 1.5,
+    borderColor: '#F5C518',
+    backgroundColor: 'rgba(229, 9, 20, 0.08)',
+  },
+  versionSheenStreak: {
+    position: 'absolute',
+    top: -20,
+    bottom: -20,
+    width: 66,
+    backgroundColor: 'rgba(255, 255, 255, 0.22)',
+  },
+  versionOptionContentRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+  },
+  heroPosterInnerImg: {
+    width: '100%',
+    height: '100%',
+  },
+  portraitSheenStreak: {
+    position: 'absolute',
+    top: -24,
+    bottom: -24,
+    width: 38,
+    backgroundColor: 'rgba(255, 255, 255, 0.24)',
   },
 });
