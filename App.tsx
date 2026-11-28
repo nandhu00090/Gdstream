@@ -13,6 +13,19 @@ import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { usePlaybackSource } from './playbackSession';
 import { isIsoArchiveUrl, withArchiveTimeout, playbackDuration, playbackErrorMessage, getPlayableUrl, encodeLibraryName, archiveSourceUrl, isoMovieDetails, sameShowEpisodes } from './archivePlayback';
+import {
+  ParsedMediaInfo,
+  FolderClassification,
+  parseMediaFilename,
+  extractSeasonNumberFromFolder,
+  hasExplicitSeriesFolderMarker,
+  isAmbiguousDriveFolder,
+  classifyFolderContents,
+  metadataCacheKey,
+  legacyMetadataCacheKeys,
+  isStaleMovieCache,
+  selectBestTmdbMovieMatch,
+} from './mediaClassification';
 
 import { linkedWatchKeys, watchAliases } from './watchHistory';
 
@@ -33,27 +46,11 @@ const standaloneProbeCandidate = (file: any) => !file.isZipEntry && (!/\.(mkv|mp
 
 let directoryAttempt = 0;
 
-interface ParsedMediaInfo {
-  rawName: string;
-  cleanTitle: string;
-  searchTitle: string;
-  year: string;
-  seasonEpisode: string;
-  seasonNum: number;
-  episodeNum: number;
-  resolution: string;
-  badges: string[];
-  hasDV: boolean;
-  hasHDR: boolean;
-  langCode: string;
-  langName: string;
-  isFolder: boolean;
-}
-
 interface MediaMetadata {
   title?: string;
   tmdbId?: number;
   originalLanguage?: string;
+  mediaType?: 'movie' | 'tv';
   poster?: string;
   backdrop?: string;
   rating?: string;
@@ -101,10 +98,6 @@ interface SeasonFolderItem {
   folderName: string;
   path: string;
 }
-
-const TYPO_FIXES: Record<string, string> = {
-  'attach on titan': 'Attack on Titan',
-};
 
 const FILTER_CATEGORIES = [
   { id: 'all', label: 'All' },
@@ -170,101 +163,15 @@ const getVersionTag = (name: string): string => {
   return tags.join(' • ');
 };
 
-const parseMediaFilename = (name: string, isFolder = false): ParsedMediaInfo => {
-  const withoutExt = isFolder ? name : name.replace(/\.(mkv|mp4|avi|mov|webm|m4v|ts|m2ts|vob|zip|rar|iso)$/i, '');
-  const normalized = withoutExt
-    .replace(/[._]+/g, ' ')
-    .replace(/\[.*?\]/g, ' ')
-    .replace(/\((?!19\d{2}|20\d{2}).*?\)/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  let resolution = '';
-  if (/\b(2160p|4k|uhd)\b/i.test(normalized)) resolution = '4K';
-  else if (/\b1080p\b/i.test(normalized)) resolution = '1080p';
-  else if (/\b720p\b/i.test(normalized)) resolution = '720p';
-  else if (/\b480p\b/i.test(normalized)) resolution = '480p';
-
-  const hasDV = /\b(dv|dovi|dolby\s*vision)\b/i.test(normalized);
-  const hasHDR = /\b(hdr|hdr10|hdr10[+])\b/i.test(normalized);
-
-  let langCode = '';
-  let langName = '';
-  if (/\b(tam|tamil)\b/i.test(normalized)) { langCode = 'ta'; langName = 'Tamil'; }
-  else if (/\b(mal|malayalam)\b/i.test(normalized)) { langCode = 'ml'; langName = 'Malayalam'; }
-  else if (/\b(tel|telugu)\b/i.test(normalized)) { langCode = 'te'; langName = 'Telugu'; }
-  else if (/\b(hin|hindi)\b/i.test(normalized)) { langCode = 'hi'; langName = 'Hindi'; }
-  else if (/\b(kan|kannada)\b/i.test(normalized)) { langCode = 'kn'; langName = 'Kannada'; }
-  else if (/\b(kor|korean)\b/i.test(normalized)) { langCode = 'ko'; langName = 'Korean'; }
-
-  const badges: string[] = [];
-  if (/\b(atmos)\b/i.test(normalized)) badges.push('Atmos');
-  if (hasDV) badges.push('DV');
-  if (hasHDR) badges.push('HDR');
-  if (/\b(remux)\b/i.test(normalized)) badges.push('REMUX');
-  else if (/\b(bluray|blu-ray)\b/i.test(normalized)) badges.push('BluRay');
-  else if (/\b(web-dl|webdl|web\s*dl|webrip)\b/i.test(normalized)) badges.push('WEB-DL');
-  if (/\b(h\s*265|x265|hevc)\b/i.test(normalized)) badges.push('HEVC');
-  if (/\b(multi|dual)\b/i.test(normalized)) badges.push('Multi Audio');
-  else if (langName) badges.push(langName);
-
-  let seasonNum = 0;
-  let episodeNum = 0;
-  const sMatch = normalized.match(/\b(?:S|Season\s*)(\d{1,2})\b/i);
-  if (sMatch) seasonNum = parseInt(sMatch[1], 10);
-  const eMatch = normalized.match(/\b(?:S\d{1,2}\s*E|E|Ep\s*|Episode\s*)(\d{1,3})\b/i);
-  if (eMatch && !isFolder) episodeNum = parseInt(eMatch[1], 10);
-
-  const seMatch = normalized.match(/\b(S\d{1,2}(?:\s*E\d{1,3})?|E\d{1,3}|Season\s*\d{1,2})\b/i);
-  let seasonEpisode = seMatch ? seMatch[1].replace(/\s+/g, '').toUpperCase() : '';
-  if (isFolder) {
-    seasonEpisode = seasonNum > 0 ? `S${seasonNum < 10 ? `0${seasonNum}` : seasonNum}` : '';
-  }
-
-  const yearMatch = normalized.match(/(?:^|[\s(])((?:19|20)\d{2})(?:[\s)]|$)/);
-  const year = yearMatch ? yearMatch[1] : '';
-
-  const cutPattern = /\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-ray|remux|web-dl|webdl|webrip|web|amzn|nf|snxt|sonyliv|jiohotstar|zee5|aha|it|hdtv|ddp\d|dd[+]|\bddp\b|aac|eac3|ac3|truehd|dts|dtshd|hevc|avc|x264|x265|h\s*264|h\s*265|multi|dual|org|fhd|jpn|kor|tam|tel|mal|hin|kan|eng|esub|esubs|msub|msubs|subs|sub|uncut|remastered|imax)\b/i;
-  let titlePart = normalized;
-  if (seMatch && seMatch.index !== undefined && seMatch.index > 1) titlePart = titlePart.slice(0, seMatch.index);
-  if (yearMatch && yearMatch.index !== undefined && yearMatch.index > 1) {
-    const beforeYear = normalized.slice(0, yearMatch.index);
-    if (beforeYear.length < titlePart.length) titlePart = beforeYear;
-  }
-  const cutMatch = titlePart.match(cutPattern);
-  if (cutMatch && cutMatch.index !== undefined && cutMatch.index > 1) titlePart = titlePart.slice(0, cutMatch.index);
-
-  titlePart = titlePart
-    .replace(/\((?:19|20)\d{2}\)/g, '')
-    .replace(/\b(movie|jpn|kor|tam|mal|tel|hin|eng|tamil|malayalam|telugu|hindi|kannada|english|japanese|korean)\b$/gi, '')
-    .replace(/[-–—:([{\s]+$/, '')
-    .trim();
-
-  const cleanTitle = titlePart || normalized.slice(0, 40);
-  const searchTitle = TYPO_FIXES[cleanTitle.toLowerCase()] || cleanTitle;
-
-  return {
-    rawName: name, cleanTitle, searchTitle, year, seasonEpisode,
-    seasonNum, episodeNum, resolution, badges: badges.slice(0, 4),
-    hasDV, hasHDR, langCode, langName, isFolder,
-  };
-};
-
-const isSeriesContainerItem = (item: any): boolean => {
+const isSeriesContainerItem = (item: any, classified?: FolderClassification): boolean => {
   if (!item || item.isZipEntry) return false;
-  if (item.mimeType?.includes('folder')) return true;
+  if (item.mimeType?.includes('folder')) {
+    if (classified) return classified.kind === 'series';
+    return hasExplicitSeriesFolderMarker(String(item.name || ''));
+  }
   const n = String(item.name || '');
   if (/\.(zip|rar)$/i.test(n)) return true;
   return false;
-};
-
-const extractSeasonNumberFromFolder = (name: string): number | null => {
-  const norm = name.replace(/[._-]+/g, ' ').trim();
-  const m1 = norm.match(/\bSeason\s*(\d{1,2})\b/i);
-  if (m1) return parseInt(m1[1], 10);
-  const m2 = norm.match(/\bS(\d{1,2})\b/i);
-  if (m2 && !/\bS\d{1,2}\s*[-–]\s*S\d{1,2}\b/i.test(norm)) return parseInt(m2[1], 10);
-  return null;
 };
 
 const ActiveLayerContext = createContext<string>('home');
@@ -523,6 +430,13 @@ const App = () => {
   
   const [showSeriesRatingTick, setShowSeriesRatingTick] = React.useState(false);
   const [seriesSeasonRangeMap, setSeriesSeasonRangeMap] = React.useState<Record<string, { min: number; max: number }>>({});
+  const [folderClassifications, setFolderClassifications] = React.useState<Record<string, FolderClassification>>({});
+  const folderClassifyingRef = React.useRef<Set<string>>(new Set());
+
+  const folderPathForItem = useCallback((item: any): string => {
+    const baseFolderPath = currentPath.startsWith('/0:/') ? currentPath : '/0:/';
+    return `${baseFolderPath}${encodeLibraryName(String(item?.name || ''))}/`;
+  }, [currentPath]);
 
   const extractSeasonRangeFromName = useCallback((raw: string): { min: number; max: number } | null => {
     const rangeMatch = raw.match(/(?:[.\s_-]|\b)S(\d{1,2})\s*[-–]\s*S?(\d{1,2})(?:[.\s_-]|\b)/i)
@@ -593,6 +507,9 @@ const App = () => {
   const [, forceSeriesBadgeUpdate] = React.useState(0);
 
   const ensureSeriesMetaLoaded = (itemObj: any, infoObj: any) => {
+    const classified = itemObj?.mimeType?.includes('folder') ? folderClassifications[folderPathForItem(itemObj)] : undefined;
+    if (classified && classified.kind !== 'series') return null;
+    if (isAmbiguousDriveFolder(itemObj) && !classified) return null;
     const searchName = String(infoObj?.searchTitle || infoObj?.cleanTitle || itemObj?.name || '').trim();
     const cleanKey = searchName.toUpperCase();
     if (!cleanKey || cleanKey.length < 2) return null;
@@ -741,7 +658,8 @@ const App = () => {
       const searchTitle = (isSeriesEp && seriesParentTitle)
         ? seriesParentTitle
         : (parsed.searchTitle || parsed.cleanTitle || rawName.replace(/\.[^.]+$/, ''));
-      const year = parsed.year || '';
+      const year = parsed.year || selectedFile?._folderYear || '';
+      const effectiveLangCode = parsed.langCode || selectedFile?._folderLangCode || '';
       const cacheKey = `${searchTitle}_${year}_${isSeriesEp ? 'tv' : 'mv'}`.toLowerCase();
 
       setTrailerState({ loading: true, available: false, cacheKey, bestQuality: '', title: searchTitle || 'Official Trailer' });
@@ -809,7 +727,9 @@ const App = () => {
             const mvSearchUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(searchTitle)}${year ? '&year=' + year : ''}`;
             const mvRes = await catalogJson(mvSearchUrl);
             const mvResults: any[] = mvRes?.results || [];
-            const mvHit = (parsed.langCode ? mvResults.find(r => r.original_language === parsed.langCode) : null) || mvResults[0];
+            const mvHit = selectBestTmdbMovieMatch(mvResults, searchTitle, year, effectiveLangCode) ||
+              (effectiveLangCode ? mvResults.find(r => r.original_language === effectiveLangCode) : null) ||
+              mvResults[0];
             const movieId = mvHit?.id;
             if (movieId && !cancelled) {
               try {
@@ -961,7 +881,7 @@ const App = () => {
     const completedDl = downloads.find(d => d.fileName === file.name && d.status === 'completed' && d.filePath);
     if (completedDl) return `file://${completedDl.filePath}`;
     const baseUrl = vaultRef.current.baseUrl;
-    return getPlayableUrl(baseUrl, currentPath, file.name, file.link);
+    return getPlayableUrl(baseUrl, file._parentPath || currentPath, file.name, file.link);
   }, [downloads, currentPath]);
 
   const [preparedUrl, setPreparedUrl] = useState('');
@@ -1372,14 +1292,18 @@ const App = () => {
   }, [playMode, selectedFile, pathStack, activeMenu, showHdrChoiceModal, showSeasonModal, isLocked, activeTab, closeInternalPlayer]);
 
   const fetchSingleMetadata = useCallback(async (info: ParsedMediaInfo, needLanguage = false): Promise<MediaMetadata | null> => {
-    const cacheKey = `meta_${/\.m2ts$/i.test(info.rawName) ? 'v9' : 'v8'}_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
+    const isTvQuery = Boolean(info.seasonEpisode || info.seasonNum > 0 || info.isFolder);
+    const cacheKey = metadataCacheKey(info);
     try {
       const cached = await AsyncStorage.getItem(cacheKey);
       if (cached) {
         const previous = JSON.parse(cached);
-        if (!needLanguage || previous.originalLanguage !== undefined) return previous;
+        if (!isStaleMovieCache(previous, info) && (!needLanguage || previous.originalLanguage !== undefined)) return previous;
       }
     } catch {}
+    if (!isTvQuery) {
+      void AsyncStorage.removeMany(legacyMetadataCacheKeys(info)).catch(() => {});
+    }
 
     const targetLower = info.searchTitle.toLowerCase().trim();
     const infoYearNum = info.year ? parseInt(info.year, 10) : 0;
@@ -1388,42 +1312,46 @@ const App = () => {
     if (tmdbKey && tmdbKey.trim().length >= 20) {
       try {
         const key = tmdbKey.trim();
-        const isTvQuery = Boolean(info.seasonEpisode || info.seasonNum > 0 || info.isFolder);
-        const endpoint = isTvQuery ? 'tv' : 'multi';
-        const multiUrl = `https://api.themoviedb.org/3/search/${endpoint}?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}`;
-        const res = await catalogJson(multiUrl);
-        const results: any[] = (res?.results || []).filter((r: any) => r.media_type !== 'person' && r.poster_path);
+        let match: any = null;
         const normTitle = (r: any) => String(r.title || r.name || r.original_title || r.original_name || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
         const cleanTarget = targetLower.replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
 
-        let match =
-          results.find((r: any) => {
-            const rYear = parseInt(String(r.release_date || r.first_air_date || '').slice(0, 4), 10);
-            return infoYearNum > 0 && rYear > 0 && Math.abs(rYear - infoYearNum) <= 1 && normTitle(r) === cleanTarget;
-          }) ||
-          (isTvQuery ? results.find((r: any) => normTitle(r) === cleanTarget) : null) ||
-          results.find((r: any) => {
-            const rYear = parseInt(String(r.release_date || r.first_air_date || '').slice(0, 4), 10);
-            return infoYearNum > 0 && rYear > 0 && Math.abs(rYear - infoYearNum) <= 1 && normTitle(r).includes(cleanTarget);
-          });
+        if (!isTvQuery) {
+          const mvYearUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}${info.year ? `&year=${encodeURIComponent(info.year)}` : ''}`;
+          const mvRes = await catalogJson(mvYearUrl);
+          match = selectBestTmdbMovieMatch(mvRes?.results || [], info.searchTitle, info.year, info.langCode);
 
-        if (!match && infoYearNum > 0 && !info.seasonEpisode) {
-          const yearUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}&primary_release_year=${info.year}`;
-          const yearRes = await catalogJson(yearUrl);
-          const yearList: any[] = (yearRes?.results || []).filter((r: any) => r.poster_path);
-          if (yearList.length > 0) {
-            match =
-              (info.langCode ? yearList.find((r: any) => r.original_language === info.langCode) : null) ||
-              yearList.find((r: any) => String(r.title || r.original_title || '').toLowerCase().trim() === targetLower) ||
-              yearList[0];
+          if (!match && infoYearNum > 0) {
+            const primaryYearUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}&primary_release_year=${encodeURIComponent(info.year)}`;
+            const primaryRes = await catalogJson(primaryYearUrl);
+            match = selectBestTmdbMovieMatch(primaryRes?.results || [], info.searchTitle, info.year, info.langCode);
           }
-        }
 
-        if (!match && results.length > 0) {
+          if (!match && infoYearNum > 0) {
+            const anyYearUrl = `https://api.themoviedb.org/3/search/movie?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}`;
+            const anyYearRes = await catalogJson(anyYearUrl);
+            match = selectBestTmdbMovieMatch(anyYearRes?.results || [], info.searchTitle, info.year, info.langCode);
+          }
+        } else {
+          const tvUrl = `https://api.themoviedb.org/3/search/tv?api_key=${encodeURIComponent(key)}&query=${encodeURIComponent(info.searchTitle)}`;
+          const res = await catalogJson(tvUrl);
+          const results: any[] = (res?.results || []).filter((r: any) => r.media_type !== 'person' && r.poster_path);
           match =
-            (info.langCode ? results.find((r: any) => r.original_language === info.langCode && String(r.title || r.name || '').toLowerCase().trim() === targetLower) : null) ||
-            results.find((r: any) => String(r.title || r.name || '').toLowerCase().trim() === targetLower) ||
-            results[0];
+            results.find((r: any) => {
+              const rYear = parseInt(String(r.release_date || r.first_air_date || '').slice(0, 4), 10);
+              return infoYearNum > 0 && rYear > 0 && Math.abs(rYear - infoYearNum) <= 1 && normTitle(r) === cleanTarget;
+            }) ||
+            results.find((r: any) => normTitle(r) === cleanTarget) ||
+            results.find((r: any) => {
+              const rYear = parseInt(String(r.release_date || r.first_air_date || '').slice(0, 4), 10);
+              return infoYearNum > 0 && rYear > 0 && Math.abs(rYear - infoYearNum) <= 1 && normTitle(r).includes(cleanTarget);
+            });
+          if (!match && results.length > 0) {
+            match =
+              (info.langCode ? results.find((r: any) => r.original_language === info.langCode && String(r.title || r.name || '').toLowerCase().trim() === targetLower) : null) ||
+              results.find((r: any) => String(r.title || r.name || '').toLowerCase().trim() === targetLower) ||
+              results[0];
+          }
         }
 
         if (match) {
@@ -1431,6 +1359,7 @@ const App = () => {
             title: match.title || match.name,
             tmdbId: match.id,
             originalLanguage: match.original_language,
+            mediaType: isTvQuery ? 'tv' : 'movie',
             poster: match.poster_path ? `https://image.tmdb.org/t/p/w342${match.poster_path}` : undefined,
             backdrop: match.backdrop_path ? `https://image.tmdb.org/t/p/w780${match.backdrop_path}` : undefined,
             rating: match.vote_average && match.vote_average > 0 ? Number(match.vote_average).toFixed(1) : undefined,
@@ -1480,7 +1409,7 @@ const App = () => {
     const signedDisc = !file?.isZipEntry && /\/download\.aspx(?:[?#]|$)/i.test(listedUrl) &&
       (/\.(m2ts|vob)$/i.test(file?.name || '') || /mp2t/i.test(file?.mimeType || ''));
     const url = signedDisc && vaultRef.current.baseUrl
-      ? getPlayableUrl(vaultRef.current.baseUrl, currentPath, file.name) : listedUrl;
+      ? getPlayableUrl(vaultRef.current.baseUrl, file._parentPath || currentPath, file.name) : listedUrl;
     if (file?.isZipEntry || !/^(https?|file):/i.test(url) || !SecurityVault?.resolveStandaloneDisc) return url;
     const name = String(file?.name || '');
     // Opaque download endpoints sometimes have no extension in either the path or title.
@@ -1502,6 +1431,77 @@ const App = () => {
     }
   }, [getStreamUrl, currentPath, metadataMap, fetchSingleMetadata]);
   useEffect(() => {
+    const rawList: any[] = Array.isArray(activeRawFiles) ? activeRawFiles : [];
+    if (rawList.length === 0 || !vaultReady || playMode !== null) return;
+
+    const pendingFolders = rawList.filter((f: any) => {
+      if (!f?.mimeType?.includes('folder') || !f?.name) return false;
+      const subPath = folderPathForItem(f);
+      return !folderClassifications[subPath] && !folderClassifyingRef.current.has(subPath);
+    });
+    if (pendingFolders.length === 0) return;
+
+    let cancelled = false;
+    const inspectFolders = async () => {
+      let cursor = 0;
+      const CONCURRENCY = 3;
+      const runWorker = async () => {
+        while (!cancelled && cursor < pendingFolders.length) {
+          const item = pendingFolders[cursor++];
+          if (!item?.name) continue;
+          const subPath = folderPathForItem(item);
+          if (folderClassifyingRef.current.has(subPath)) continue;
+          folderClassifyingRef.current.add(subPath);
+          try {
+            const subFiles = await requestRawDirectory(subPath);
+            if (cancelled || !Array.isArray(subFiles)) continue;
+            const classified = classifyFolderContents(String(item.name), subFiles, subPath);
+            if (classified.kind === 'movie') {
+              const movieInfo = parseMediaFilename(String(item.name), false);
+              const enrichedInfo: ParsedMediaInfo = {
+                ...movieInfo,
+                year: movieInfo.year || classified.year,
+                langCode: movieInfo.langCode || classified.langCode,
+                langName: movieInfo.langName || classified.langName,
+              };
+              const staleKeys = [
+                ...legacyMetadataCacheKeys(movieInfo),
+                ...legacyMetadataCacheKeys(enrichedInfo),
+              ];
+              void AsyncStorage.removeMany(Array.from(new Set(staleKeys))).catch(() => {});
+              fetchedKeysRef.current.delete(String(item.name));
+              setMetadataMap(prev => {
+                if (prev[item.name]?.mediaType !== 'tv') return prev;
+                const next = { ...prev };
+                delete next[item.name];
+                return next;
+              });
+            } else if (classified.kind === 'series') {
+              const clean = String(classified.searchTitle || classified.title || '').trim().toUpperCase();
+              if (clean && classified.minSeason > 0) {
+                setSeriesSeasonRangeMap(prev => ({
+                  ...prev,
+                  [clean]: prev[clean]
+                    ? { min: Math.min(prev[clean].min, classified.minSeason), max: Math.max(prev[clean].max, classified.maxSeason) }
+                    : { min: classified.minSeason, max: classified.maxSeason },
+                }));
+              }
+            }
+            if (!cancelled) {
+              setFolderClassifications(prev => ({ ...prev, [subPath]: classified }));
+            }
+          } catch {
+            folderClassifyingRef.current.delete(subPath);
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(CONCURRENCY, pendingFolders.length) }, () => runWorker()));
+    };
+    void inspectFolders();
+    return () => { cancelled = true; };
+  }, [activeRawFiles, vaultReady, playMode, folderClassifications, folderPathForItem]);
+
+  useEffect(() => {
     if (!activeRawFiles.length || !vaultReady || selectedFile || playMode !== null) return;
     let cancelled = false;
 
@@ -1515,20 +1515,35 @@ const App = () => {
         return mb - ma;
       });
 
-      const pendingItems: Array<{ itemKey: string; info: ParsedMediaInfo; cacheKey: string }> = [];
+      const pendingItems: Array<{ itemKey: string; info: ParsedMediaInfo; cacheKey: string; versions?: any[] }> = [];
       for (const item of orderedItems) {
         if (!item?.name) continue;
         const itemKey = item.name;
+        const classified = item?.mimeType?.includes('folder') ? folderClassifications[folderPathForItem(item)] : undefined;
+        if (isAmbiguousDriveFolder(item)) {
+          if (!classified || classified.kind === 'collection') continue;
+        }
+        if (classified?.kind === 'movie' && metadataMap[itemKey]?.mediaType === 'tv') {
+          fetchedKeysRef.current.delete(itemKey);
+        }
         if (fetchedKeysRef.current.has(itemKey)) continue;
-        const isFolder = isSeriesContainerItem(item);
-        const info = parseMediaFilename(itemKey, isFolder);
-        const cacheKey = `meta_${/\.m2ts$/i.test(info.rawName) ? 'v9' : 'v8'}_${info.searchTitle.toLowerCase()}_${info.year}_${info.langCode}`;
-        pendingItems.push({ itemKey, info, cacheKey });
+        const isFolder = isSeriesContainerItem(item, classified);
+        const rawInfo = parseMediaFilename(itemKey, isFolder);
+        const info: ParsedMediaInfo = classified?.kind === 'movie'
+          ? {
+              ...rawInfo,
+              year: rawInfo.year || classified.year,
+              langCode: rawInfo.langCode || classified.langCode,
+              langName: rawInfo.langName || classified.langName,
+            }
+          : rawInfo;
+        const cacheKey = metadataCacheKey(info);
+        pendingItems.push({ itemKey, info, cacheKey, versions: classified?.kind === 'movie' ? classified.versions : undefined });
       }
 
       if (!pendingItems.length) return;
 
-      const uncachedQueue: Array<{ itemKey: string; info: ParsedMediaInfo; cacheKey: string }> = [];
+      const uncachedQueue: Array<{ itemKey: string; info: ParsedMediaInfo; cacheKey: string; versions?: any[] }> = [];
       try {
         const uniqueCacheKeys = Array.from(new Set(pendingItems.map(p => p.cacheKey)));
         const cachedPairs = await readStoragePairs(uniqueCacheKeys);
@@ -1540,8 +1555,14 @@ const App = () => {
         }
         const instantBatch: Record<string, MediaMetadata> = {};
         for (const p of pendingItems) {
-          if (cacheLookup[p.cacheKey]) {
-            instantBatch[p.itemKey] = cacheLookup[p.cacheKey];
+          const hit = cacheLookup[p.cacheKey];
+          if (hit && !isStaleMovieCache(hit, p.info)) {
+            instantBatch[p.itemKey] = hit;
+            if (p.versions) {
+              for (const v of p.versions) {
+                if (v?.name) instantBatch[v.name] = hit;
+              }
+            }
             fetchedKeysRef.current.add(p.itemKey);
           } else {
             uncachedQueue.push(p);
@@ -1589,6 +1610,11 @@ const App = () => {
           const meta = await p;
           if (meta && !cancelled) {
             stagedUpdates[current.itemKey] = meta;
+            if (current.versions) {
+              for (const v of current.versions) {
+                if (v?.name) stagedUpdates[v.name] = meta;
+              }
+            }
             flushStaged(false);
           }
         }
@@ -1600,7 +1626,7 @@ const App = () => {
 
     enrichAllFast();
     return () => { cancelled = true; };
-  }, [activeRawFiles, vaultReady, selectedFile, playMode, fetchSingleMetadata, loadSavedTimesForFiles]);
+  }, [activeRawFiles, vaultReady, selectedFile, playMode, fetchSingleMetadata, loadSavedTimesForFiles, folderClassifications, folderPathForItem]);
 
   React.useEffect(() => {
     if (!vaultReady || playMode !== null || !isInsideFolder || !Array.isArray(folderFiles) || folderFiles.length === 0) return;
@@ -1675,10 +1701,28 @@ const App = () => {
 
   const buildProcessedList = useCallback((rawList: any[], isEpFolder: boolean) => {
     const q = searchQuery.trim().toLowerCase();
+    const resolveEntry = (file: any) => {
+      const classified = file?.mimeType?.includes('folder') ? folderClassifications[folderPathForItem(file)] : undefined;
+      const isSeriesItem = isSeriesContainerItem(file, classified);
+      const isCollectionFolder = Boolean(file?.mimeType?.includes('folder') && classified?.kind === 'collection');
+      const isMovieFolder = Boolean(file?.mimeType?.includes('folder') && classified?.kind === 'movie');
+      const isPendingAmbiguous = Boolean(file?.mimeType?.includes('folder') && !classified && isAmbiguousDriveFolder(file));
+      const rawInfo = parseMediaFilename(file.name, isSeriesItem);
+      const info: ParsedMediaInfo = isMovieFolder && classified
+        ? {
+            ...rawInfo,
+            year: rawInfo.year || classified.year,
+            langCode: rawInfo.langCode || classified.langCode,
+            langName: rawInfo.langName || classified.langName,
+          }
+        : rawInfo;
+      return { classified, isSeriesItem, isCollectionFolder, isMovieFolder, isPendingAmbiguous, info };
+    };
+
     const filtered = rawList.filter((file) => {
-      const isFolder = isSeriesContainerItem(file);
-      const info = parseMediaFilename(file.name, isFolder);
+      const { classified, isSeriesItem, isCollectionFolder, isMovieFolder, isPendingAmbiguous, info } = resolveEntry(file);
       const realMi: RealMediaInfo | undefined = file.mediaInfo ?? mediaInfoMap[file.name];
+      const versions = isMovieFolder ? classified?.versions : undefined;
 
       if (q) {
         const titleLower = info.cleanTitle.toLowerCase();
@@ -1692,21 +1736,28 @@ const App = () => {
         if (!matchesSearch) return false;
       }
       switch (activeCategory) {
-        case 'movies': return !isFolder && !info.seasonEpisode;
-        case 'series': return isFolder || !!info.seasonEpisode;
-        case '4k': return (realMi?.resolution || info.resolution) === '4K';
-        case 'dv': return realMi ? realMi.hasDV : info.hasDV;
+        case 'movies': return !isSeriesItem && !isCollectionFolder && !isPendingAmbiguous && !info.seasonEpisode;
+        case 'series': return isSeriesItem || !!info.seasonEpisode;
+        case '4k':
+          return (realMi?.resolution || info.resolution) === '4K' ||
+            Boolean(versions?.some(v => (mediaInfoMap[v.name]?.resolution || parseMediaFilename(v.name, false).resolution) === '4K'));
+        case 'dv':
+          return (realMi ? realMi.hasDV : info.hasDV) ||
+            Boolean(versions?.some(v => (mediaInfoMap[v.name] ? mediaInfoMap[v.name].hasDV : parseMediaFilename(v.name, false).hasDV)));
         case 'watchlist': return !!watchlist[file.name];
         default: return true;
       }
     });
 
-    const indexed = filtered.map((item, originalIndex) => ({
-      item,
-      originalIndex,
-      info: parseMediaFilename(item.name, !!item.mimeType?.includes('folder')),
-      modMs: item.modifiedTime ? Date.parse(item.modifiedTime) || 0 : 0,
-    }));
+    const indexed = filtered.map((item, originalIndex) => {
+      const resolved = resolveEntry(item);
+      return {
+        item,
+        originalIndex,
+        ...resolved,
+        modMs: item.modifiedTime ? Date.parse(item.modifiedTime) || 0 : 0,
+      };
+    });
 
     if (isEpFolder && sortBy === 'newest') {
       indexed.sort((a, b) => {
@@ -1730,9 +1781,16 @@ const App = () => {
     const groupedMap = new Map<string, any[]>();
     const mergedOrder: any[] = [];
     for (const entry of indexed) {
-      const { item, info } = entry;
-      if (info.isFolder || info.seasonEpisode || info.episodeNum > 0) {
+      const { item, info, classified, isSeriesItem, isCollectionFolder, isMovieFolder } = entry;
+      if (isSeriesItem || isCollectionFolder || info.seasonEpisode || info.episodeNum > 0) {
         mergedOrder.push(item);
+      } else if (isMovieFolder && classified && classified.versions.length > 0) {
+        const key = `${info.cleanTitle.toLowerCase()}|${info.year}`;
+        const existing = groupedMap.get(key) || [];
+        groupedMap.set(key, [...existing, ...classified.versions]);
+        if (existing.length === 0) {
+          mergedOrder.push({ ...item, _movieFolder: true, _versions: classified.versions });
+        }
       } else {
         const key = `${info.cleanTitle.toLowerCase()}|${info.year}`;
         if (!groupedMap.has(key)) {
@@ -1745,14 +1803,14 @@ const App = () => {
     }
 
     return mergedOrder.map(item => {
-      const isFolder = isSeriesContainerItem(item);
-      const info = parseMediaFilename(item.name, isFolder);
-      if (info.isFolder || info.seasonEpisode || info.episodeNum > 0) return item;
+      const { isSeriesItem, isCollectionFolder, isMovieFolder, info } = resolveEntry(item);
+      if (isSeriesItem || isCollectionFolder || info.seasonEpisode || info.episodeNum > 0) return item;
       const key = `${info.cleanTitle.toLowerCase()}|${info.year}`;
-      const vers = groupedMap.get(key) || [item];
+      const vers = groupedMap.get(key) || item._versions || [item];
+      if (isMovieFolder) return { ...item, _movieFolder: true, _versions: vers };
       return vers.length > 1 ? { ...item, _versions: vers } : item;
     });
-  }, [searchQuery, activeCategory, sortBy, mediaInfoMap, watchlist]);
+  }, [searchQuery, activeCategory, sortBy, mediaInfoMap, watchlist, folderClassifications, folderPathForItem]);
 
   const homeDisplayedFiles = useMemo(() => buildProcessedList(homeFiles, false), [homeFiles, buildProcessedList]);
   const folderDisplayedFiles = useMemo(() => {
@@ -1810,7 +1868,7 @@ const App = () => {
     directoryRequest.current++;
     const requestId = ++archiveOpenRequestRef.current;
     lastFolderCardIdRef.current = 'fcard_0';
-    const effectiveBasePath = basePathOverride || (currentPath.startsWith('/0:/') ? currentPath : '/0:/');
+    const effectiveBasePath = basePathOverride || zipItem?._parentPath || (currentPath.startsWith('/0:/') ? currentPath : '/0:/');
     const prevBackup = {
       pathStack: [...pathStack],
       folderFiles: [...folderFiles],
@@ -2429,7 +2487,19 @@ const App = () => {
       void AsyncStorage.setItem(key, JSON.stringify({ files, displayPath, seasons, season, title })).catch(() => {});
     };
 
-    if (isPullRefresh) setRefreshing(true);
+    if (isPullRefresh) {
+      setRefreshing(true);
+      for (const k of Array.from(folderClassifyingRef.current)) {
+        if (k.startsWith(path)) folderClassifyingRef.current.delete(k);
+      }
+      setFolderClassifications(prev => {
+        const next: Record<string, FolderClassification> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (!k.startsWith(path)) next[k] = v;
+        }
+        return next;
+      });
+    }
     else if (isRoot) setLoading(true);
     else setFolderLoading(true);
 
@@ -2560,7 +2630,7 @@ const App = () => {
   const getRemoteDownloadUrl = (file: any) => {
     if (!file) return '';
     const baseUrl = vaultRef.current.baseUrl;
-    return getPlayableUrl(baseUrl, currentPath, file.name, file.link);
+    return getPlayableUrl(baseUrl, file._parentPath || currentPath, file.name, file.link);
   };
 
   const openFile = (file: any) => {
@@ -2668,8 +2738,19 @@ const App = () => {
   };
 
   const handlePress = (item: any) => {
+    if (item?._movieFolder && Array.isArray(item._versions) && item._versions.length > 0) {
+      const vers = item._versions;
+      if (vers.length === 1 && /\.iso$/i.test(String(vers[0]?.name || '')) && !vers[0]?.isZipEntry) {
+        openZipArchiveFile(vers[0], vers[0]._parentPath);
+        return;
+      }
+      setVersionGroup(vers);
+      const resumedVer = vers.find((v: any) => (savedTimesMap[v.name] || 0) > 3) || vers[0];
+      openFile(resumedVer);
+      return;
+    }
     if (item?.name && /\.(zip|rar|iso)$/i.test(String(item.name)) && !item?.isZipEntry) {
-      openZipArchiveFile(item);
+      openZipArchiveFile(item, item._parentPath);
       return;
     }
     if (item?.mimeType?.includes('folder')) {
@@ -3617,7 +3698,8 @@ const App = () => {
   const renderDetailOverlay = () => {
     if (!selectedFile || (playMode !== null && playMode !== 'external')) return null;
     const info = parseMediaFilename(selectedFile.name, false);
-    const meta = metadataMap[selectedFile.name];
+    const meta = metadataMap[selectedFile.name] || (selectedFile._folderName ? metadataMap[selectedFile._folderName] : undefined);
+    const displayYear = meta?.year || info.year || selectedFile._folderYear || '';
     const realMi: RealMediaInfo | undefined = selectedFile.mediaInfo ?? mediaInfoMap[selectedFile.name];
     const savedSec = savedTimesMap[selectedFile.name] || 0;
     const totalDur = playbackDuration(selectedFile, realMi?.durationSec || 0, savedDurationsMap[selectedFile.name]);
@@ -3673,7 +3755,7 @@ const App = () => {
                 </Text>
               )}
               <View style={styles.detailMetaRow}>
-                {!!(meta?.year || info.year) && <Text style={styles.detailYearText}>{meta?.year || info.year}</Text>}
+                {!!displayYear && <Text style={styles.detailYearText}>{displayYear}</Text>}
                 {!!info.seasonEpisode && <View style={styles.seasonBadge}><Text style={styles.seasonBadgeText}>{info.seasonEpisode}</Text></View>}
                 {!!(episodeTmdbMeta?.rating || meta?.rating) && <View style={styles.ratingBadge}><Text style={styles.ratingBadgeText}>★ {(episodeTmdbMeta?.rating || meta.rating)}</Text></View>}
                 {!!effectiveResolution && <View style={styles.qualityBadge}><Text style={styles.qualityBadgeText}>{effectiveResolution}</Text></View>}
@@ -4095,17 +4177,30 @@ const App = () => {
   const activeDownloadsCount = downloads.filter(d => d.status === 'downloading').length;
 
   const renderCatalogCard = ({ item, index, isFolderCard = false }: { item: any; index: number; isFolderCard?: boolean }) => {
-    const isFolder = isSeriesContainerItem(item);
-    const info = parseMediaFilename(item.name, isFolder);
+    const classified = item?.mimeType?.includes('folder') ? folderClassifications[folderPathForItem(item)] : undefined;
+    const isFolder = isSeriesContainerItem(item, classified);
+    const isPhysicalFolder = Boolean(item?.mimeType?.includes('folder'));
+    const isMovieFolder = Boolean(item?._movieFolder || classified?.kind === 'movie');
+    const rawInfo = parseMediaFilename(item.name, isFolder);
+    const info: ParsedMediaInfo = isMovieFolder && classified
+      ? {
+          ...rawInfo,
+          year: rawInfo.year || classified.year,
+          langCode: rawInfo.langCode || classified.langCode,
+          langName: rawInfo.langName || classified.langName,
+        }
+      : rawInfo;
     const meta = metadataMap[item.name];
     const realMi: RealMediaInfo | undefined = item.mediaInfo ?? mediaInfoMap[item.name];
-    const activeVerForCard = item._versions?.find((v: any) => (savedTimesMap[v.name] || 0) > 3) || item;
+    const activeVerForCard = item._versions?.find((v: any) => (savedTimesMap[v.name] || 0) > 3) || item._versions?.[0] || item;
     const savedSec = savedTimesMap[activeVerForCard.name] || 0;
     const totalDur = savedDurationsMap[activeVerForCard.name] || mediaInfoMap[activeVerForCard.name]?.durationSec || 0;
     const resumePct = totalDur > 0 && savedSec > 0 ? Math.min(98, Math.max(5, (savedSec / totalDur) * 100)) : 45;
-    const cardRes = realMi?.resolution || info.resolution;
+    const verInfo = activeVerForCard !== item ? parseMediaFilename(activeVerForCard.name, false) : null;
+    const cardRes = realMi?.resolution || info.resolution || mediaInfoMap[activeVerForCard.name]?.resolution || verInfo?.resolution || '';
     const isFav = !!watchlist[item.name];
     const versionCount = item._versions?.length || 1;
+    const showSeriesBadge = isFolder || (!isInsideFolder && !!info.seasonEpisode);
 
     const cardFocusId = isFolderCard ? `fcard_${index}` : `card_${index}`;
     const recordCardFocus = () => {
@@ -4124,7 +4219,7 @@ const App = () => {
             handlePress(item);
           }}>
           <View style={styles.listPosterFallback}>
-            <Icon name={isFolder ? 'folder' : 'movie'} size={26} color={isFolder ? '#F5C518' : '#E50914'} />
+            <Icon name={!isMovieFolder && isPhysicalFolder ? 'folder' : 'movie'} size={26} color={!isMovieFolder && isPhysicalFolder ? '#F5C518' : '#E50914'} />
             {!!meta?.poster && (
               <Image source={{ uri: meta.poster }} style={[styles.listPosterThumb, StyleSheet.absoluteFill]} resizeMode="cover" />
             )}
@@ -4162,7 +4257,7 @@ const App = () => {
         }}>
         <View style={[styles.posterImageContainer, isEpisodeStillCard && { aspectRatio: 16 / 9 }]}>
           <View style={styles.posterFallback}>
-            <Icon name={isFolder ? 'folder-special' : 'local-movies'} size={isEpisodeStillCard ? 30 : 38} color={isFolder ? '#F5C518' : '#E50914'} />
+            <Icon name={!isMovieFolder && isPhysicalFolder ? 'folder-special' : 'local-movies'} size={isEpisodeStillCard ? 30 : 38} color={!isMovieFolder && isPhysicalFolder ? '#F5C518' : '#E50914'} />
             <Text style={styles.posterFallbackTitle} numberOfLines={2}>{epCardMeta?.epTitle || info.cleanTitle}</Text>
           </View>
           {!!cardImageUri && (
@@ -4170,7 +4265,7 @@ const App = () => {
           )}
 
           <View style={styles.posterTopBadges}>
-            {(isFolder || (!isInsideFolder && !!info.seasonEpisode)) ? (() => {
+            {showSeriesBadge ? (() => {
               const badgeInfo = getHomeSeriesBadgeText(item, info, meta);
               return (
                 <View style={badgeInfo.isRating ? styles.ratingPill : styles.folderPill}>
