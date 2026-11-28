@@ -3895,17 +3895,17 @@ const App = () => {
     const vMi = realMi;
     const vRes = effectiveResolution;
     const stickyBgOpacity = detailScrollY.interpolate({
-      inputRange: [110, 195],
+      inputRange: [80, 165],
       outputRange: [0, 1],
       extrapolate: 'clamp',
     });
     const stickyTitleOpacity = detailScrollY.interpolate({
-      inputRange: [135, 205],
+      inputRange: [110, 180],
       outputRange: [0, 1],
       extrapolate: 'clamp',
     });
     const stickyTitleTranslateY = detailScrollY.interpolate({
-      inputRange: [135, 205],
+      inputRange: [110, 180],
       outputRange: [6, 0],
       extrapolate: 'clamp',
     });
@@ -4254,49 +4254,53 @@ const App = () => {
             })()}
           </StaggeredSection>
 
-          {/* Single MediaInfo Card for Currently Selected Version Only */}
-          <StaggeredSection delayMs={120} style={styles.mediaInfoCard}>
-            
-              <FocusableButton
-                focusId="detail_trailer_btn"
-                Component={TrailerGlowButton}
-                available={trailerState.available}
-                disabled={trailerState.loading || !trailerState.available}
-                onPress={() => {
-                  if (trailerState.available && trailerState.cacheKey && SecurityVault?.playYoutubeTrailer) {
-                    SecurityVault.playYoutubeTrailer(trailerState.cacheKey, trailerState.title);
-                  }
-                }}
-                style={{
-                  backgroundColor: trailerState.available ? '#1E1B2E' : '#141418',
-                  borderColor: trailerState.available ? '#A855F7' : '#27272A',
-                  borderWidth: 1,
-                  borderRadius: 10,
-                  paddingVertical: 13,
-                  paddingHorizontal: 16,
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  opacity: (trailerState.loading || !trailerState.available) ? 0.40 : 1,
-                }}
-              >
-                <Text style={{
-                  color: trailerState.available ? '#E9D5FF' : '#71717A',
-                  fontWeight: 'bold',
-                  fontSize: 14,
-                }}>
-                  {trailerState.loading
-                    ? '⏳ Verifying Official Trailer...'
-                    : trailerState.available
-                    ? `🎬 Watch Official Trailer (In-App • ${trailerState.bestQuality})`
-                    : '🎬 Trailer Unavailable'}
-                </Text>
-              </FocusableButton>
+          {/* Standalone Official Trailer Cinema Card */}
+          <StaggeredSection delayMs={105} style={styles.trailerStripSection}>
+            <FocusableButton
+              focusId="detail_trailer_btn"
+              Component={TrailerGlowButton}
+              available={trailerState.available}
+              disabled={trailerState.loading || !trailerState.available}
+              onPress={() => {
+                if (trailerState.available && trailerState.cacheKey && SecurityVault?.playYoutubeTrailer) {
+                  SecurityVault.playYoutubeTrailer(trailerState.cacheKey, trailerState.title);
+                }
+              }}
+              style={{
+                backgroundColor: trailerState.available ? '#151226' : '#11131A',
+                borderColor: trailerState.available ? 'rgba(139, 92, 246, 0.35)' : '#252936',
+                borderWidth: 1,
+                borderRadius: 12,
+                paddingVertical: 13,
+                paddingHorizontal: 16,
+                flexDirection: 'row',
+                alignItems: 'center',
+                justifyContent: 'center',
+                opacity: (trailerState.loading || !trailerState.available) ? 0.45 : 1,
+              }}
+            >
+              <Text style={{
+                color: trailerState.available ? '#EDE9FE' : '#71717A',
+                fontWeight: '700',
+                fontSize: 14,
+                letterSpacing: 0.2,
+              }}>
+                {trailerState.loading
+                  ? '⏳ Verifying Official Trailer...'
+                  : trailerState.available
+                  ? `🎬 Watch Official Trailer (In-App • ${trailerState.bestQuality})`
+                  : '🎬 Trailer Unavailable'}
+              </Text>
+            </FocusableButton>
+          </StaggeredSection>
 
-              <View style={styles.mediaInfoHeaderRow}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flex: 1 }}>
-                <Icon name="memory" size={16} color="#E50914" />
-                <Text style={[styles.mediaInfoHeaderTitle, { color: '#FFF' }]}>
+          {/* Standalone Obsidian-Glass MediaInfo Telemetry Card */}
+          <StaggeredSection delayMs={135} style={styles.mediaInfoCard}>
+            <View pointerEvents="none" style={styles.mediaInfoTopHighlight} />
+            <View style={styles.mediaInfoHeaderRow}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 7, flex: 1 }}>
+                <Icon name="memory" size={16} color="#F5C518" />
+                <Text style={[styles.mediaInfoHeaderTitle, { color: '#F1F5F9' }]}>
                   {versionGroup.length > 1 ? `MEDIAINFO • ${getVersionTag(vItem.name).toUpperCase()}` : 'MEDIAINFO TECHNICAL SPECS'}
                 </Text>
               </View>
@@ -4316,6 +4320,32 @@ const App = () => {
                 0,
                 vMi.audioTracks ? vMi.audioTracks.findIndex(t => /tamil/i.test(t.language || t.summary || '')) : 0,
               );
+              const lowerName = String(vItem.name || '').toLowerCase();
+              const isDvdContainer = vItem?.videoExtension === 'vob' || /\b(dvd|video_ts|vob)\b/.test(lowerName);
+              const isIsoContainer = vItem?.archiveFormat === 'ISO' || /\.iso$|m2ts$/.test(lowerName);
+              const containerLabel = isDvdContainer
+                ? 'DVD • VIDEO_TS'
+                : isIsoContainer
+                ? 'BDMV • ISO'
+                : /\.mkv$/.test(lowerName)
+                ? 'MKV • Matroska'
+                : /\.mp4$|\.m4v$/.test(lowerName)
+                ? 'MP4 • MPEG-4'
+                : 'Digital Stream';
+              const fpsClean = vMi.frameRate > 0 ? vMi.frameRate.toFixed(3).replace(/0+$/, '').replace(/\.$/, '') : '';
+              const explicitMbps = vMi.videoBitrateMbps && vMi.videoBitrateMbps > 0 ? vMi.videoBitrateMbps : 0;
+              const estimatedMbps = explicitMbps === 0 && vMi.totalBytes > 0 && vMi.durationSec > 0
+                ? (vMi.totalBytes * 8) / (vMi.durationSec * 1_000_000)
+                : 0;
+              const meterMbps = explicitMbps > 0 ? explicitMbps : estimatedMbps;
+              const bitrateTitle = explicitMbps > 0
+                ? `${explicitMbps.toFixed(1)} Mbps`
+                : estimatedMbps > 0
+                ? `~${estimatedMbps.toFixed(1)} Mbps`
+                : 'VBR Stream';
+              const bitrateSub = explicitMbps > 0
+                ? (fpsClean ? `Cinema ${fpsClean} fps` : 'Dedicated bitrate')
+                : (fpsClean ? `VBR • ${fpsClean} fps` : 'VBR adaptive stream');
               return (
                 <View style={{ gap: 12, marginTop: 10 }}>
                   <View style={styles.miTelemetryGrid}>
@@ -4337,20 +4367,16 @@ const App = () => {
                         </View>
                       </View>
                       <Text style={styles.miTileSub}>
-                        {vMi.width > 0 ? `${vMi.width}×${vMi.height}` : resDisplay}
+                        {vMi.width > 0 ? `${vMi.width}×${vMi.height}` : containerLabel}
                       </Text>
                     </View>
 
                     <View style={styles.miTelemetryTile}>
                       <Text style={styles.miTileLabel}>BITRATE & FPS</Text>
-                      <Text style={styles.miTileValue}>
-                        {vMi.videoBitrateMbps && vMi.videoBitrateMbps > 0 ? `${vMi.videoBitrateMbps.toFixed(1)} Mbps` : 'VBR Stream'}
-                      </Text>
-                      <Text style={styles.miTileSub}>
-                        {vMi.frameRate > 0 ? `${vMi.frameRate.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')} fps` : 'Standard cadence'}
-                      </Text>
+                      <Text style={styles.miTileValue}>{bitrateTitle}</Text>
+                      <Text style={styles.miTileSub}>{bitrateSub}</Text>
                       <BitrateMeterBar
-                        bitrateMbps={vMi.videoBitrateMbps}
+                        bitrateMbps={meterMbps}
                         color={vMi.hasDV ? '#C084FC' : (vRes === '4K' || vRes === '2160p') ? '#F5C518' : '#38BDF8'}
                       />
                     </View>
@@ -4360,7 +4386,7 @@ const App = () => {
                       <Text style={styles.miTileValue}>
                         {vMi.totalBytes > 0 ? formatBytes(vMi.totalBytes) : '—'}
                       </Text>
-                      <Text style={styles.miTileSub}>Container footprint</Text>
+                      <Text style={styles.miTileSub}>Total stream size</Text>
                     </View>
 
                     <View style={styles.miTelemetryTile}>
@@ -4368,7 +4394,9 @@ const App = () => {
                       <Text style={styles.miTileValue}>
                         {vMi.durationSec > 0 ? formatRuntime(vMi.durationSec) : '—'}
                       </Text>
-                      <Text style={styles.miTileSub}>Feature duration</Text>
+                      <Text style={styles.miTileSub}>
+                        {fpsClean ? `${containerLabel} • ${fpsClean} fps` : containerLabel}
+                      </Text>
                     </View>
                   </View>
 
@@ -5196,7 +5224,7 @@ const styles = StyleSheet.create({
   tvFocused: { borderColor: '#FFD700', borderWidth: 2, backgroundColor: 'rgba(255, 215, 0, 0.22)' },
   detailScreen: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 50, backgroundColor: '#0B0C10' },
   detailStickyBar: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 60 },
-  detailStickyBg: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(11, 11, 15, 0.96)', borderBottomWidth: 1, borderBottomColor: 'rgba(255, 255, 255, 0.08)' },
+  detailStickyBg: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(11, 11, 15, 0.97)', borderBottomWidth: 1, borderBottomColor: 'rgba(255, 255, 255, 0.08)' },
   detailStickyRow: { paddingTop: (StatusBar.currentHeight || (Platform.OS === 'android' ? 28 : 44)) + 6, paddingBottom: 10, paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center', gap: 12 },
   detailStickyBackBtn: { width: 38, height: 38, borderRadius: 19, backgroundColor: 'rgba(12, 14, 20, 0.72)', alignItems: 'center', justifyContent: 'center', borderWidth: 1.5, borderColor: 'rgba(255, 255, 255, 0.14)' },
   detailStickyTitle: { flex: 1, color: '#FFFFFF', fontSize: 16, fontWeight: '800', letterSpacing: 0.2 },
@@ -5253,14 +5281,16 @@ const styles = StyleSheet.create({
   dlProgressBarBg: { height: 6, backgroundColor: '#252C3A', borderRadius: 3, overflow: 'hidden', marginVertical: 6 },
   dlProgressBarFill: { height: '100%', backgroundColor: '#E50914', borderRadius: 3 },
   dlCardSubText: { color: '#99A3B3', fontSize: 11, marginTop: 2 },
-  mediaInfoCard: { marginTop: 18, padding: 14, borderRadius: 12, backgroundColor: '#12151E', borderWidth: 1.5, borderColor: '#E50914' },
+  trailerStripSection: { marginTop: 18 },
+  mediaInfoCard: { marginTop: 12, padding: 15, borderRadius: 18, backgroundColor: '#10131B', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.08)', overflow: 'hidden', position: 'relative' },
+  mediaInfoTopHighlight: { position: 'absolute', top: 0, left: 0, right: 0, height: 1, backgroundColor: 'rgba(255, 255, 255, 0.14)' },
   mediaInfoHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 },
   mediaInfoHeaderTitle: { color: '#9BA6B8', fontSize: 11, fontWeight: '900', letterSpacing: 0.9 },
-  scanningText: { color: '#E50914', fontSize: 11, fontWeight: '700' },
+  scanningText: { color: '#F5C518', fontSize: 11, fontWeight: '700' },
   heartBurstWrap: { position: 'relative', width: 22, height: 22, alignItems: 'center', justifyContent: 'center' },
   heartBurstRing: { position: 'absolute', width: 28, height: 28, borderRadius: 14, borderWidth: 2, borderColor: '#E50914' },
   miTelemetryGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  miTelemetryTile: { width: '48.5%', backgroundColor: '#161B26', borderRadius: 10, padding: 11, borderWidth: 1, borderColor: '#252E40' },
+  miTelemetryTile: { width: '48.5%', backgroundColor: '#171B26', borderRadius: 12, padding: 12, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.07)' },
   miTileLabel: { color: '#78849A', fontSize: 9.5, fontWeight: '800', letterSpacing: 0.8, marginBottom: 5 },
   miTileValue: { color: '#F8FAFC', fontSize: 15, fontWeight: '800' },
   miTileSub: { color: '#94A3B8', fontSize: 11, fontWeight: '600', marginTop: 3 },
@@ -5273,11 +5303,11 @@ const styles = StyleSheet.create({
   miSpecLabel: { color: '#6C7789', fontSize: 10, fontWeight: '800', letterSpacing: 0.8, marginBottom: 4 },
   miSpecValue: { color: '#E2E8F0', fontSize: 13, fontWeight: '700' },
   miTrackPillWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
-  miAudioPill: { backgroundColor: '#1A202E', borderWidth: 1, borderColor: '#2E384D', paddingHorizontal: 9, paddingVertical: 5, borderRadius: 7 },
-  miAudioPillPreferred: { backgroundColor: 'rgba(229, 9, 20, 0.16)', borderColor: '#F5C518' },
+  miAudioPill: { backgroundColor: '#171B26', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.07)', paddingHorizontal: 10, paddingVertical: 5.5, borderRadius: 8 },
+  miAudioPillPreferred: { backgroundColor: 'rgba(245, 197, 24, 0.12)', borderColor: 'rgba(245, 197, 24, 0.45)' },
   miAudioRowInner: { flexDirection: 'row', alignItems: 'center' },
-  miAudioPillText: { color: '#D8E1EE', fontSize: 11.5, fontWeight: '600' },
-  miSubPill: { backgroundColor: '#171C26', borderWidth: 1, borderColor: '#283040', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
+  miAudioPillText: { color: '#CBD5E1', fontSize: 11.5, fontWeight: '600' },
+  miSubPill: { backgroundColor: '#171B26', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.07)', paddingHorizontal: 9, paddingVertical: 4.5, borderRadius: 7 },
   miSubPillText: { color: '#A8B3C5', fontSize: 11, fontWeight: '600' },
   sourceFileDivider: { marginTop: 14, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#1E2430' },
   rawFileLabel: { color: '#6C7789', fontSize: 10, fontWeight: '800', letterSpacing: 1, marginBottom: 4 },

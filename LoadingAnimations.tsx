@@ -1795,7 +1795,9 @@ export const SeriesCycleBadge: React.FC<{
   if (!hasValidRating) {
     return (
       <View style={styles.seriesSeasonPill}>
-        <Text style={styles.seriesSeasonPillText}>{safeSeason}</Text>
+        <Text style={styles.seriesSeasonPillText} numberOfLines={1} ellipsizeMode="clip">
+          {safeSeason}
+        </Text>
       </View>
     );
   }
@@ -1811,8 +1813,10 @@ export const SeriesCycleBadge: React.FC<{
       active={hasValidRating && rating! >= 7.5}
       tintColor="rgba(253, 230, 138, 0.52)"
       style={styles.seriesCycleWrap}>
-      <View style={[styles.seriesSeasonPill, { backgroundColor: 'transparent' }]}>
-        <Text style={[styles.seriesSeasonPillText, { opacity: 0 }]}>{sizingLabel}</Text>
+      <View style={[styles.seriesSeasonPill, { backgroundColor: 'transparent', minWidth: 52 }]}>
+        <Text style={[styles.seriesSeasonPillText, { opacity: 0 }]} numberOfLines={1} ellipsizeMode="clip">
+          {sizingLabel}
+        </Text>
       </View>
       <Animated.View
         pointerEvents="none"
@@ -1821,7 +1825,7 @@ export const SeriesCycleBadge: React.FC<{
           styles.seriesSeasonPill,
           { opacity: seasonOpacity, transform: [{ translateY: seasonY }] },
         ]}>
-        <Text style={styles.seriesSeasonPillText} numberOfLines={1}>
+        <Text style={styles.seriesSeasonPillText} numberOfLines={1} ellipsizeMode="clip">
           {safeSeason}
         </Text>
       </Animated.View>
@@ -1832,7 +1836,7 @@ export const SeriesCycleBadge: React.FC<{
           styles.seriesRatingPill,
           { opacity: ratingOpacity, transform: [{ translateY: ratingY }] },
         ]}>
-        <Text style={styles.seriesRatingPillText} numberOfLines={1}>
+        <Text style={styles.seriesRatingPillText} numberOfLines={1} ellipsizeMode="clip">
           {ratingText}
         </Text>
       </Animated.View>
@@ -2360,7 +2364,7 @@ const styles = StyleSheet.create({
   },
   trailerGlowWrap: {
     position: 'relative',
-    marginBottom: 14,
+    marginBottom: 0,
   },
   trailerVioletRim: {
     position: 'absolute',
@@ -2383,15 +2387,17 @@ const styles = StyleSheet.create({
     borderColor: '#EC4899',
   },
   seriesCycleWrap: {
+    minWidth: 52,
     borderRadius: 5,
     overflow: 'hidden',
     position: 'relative',
   },
   seriesSeasonPill: {
     backgroundColor: 'rgba(245, 197, 24, 0.94)',
-    paddingHorizontal: 7,
+    paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 5,
+    minWidth: 52,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -2402,9 +2408,10 @@ const styles = StyleSheet.create({
   },
   seriesRatingPill: {
     backgroundColor: 'rgba(11, 13, 18, 0.9)',
-    paddingHorizontal: 7,
+    paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 5,
+    minWidth: 52,
     borderWidth: 1,
     borderColor: 'rgba(245, 197, 24, 0.65)',
     alignItems: 'center',
